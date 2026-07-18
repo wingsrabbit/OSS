@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# Parseable template only. Replace every placeholder before freezing a card.
+
+$schema: ./evidence-card.schema.json
+schema_version: 1.0.0
+evidence_id: EV-TEMPLATE-0001
+feature_id: FEATURE-TEMPLATE-0001
+title: Replace with an independently stated capability
+priority: P2
+business_description: Replace with an implementation-independent business description.
+sources:
+  - source_id: SRC-TEMPLATE-0001
+    source_type: goal_specification
+    reference: goal://replace-with-section-anchor
+    authority_rank: 1
+    verification_status: unknown
+    notes: Replace with a minimal approved source reference.
+classification:
+  status: unknown
+  rationale: Classification is pending evidence review.
+  freeze_version: draft
+  fail_safe_behavior: Keep the capability unavailable until the evidence is resolved.
+  negative_test_refs: []
+disposition:
+  targets:
+    - exclude
+  module_ids: []
+  provider_capability_ids: []
+  configuration_keys: []
+  exclusion_assertion_ids: []
+traceability:
+  aggregate_ids: []
+  command_ids: []
+  state_transition_ids: []
+  guard_ids: []
+  permission_ids: []
+  ledger_vector_ids: []
+  contract_schema_ids: []
+  implementation_refs: []
+  test_refs: []
+  artifact_refs: []
+data_and_trust:
+  data_class_ids: []
+  trust_boundary_ids: []
+  retention_rule_ids: []
+  minimum_disclosure: Record only the minimum approved evidence needed for traceability.
+unknown_handling:
+  owner_role: Replace with the decision owner role
+  impact: Replace with the impact of leaving this evidence unresolved.
+  fail_safe: Keep the capability unavailable and preserve an auditable review path.
+  resolution_gate: G0
+scenarios:
+  normal: []
+  failure: []
+  duplicate: []
+  out_of_order: []
+  crash: []
+  recovery: []
+review:
+  author_role: evidence_author
+  reviewer_roles:
+    - independent_reviewer
+  independent_review: false
+  status: pending
+  reproduction_commands: []
+  evidence_refs: []
+  findings: []
+lifecycle:
+  status: draft
+  goal_scope: current_goal
+  first_gate: G0
+  acceptance_gate: G9
+  last_verified_gate: null
+  created_at: "2000-01-01T00:00:00Z"
+  updated_at: "2000-01-01T00:00:00Z"
+  content_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  supersedes: null

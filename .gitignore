@@ -1,0 +1,33 @@
+# Dependencies and package-manager state
+node_modules/
+.pnpm-store/
+
+# Build and test output
+dist/
+build/
+coverage/
+playwright-report/
+test-results/
+artifacts/
+*.log
+
+# Runtime configuration and secrets
+.env
+.env.*
+!.env.example
+secrets/
+private/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp
+.tmp/

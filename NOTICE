@@ -1,0 +1,16 @@
+OpenSales System
+Copyright 2026 OpenSales System contributors
+
+OpenSales System is independently developed as a clean-room project. It contains
+no WHMCS source code, schema, template, route, module ABI, hook ABI, plugin
+signature, customer data, or other proprietary implementation material.
+
+The Core, Web, Worker, and core administration tools are licensed under
+AGPL-3.0-or-later. OpenAPI documents, JSON and event schemas, Provider contracts,
+generators, the official TypeScript SDK, conformance assets, and Reference/Mock
+Providers are licensed under Apache-2.0 as described in LICENSES/README.md.
+
+Cloud TermRat is a deployment configuration and synthetic laboratory acceptance
+profile; it is not hard-coded product logic.
+
+NOT FOR PRODUCTION — MOCK PROVIDERS ONLY

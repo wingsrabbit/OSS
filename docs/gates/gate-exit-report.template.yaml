@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+# NOT FOR PRODUCTION — MOCK PROVIDERS ONLY
+
+schema_version: 1
+report_id: gate.g0.example
+supersedes_report_id: null
+gate: G0
+recorded_at: "2026-07-18T00:00:00Z"
+
+release_identity:
+  project_version: 0.0.0
+  source_commit: "0000000000000000000000000000000000000000"
+  image_digests: []
+  schema_version: not-applicable
+  contract_versions: {}
+
+scope:
+  objective: Replace this with the exact Gate objective.
+  included:
+    - Replace with a reviewed in-scope item.
+  excluded:
+    - Real providers and production operations.
+
+feature_evidence:
+  total: 0
+  classified: 0
+  frozen_total: 0
+  retained_total: 0
+  due_for_acceptance: 0
+  due_verified: 0
+  p0_total: 0
+  p0_unexplained: 0
+  coverage_complete: false
+  due_acceptance_complete: false
+  card_artifacts: []
+  matrix_artifact: repo:docs/provenance/matrix.example.json
+
+g0_oracles:
+  state_transition_tables:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  guard_rbac_matrices:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  ledger_posting_matrices:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  transport_contracts:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  provider_contracts:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  data_retention_models:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  threat_models:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+  test_strategies:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
+
+verification:
+  commands:
+    - command_id: verify.example
+      command: Replace with a reproducible command that contains no secret.
+      environment: Replace with a logical, non-sensitive environment identifier.
+      result: Replace with the observed result.
+      passed: false
+      artifact_refs:
+        - test:example-result
+  summary:
+    passed: 0
+    failed: 1
+    skipped: 0
+  artifact_refs:
+    - test:example-result
+  measurements: []
+
+security:
+  open_critical: 0
+  open_high: 0
+  accepted_risks: []
+
+reviews:
+  evidence_audit:
+    review_id: review.evidence.example
+    reviewer_role: evidence_audit
+    independent_of_authors: true
+    artifact_ref: review:evidence-example
+    command: Replace with the evidence review command.
+    result: Pending review.
+    passed: false
+  blue_team:
+    review_id: review.blue.example
+    reviewer_role: blue_team
+    independent_of_authors: true
+    artifact_ref: review:blue-example
+    command: Replace with the Blue Team review command.
+    result: Pending review.
+    passed: false
+  red_team:
+    review_id: review.red.example
+    reviewer_role: red_team
+    independent_of_authors: true
+    artifact_ref: review:red-example
+    command: Replace with the Red Team review command.
+    result: Pending review.
+    passed: false
+  release_audit:
+    review_id: review.release.example
+    reviewer_role: release_audit
+    independent_of_authors: true
+    artifact_ref: review:release-example
+    command: Replace with the release audit command.
+    result: Pending review.
+    passed: false
+
+rollback:
+  rollback_point: Replace with the last known compatible release or commit.
+  procedure_ref: runbook:rollback-example
+  verified: false
+  data_loss_boundary: No claim until a recovery rehearsal measures it.
+
+decision:
+  outcome: no-go
+  rationale: Template values are not acceptance evidence.
+  incomplete_items:
+    - item_id: incomplete.example
+      description: Replace all template values with reproducible evidence.
+      owner: owner.example
+      fail_safe: Keep the Gate closed.
+      resolution_gate: G0
+  next_gate: G1
+
+assertions:
+  mock_only: true
+  no_secret_or_customer_data: true
+  no_proprietary_material: true
+  role_separation_recorded: true
+
+content_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

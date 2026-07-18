@@ -1,0 +1,1019 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evidence-card.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "OpenSales System Feature Evidence Card",
+  "description": "Machine-readable traceability from independently sourced evidence to disposition, implementation, tests, and review.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "evidence_id",
+    "feature_id",
+    "title",
+    "priority",
+    "business_description",
+    "sources",
+    "classification",
+    "disposition",
+    "traceability",
+    "scenarios",
+    "review",
+    "lifecycle"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "./evidence-card.schema.json"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "evidence_id": {
+      "$ref": "#/$defs/stableId"
+    },
+    "feature_id": {
+      "$ref": "#/$defs/stableId"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["P0", "P1", "P2", "P3"]
+    },
+    "business_description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "classification": {
+      "$ref": "#/$defs/classification"
+    },
+    "disposition": {
+      "$ref": "#/$defs/disposition"
+    },
+    "traceability": {
+      "$ref": "#/$defs/traceability"
+    },
+    "data_and_trust": {
+      "$ref": "#/$defs/dataAndTrust"
+    },
+    "unknown_handling": {
+      "$ref": "#/$defs/unknownHandling"
+    },
+    "scenarios": {
+      "$ref": "#/$defs/scenarioSet"
+    },
+    "review": {
+      "$ref": "#/$defs/review"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/lifecycle"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "priority": {
+            "const": "P0"
+          }
+        },
+        "required": ["priority"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "scenarios": {
+            "type": "object",
+            "properties": {
+              "normal": { "type": "array", "minItems": 1 },
+              "failure": { "type": "array", "minItems": 1 },
+              "duplicate": { "type": "array", "minItems": 1 },
+              "out_of_order": { "type": "array", "minItems": 1 },
+              "crash": { "type": "array", "minItems": 1 },
+              "recovery": { "type": "array", "minItems": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "retained"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["classification"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "targets": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "enum": ["core", "provider_contract", "deployment_config"]
+                },
+                "contains": {
+                  "type": "string",
+                  "enum": ["core", "provider_contract", "deployment_config"]
+                }
+              },
+              "exclusion_assertion_ids": {
+                "type": "array",
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "config"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["classification"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "targets": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "enum": ["core", "provider_contract", "deployment_config"]
+                },
+                "contains": {
+                  "type": "string",
+                  "const": "deployment_config"
+                }
+              },
+              "exclusion_assertion_ids": {
+                "type": "array",
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "excluded"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["classification"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "required": ["negative_test_refs"],
+            "properties": {
+              "negative_test_refs": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          },
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "targets": {
+                "type": "array",
+                "const": ["exclude"]
+              },
+              "module_ids": {
+                "type": "array",
+                "maxItems": 0
+              },
+              "provider_capability_ids": {
+                "type": "array",
+                "maxItems": 0
+              },
+              "configuration_keys": {
+                "type": "array",
+                "maxItems": 0
+              },
+              "exclusion_assertion_ids": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "quarantined"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["classification"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "required": ["fail_safe_behavior", "negative_test_refs"],
+            "properties": {
+              "fail_safe_behavior": {
+                "type": "string",
+                "minLength": 1
+              },
+              "negative_test_refs": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "classification": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "unknown"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["classification"]
+      },
+      "then": {
+        "type": "object",
+        "required": ["unknown_handling"],
+        "properties": {
+          "unknown_handling": {
+            "$ref": "#/$defs/unknownHandling"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": ["frozen", "implemented", "verified", "superseded"]
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["lifecycle"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "review": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "passed"
+              }
+            },
+            "required": ["status"]
+          },
+          "lifecycle": {
+            "type": "object",
+            "properties": {
+              "content_digest": {
+                "$ref": "#/$defs/nonPlaceholderDigest"
+              }
+            },
+            "required": ["content_digest"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "verified"
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["lifecycle"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "type": "object",
+            "properties": {
+              "last_verified_gate": {
+                "$ref": "#/$defs/gate"
+              }
+            },
+            "required": ["last_verified_gate"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "targets": { "type": "array", "contains": { "const": "core" } }
+            },
+            "required": ["targets"]
+          }
+        },
+        "required": ["disposition"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "module_ids": { "type": "array", "minItems": 1 }
+            },
+            "required": ["module_ids"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "targets": { "type": "array", "contains": { "const": "provider_contract" } }
+            },
+            "required": ["targets"]
+          }
+        },
+        "required": ["disposition"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "provider_capability_ids": { "type": "array", "minItems": 1 }
+            },
+            "required": ["provider_capability_ids"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "targets": { "type": "array", "contains": { "const": "deployment_config" } }
+            },
+            "required": ["targets"]
+          }
+        },
+        "required": ["disposition"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "configuration_keys": { "type": "array", "minItems": 1 }
+            },
+            "required": ["configuration_keys"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "classification": {
+                "type": "object",
+                "properties": { "status": { "enum": ["retained", "config"] } },
+                "required": ["status"]
+              }
+            },
+            "required": ["classification"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "lifecycle": {
+                "type": "object",
+                "properties": { "status": { "enum": ["implemented", "verified"] } },
+                "required": ["status"]
+              }
+            },
+            "required": ["lifecycle"]
+          }
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "traceability": {
+            "type": "object",
+            "properties": {
+              "implementation_refs": { "type": "array", "minItems": 1 }
+            },
+            "required": ["implementation_refs"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "type": "object",
+            "properties": { "status": { "const": "verified" } },
+            "required": ["status"]
+          }
+        },
+        "required": ["lifecycle"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "sources": {
+            "type": "array",
+            "contains": {
+              "type": "object",
+              "properties": { "verification_status": { "const": "verified" } },
+              "required": ["verification_status"]
+            },
+            "minContains": 1
+          },
+          "traceability": {
+            "type": "object",
+            "properties": {
+              "test_refs": { "type": "array", "minItems": 1 },
+              "artifact_refs": { "type": "array", "minItems": 1 }
+            },
+            "required": ["test_refs", "artifact_refs"]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+      "maxLength": 96
+    },
+    "reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonPlaceholderDigest": {
+      "type": "string",
+      "allOf": [
+        {
+          "$ref": "#/$defs/digest"
+        }
+      ],
+      "not": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9+._-]*:0+$"
+      }
+    },
+    "gate": {
+      "type": "string",
+      "enum": ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "POST_GOAL"]
+    },
+    "stringList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "idList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stableId"
+      },
+      "uniqueItems": true
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "source_type",
+        "reference",
+        "authority_rank",
+        "verification_status"
+      ],
+      "properties": {
+        "source_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "source_type": {
+          "type": "string",
+          "enum": [
+            "owner_decision",
+            "financial_security_or_permission_invariant",
+            "audited_black_box_behavior",
+            "legacy_observation",
+            "public_behavior",
+            "goal_specification",
+            "other"
+          ]
+        },
+        "reference": {
+          "$ref": "#/$defs/reference"
+        },
+        "line_start": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "line_end": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "authority_rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "verification_status": {
+          "type": "string",
+          "enum": ["verified", "frozen", "unknown", "not_authorized_to_verify"]
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "source_type": { "const": "other" }
+            },
+            "required": ["source_type"]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "authority_rank": { "const": 4 },
+              "notes": { "type": "string", "minLength": 1 }
+            },
+            "required": ["notes"]
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "verification_status": { "enum": ["frozen", "verified"] }
+            },
+            "required": ["verification_status"]
+          },
+          "then": {
+            "type": "object",
+            "required": ["content_digest"],
+            "properties": { "content_digest": { "$ref": "#/$defs/nonPlaceholderDigest" } }
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "verification_status": { "const": "verified" }
+            },
+            "required": ["verification_status"]
+          },
+          "then": {
+            "type": "object",
+            "required": ["observed_at"],
+            "properties": { "observed_at": {} }
+          }
+        }
+      ]
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "rationale", "freeze_version"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["retained", "config", "excluded", "quarantined", "unknown"]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "freeze_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "approved_deviation_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "fail_safe_behavior": {
+          "type": "string",
+          "minLength": 1
+        },
+        "negative_test_refs": {
+          "$ref": "#/$defs/idList"
+        }
+      }
+    },
+    "disposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targets",
+        "module_ids",
+        "provider_capability_ids",
+        "configuration_keys",
+        "exclusion_assertion_ids"
+      ],
+      "properties": {
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["core", "provider_contract", "deployment_config", "exclude"]
+          }
+        },
+        "module_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "provider_capability_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "configuration_keys": {
+          "$ref": "#/$defs/stringList"
+        },
+        "exclusion_assertion_ids": {
+          "$ref": "#/$defs/idList"
+        }
+      }
+    },
+    "traceability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "aggregate_ids",
+        "command_ids",
+        "state_transition_ids",
+        "guard_ids",
+        "permission_ids",
+        "ledger_vector_ids",
+        "contract_schema_ids",
+        "implementation_refs",
+        "test_refs",
+        "artifact_refs"
+      ],
+      "properties": {
+        "aggregate_ids": { "$ref": "#/$defs/idList" },
+        "command_ids": { "$ref": "#/$defs/idList" },
+        "state_transition_ids": { "$ref": "#/$defs/idList" },
+        "guard_ids": { "$ref": "#/$defs/idList" },
+        "permission_ids": { "$ref": "#/$defs/idList" },
+        "ledger_vector_ids": { "$ref": "#/$defs/idList" },
+        "contract_schema_ids": { "$ref": "#/$defs/idList" },
+        "implementation_refs": { "$ref": "#/$defs/stringList" },
+        "test_refs": { "$ref": "#/$defs/idList" },
+        "artifact_refs": { "$ref": "#/$defs/stringList" }
+      }
+    },
+    "dataAndTrust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data_class_ids",
+        "trust_boundary_ids",
+        "retention_rule_ids",
+        "minimum_disclosure"
+      ],
+      "properties": {
+        "data_class_ids": { "$ref": "#/$defs/idList" },
+        "trust_boundary_ids": { "$ref": "#/$defs/idList" },
+        "retention_rule_ids": { "$ref": "#/$defs/idList" },
+        "minimum_disclosure": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "unknownHandling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_role", "impact", "fail_safe", "resolution_gate"],
+      "properties": {
+        "owner_role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "impact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fail_safe": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_gate": {
+          "$ref": "#/$defs/gate"
+        },
+        "due_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decision_reference": {
+          "$ref": "#/$defs/reference"
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "preconditions",
+        "stimulus",
+        "expected_outcomes",
+        "test_refs",
+        "artifact_refs"
+      ],
+      "properties": {
+        "scenario_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "preconditions": {
+          "$ref": "#/$defs/stringList"
+        },
+        "stimulus": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "test_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/stableId" },
+          "uniqueItems": true
+        },
+        "artifact_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "scenarioSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["normal", "failure", "duplicate", "out_of_order", "crash", "recovery"],
+      "properties": {
+        "normal": { "type": "array", "items": { "$ref": "#/$defs/scenario" } },
+        "failure": { "type": "array", "items": { "$ref": "#/$defs/scenario" } },
+        "duplicate": { "type": "array", "items": { "$ref": "#/$defs/scenario" } },
+        "out_of_order": { "type": "array", "items": { "$ref": "#/$defs/scenario" } },
+        "crash": { "type": "array", "items": { "$ref": "#/$defs/scenario" } },
+        "recovery": { "type": "array", "items": { "$ref": "#/$defs/scenario" } }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "author_role",
+        "reviewer_roles",
+        "independent_review",
+        "status",
+        "reproduction_commands",
+        "evidence_refs",
+        "findings"
+      ],
+      "properties": {
+        "author_role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "independent_review": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "passed", "failed"]
+        },
+        "reproduction_commands": {
+          "$ref": "#/$defs/stringList"
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/stringList"
+        },
+        "findings": {
+          "$ref": "#/$defs/stringList"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "passed"
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "independent_review": {
+                "const": true
+              },
+              "reproduction_commands": {
+                "type": "array",
+                "minItems": 1
+              },
+              "evidence_refs": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "goal_scope",
+        "first_gate",
+        "acceptance_gate",
+        "created_at",
+        "updated_at",
+        "content_digest"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["draft", "frozen", "implemented", "verified", "superseded"]
+        },
+        "goal_scope": {
+          "enum": ["current_goal", "post_goal"]
+        },
+        "first_gate": {
+          "$ref": "#/$defs/gate"
+        },
+        "acceptance_gate": {
+          "$ref": "#/$defs/gate"
+        },
+        "last_verified_gate": {
+          "oneOf": [
+            { "$ref": "#/$defs/gate" },
+            { "type": "null" }
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "supersedes": {
+          "oneOf": [
+            { "$ref": "#/$defs/stableId" },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

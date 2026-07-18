@@ -1,0 +1,22 @@
+{
+  "name": "opensales-system",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OpenSales System clean-room specification and laboratory workspace",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "packageManager": "pnpm@11.14.0+sha512.66c1ac4c7d4762d6d7dde44c7f3e5a73591ed0a0806e751d4ed32d4f004f25b2285a906b1fd8a9e3e621df3b4e2858bf88e50e0cf626bedbe977fe434a5caf85",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "scripts": {
+    "check": "node --test tools/validate-specifications.test.mjs && node tools/validate-specifications.mjs",
+    "test:specifications": "node --test tools/validate-specifications.test.mjs",
+    "validate:specifications": "node tools/validate-specifications.mjs"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "yaml": "2.9.0"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "license": "AGPL-3.0-or-later",
+  "source_id": "cloud-termrat-core-goal-prompt",
+  "source_sha256": "9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392",
+  "frozen_on": "2026-07-18",
+  "status": "bootstrap-source-freeze",
+  "notes": "G0 will decompose this independently authored business specification into reviewed machine-readable evidence and test oracles."
+}

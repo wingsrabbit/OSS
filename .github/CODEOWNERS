@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+* @wingsrabbit
+
+# Normative contracts, financial oracles, security policy, CI, and release evidence
+# require explicit owner visibility in addition to role-separated engineering review.
+/packages/contracts/ @wingsrabbit
+/conformance/ @wingsrabbit
+/docs/specifications/ @wingsrabbit
+/docs/threat-model/ @wingsrabbit
+/.github/workflows/ @wingsrabbit
+/SECURITY.md @wingsrabbit

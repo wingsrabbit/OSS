@@ -1,0 +1,511 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "guard-rbac-matrix.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "OpenSales System Guard and RBAC Matrix",
+  "description": "Structural schema for server-enforced eligibility guards, permissions, role presets, subject scope, high-risk actions, and negative authorization tests.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "matrix_id",
+    "title",
+    "version",
+    "source_evidence_ids",
+    "actor_types",
+    "resource_types",
+    "permissions",
+    "guards",
+    "role_presets",
+    "matrix",
+    "state_combinations",
+    "high_risk_actions",
+    "review"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "./guard-rbac-matrix.schema.json"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "matrix_id": {
+      "$ref": "#/$defs/stableId"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "description": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_evidence_ids": {
+      "$ref": "#/$defs/idList"
+    },
+    "actor_types": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/namedType"
+      }
+    },
+    "resource_types": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/namedType"
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/permission"
+      }
+    },
+    "guards": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/guard"
+      }
+    },
+    "role_presets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rolePreset"
+      }
+    },
+    "matrix": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/matrixEntry"
+      }
+    },
+    "state_combinations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/stateCombination"
+      }
+    },
+    "high_risk_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/highRiskAction"
+      }
+    },
+    "review": {
+      "$ref": "#/$defs/review"
+    }
+  },
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+      "maxLength": 96
+    },
+    "idList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stableId"
+      },
+      "uniqueItems": true
+    },
+    "stringList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "namedType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type_id", "name", "description"],
+      "properties": {
+        "type_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "permission_id",
+        "name",
+        "description",
+        "resource_type_id",
+        "high_risk",
+        "revocable"
+      ],
+      "properties": {
+        "permission_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.:]*$",
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resource_type_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "high_risk": {
+          "type": "boolean"
+        },
+        "revocable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "guard_id",
+        "description",
+        "inputs",
+        "conditions",
+        "failure_mode",
+        "server_enforced",
+        "audit_required",
+        "evidence_ids",
+        "positive_test_ids",
+        "negative_test_ids"
+      ],
+      "properties": {
+        "guard_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputs": {
+          "$ref": "#/$defs/stringList"
+        },
+        "conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "failure_mode": {
+          "type": "string",
+          "enum": ["deny", "hold", "manual_review"]
+        },
+        "denial_problem_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "server_enforced": {
+          "type": "boolean",
+          "const": true
+        },
+        "audit_required": {
+          "type": "boolean"
+        },
+        "evidence_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "positive_test_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "negative_test_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "rolePreset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role_id", "name", "description", "permission_ids", "editable"],
+      "properties": {
+        "role_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "permission_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "editable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "matrixEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_id",
+        "actor_type_id",
+        "resource_type_id",
+        "permission_id",
+        "scope_rule",
+        "guard_ids",
+        "effect",
+        "test_ids"
+      ],
+      "properties": {
+        "entry_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "actor_type_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "resource_type_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "permission_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "scope_rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "guard_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "effect": {
+          "type": "string",
+          "enum": ["allow", "deny", "conditional"]
+        },
+        "test_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "effect": {
+                "const": "conditional"
+              }
+            },
+            "required": ["effect"]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "guard_ids": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stateCombination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "combination_id",
+        "state_inputs",
+        "permission_id",
+        "expected_effect",
+        "guard_ids",
+        "test_ids"
+      ],
+      "properties": {
+        "combination_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "state_inputs": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "permission_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "expected_effect": {
+          "type": "string",
+          "enum": ["allow", "deny", "hold", "manual_review"]
+        },
+        "guard_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          },
+          "uniqueItems": true
+        },
+        "test_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "highRiskAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "permission_id",
+        "guard_ids",
+        "step_up_required",
+        "two_person_review_capable",
+        "audit_event_id",
+        "test_ids"
+      ],
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "permission_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "guard_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          },
+          "uniqueItems": true
+        },
+        "step_up_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "two_person_review_capable": {
+          "type": "boolean"
+        },
+        "audit_event_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "test_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "author_role",
+        "reviewer_roles",
+        "independent_review",
+        "status",
+        "reproduction_commands",
+        "artifact_refs"
+      ],
+      "properties": {
+        "author_role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "independent_review": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "passed", "failed"]
+        },
+        "reproduction_commands": {
+          "$ref": "#/$defs/stringList"
+        },
+        "artifact_refs": {
+          "$ref": "#/$defs/stringList"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "passed"
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "independent_review": {
+                "const": true
+              },
+              "reproduction_commands": {
+                "type": "array",
+                "minItems": 1
+              },
+              "artifact_refs": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

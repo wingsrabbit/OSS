@@ -1,0 +1,750 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gate-exit-report.schema.json",
+  "title": "OpenSales System Gate Exit Report",
+  "description": "Machine-readable, role-separated evidence for a G0-G9 gate decision. NOT FOR PRODUCTION — MOCK PROVIDERS ONLY.",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "report_id",
+    "supersedes_report_id",
+    "gate",
+    "recorded_at",
+    "release_identity",
+    "scope",
+    "feature_evidence",
+    "verification",
+    "security",
+    "reviews",
+    "rollback",
+    "decision",
+    "assertions",
+    "content_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "report_id": {
+      "$ref": "#/$defs/stableId"
+    },
+    "supersedes_report_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/stableId" },
+        { "type": "null" }
+      ]
+    },
+    "gate": {
+      "enum": ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9"]
+    },
+    "recorded_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "release_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_version", "source_commit", "schema_version", "contract_versions"],
+      "properties": {
+        "project_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "image_digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/digest"
+          },
+          "uniqueItems": true
+        },
+        "schema_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "contract_versions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "sbom_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "release_manifest_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective", "included", "excluded"],
+      "properties": {
+        "objective": {
+          "$ref": "#/$defs/nonSecretText"
+        },
+        "included": {
+          "$ref": "#/$defs/textList"
+        },
+        "excluded": {
+          "$ref": "#/$defs/textList"
+        }
+      }
+    },
+    "feature_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "classified", "frozen_total", "retained_total", "due_for_acceptance", "due_verified", "p0_total", "p0_unexplained", "coverage_complete", "due_acceptance_complete", "card_artifacts", "matrix_artifact"],
+      "properties": {
+        "total": {
+          "$ref": "#/$defs/count"
+        },
+        "classified": {
+          "$ref": "#/$defs/count"
+        },
+        "frozen_total": {
+          "$ref": "#/$defs/count"
+        },
+        "retained_total": {
+          "$ref": "#/$defs/count"
+        },
+        "due_for_acceptance": {
+          "$ref": "#/$defs/count"
+        },
+        "due_verified": {
+          "$ref": "#/$defs/count"
+        },
+        "p0_total": {
+          "$ref": "#/$defs/count"
+        },
+        "p0_unexplained": {
+          "$ref": "#/$defs/count"
+        },
+        "coverage_complete": {
+          "type": "boolean"
+        },
+        "due_acceptance_complete": {
+          "type": "boolean"
+        },
+        "card_artifacts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["evidence_id", "reference", "content_digest"],
+            "properties": {
+              "evidence_id": {
+                "$ref": "#/$defs/evidenceId"
+              },
+              "reference": {
+                "type": "string",
+                "pattern": "^repo:docs/provenance/cards/[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+\\.yaml$",
+                "maxLength": 512
+              },
+              "content_digest": {
+                "$ref": "#/$defs/nonPlaceholderDigest"
+              }
+            }
+          }
+        },
+        "matrix_artifact": {
+          "$ref": "#/$defs/artifactRef"
+        }
+      }
+    },
+    "g0_oracles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_transition_tables",
+        "guard_rbac_matrices",
+        "ledger_posting_matrices",
+        "transport_contracts",
+        "provider_contracts",
+        "data_retention_models",
+        "threat_models",
+        "test_strategies"
+      ],
+      "properties": {
+        "state_transition_tables": { "$ref": "#/$defs/oracleSummary" },
+        "guard_rbac_matrices": { "$ref": "#/$defs/oracleSummary" },
+        "ledger_posting_matrices": { "$ref": "#/$defs/oracleSummary" },
+        "transport_contracts": { "$ref": "#/$defs/oracleSummary" },
+        "provider_contracts": { "$ref": "#/$defs/oracleSummary" },
+        "data_retention_models": { "$ref": "#/$defs/oracleSummary" },
+        "threat_models": { "$ref": "#/$defs/oracleSummary" },
+        "test_strategies": { "$ref": "#/$defs/oracleSummary" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands", "summary", "artifact_refs"],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command_id", "command", "result", "passed", "artifact_refs"],
+            "properties": {
+              "command_id": {
+                "$ref": "#/$defs/stableId"
+              },
+              "command": {
+                "$ref": "#/$defs/nonSecretText"
+              },
+              "environment": {
+                "$ref": "#/$defs/nonSecretText"
+              },
+              "result": {
+                "$ref": "#/$defs/nonSecretText"
+              },
+              "passed": {
+                "type": "boolean"
+              },
+              "started_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "finished_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "artifact_refs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/artifactRef"
+                },
+                "uniqueItems": true
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "type": "object",
+                  "properties": { "passed": { "const": true } },
+                  "required": ["passed"]
+                },
+                "then": {
+                  "type": "object",
+                  "properties": {
+                    "artifact_refs": { "type": "array", "minItems": 1 }
+                  },
+                  "required": ["artifact_refs"]
+                }
+              }
+            ]
+          }
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "failed", "skipped"],
+          "properties": {
+            "passed": {
+              "$ref": "#/$defs/count"
+            },
+            "failed": {
+              "$ref": "#/$defs/count"
+            },
+            "skipped": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        },
+        "artifact_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/artifactRef"
+          },
+          "uniqueItems": true
+        },
+        "measurements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "value", "unit", "context"],
+            "properties": {
+              "name": {
+                "$ref": "#/$defs/stableId"
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              },
+              "context": {
+                "$ref": "#/$defs/nonSecretText"
+              }
+            }
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["open_critical", "open_high", "accepted_risks"],
+      "properties": {
+        "open_critical": {
+          "$ref": "#/$defs/count"
+        },
+        "open_high": {
+          "$ref": "#/$defs/count"
+        },
+        "accepted_risks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["risk_id", "severity", "owner", "status", "due_at", "mitigation"],
+            "properties": {
+              "risk_id": {
+                "$ref": "#/$defs/stableId"
+              },
+              "severity": {
+                "enum": ["high", "medium", "low"]
+              },
+              "owner": {
+                "$ref": "#/$defs/stableId"
+              },
+              "status": {
+                "enum": ["time_limited_acceptance", "mitigating", "tracking"]
+              },
+              "due_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "expires_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "mitigation": {
+                "$ref": "#/$defs/nonSecretText"
+              },
+              "artifact_ref": {
+                "$ref": "#/$defs/artifactRef"
+              },
+              "scope": {
+                "$ref": "#/$defs/nonSecretText"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "const": "high"
+                    }
+                  },
+                  "required": ["severity"]
+                },
+                "then": {
+                  "type": "object",
+                  "required": ["expires_at", "artifact_ref", "scope"],
+                  "properties": {
+                    "expires_at": {},
+                    "artifact_ref": {},
+                    "scope": {},
+                    "status": {
+                      "const": "time_limited_acceptance"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "reviews": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_audit", "blue_team", "red_team", "release_audit"],
+      "properties": {
+        "evidence_audit": {
+          "allOf": [
+            { "$ref": "#/$defs/review" },
+            {
+              "type": "object",
+              "properties": {
+                "reviewer_role": { "const": "evidence_audit" }
+              }
+            }
+          ]
+        },
+        "blue_team": {
+          "allOf": [
+            { "$ref": "#/$defs/review" },
+            {
+              "type": "object",
+              "properties": {
+                "reviewer_role": { "const": "blue_team" }
+              }
+            }
+          ]
+        },
+        "red_team": {
+          "allOf": [
+            { "$ref": "#/$defs/review" },
+            {
+              "type": "object",
+              "properties": {
+                "reviewer_role": { "const": "red_team" }
+              }
+            }
+          ]
+        },
+        "release_audit": {
+          "allOf": [
+            { "$ref": "#/$defs/review" },
+            {
+              "type": "object",
+              "properties": {
+                "reviewer_role": { "const": "release_audit" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rollback_point", "procedure_ref", "verified"],
+      "properties": {
+        "rollback_point": {
+          "$ref": "#/$defs/nonSecretText"
+        },
+        "procedure_ref": {
+          "$ref": "#/$defs/artifactRef"
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "data_loss_boundary": {
+          "$ref": "#/$defs/nonSecretText"
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "rationale", "incomplete_items", "next_gate"],
+      "properties": {
+        "outcome": {
+          "enum": ["go", "no-go"]
+        },
+        "rationale": {
+          "$ref": "#/$defs/nonSecretText"
+        },
+        "incomplete_items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["item_id", "description", "owner", "fail_safe", "resolution_gate"],
+            "properties": {
+              "item_id": {
+                "$ref": "#/$defs/stableId"
+              },
+              "description": {
+                "$ref": "#/$defs/nonSecretText"
+              },
+              "owner": {
+                "$ref": "#/$defs/stableId"
+              },
+              "fail_safe": {
+                "$ref": "#/$defs/nonSecretText"
+              },
+              "resolution_gate": {
+                "enum": ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "post-goal"]
+              }
+            }
+          }
+        },
+        "next_gate": {
+          "enum": ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "none"]
+        }
+      }
+    },
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mock_only", "no_secret_or_customer_data", "no_proprietary_material", "role_separation_recorded"],
+      "properties": {
+        "mock_only": {
+          "const": true
+        },
+        "no_secret_or_customer_data": {
+          "const": true
+        },
+        "no_proprietary_material": {
+          "const": true
+        },
+        "role_separation_recorded": {
+          "const": true
+        }
+      }
+    },
+    "content_digest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "gate": { "const": "G0" },
+          "decision": {
+            "type": "object",
+            "properties": { "outcome": { "const": "go" } },
+            "required": ["outcome"]
+          }
+        },
+        "required": ["gate", "decision"]
+      },
+      "then": {
+        "type": "object",
+        "required": ["g0_oracles"],
+        "properties": {
+          "g0_oracles": { "$ref": "#/properties/g0_oracles" }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "decision": {
+            "type": "object",
+            "properties": {
+              "outcome": {
+                "const": "go"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "feature_evidence": {
+            "type": "object",
+            "properties": {
+              "p0_unexplained": {
+                "const": 0
+              },
+              "coverage_complete": {
+                "const": true
+              },
+              "due_acceptance_complete": {
+                "const": true
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "verification": {
+            "type": "object",
+            "properties": {
+              "summary": {
+                "type": "object",
+                "properties": {
+                  "failed": {
+                    "const": 0
+                  },
+                  "skipped": {
+                    "const": 0
+                  }
+                }
+              },
+              "commands": {
+                "type": "array",
+                "not": {
+                  "contains": {
+                    "type": "object",
+                    "properties": {
+                      "passed": {
+                        "const": false
+                      }
+                    },
+                    "required": ["passed"]
+                  }
+                }
+              }
+            }
+          },
+          "security": {
+            "type": "object",
+            "properties": {
+              "open_critical": {
+                "const": 0
+              },
+              "open_high": {
+                "const": 0
+              }
+            }
+          },
+          "reviews": {
+            "type": "object",
+            "properties": {
+              "evidence_audit": { "$ref": "#/$defs/passingReview" },
+              "blue_team": { "$ref": "#/$defs/passingReview" },
+              "red_team": { "$ref": "#/$defs/passingReview" },
+              "release_audit": { "$ref": "#/$defs/passingReview" }
+            }
+          },
+          "rollback": {
+            "type": "object",
+            "properties": {
+              "verified": {
+                "const": true
+              }
+            }
+          },
+          "release_identity": {
+            "type": "object",
+            "properties": {
+              "source_commit": {
+                "not": {
+                  "const": "0000000000000000000000000000000000000000"
+                }
+              }
+            }
+          },
+          "content_digest": {
+            "not": {
+              "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "evidenceId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+      "maxLength": 96
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonPlaceholderDigest": {
+      "allOf": [
+        { "$ref": "#/$defs/digest" }
+      ],
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "artifactRef": {
+      "type": "string",
+      "pattern": "^(repo|ci|release|review|test|runbook):[A-Za-z0-9._/@+-]+$",
+      "minLength": 6,
+      "maxLength": 512
+    },
+    "oracleSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_count", "passed_count", "frozen_count", "artifact_refs"],
+      "properties": {
+        "document_count": { "$ref": "#/$defs/count" },
+        "passed_count": { "$ref": "#/$defs/count" },
+        "frozen_count": { "$ref": "#/$defs/count" },
+        "artifact_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifactRef" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "nonSecretText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "textList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nonSecretText"
+      },
+      "uniqueItems": true
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["review_id", "reviewer_role", "independent_of_authors", "artifact_ref", "command", "result", "passed"],
+      "properties": {
+        "review_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "reviewer_role": {
+          "enum": ["evidence_audit", "blue_team", "red_team", "release_audit"]
+        },
+        "independent_of_authors": {
+          "const": true
+        },
+        "artifact_ref": {
+          "$ref": "#/$defs/artifactRef"
+        },
+        "command": {
+          "$ref": "#/$defs/nonSecretText"
+        },
+        "result": {
+          "$ref": "#/$defs/nonSecretText"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "reviewed_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "passingReview": {
+      "type": "object",
+      "properties": {
+        "passed": {
+          "const": true
+        }
+      },
+      "required": ["passed"]
+    }
+  }
+}

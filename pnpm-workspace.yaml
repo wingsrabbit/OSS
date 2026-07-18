@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+packages:
+  - apps/*
+  - packages/*
+  - providers/*
+  - conformance/*
+  - tools/*
+
+# pnpm 11 reads non-registry project settings from this file, not .npmrc.
+engineStrict: true
+saveExact: true
+strictPeerDependencies: true
+autoInstallPeers: false
+verifyStoreIntegrity: true
+sharedWorkspaceLockfile: true
+minimumReleaseAge: 1440
+trustLockfile: false
+blockExoticSubdeps: true

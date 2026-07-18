@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "license": "AGPL-3.0-or-later",
+  "recorded_at": "2026-07-18T03:52:08Z",
+  "nonce": "9acefa56eb582c2178a2059f4bebc28f",
+  "private_record_sha256": "59447dea237574d67bad0e07734d77c76ae09fad53d731b5e3c2368223fd8977",
+  "governing_prompt_sha256": "9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392",
+  "assets": [
+    {
+      "logical_id": "oss_repository",
+      "authorization": "one intentional bootstrap while empty; scoped pull requests thereafter"
+    },
+    {
+      "logical_id": "lab_core",
+      "authorization": "verified dedicated disposable laboratory host"
+    },
+    {
+      "logical_id": "lab_provider",
+      "authorization": "verified dedicated disposable laboratory host"
+    },
+    {
+      "logical_id": "test_a_record",
+      "authorization": "query and manage one exact allowlisted A record and its proxy state"
+    }
+  ],
+  "secret_inputs": [
+    {
+      "logical_id": "ssh_key_lab",
+      "scope": "verified laboratory hosts only",
+      "persistence": "controlled source reference only"
+    },
+    {
+      "logical_id": "dns_token_exact_record",
+      "scope": "exact allowlisted A record and proxy state only",
+      "persistence": "controlled source reference only"
+    }
+  ],
+  "pre_write_results": {
+    "repository": "empty and authorized",
+    "laboratory_hosts": "identity and clean baseline matched controlled record",
+    "test_a_record": "absent"
+  },
+  "prohibited_scope": [
+    "legacy systems and data",
+    "real providers",
+    "production operations",
+    "unlisted hosts, domains, records, or accounts",
+    "secrets or private infrastructure identifiers in public artifacts"
+  ]
+}
