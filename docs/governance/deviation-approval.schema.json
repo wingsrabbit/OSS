@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "deviation-approval.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "OpenSales System Scope Deviation Approval",
+  "description": "A frozen exception drawn only from the registered explicit Goal Owner decisions and bound to an exact same-commit Feature set and G0 trust anchors.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "decision_id",
+    "decision_kind",
+    "outcome",
+    "title",
+    "feature_ids",
+    "approved_change",
+    "constraints",
+    "goal_source",
+    "scope_binding",
+    "authorization",
+    "owner_role",
+    "authorization_basis",
+    "recorded_at",
+    "lifecycle"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./deviation-approval.schema.json"
+    },
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "decision_id": {
+      "enum": ["DEVIATION-MFA-OPTIONAL", "DEVIATION-TERMRAT-USD-ONLY"]
+    },
+    "decision_kind": {
+      "const": "scope_deviation"
+    },
+    "outcome": {
+      "const": "approved"
+    },
+    "title": {
+      "allOf": [
+        { "$ref": "#/$defs/nonPlaceholderText" },
+        { "type": "string", "maxLength": 160 }
+      ]
+    },
+    "feature_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/stableId"
+      }
+    },
+    "approved_change": {
+      "$ref": "#/$defs/nonPlaceholderText"
+    },
+    "constraints": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "allOf": [
+          { "$ref": "#/$defs/nonPlaceholderText" },
+          { "type": "string", "maxLength": 1000 }
+        ]
+      }
+    },
+    "goal_source": {
+      "$ref": "#/$defs/goalSource"
+    },
+    "scope_binding": {
+      "$ref": "#/$defs/scopeBinding"
+    },
+    "authorization": {
+      "$ref": "#/$defs/authorization"
+    },
+    "owner_role": {
+      "const": "project_owner"
+    },
+    "authorization_basis": {
+      "const": "explicit_goal_owner_decision"
+    },
+    "recorded_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/lifecycle"
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "decision_id": { "const": "DEVIATION-MFA-OPTIONAL" },
+        "title": { "const": "Keep customer and Staff MFA optional" },
+        "approved_change": {
+          "const": "Customer and Staff MFA remain optional rather than mandatory."
+        },
+        "constraints": {
+          "const": [
+            "High-risk actions still require password re-entry.",
+            "When Staff voluntarily enables MFA, qualifying step-up also requires the configured factor.",
+            "Break-glass, immutable audit, and configured dual-review controls remain required."
+          ]
+        },
+        "authorization": {
+          "const": {
+            "kind": "explicit_goal_owner_decision",
+            "authorization_key": "OWNER-AUTH-MFA-OPTIONAL",
+            "goal_anchor": {
+              "reference": "goal://cloud-termrat-core-goal-prompt#L337-L337",
+              "line_start": 337,
+              "line_end": 337,
+              "content_digest": "sha256:9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "decision_id": { "const": "DEVIATION-TERMRAT-USD-ONLY" },
+        "title": { "const": "Keep the new TermRat deployment USD-only" },
+        "approved_change": {
+          "const": "The new TermRat deployment enables USD only and does not re-enable historical HKD behavior."
+        },
+        "constraints": {
+          "const": [
+            "Core may support multiple fiat currencies, but each order and invoice keeps one immutable currency.",
+            "USDT remains a payment asset and is not a TermRat invoice currency.",
+            "No automatic exchange-rate process may silently rewrite historical prices."
+          ]
+        },
+        "authorization": {
+          "const": {
+            "kind": "explicit_goal_owner_decision",
+            "authorization_key": "OWNER-AUTH-TERMRAT-USD-ONLY",
+            "goal_anchor": {
+              "reference": "goal://cloud-termrat-core-goal-prompt#L482-L483",
+              "line_start": 482,
+              "line_end": 483,
+              "content_digest": "sha256:9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+      "maxLength": 96
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonPlaceholderDigest": {
+      "allOf": [
+        { "$ref": "#/$defs/digest" }
+      ],
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "nonPlaceholderText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "[\\p{L}\\p{N}]",
+      "not": {
+        "pattern": "^\\s*(?:TODO|todo|TBD|tbd|PLACEHOLDER|placeholder|CHANGEME|changeme|UNKNOWN|unknown|REPLACE(?:[_ -]?ME| WITH.*)|replace(?:[_ -]?me| with.*))\\s*[.!]?\\s*$"
+      }
+    },
+    "goalSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "reference", "content_digest", "total_lines"],
+      "properties": {
+        "source_id": {
+          "const": "cloud-termrat-core-goal-prompt"
+        },
+        "reference": {
+          "const": "goal://cloud-termrat-core-goal-prompt"
+        },
+        "content_digest": {
+          "const": "sha256:9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392"
+        },
+        "total_lines": {
+          "const": 1070
+        }
+      }
+    },
+    "scopeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_summary", "private_scope_record_digest"],
+      "properties": {
+        "public_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "content_digest"],
+          "properties": {
+            "reference": {
+              "const": "repo:docs/governance/scope-summary.json"
+            },
+            "content_digest": {
+              "const": "sha256:81deb422cde10d5f62502024135bcddd2840f962bd90feb1720ceead7c6320d7"
+            }
+          }
+        },
+        "private_scope_record_digest": {
+          "const": "sha256:59447dea237574d67bad0e07734d77c76ae09fad53d731b5e3c2368223fd8977"
+        }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "authorization_key", "goal_anchor"],
+      "properties": {
+        "kind": { "const": "explicit_goal_owner_decision" },
+        "authorization_key": {
+          "enum": ["OWNER-AUTH-MFA-OPTIONAL", "OWNER-AUTH-TERMRAT-USD-ONLY"]
+        },
+        "goal_anchor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "line_start", "line_end", "content_digest"],
+          "properties": {
+            "reference": {
+              "enum": [
+                "goal://cloud-termrat-core-goal-prompt#L337-L337",
+                "goal://cloud-termrat-core-goal-prompt#L482-L483"
+              ]
+            },
+            "line_start": { "enum": [337, 482] },
+            "line_end": { "enum": [337, 483] },
+            "content_digest": {
+              "const": "sha256:9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392"
+            }
+          }
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "frozen_at", "content_digest"],
+      "properties": {
+        "status": {
+          "const": "frozen"
+        },
+        "frozen_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/nonPlaceholderDigest"
+        }
+      }
+    }
+  }
+}

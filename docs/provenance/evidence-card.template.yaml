@@ -2,7 +2,7 @@
 # Parseable template only. Replace every placeholder before freezing a card.
 
 $schema: ./evidence-card.schema.json
-schema_version: 1.0.0
+schema_version: 1.1.0
 evidence_id: EV-TEMPLATE-0001
 feature_id: FEATURE-TEMPLATE-0001
 title: Replace with an independently stated capability
@@ -21,6 +21,12 @@ classification:
   freeze_version: draft
   fail_safe_behavior: Keep the capability unavailable until the evidence is resolved.
   negative_test_refs: []
+governance:
+  scope_summary:
+    reference: repo:docs/governance/scope-summary.json
+    content_digest: sha256:81deb422cde10d5f62502024135bcddd2840f962bd90feb1720ceead7c6320d7
+  private_scope_record_digest: sha256:59447dea237574d67bad0e07734d77c76ae09fad53d731b5e3c2368223fd8977
+  approved_deviation_id: null
 disposition:
   targets:
     - exclude
@@ -45,7 +51,7 @@ data_and_trust:
   retention_rule_ids: []
   minimum_disclosure: Record only the minimum approved evidence needed for traceability.
 unknown_handling:
-  owner_role: Replace with the decision owner role
+  owner_role: evidence_owner
   impact: Replace with the impact of leaving this evidence unresolved.
   fail_safe: Keep the capability unavailable and preserve an auditable review path.
   resolution_gate: G0

@@ -16,6 +16,7 @@
     "business_description",
     "sources",
     "classification",
+    "governance",
     "disposition",
     "traceability",
     "scenarios",
@@ -29,7 +30,7 @@
     },
     "schema_version": {
       "type": "string",
-      "const": "1.0.0"
+      "const": "1.1.0"
     },
     "evidence_id": {
       "$ref": "#/$defs/stableId"
@@ -38,17 +39,17 @@
       "$ref": "#/$defs/stableId"
     },
     "title": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 160
+      "allOf": [
+        { "$ref": "#/$defs/meaningfulText" },
+        { "type": "string", "maxLength": 160 }
+      ]
     },
     "priority": {
       "type": "string",
       "enum": ["P0", "P1", "P2", "P3"]
     },
     "business_description": {
-      "type": "string",
-      "minLength": 1
+      "$ref": "#/$defs/meaningfulText"
     },
     "sources": {
       "type": "array",
@@ -59,6 +60,9 @@
     },
     "classification": {
       "$ref": "#/$defs/classification"
+    },
+    "governance": {
+      "$ref": "#/$defs/governance"
     },
     "disposition": {
       "$ref": "#/$defs/disposition"
@@ -281,6 +285,15 @@
                 "minLength": 1
               },
               "negative_test_refs": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          },
+          "disposition": {
+            "type": "object",
+            "properties": {
+              "exclusion_assertion_ids": {
                 "type": "array",
                 "minItems": 1
               }
@@ -550,6 +563,17 @@
       "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
       "maxLength": 96
     },
+    "meaningfulText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "[\\p{L}\\p{N}]"
+    },
+    "roleId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+      "maxLength": 96
+    },
     "reference": {
       "type": "string",
       "minLength": 1,
@@ -644,7 +668,7 @@
           "$ref": "#/$defs/digest"
         },
         "notes": {
-          "type": "string"
+          "$ref": "#/$defs/meaningfulText"
         }
       },
       "allOf": [
@@ -660,7 +684,7 @@
             "type": "object",
             "properties": {
               "authority_rank": { "const": 4 },
-              "notes": { "type": "string", "minLength": 1 }
+              "notes": { "$ref": "#/$defs/meaningfulText" }
             },
             "required": ["notes"]
           }
@@ -705,22 +729,50 @@
           "enum": ["retained", "config", "excluded", "quarantined", "unknown"]
         },
         "rationale": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/meaningfulText"
         },
         "freeze_version": {
           "type": "string",
           "minLength": 1
         },
-        "approved_deviation_id": {
-          "$ref": "#/$defs/stableId"
-        },
         "fail_safe_behavior": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/meaningfulText"
         },
         "negative_test_refs": {
           "$ref": "#/$defs/idList"
+        }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_summary",
+        "private_scope_record_digest",
+        "approved_deviation_id"
+      ],
+      "properties": {
+        "scope_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "content_digest"],
+          "properties": {
+            "reference": {
+              "const": "repo:docs/governance/scope-summary.json"
+            },
+            "content_digest": {
+              "const": "sha256:81deb422cde10d5f62502024135bcddd2840f962bd90feb1720ceead7c6320d7"
+            }
+          }
+        },
+        "private_scope_record_digest": {
+          "const": "sha256:59447dea237574d67bad0e07734d77c76ae09fad53d731b5e3c2368223fd8977"
+        },
+        "approved_deviation_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/stableId" },
+            { "type": "null" }
+          ]
         }
       }
     },
@@ -800,8 +852,7 @@
         "trust_boundary_ids": { "$ref": "#/$defs/idList" },
         "retention_rule_ids": { "$ref": "#/$defs/idList" },
         "minimum_disclosure": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/meaningfulText"
         }
       }
     },
@@ -811,16 +862,13 @@
       "required": ["owner_role", "impact", "fail_safe", "resolution_gate"],
       "properties": {
         "owner_role": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/roleId"
         },
         "impact": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/meaningfulText"
         },
         "fail_safe": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/meaningfulText"
         },
         "resolution_gate": {
           "$ref": "#/$defs/gate"
@@ -853,15 +901,13 @@
           "$ref": "#/$defs/stringList"
         },
         "stimulus": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/meaningfulText"
         },
         "expected_outcomes": {
           "type": "array",
           "minItems": 1,
           "items": {
-            "type": "string",
-            "minLength": 1
+            "$ref": "#/$defs/meaningfulText"
           }
         },
         "test_refs": {
@@ -905,16 +951,14 @@
       ],
       "properties": {
         "author_role": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/roleId"
         },
         "reviewer_roles": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
           "items": {
-            "type": "string",
-            "minLength": 1
+            "$ref": "#/$defs/roleId"
           }
         },
         "independent_review": {
