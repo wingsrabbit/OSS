@@ -1,0 +1,460 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evidence-inventory.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "OpenSales System G0 Evidence Inventory",
+  "description": "Fail-closed inventory binding reviewed Goal requirement records to cohesive current-goal Feature Evidence Cards with exact semantic-review coverage.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "inventory_id",
+    "gate",
+    "title",
+    "goal_source",
+    "scope_binding",
+    "section_coverage",
+    "requirements",
+    "features",
+    "classification_counts",
+    "priority_counts",
+    "review",
+    "lifecycle"
+  ],
+  "properties": {
+    "$schema": { "const": "./evidence-inventory.schema.json" },
+    "schema_version": { "const": "1.0.0" },
+    "inventory_id": { "$ref": "#/$defs/stableId" },
+    "gate": { "const": "G0" },
+    "title": {
+      "allOf": [
+        { "$ref": "#/$defs/meaningfulText" },
+        { "type": "string", "maxLength": 160 }
+      ]
+    },
+    "goal_source": { "$ref": "#/$defs/goalSource" },
+    "scope_binding": { "$ref": "#/$defs/scopeBinding" },
+    "section_coverage": {
+      "type": "array",
+      "minItems": 72,
+      "items": { "$ref": "#/$defs/sectionCoverage" }
+    },
+    "requirements": {
+      "type": "array",
+      "minItems": 72,
+      "items": { "$ref": "#/$defs/requirement" }
+    },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/feature" }
+    },
+    "classification_counts": { "$ref": "#/$defs/classificationCounts" },
+    "priority_counts": { "$ref": "#/$defs/priorityCounts" },
+    "review": { "$ref": "#/$defs/review" },
+    "lifecycle": { "$ref": "#/$defs/lifecycle" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "type": "object",
+            "properties": { "status": { "const": "draft" } },
+            "required": ["status"]
+          }
+        },
+        "required": ["lifecycle"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "review": {
+            "type": "object",
+            "properties": {
+              "independent_review": { "const": false },
+              "status": { "const": "pending" }
+            }
+          },
+          "lifecycle": {
+            "type": "object",
+            "properties": {
+              "content_digest": {
+                "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "type": "object",
+            "properties": { "status": { "const": "frozen" } },
+            "required": ["status"]
+          }
+        },
+        "required": ["lifecycle"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "review": {
+            "type": "object",
+            "properties": {
+              "independent_review": { "const": true },
+              "status": { "const": "passed" },
+              "reproduction_commands": { "type": "array", "minItems": 1 },
+              "evidence_refs": { "type": "array", "minItems": 1 }
+            }
+          },
+          "lifecycle": {
+            "type": "object",
+            "properties": {
+              "content_digest": { "$ref": "#/$defs/nonPlaceholderDigest" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+      "maxLength": 96
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonPlaceholderDigest": {
+      "allOf": [{ "$ref": "#/$defs/digest" }],
+      "not": {
+        "const": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "meaningfulText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "[\\p{L}\\p{N}]"
+    },
+    "roleId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+      "maxLength": 96
+    },
+    "idList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/stableId" }
+    },
+    "nonEmptyIdList": {
+      "type": "array",
+      "allOf": [{ "$ref": "#/$defs/idList" }],
+      "minItems": 1
+    },
+    "stringList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "goalSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "reference", "content_digest", "total_lines"],
+      "properties": {
+        "source_id": { "const": "cloud-termrat-core-goal-prompt" },
+        "reference": { "const": "goal://cloud-termrat-core-goal-prompt" },
+        "content_digest": {
+          "const": "sha256:9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392"
+        },
+        "total_lines": { "const": 1070 }
+      }
+    },
+    "scopeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_summary", "private_scope_record_digest"],
+      "properties": {
+        "public_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "content_digest"],
+          "properties": {
+            "reference": { "const": "repo:docs/governance/scope-summary.json" },
+            "content_digest": {
+              "const": "sha256:81deb422cde10d5f62502024135bcddd2840f962bd90feb1720ceead7c6320d7"
+            }
+          }
+        },
+        "private_scope_record_digest": {
+          "const": "sha256:59447dea237574d67bad0e07734d77c76ae09fad53d731b5e3c2368223fd8977"
+        }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id",
+        "feature_id",
+        "description",
+        "source_line_start",
+        "source_line_end"
+      ],
+      "properties": {
+        "requirement_id": {
+          "allOf": [
+            { "$ref": "#/$defs/stableId" },
+            { "type": "string", "pattern": "^REQ-(?:[A-Z0-9]+-)+[0-9]{3,}$" }
+          ]
+        },
+        "feature_id": { "$ref": "#/$defs/stableId" },
+        "description": { "$ref": "#/$defs/meaningfulText" },
+        "source_line_start": { "type": "integer", "minimum": 1, "maximum": 1070 },
+        "source_line_end": { "type": "integer", "minimum": 1, "maximum": 1070 }
+      }
+    },
+    "sectionCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["section_id", "requirement_ids"],
+      "properties": {
+        "section_id": { "$ref": "#/$defs/stableId" },
+        "requirement_ids": { "$ref": "#/$defs/nonEmptyIdList" }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "feature_id",
+        "evidence_id",
+        "title",
+        "priority",
+        "classification",
+        "classification_policy",
+        "disposition",
+        "first_gate",
+        "acceptance_gate",
+        "goal_anchors",
+        "requirement_ids"
+      ],
+      "properties": {
+        "feature_id": { "$ref": "#/$defs/stableId" },
+        "evidence_id": { "$ref": "#/$defs/stableId" },
+        "title": {
+          "allOf": [
+            { "$ref": "#/$defs/meaningfulText" },
+            { "type": "string", "maxLength": 160 }
+          ]
+        },
+        "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+        "classification": {
+          "enum": ["retained", "config", "excluded", "quarantined", "unknown"]
+        },
+        "classification_policy": { "$ref": "#/$defs/classificationPolicy" },
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "first_gate": { "const": "G0" },
+        "acceptance_gate": {
+          "enum": ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9"]
+        },
+        "goal_anchors": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/goalAnchor" }
+        },
+        "requirement_ids": { "$ref": "#/$defs/nonEmptyIdList" }
+      }
+    },
+    "goalAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "line_start", "line_end"],
+      "properties": {
+        "reference": {
+          "type": "string",
+          "pattern": "^goal://cloud-termrat-core-goal-prompt#L[0-9]+-L[0-9]+$",
+          "maxLength": 512
+        },
+        "line_start": { "type": "integer", "minimum": 1, "maximum": 1070 },
+        "line_end": { "type": "integer", "minimum": 1, "maximum": 1070 }
+      }
+    },
+    "classificationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approved_deviation_id",
+        "fail_safe_behavior",
+        "negative_test_refs",
+        "unknown_handling"
+      ],
+      "properties": {
+        "approved_deviation_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/stableId" },
+            { "type": "null" }
+          ]
+        },
+        "fail_safe_behavior": {
+          "oneOf": [
+            { "$ref": "#/$defs/meaningfulText" },
+            { "type": "null" }
+          ]
+        },
+        "negative_test_refs": { "$ref": "#/$defs/idList" },
+        "unknown_handling": {
+          "oneOf": [
+            { "$ref": "#/$defs/unknownHandling" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "unknownHandling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_role", "impact", "fail_safe", "resolution_gate"],
+      "properties": {
+        "owner_role": { "$ref": "#/$defs/roleId" },
+        "impact": { "$ref": "#/$defs/meaningfulText" },
+        "fail_safe": { "$ref": "#/$defs/meaningfulText" },
+        "resolution_gate": {
+          "enum": ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9"]
+        },
+        "due_at": { "type": "string", "format": "date-time" },
+        "decision_reference": { "type": "string", "minLength": 1 }
+      }
+    },
+    "disposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targets",
+        "module_ids",
+        "provider_capability_ids",
+        "configuration_keys",
+        "exclusion_assertion_ids"
+      ],
+      "properties": {
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["core", "provider_contract", "deployment_config", "exclude"]
+          }
+        },
+        "module_ids": { "$ref": "#/$defs/idList" },
+        "provider_capability_ids": { "$ref": "#/$defs/idList" },
+        "configuration_keys": { "$ref": "#/$defs/stringList" },
+        "exclusion_assertion_ids": { "$ref": "#/$defs/idList" }
+      }
+    },
+    "classificationCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_features",
+        "total_requirements",
+        "retained",
+        "config",
+        "excluded",
+        "quarantined",
+        "unknown"
+      ],
+      "properties": {
+        "total_features": { "type": "integer", "minimum": 1 },
+        "total_requirements": { "type": "integer", "minimum": 1 },
+        "retained": { "type": "integer", "minimum": 0 },
+        "config": { "type": "integer", "minimum": 0 },
+        "excluded": { "type": "integer", "minimum": 0 },
+        "quarantined": { "type": "integer", "minimum": 0 },
+        "unknown": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "priorityCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["P0", "P1", "P2", "P3"],
+      "properties": {
+        "P0": { "type": "integer", "minimum": 0 },
+        "P1": { "type": "integer", "minimum": 0 },
+        "P2": { "type": "integer", "minimum": 0 },
+        "P3": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "author_role",
+        "reviewer_roles",
+        "independent_review",
+        "status",
+        "reproduction_commands",
+        "evidence_refs",
+        "findings",
+        "coverage"
+      ],
+      "properties": {
+        "author_role": { "$ref": "#/$defs/roleId" },
+        "reviewer_roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/roleId" }
+        },
+        "independent_review": { "type": "boolean" },
+        "status": { "enum": ["pending", "passed", "failed"] },
+        "reproduction_commands": { "$ref": "#/$defs/stringList" },
+        "evidence_refs": { "$ref": "#/$defs/stringList" },
+        "findings": { "$ref": "#/$defs/stringList" },
+        "coverage": { "$ref": "#/$defs/reviewCoverage" }
+      }
+    },
+    "reviewCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement_ids", "feature_ids", "checks"],
+      "properties": {
+        "requirement_ids": { "$ref": "#/$defs/idList" },
+        "feature_ids": { "$ref": "#/$defs/idList" },
+        "checks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "atomic_single_obligation",
+              "source_fidelity",
+              "feature_cohesion",
+              "classification_and_disposition",
+              "scope_and_deviation",
+              "gate_deadline"
+            ]
+          }
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "created_at", "updated_at", "content_digest"],
+      "properties": {
+        "status": { "enum": ["draft", "frozen"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "content_digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

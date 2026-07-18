@@ -10,6 +10,8 @@ Cloud TermRat is the first synthetic deployment profile and laboratory acceptanc
 
 ## Current status
 
+Current project version: `0.1.0`.
+
 The repository is at bootstrap and G0 specification preparation. It does not yet contain a runnable service, a release candidate, real Provider integration, or production-ready controls. A page opening or a mock happy path will not change that status.
 
 The project may be described as a Mock-only Laboratory Release Candidate only after every G0–G9 gate has machine-reproducible evidence, role-separated review, and an explicit passing exit report.

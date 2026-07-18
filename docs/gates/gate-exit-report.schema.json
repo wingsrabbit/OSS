@@ -49,7 +49,7 @@
       "properties": {
         "project_version": {
           "type": "string",
-          "minLength": 1,
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
           "maxLength": 64
         },
         "source_commit": {
@@ -166,6 +166,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "evidence_inventories",
         "state_transition_tables",
         "guard_rbac_matrices",
         "ledger_posting_matrices",
@@ -176,6 +177,7 @@
         "test_strategies"
       ],
       "properties": {
+        "evidence_inventories": { "$ref": "#/$defs/oracleSummary" },
         "state_transition_tables": { "$ref": "#/$defs/oracleSummary" },
         "guard_rbac_matrices": { "$ref": "#/$defs/oracleSummary" },
         "ledger_posting_matrices": { "$ref": "#/$defs/oracleSummary" },

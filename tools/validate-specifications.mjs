@@ -2,7 +2,7 @@
 // NOT FOR PRODUCTION — MOCK PROVIDERS ONLY
 
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync as rawExecFileSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,11 +11,33 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import YAML from "yaml";
 
+const GIT_REPOSITORY_OVERRIDE_ENVIRONMENT = Object.freeze([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_NAMESPACE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_SHALLOW_FILE",
+  "GIT_WORK_TREE",
+]);
+
+function execFileSync(file, args, options = {}) {
+  if (file !== "git") return rawExecFileSync(file, args, options);
+  const environment = { ...process.env, ...(options.env ?? {}) };
+  for (const name of GIT_REPOSITORY_OVERRIDE_ENVIRONMENT) delete environment[name];
+  environment.GIT_NO_REPLACE_OBJECTS = "1";
+  return rawExecFileSync(file, args, { ...options, env: environment });
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = resolve(HERE, "..");
 
 const SCHEMA_FILES = Object.freeze({
   evidence: "docs/provenance/evidence-card.schema.json",
+  inventory: "docs/provenance/evidence-inventory.schema.json",
+  deviation: "docs/governance/deviation-approval.schema.json",
   state: "docs/specifications/state-transition-table.schema.json",
   guard: "docs/specifications/guard-rbac-matrix.schema.json",
   ledger: "docs/specifications/ledger-posting-matrix.schema.json",
@@ -55,9 +77,15 @@ const GATE_INDEX = new Map(
 
 const MAX_HIGH_RISK_ACCEPTANCE_MS = 30 * 24 * 60 * 60 * 1000;
 const VALIDATION_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const NON_MEANINGFUL_TEXT =
+  /[\p{White_Space}\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}]/gu;
+const PLACEHOLDER_TEXT =
+  /^(?:todo|tbd|placeholder|changeme|unknown|replaceme|replacewith.*)[.!]?$/iu;
+const ROLE_ID = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const TRUSTED_WORKFLOW_RUNNERS = new Set(["ubuntu-24.04", "windows-2025", "macos-15"]);
 const EXPECTED_BOOTSTRAP_WORKFLOW_DIGEST =
   "sha256:9397a19b2445d86115f63980d65adfad93b46074b39b18fd094fe862fa6357af";
+const TRUSTED_BOOTSTRAP_COMMIT = "ca8f5ec048b5779bc753249f63a0297154028a0e";
 const EXPECTED_PACKAGE_MANAGER =
   "pnpm@11.14.0+sha512.66c1ac4c7d4762d6d7dde44c7f3e5a73591ed0a0806e751d4ed32d4f004f25b2285a906b1fd8a9e3e621df3b4e2858bf88e50e0cf626bedbe977fe434a5caf85";
 const EXPECTED_PACKAGE_SCRIPTS = Object.freeze({
@@ -73,6 +101,56 @@ const EXPECTED_BOOTSTRAP_DEPENDENCIES = Object.freeze({
 const TRUSTED_GOAL_SOURCE_ID = "cloud-termrat-core-goal-prompt";
 const TRUSTED_GOAL_SOURCE_SHA256 =
   "9cd354eacdc194b94d03ced6e986687da71f8cb58bdb50450c2ff91bca843392";
+const TRUSTED_GOAL_SOURCE_LINES = 1070;
+const TRUSTED_SCOPE_SUMMARY_REFERENCE = "repo:docs/governance/scope-summary.json";
+const TRUSTED_SCOPE_SUMMARY_DIGEST =
+  "sha256:81deb422cde10d5f62502024135bcddd2840f962bd90feb1720ceead7c6320d7";
+const TRUSTED_PRIVATE_SCOPE_RECORD_DIGEST =
+  "sha256:59447dea237574d67bad0e07734d77c76ae09fad53d731b5e3c2368223fd8977";
+const TRUSTED_OWNER_DEVIATIONS = Object.freeze({
+  "DEVIATION-MFA-OPTIONAL": Object.freeze({
+    authorization_key: "OWNER-AUTH-MFA-OPTIONAL",
+    title: "Keep customer and Staff MFA optional",
+    approved_change:
+      "Customer and Staff MFA remain optional rather than mandatory.",
+    constraints: Object.freeze([
+      "High-risk actions still require password re-entry.",
+      "When Staff voluntarily enables MFA, qualifying step-up also requires the configured factor.",
+      "Break-glass, immutable audit, and configured dual-review controls remain required.",
+    ]),
+    authorization_anchor: Object.freeze({
+      reference: "goal://cloud-termrat-core-goal-prompt#L337-L337",
+      line_start: 337,
+      line_end: 337,
+      content_digest: `sha256:${TRUSTED_GOAL_SOURCE_SHA256}`,
+    }),
+  }),
+  "DEVIATION-TERMRAT-USD-ONLY": Object.freeze({
+    authorization_key: "OWNER-AUTH-TERMRAT-USD-ONLY",
+    title: "Keep the new TermRat deployment USD-only",
+    approved_change:
+      "The new TermRat deployment enables USD only and does not re-enable historical HKD behavior.",
+    constraints: Object.freeze([
+      "Core may support multiple fiat currencies, but each order and invoice keeps one immutable currency.",
+      "USDT remains a payment asset and is not a TermRat invoice currency.",
+      "No automatic exchange-rate process may silently rewrite historical prices.",
+    ]),
+    authorization_anchor: Object.freeze({
+      reference: "goal://cloud-termrat-core-goal-prompt#L482-L483",
+      line_start: 482,
+      line_end: 483,
+      content_digest: `sha256:${TRUSTED_GOAL_SOURCE_SHA256}`,
+    }),
+  }),
+});
+const REQUIRED_INVENTORY_REVIEW_CHECKS = Object.freeze([
+  "atomic_single_obligation",
+  "source_fidelity",
+  "feature_cohesion",
+  "classification_and_disposition",
+  "scope_and_deviation",
+  "gate_deadline",
+]);
 const TRUSTED_LEDGER_RUNNER_DIGEST =
   "sha256:86fd5c597ba87f15b5c0d09bdb67579f34420f7e00ecd6c72e5b770c11467c97";
 const PRIORITY_INDEX = new Map(["P0", "P1", "P2", "P3"].map((priority, index) => [priority, index]));
@@ -89,12 +167,16 @@ const EVIDENCE_LIFECYCLE_TRANSITIONS = Object.freeze({
   superseded: new Set(["superseded"]),
 });
 const SOURCE_VERIFICATION_TRANSITIONS = Object.freeze({
-  unknown: new Set(["unknown", "frozen", "verified"]),
-  not_authorized_to_verify: new Set(["not_authorized_to_verify", "frozen", "verified"]),
+  unknown: new Set(["unknown"]),
+  not_authorized_to_verify: new Set(["not_authorized_to_verify"]),
   frozen: new Set(["frozen", "verified"]),
   verified: new Set(["verified"]),
 });
 const G0_ORACLE_CATEGORIES = Object.freeze({
+  evidence_inventories: {
+    recordKind: "inventory",
+    pathPrefix: "docs/provenance/",
+  },
   state_transition_tables: {
     recordKind: "state",
     pathPrefix: "docs/specifications/",
@@ -133,6 +215,84 @@ const G0_ORACLE_CATEGORIES = Object.freeze({
     pathPrefix: "docs/testing/",
   },
 });
+
+const GOAL_SECTION_RANGES = Object.freeze([
+  ["SECTION-0", 1, 19],
+  ["SECTION-1", 20, 63],
+  ["SECTION-2", 64, 75],
+  ["SECTION-3", 76, 98],
+  ["SECTION-4", 99, 133],
+  ["SECTION-5", 134, 188],
+  ["SECTION-6", 189, 261],
+  ["SECTION-7", 262, 342],
+  ["SECTION-8", 343, 400],
+  ["SECTION-9", 401, 459],
+  ["SECTION-10", 460, 545],
+  ["SECTION-11", 546, 584],
+  ["SECTION-12", 585, 622],
+  ["SECTION-13", 623, 675],
+  ["SECTION-14", 676, 719],
+  ["SECTION-15", 720, 773],
+  ["SECTION-16", 774, 853],
+  ["SECTION-17", 854, 949],
+  ["SECTION-18", 950, 1006],
+  ["SECTION-19", 1007, 1034],
+  ["SECTION-20", 1035, 1054],
+  ["SECTION-21", 1055, 1070],
+  ["SECTION-3-1", 78, 85],
+  ["SECTION-3-2", 86, 94],
+  ["SECTION-3-3", 95, 98],
+  ["SECTION-6-1", 191, 212],
+  ["SECTION-6-2", 213, 237],
+  ["SECTION-6-3", 238, 250],
+  ["SECTION-6-4", 251, 261],
+  ["SECTION-7-1", 264, 273],
+  ["SECTION-7-2", 274, 301],
+  ["SECTION-7-3", 302, 319],
+  ["SECTION-7-4", 320, 327],
+  ["SECTION-7-5", 328, 338],
+  ["SECTION-7-6", 339, 342],
+  ["SECTION-8-1", 345, 358],
+  ["SECTION-8-2", 359, 366],
+  ["SECTION-8-3", 367, 384],
+  ["SECTION-8-4", 385, 400],
+  ["SECTION-10-1", 462, 479],
+  ["SECTION-10-2", 480, 488],
+  ["SECTION-10-3", 489, 510],
+  ["SECTION-10-4", 511, 524],
+  ["SECTION-10-5", 525, 536],
+  ["SECTION-10-6", 537, 545],
+  ["SECTION-13-1", 625, 641],
+  ["SECTION-13-2", 642, 656],
+  ["SECTION-13-3", 657, 666],
+  ["SECTION-13-4", 667, 675],
+  ["SECTION-14-1", 678, 685],
+  ["SECTION-14-2", 686, 703],
+  ["SECTION-14-3", 704, 719],
+  ["SECTION-15-1", 722, 735],
+  ["SECTION-15-2", 736, 753],
+  ["SECTION-15-3", 754, 773],
+  ["SECTION-16-1", 776, 816],
+  ["SECTION-16-2", 817, 828],
+  ["SECTION-16-3", 829, 853],
+  ["SECTION-17-G0", 858, 867],
+  ["SECTION-17-G1", 868, 876],
+  ["SECTION-17-G2", 877, 885],
+  ["SECTION-17-G3", 886, 893],
+  ["SECTION-17-G4", 894, 903],
+  ["SECTION-17-G5", 904, 910],
+  ["SECTION-17-G6", 911, 922],
+  ["SECTION-17-G7", 923, 929],
+  ["SECTION-17-G8", 930, 937],
+  ["SECTION-17-G9", 938, 947],
+  ["SECTION-18-IDENTITY-AUTHORIZATION", 954, 962],
+  ["SECTION-18-MONEY", 963, 979],
+  ["SECTION-18-SERVICE", 980, 994],
+  ["SECTION-18-DEPLOYMENT-RECOVERY", 995, 1006],
+]);
+const REQUIRED_GOAL_SECTION_IDS = Object.freeze(
+  GOAL_SECTION_RANGES.map(([sectionId]) => sectionId),
+);
 
 const REQUIRED_STATE_AGGREGATE_IDS = Object.freeze([
   "AGGREGATE-USER",
@@ -341,6 +501,48 @@ function list(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function normalizedNarrative(value) {
+  if (typeof value !== "string") return "";
+  return value.normalize("NFKC").replace(NON_MEANINGFUL_TEXT, "");
+}
+
+function narrativeIssues(value, label, { minimumLettersOrNumbers = 1, rejectPlaceholder = true } = {}) {
+  if (typeof value !== "string") return [];
+  const normalized = normalizedNarrative(value);
+  const lettersOrNumbers = normalized.match(/[\p{L}\p{N}]/gu)?.length ?? 0;
+  const issues = [];
+  if (!normalized || lettersOrNumbers < minimumLettersOrNumbers) {
+    issues.push(
+      `${label}: must contain at least ${minimumLettersOrNumbers} visible Unicode letter or number${minimumLettersOrNumbers === 1 ? "" : "s"}`,
+    );
+  }
+  if (rejectPlaceholder && PLACEHOLDER_TEXT.test(normalized)) {
+    issues.push(`${label}: must not be placeholder text`);
+  }
+  return issues;
+}
+
+function normalizedNarrativeKey(value) {
+  return normalizedNarrative(value).toLocaleLowerCase("en-US").replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function chronologyIssues(createdAtValue, updatedAtValue, label) {
+  const issues = [];
+  const createdAt = Date.parse(createdAtValue ?? "");
+  const updatedAt = Date.parse(updatedAtValue ?? "");
+  const latestAllowed = Date.now() + VALIDATION_CLOCK_SKEW_MS;
+  if (Number.isFinite(createdAt) && createdAt > latestAllowed) {
+    issues.push(`${label}: created_at cannot be in the future`);
+  }
+  if (Number.isFinite(updatedAt) && updatedAt > latestAllowed) {
+    issues.push(`${label}: updated_at cannot be in the future`);
+  }
+  if (Number.isFinite(createdAt) && Number.isFinite(updatedAt) && updatedAt < createdAt) {
+    issues.push(`${label}: updated_at cannot precede created_at`);
+  }
+  return issues;
+}
+
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -418,16 +620,39 @@ function expressionReferenceSets(expression, depth = 0, budget = { nodes: 0 }) {
 }
 
 function reviewIssues(review, label) {
-  if (review?.status !== "passed") return [];
   const issues = [];
+  const authorRole = review?.author_role;
+  const reviewerRoles = list(review?.reviewer_roles);
+  if (typeof authorRole === "string" && !ROLE_ID.test(authorRole)) {
+    issues.push(`${label}: author_role must be a canonical lowercase role id`);
+  }
+  for (const reviewerRole of reviewerRoles) {
+    if (typeof reviewerRole === "string" && !ROLE_ID.test(reviewerRole)) {
+      issues.push(`${label}: reviewer role must be a canonical lowercase role id`);
+    }
+  }
+  if (new Set(reviewerRoles).size !== reviewerRoles.length) {
+    issues.push(`${label}: reviewer roles must be unique`);
+  }
+  if (reviewerRoles.includes(authorRole)) {
+    issues.push(`${label}: author role cannot also be a reviewer role`);
+  }
+  for (const [index, finding] of list(review?.findings).entries()) {
+    issues.push(...narrativeIssues(finding, `${label}.findings.${index}`));
+  }
+  if (review?.status !== "passed") return issues;
   if (review.independent_review !== true) {
     issues.push(`${label}: passed review must be independent`);
   }
-  if (list(review.reviewer_roles).includes(review.author_role)) {
-    issues.push(`${label}: author role cannot also be a reviewer role`);
-  }
   if (list(review.reproduction_commands).length === 0) {
     issues.push(`${label}: passed review needs a reproduction command`);
+  }
+  for (const [index, command] of list(review.reproduction_commands).entries()) {
+    issues.push(
+      ...narrativeIssues(command, `${label}.reproduction_commands.${index}`, {
+        minimumLettersOrNumbers: 2,
+      }),
+    );
   }
   const artifacts = review.evidence_refs ?? review.artifact_refs;
   if (list(artifacts).length === 0) {
@@ -446,6 +671,58 @@ function evidenceIssues(document) {
     ...duplicateIdIssues(document.sources, "source_id", "evidence.sources"),
     ...reviewIssues(document.review, "evidence.review"),
   ];
+  const rejectPlaceholder = FROZEN_EVIDENCE_STATUSES.includes(document.lifecycle?.status);
+  for (const [field, value, minimumLettersOrNumbers] of [
+    ["title", document.title, 2],
+    ["business_description", document.business_description, 12],
+    ["classification.rationale", document.classification?.rationale, 8],
+    ["classification.fail_safe_behavior", document.classification?.fail_safe_behavior, 8],
+    ["data_and_trust.minimum_disclosure", document.data_and_trust?.minimum_disclosure, 8],
+    ["unknown_handling.impact", document.unknown_handling?.impact, 8],
+    ["unknown_handling.fail_safe", document.unknown_handling?.fail_safe, 8],
+  ]) {
+    if (value === undefined || value === null) continue;
+    issues.push(
+      ...narrativeIssues(value, `evidence.${field}`, {
+        minimumLettersOrNumbers,
+        rejectPlaceholder,
+      }),
+    );
+  }
+  for (const source of list(document.sources)) {
+    if (source?.notes === undefined) continue;
+    issues.push(
+      ...narrativeIssues(source.notes, `evidence.sources.${source?.source_id}.notes`, {
+        minimumLettersOrNumbers: 2,
+        rejectPlaceholder,
+      }),
+    );
+  }
+  for (const scenario of Object.values(document.scenarios ?? {}).flatMap(list)) {
+    const scenarioLabel = `evidence.scenarios.${scenario?.scenario_id ?? "unknown"}`;
+    issues.push(
+      ...narrativeIssues(scenario?.stimulus, `${scenarioLabel}.stimulus`, {
+        minimumLettersOrNumbers: 4,
+        rejectPlaceholder,
+      }),
+    );
+    for (const [index, value] of list(scenario?.preconditions).entries()) {
+      issues.push(
+        ...narrativeIssues(value, `${scenarioLabel}.preconditions.${index}`, {
+          minimumLettersOrNumbers: 2,
+          rejectPlaceholder,
+        }),
+      );
+    }
+    for (const [index, value] of list(scenario?.expected_outcomes).entries()) {
+      issues.push(
+        ...narrativeIssues(value, `${scenarioLabel}.expected_outcomes.${index}`, {
+          minimumLettersOrNumbers: 2,
+          rejectPlaceholder,
+        }),
+      );
+    }
+  }
 
   for (const source of list(document.sources)) {
     const expected = AUTHORITY_RANKS[source?.source_type];
@@ -461,6 +738,15 @@ function evidenceIssues(document) {
     ) {
       issues.push(`evidence.sources.${source.source_id}: line_end precedes line_start`);
     }
+    if (
+      source?.source_type === "goal_specification" &&
+      Number.isInteger(source?.line_start) &&
+      Number.isInteger(source?.line_end) &&
+      source.reference !==
+        `goal://${TRUSTED_GOAL_SOURCE_ID}#L${source.line_start}-L${source.line_end}`
+    ) {
+      issues.push(`evidence.sources.${source.source_id}: goal anchor fragment must match its line range`);
+    }
     if (source?.source_type === "other" && !source?.notes?.trim()) {
       issues.push(`evidence.sources.${source.source_id}: other source needs an explicit note`);
     }
@@ -475,6 +761,43 @@ function evidenceIssues(document) {
     }
     if (source?.verification_status === "verified" && !source?.observed_at) {
       issues.push(`evidence.sources.${source.source_id}: verified source needs observed_at`);
+    }
+    if (
+      Number.isFinite(Date.parse(source?.observed_at ?? "")) &&
+      Date.parse(source.observed_at) > Date.now() + VALIDATION_CLOCK_SKEW_MS
+    ) {
+      issues.push(`evidence.sources.${source.source_id}: observed_at cannot be in the future`);
+    }
+  }
+
+  issues.push(
+    ...chronologyIssues(
+      document.lifecycle?.created_at,
+      document.lifecycle?.updated_at,
+      "evidence.lifecycle",
+    ),
+  );
+
+  const governance = document.governance ?? {};
+  if (
+    governance.scope_summary?.reference !== TRUSTED_SCOPE_SUMMARY_REFERENCE ||
+    governance.scope_summary?.content_digest !== TRUSTED_SCOPE_SUMMARY_DIGEST ||
+    governance.private_scope_record_digest !== TRUSTED_PRIVATE_SCOPE_RECORD_DIGEST
+  ) {
+    issues.push("evidence.governance: card must bind the exact public and private Scope Record digests");
+  }
+  if (governance.approved_deviation_id) {
+    const ownerDecision = list(document.sources).some(
+      (source) =>
+        source?.source_id === governance.approved_deviation_id &&
+        source?.source_type === "owner_decision" &&
+        source?.reference?.startsWith("repo:docs/governance/decisions/") &&
+        ["frozen", "verified"].includes(source?.verification_status),
+    );
+    if (!ownerDecision) {
+      issues.push(
+        "evidence.governance: approved deviation needs an exactly matching frozen owner decision source",
+      );
     }
   }
 
@@ -510,6 +833,18 @@ function evidenceIssues(document) {
   ) {
     issues.push(`evidence.classification: ${status} evidence needs a negative test`);
   }
+  if (
+    ["excluded", "quarantined"].includes(status) &&
+    list(document.disposition?.exclusion_assertion_ids).length === 0
+  ) {
+    issues.push(`evidence.disposition: ${status} evidence needs an exclusion assertion`);
+  }
+  if (
+    ["retained", "config"].includes(status) &&
+    list(document.disposition?.exclusion_assertion_ids).length > 0
+  ) {
+    issues.push(`evidence.disposition: ${status} evidence cannot declare exclusion assertions`);
+  }
 
   const lifecycle = document.lifecycle?.status;
   if (["frozen", "implemented", "verified", "superseded"].includes(lifecycle)) {
@@ -543,6 +878,16 @@ function evidenceIssues(document) {
     if (list(document.traceability?.artifact_refs).length === 0) {
       issues.push("evidence.lifecycle: verified evidence needs an acceptance artifact reference");
     }
+    if (["excluded", "quarantined"].includes(status)) {
+      const acceptanceTests = new Set(list(document.traceability?.test_refs));
+      for (const testId of list(document.classification?.negative_test_refs)) {
+        if (!acceptanceTests.has(testId)) {
+          issues.push(
+            `evidence.lifecycle: verified negative test ${testId} must appear in traceability.test_refs`,
+          );
+        }
+      }
+    }
     if (
       GATE_INDEX.get(document.lifecycle?.last_verified_gate) <
       GATE_INDEX.get(document.lifecycle?.acceptance_gate)
@@ -572,20 +917,31 @@ function evidenceIssues(document) {
     if (!["frozen", "implemented", "verified", "superseded"].includes(lifecycle)) {
       issues.push("evidence.lifecycle: post-goal evidence must be frozen and independently reviewed");
     }
-    if (!document.classification?.approved_deviation_id) {
+    if (!document.governance?.approved_deviation_id) {
       issues.push("evidence.lifecycle: post-goal evidence needs an approved deviation id");
     }
     if (
       !list(document.sources).some(
         (source) =>
-          source?.source_type === "owner_decision" &&
-          ["frozen", "verified"].includes(source?.verification_status),
+        source?.source_id === document.governance?.approved_deviation_id &&
+        source?.source_type === "owner_decision" &&
+        source?.reference?.startsWith("repo:docs/governance/decisions/") &&
+        ["frozen", "verified"].includes(source?.verification_status),
       )
     ) {
-      issues.push("evidence.lifecycle: post-goal evidence needs a frozen owner decision source");
+      issues.push("evidence.lifecycle: post-goal evidence needs the matching frozen owner decision source");
     }
   }
   if (status === "unknown") {
+    if (
+      !list(document.sources).some((source) =>
+        ["unknown", "not_authorized_to_verify"].includes(source?.verification_status),
+      )
+    ) {
+      issues.push(
+        "evidence.unknown_handling: unknown evidence needs an unknown or not-authorized source",
+      );
+    }
     const resolutionGate = document.unknown_handling?.resolution_gate;
     const resolutionIndex = GATE_INDEX.get(resolutionGate);
     const firstIndex = GATE_INDEX.get(document.lifecycle?.first_gate);
@@ -601,9 +957,474 @@ function evidenceIssues(document) {
         "evidence.unknown_handling: resolution_gate must be between first_gate and acceptance_gate",
       );
     }
+  } else if (document.unknown_handling !== undefined && document.unknown_handling !== null) {
+    issues.push("evidence.unknown_handling: non-unknown evidence cannot declare unknown handling");
   }
   const scenarios = Object.values(document.scenarios ?? {}).flatMap(list);
   issues.push(...duplicateIdIssues(scenarios, "scenario_id", "evidence.scenarios"));
+  return issues;
+}
+
+function deviationIssues(document) {
+  const issues = [];
+  const label = `deviation.${document.decision_id ?? "unknown"}`;
+  const trustedDecision = TRUSTED_OWNER_DEVIATIONS[document.decision_id];
+  if (!trustedDecision) {
+    issues.push(
+      `${label}: decision_id is not in the frozen explicit-Owner authorization registry; add future authorizations through a separately reviewed policy change`,
+    );
+  } else {
+    if (
+      document.authorization_basis !== "explicit_goal_owner_decision" ||
+      document.authorization?.kind !== "explicit_goal_owner_decision" ||
+      document.authorization?.authorization_key !== trustedDecision.authorization_key ||
+      canonicalJson(document.authorization?.goal_anchor) !==
+        canonicalJson(trustedDecision.authorization_anchor)
+    ) {
+      issues.push(`${label}.authorization: must bind the exact registered Goal Owner-decision anchor`);
+    }
+    if (
+      document.title !== trustedDecision.title ||
+      document.approved_change !== trustedDecision.approved_change ||
+      canonicalJson(document.constraints) !== canonicalJson(trustedDecision.constraints)
+    ) {
+      issues.push(`${label}: approved scope and constraints must exactly match the registered Owner decision`);
+    }
+  }
+  if (
+    document.goal_source?.source_id !== TRUSTED_GOAL_SOURCE_ID ||
+    document.goal_source?.reference !== `goal://${TRUSTED_GOAL_SOURCE_ID}` ||
+    document.goal_source?.content_digest !== `sha256:${TRUSTED_GOAL_SOURCE_SHA256}` ||
+    document.goal_source?.total_lines !== TRUSTED_GOAL_SOURCE_LINES
+  ) {
+    issues.push(`${label}.goal_source: decision must bind the exact frozen Goal source`);
+  }
+  if (
+    document.scope_binding?.public_summary?.reference !== TRUSTED_SCOPE_SUMMARY_REFERENCE ||
+    document.scope_binding?.public_summary?.content_digest !== TRUSTED_SCOPE_SUMMARY_DIGEST ||
+    document.scope_binding?.private_scope_record_digest !== TRUSTED_PRIVATE_SCOPE_RECORD_DIGEST
+  ) {
+    issues.push(`${label}.scope_binding: decision must bind the exact public and private Scope Record digests`);
+  }
+  for (const [field, value] of [
+    ["title", document.title],
+    ["approved_change", document.approved_change],
+    ...list(document.constraints).map((constraint, index) => [
+      `constraints.${index}`,
+      constraint,
+    ]),
+  ]) {
+    if (typeof value !== "string") continue;
+    issues.push(
+      ...narrativeIssues(value, `${label}.${field}`, {
+        minimumLettersOrNumbers: field === "title" ? 4 : 8,
+      }),
+    );
+  }
+  if (document.lifecycle?.content_digest !== contentDigest(document, ["lifecycle", "content_digest"])) {
+    issues.push(`${label}.lifecycle.content_digest: does not match the decision record`);
+  }
+  const recordedAt = Date.parse(document.recorded_at ?? "");
+  const frozenAt = Date.parse(document.lifecycle?.frozen_at ?? "");
+  const latestAllowed = Date.now() + VALIDATION_CLOCK_SKEW_MS;
+  if (Number.isFinite(recordedAt) && recordedAt > latestAllowed) {
+    issues.push(`${label}.recorded_at: cannot be in the future`);
+  }
+  if (Number.isFinite(frozenAt) && frozenAt > latestAllowed) {
+    issues.push(`${label}.lifecycle.frozen_at: cannot be in the future`);
+  }
+  if (Number.isFinite(recordedAt) && Number.isFinite(frozenAt) && frozenAt < recordedAt) {
+    issues.push(`${label}.lifecycle.frozen_at: cannot precede recorded_at`);
+  }
+  return issues;
+}
+
+function canonicalGoalSectionId(line) {
+  let selected = null;
+  for (const candidate of GOAL_SECTION_RANGES) {
+    const [, lineStart, lineEnd] = candidate;
+    if (line < lineStart || line > lineEnd) continue;
+    if (!selected || lineEnd - lineStart < selected[2] - selected[1]) selected = candidate;
+  }
+  return selected?.[0] ?? null;
+}
+
+function compactGoalLineRanges(lines) {
+  const sorted = [...lines].sort((left, right) => left - right);
+  const ranges = [];
+  for (const line of sorted) {
+    const current = ranges.at(-1);
+    if (current && line === current[1] + 1) current[1] = line;
+    else ranges.push([line, line]);
+  }
+  return ranges
+    .map(([lineStart, lineEnd]) =>
+      lineStart === lineEnd ? `L${lineStart}` : `L${lineStart}-L${lineEnd}`,
+    )
+    .join(", ");
+}
+
+function inventoryIssues(document) {
+  const issues = [
+    ...duplicateIdIssues(document.section_coverage, "section_id", "inventory.section_coverage"),
+    ...duplicateIdIssues(document.requirements, "requirement_id", "inventory.requirements"),
+    ...duplicateIdIssues(document.features, "feature_id", "inventory.features"),
+    ...duplicateIdIssues(document.features, "evidence_id", "inventory.features.evidence_ids"),
+    ...reviewIssues(document.review, "inventory.review"),
+  ];
+  issues.push(
+    ...narrativeIssues(document.title, "inventory.title", {
+      minimumLettersOrNumbers: 6,
+    }),
+  );
+
+  if (
+    document.goal_source?.source_id !== TRUSTED_GOAL_SOURCE_ID ||
+    document.goal_source?.reference !== `goal://${TRUSTED_GOAL_SOURCE_ID}` ||
+    document.goal_source?.content_digest !== `sha256:${TRUSTED_GOAL_SOURCE_SHA256}` ||
+    document.goal_source?.total_lines !== TRUSTED_GOAL_SOURCE_LINES
+  ) {
+    issues.push("inventory.goal_source: must bind the exact trusted goal id, digest, and line count");
+  }
+  if (
+    document.scope_binding?.public_summary?.reference !== TRUSTED_SCOPE_SUMMARY_REFERENCE ||
+    document.scope_binding?.public_summary?.content_digest !== TRUSTED_SCOPE_SUMMARY_DIGEST ||
+    document.scope_binding?.private_scope_record_digest !== TRUSTED_PRIVATE_SCOPE_RECORD_DIGEST
+  ) {
+    issues.push("inventory.scope_binding: must bind the exact public and private Scope Record digests");
+  }
+
+  const requirements = list(document.requirements);
+  const features = list(document.features);
+  const sectionCoverage = list(document.section_coverage);
+  if (requirements.length < REQUIRED_GOAL_SECTION_IDS.length) {
+    issues.push(
+      `inventory.requirements: at least ${REQUIRED_GOAL_SECTION_IDS.length} unique atomic requirements are required`,
+    );
+  }
+  const requirementById = new Map(
+    requirements.filter((entry) => entry?.requirement_id).map((entry) => [entry.requirement_id, entry]),
+  );
+  const featureById = new Map(
+    features.filter((entry) => entry?.feature_id).map((entry) => [entry.feature_id, entry]),
+  );
+  const requirementOwners = new Map();
+  const sectionOwners = new Map();
+  const coveredGoalLines = new Set();
+  const requirementDescriptionOwners = new Map();
+  const featureTitleOwners = new Map();
+
+  const actualSectionIds = sectionCoverage.map((entry) => entry?.section_id);
+  issues.push(
+    ...missingRequiredValues(
+      actualSectionIds,
+      REQUIRED_GOAL_SECTION_IDS,
+      "inventory.section_coverage",
+    ),
+  );
+  const allowedSectionIds = new Set(REQUIRED_GOAL_SECTION_IDS);
+  for (const section of sectionCoverage) {
+    const label = `inventory.section_coverage.${section?.section_id ?? "unknown"}`;
+    if (!allowedSectionIds.has(section?.section_id)) {
+      issues.push(`${label}: unknown section id`);
+    }
+    for (const requirementId of list(section?.requirement_ids)) {
+      if (!requirementById.has(requirementId)) {
+        issues.push(`${label}: references unknown requirement ${requirementId}`);
+        continue;
+      }
+      const owners = sectionOwners.get(requirementId) ?? [];
+      owners.push(section.section_id);
+      sectionOwners.set(requirementId, owners);
+    }
+  }
+
+  for (const requirement of requirements) {
+    const label = `inventory.requirements.${requirement?.requirement_id ?? "unknown"}`;
+    issues.push(
+      ...narrativeIssues(requirement?.description, `${label}.description`, {
+        minimumLettersOrNumbers: 12,
+      }),
+    );
+    const descriptionKey = normalizedNarrativeKey(requirement?.description);
+    if (descriptionKey) {
+      const existing = requirementDescriptionOwners.get(descriptionKey);
+      if (existing) {
+        issues.push(`${label}.description: duplicates requirement narrative ${existing}`);
+      } else {
+        requirementDescriptionOwners.set(descriptionKey, requirement?.requirement_id);
+      }
+    }
+    const invalidRange =
+      !Number.isInteger(requirement?.source_line_start) ||
+      !Number.isInteger(requirement?.source_line_end) ||
+      requirement.source_line_start < 1 ||
+      requirement.source_line_end > TRUSTED_GOAL_SOURCE_LINES ||
+      requirement.source_line_end < requirement.source_line_start;
+    if (invalidRange) {
+      issues.push(`${label}: source line range is invalid`);
+    } else {
+      const declaredSections = sectionOwners.get(requirement.requirement_id) ?? [];
+      for (let line = requirement.source_line_start; line <= requirement.source_line_end; line += 1) {
+        coveredGoalLines.add(line);
+        if (
+          declaredSections.length === 1 &&
+          canonicalGoalSectionId(line) !== declaredSections[0]
+        ) {
+          issues.push(
+            `${label}: ${line === requirement.source_line_start && line === requirement.source_line_end ? `L${line}` : `line range L${requirement.source_line_start}-L${requirement.source_line_end}`} belongs to ${canonicalGoalSectionId(line)}, not ${declaredSections[0]}`,
+          );
+          break;
+        }
+      }
+    }
+    if (!featureById.has(requirement?.feature_id)) {
+      issues.push(`${label}: references unknown feature ${requirement?.feature_id}`);
+    }
+  }
+
+  const missingGoalLines = Array.from(
+    { length: TRUSTED_GOAL_SOURCE_LINES },
+    (_, index) => index + 1,
+  ).filter((line) => !coveredGoalLines.has(line));
+  if (missingGoalLines.length > 0) {
+    issues.push(
+      `inventory.requirements: trusted goal lines are not completely covered; missing ${compactGoalLineRanges(missingGoalLines)}`,
+    );
+  }
+
+  for (const feature of features) {
+    const label = `inventory.features.${feature?.feature_id ?? "unknown"}`;
+    issues.push(
+      ...narrativeIssues(feature?.title, `${label}.title`, {
+        minimumLettersOrNumbers: 3,
+      }),
+    );
+    const titleKey = normalizedNarrativeKey(feature?.title);
+    if (titleKey) {
+      const existing = featureTitleOwners.get(titleKey);
+      if (existing) {
+        issues.push(`${label}.title: duplicates Feature title ${existing}`);
+      } else {
+        featureTitleOwners.set(titleKey, feature?.feature_id);
+      }
+    }
+    const anchors = list(feature?.goal_anchors);
+    const anchorKeys = new Set();
+    for (const [anchorIndex, anchor] of anchors.entries()) {
+      const anchorLabel = `${label}.goal_anchors.${anchorIndex}`;
+      if (
+        typeof anchor?.reference !== "string" ||
+        !Number.isInteger(anchor.line_start) ||
+        !Number.isInteger(anchor.line_end) ||
+        anchor.line_start < 1 ||
+        anchor.line_end > TRUSTED_GOAL_SOURCE_LINES ||
+        anchor.line_end < anchor.line_start ||
+        anchor.reference !==
+          `goal://${TRUSTED_GOAL_SOURCE_ID}#L${anchor.line_start}-L${anchor.line_end}`
+      ) {
+        issues.push(`${anchorLabel}: exact anchored goal reference and valid line range required`);
+      }
+      const key = canonicalJson({
+        reference: anchor?.reference,
+        line_start: anchor?.line_start,
+        line_end: anchor?.line_end,
+      });
+      if (anchorKeys.has(key)) {
+        issues.push(`${label}.goal_anchors: duplicate goal anchor`);
+      }
+      anchorKeys.add(key);
+    }
+    if (anchors.length === 0) issues.push(`${label}.goal_anchors: at least one anchor is required`);
+
+    const targets = new Set(list(feature?.disposition?.targets));
+    if (["retained", "config"].includes(feature?.classification) && targets.has("exclude")) {
+      issues.push(`${label}.disposition: ${feature.classification} feature cannot target exclude`);
+    }
+    if (feature?.classification === "excluded" && (targets.size !== 1 || !targets.has("exclude"))) {
+      issues.push(`${label}.disposition: excluded feature must target only exclude`);
+    }
+    if (feature?.classification === "config" && !targets.has("deployment_config")) {
+      issues.push(`${label}.disposition: config feature must target deployment_config`);
+    }
+    if (targets.has("core") && list(feature?.disposition?.module_ids).length === 0) {
+      issues.push(`${label}.disposition: core target needs a module id`);
+    }
+    if (
+      targets.has("provider_contract") &&
+      list(feature?.disposition?.provider_capability_ids).length === 0
+    ) {
+      issues.push(`${label}.disposition: provider contract target needs a capability id`);
+    }
+    if (
+      targets.has("deployment_config") &&
+      list(feature?.disposition?.configuration_keys).length === 0
+    ) {
+      issues.push(`${label}.disposition: deployment config target needs a configuration key`);
+    }
+    const policy = feature?.classification_policy ?? {};
+    if (policy.fail_safe_behavior !== null && policy.fail_safe_behavior !== undefined) {
+      issues.push(
+        ...narrativeIssues(
+          policy.fail_safe_behavior,
+          `${label}.classification_policy.fail_safe_behavior`,
+          { minimumLettersOrNumbers: 8 },
+        ),
+      );
+    }
+    if (
+      ["excluded", "quarantined"].includes(feature?.classification) &&
+      list(policy.negative_test_refs).length === 0
+    ) {
+      issues.push(`${label}.classification_policy: ${feature.classification} needs a negative test`);
+    }
+    if (
+      ["excluded", "quarantined"].includes(feature?.classification) &&
+      list(feature?.disposition?.exclusion_assertion_ids).length === 0
+    ) {
+      issues.push(`${label}.disposition: ${feature.classification} needs an exclusion assertion`);
+    }
+    if (
+      ["retained", "config"].includes(feature?.classification) &&
+      list(feature?.disposition?.exclusion_assertion_ids).length > 0
+    ) {
+      issues.push(`${label}.disposition: ${feature.classification} cannot declare exclusion assertions`);
+    }
+    if (feature?.classification === "quarantined" && !policy.fail_safe_behavior) {
+      issues.push(`${label}.classification_policy: quarantined feature needs fail-safe behavior`);
+    }
+    if (feature?.classification === "unknown") {
+      const unknown = policy.unknown_handling;
+      if (!unknown) {
+        issues.push(`${label}.classification_policy: unknown feature needs owner and fail-safe handling`);
+      } else if (
+        GATE_INDEX.get(unknown.resolution_gate) < GATE_INDEX.get(feature.first_gate) ||
+        GATE_INDEX.get(unknown.resolution_gate) > GATE_INDEX.get(feature.acceptance_gate)
+      ) {
+        issues.push(`${label}.classification_policy: unknown resolution Gate is outside lifecycle`);
+      }
+      if (unknown) {
+        if (!ROLE_ID.test(unknown.owner_role ?? "")) {
+          issues.push(`${label}.classification_policy.unknown_handling: owner_role must be canonical`);
+        }
+        issues.push(
+          ...narrativeIssues(
+            unknown.impact,
+            `${label}.classification_policy.unknown_handling.impact`,
+            { minimumLettersOrNumbers: 8 },
+          ),
+          ...narrativeIssues(
+            unknown.fail_safe,
+            `${label}.classification_policy.unknown_handling.fail_safe`,
+            { minimumLettersOrNumbers: 8 },
+          ),
+        );
+      }
+    } else if (policy.unknown_handling !== null) {
+      issues.push(`${label}.classification_policy: non-unknown feature cannot declare unknown handling`);
+    }
+
+    for (const requirementId of list(feature?.requirement_ids)) {
+      const requirement = requirementById.get(requirementId);
+      if (!requirement) {
+        issues.push(`${label}.requirement_ids: references unknown requirement ${requirementId}`);
+        continue;
+      }
+      const owners = requirementOwners.get(requirementId) ?? [];
+      owners.push(feature.feature_id);
+      requirementOwners.set(requirementId, owners);
+      if (requirement.feature_id !== feature.feature_id) {
+        issues.push(`${label}.requirement_ids: ${requirementId} names feature ${requirement.feature_id}`);
+      }
+      if (
+        !anchors.some(
+          (anchor) =>
+            Number.isInteger(anchor?.line_start) &&
+            Number.isInteger(anchor?.line_end) &&
+            requirement.source_line_start >= anchor.line_start &&
+            requirement.source_line_end <= anchor.line_end,
+        )
+      ) {
+        issues.push(`${label}.requirement_ids: ${requirementId} lies outside every feature goal anchor`);
+      }
+    }
+    const featureSections = new Set(
+      list(feature?.requirement_ids).flatMap((requirementId) => sectionOwners.get(requirementId) ?? []),
+    );
+    if (featureSections.size < 1) {
+      issues.push(`${label}: a feature must cover at least one required goal section`);
+    }
+  }
+
+  for (const requirement of requirements) {
+    const owners = requirementOwners.get(requirement?.requirement_id) ?? [];
+    if (owners.length !== 1) {
+      issues.push(
+        `inventory.requirements.${requirement?.requirement_id}: must be mapped exactly once; found ${owners.length}`,
+      );
+    }
+    const sections = sectionOwners.get(requirement?.requirement_id) ?? [];
+    if (sections.length !== 1) {
+      issues.push(
+        `inventory.requirements.${requirement?.requirement_id}: must belong to exactly one required section; found ${sections.length}`,
+      );
+    }
+  }
+
+  const expectedClassifications = {
+    total_features: features.length,
+    total_requirements: requirements.length,
+    retained: features.filter((entry) => entry?.classification === "retained").length,
+    config: features.filter((entry) => entry?.classification === "config").length,
+    excluded: features.filter((entry) => entry?.classification === "excluded").length,
+    quarantined: features.filter((entry) => entry?.classification === "quarantined").length,
+    unknown: features.filter((entry) => entry?.classification === "unknown").length,
+  };
+  for (const [key, expected] of Object.entries(expectedClassifications)) {
+    if (document.classification_counts?.[key] !== expected) {
+      issues.push(`inventory.classification_counts.${key}: expected ${expected}`);
+    }
+  }
+  for (const priority of ["P0", "P1", "P2", "P3"]) {
+    const expected = features.filter((entry) => entry?.priority === priority).length;
+    if (document.priority_counts?.[priority] !== expected) {
+      issues.push(`inventory.priority_counts.${priority}: expected ${expected}`);
+    }
+  }
+
+  if (document.lifecycle?.status === "draft") {
+    if (document.review?.status !== "pending" || document.review?.independent_review !== false) {
+      issues.push("inventory.lifecycle: draft inventory must remain pending and unapproved");
+    }
+  } else if (document.lifecycle?.status === "frozen") {
+    if (document.review?.status !== "passed" || document.review?.independent_review !== true) {
+      issues.push("inventory.lifecycle: frozen inventory needs a passed independent review");
+    }
+    if (document.lifecycle?.content_digest !== contentDigest(document, ["lifecycle", "content_digest"])) {
+      issues.push("inventory.lifecycle: frozen content digest does not match the inventory");
+    }
+    const reviewedRequirementIds = list(document.review?.coverage?.requirement_ids);
+    const reviewedFeatureIds = list(document.review?.coverage?.feature_ids);
+    const reviewedChecks = list(document.review?.coverage?.checks);
+    const exactSet = (actual, expected) =>
+      canonicalJson([...new Set(actual)].sort()) === canonicalJson([...new Set(expected)].sort());
+    if (!exactSet(reviewedRequirementIds, requirements.map((entry) => entry?.requirement_id))) {
+      issues.push("inventory.review.coverage.requirement_ids: must exactly cover every requirement");
+    }
+    if (!exactSet(reviewedFeatureIds, features.map((entry) => entry?.feature_id))) {
+      issues.push("inventory.review.coverage.feature_ids: must exactly cover every Feature");
+    }
+    if (!exactSet(reviewedChecks, REQUIRED_INVENTORY_REVIEW_CHECKS)) {
+      issues.push("inventory.review.coverage.checks: must attest every required decomposition check");
+    }
+  }
+  issues.push(
+    ...chronologyIssues(
+      document.lifecycle?.created_at,
+      document.lifecycle?.updated_at,
+      "inventory.lifecycle",
+    ),
+  );
   return issues;
 }
 
@@ -1283,6 +2104,10 @@ export function validateSemantics(kind, document) {
   switch (kind) {
     case "evidence":
       return evidenceIssues(document);
+    case "inventory":
+      return inventoryIssues(document);
+    case "deviation":
+      return deviationIssues(document);
     case "state":
       return stateIssues(document);
     case "guard":
@@ -1305,7 +2130,12 @@ function loadSchemas(root) {
   addFormats(ajv);
   const validators = {};
   for (const [kind, file] of Object.entries(SCHEMA_FILES)) {
-    const schema = parseJsonStrict(readFileSync(join(root, file), "utf8"));
+    const schemaFile = join(root, file);
+    const metadata = lstatSync(schemaFile);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error(`${file}: schema must be a regular non-symlink file`);
+    }
+    const schema = parseJsonStrict(readFileSync(schemaFile, "utf8"));
     validators[kind] = ajv.compile(schema);
   }
   return validators;
@@ -1432,6 +2262,196 @@ function workflowRunnerIssue(value, label) {
   return null;
 }
 
+function numericProjectVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(value);
+  if (!match) return null;
+  return match.slice(1).map((part) => BigInt(part));
+}
+
+function compareNumericProjectVersions(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] < right[index]) return -1;
+    if (left[index] > right[index]) return 1;
+  }
+  return 0;
+}
+
+function projectVersionIssues(root, packageVersion) {
+  const label = "VERSION";
+  const file = join(root, label);
+  const issues = [];
+  let current;
+  let currentParts;
+  try {
+    const metadata = lstatSync(file);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error("not a regular file");
+    const content = readFileSync(file, "utf8");
+    const match = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\n$/.exec(
+      content,
+    );
+    if (!match) throw new Error("must contain exactly one numeric major.minor.patch version and newline");
+    current = match[1];
+    currentParts = numericProjectVersion(current);
+  } catch (error) {
+    return [`${label}: project version policy cannot be loaded: ${error.message}`];
+  }
+  if (packageVersion !== current) {
+    issues.push(`package.json.version: must exactly match VERSION (${current})`);
+  }
+
+  for (const [documentationPath, predicate, expectation] of [
+    [
+      "README.md",
+      (content) =>
+        content.split("\n").filter((line) => line === `Current project version: \`${current}\`.`)
+          .length === 1,
+      `must contain exactly one canonical current-version line for ${current}`,
+    ],
+    [
+      "CHANGELOG.md",
+      (content) =>
+        content
+          .split("\n")
+          .some((line) => new RegExp(`^## \\[${current.replaceAll(".", "\\.")}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$`).test(line)),
+      `must contain a dated release heading for ${current}`,
+    ],
+  ]) {
+    try {
+      const documentationFile = join(root, documentationPath);
+      const metadata = lstatSync(documentationFile);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error("not a regular file");
+      if (!predicate(readFileSync(documentationFile, "utf8"))) throw new Error(expectation);
+    } catch (error) {
+      issues.push(`${documentationPath}: project version is not synchronized: ${error.message}`);
+    }
+  }
+
+  if (!existsSync(join(root, ".git"))) return issues;
+  try {
+    const versionPaths = ["VERSION", "package.json", "README.md", "CHANGELOG.md"];
+    const commits = execFileSync(
+      "git",
+      [
+        "rev-list",
+        "--full-history",
+        "--topo-order",
+        "--reverse",
+        "HEAD",
+        "--",
+        ...versionPaths,
+      ],
+      { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    )
+      .split("\n")
+      .filter(Boolean);
+    const snapshots = new Map();
+    const snapshotAt = (commit) => {
+      if (snapshots.has(commit)) return snapshots.get(commit);
+      let snapshot;
+      try {
+        const contents = new Map();
+        for (const repositoryPath of versionPaths) {
+          const entry = execFileSync("git", ["ls-tree", commit, "--", repositoryPath], {
+            cwd: root,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }).trim();
+          if (!/^100(?:644|755) blob [0-9a-f]{40,64}\t[^\n]+$/.test(entry)) {
+            throw new Error(`${repositoryPath} is not a regular blob`);
+          }
+          contents.set(
+            repositoryPath,
+            execFileSync("git", ["show", `${commit}:${repositoryPath}`], {
+              cwd: root,
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+            }),
+          );
+        }
+        const match = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\n$/.exec(
+          contents.get("VERSION"),
+        );
+        if (!match) throw new Error("noncanonical version bytes");
+        const version = match[1];
+        const historicalPackage = parseJsonStrict(contents.get("package.json"));
+        if (historicalPackage.version !== version) {
+          throw new Error(`package.json.version does not match VERSION ${version}`);
+        }
+        if (
+          commit !== TRUSTED_BOOTSTRAP_COMMIT &&
+          contents
+            .get("README.md")
+            .split("\n")
+            .filter((line) => line === `Current project version: \`${version}\`.`).length !== 1
+        ) {
+          throw new Error(`README.md does not contain the canonical ${version} version line`);
+        }
+        const escapedVersion = version.replaceAll(".", "\\.");
+        if (
+          !contents
+            .get("CHANGELOG.md")
+            .split("\n")
+            .some((line) =>
+              new RegExp(`^## \\[${escapedVersion}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$`).test(
+                line,
+              ),
+            )
+        ) {
+          throw new Error(`CHANGELOG.md lacks a dated ${version} release heading`);
+        }
+        snapshot = {
+          version,
+          parts: numericProjectVersion(version),
+          error: null,
+        };
+      } catch (error) {
+        snapshot = { version: null, parts: null, error: error.message };
+      }
+      snapshots.set(commit, snapshot);
+      return snapshot;
+    };
+    for (const commit of commits) {
+      const historical = snapshotAt(commit);
+      if (historical.error) {
+        issues.push(`${label}: committed version bundle at ${commit} is invalid: ${historical.error}`);
+        continue;
+      }
+      const parents = execFileSync("git", ["show", "-s", "--format=%P", commit], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      for (const parent of parents) {
+        const previous = snapshotAt(parent);
+        if (
+          !previous.error &&
+          compareNumericProjectVersions(historical.parts, previous.parts) < 0
+        ) {
+          issues.push(
+            `${label}: committed project version ${historical.version} at ${commit} cannot regress below parent ${previous.version}`,
+          );
+        }
+      }
+    }
+    const head = snapshotAt("HEAD");
+    if (
+      !head.error &&
+      compareNumericProjectVersions(currentParts, head.parts) < 0
+    ) {
+      issues.push(
+        `${label}: project version ${current} cannot regress below committed ${head.version}`,
+      );
+    }
+  } catch (error) {
+    issues.push(`${label}: committed project-version history could not be verified: ${error.message}`);
+  }
+  return issues;
+}
+
 function bootstrapPackageIssues(root) {
   const file = join(root, "package.json");
   const label = "package.json";
@@ -1446,7 +2466,6 @@ function bootstrapPackageIssues(root) {
   const issues = [];
   if (
     document.name !== "opensales-system" ||
-    document.version !== "0.0.0" ||
     document.private !== true ||
     document.license !== "AGPL-3.0-or-later" ||
     document.type !== "module" ||
@@ -1455,6 +2474,7 @@ function bootstrapPackageIssues(root) {
   ) {
     issues.push(`${label}: bootstrap identity, runtime, and package-manager pins must remain exact`);
   }
+  issues.push(...projectVersionIssues(root, document.version));
   if (canonicalJson(document.scripts) !== canonicalJson(EXPECTED_PACKAGE_SCRIPTS)) {
     issues.push(
       `${label}: bootstrap scripts must remain exact and cannot add pre/post lifecycle aliases`,
@@ -1656,6 +2676,8 @@ function inferKind(file, document) {
     : undefined;
   if (schemaEntry) return schemaEntry[0];
   if (document?.report_id && document?.gate) return "gate";
+  if (document?.decision_id && document?.decision_kind === "scope_deviation") return "deviation";
+  if (document?.inventory_id && document?.gate === "G0" && document?.features) return "inventory";
   if (document?.table_id && document?.aggregate_id) return "state";
   if (document?.matrix_id && document?.actor_types && document?.permissions) return "guard";
   if (document?.matrix_id && document?.accounts && document?.posting_rules) return "ledger";
@@ -1973,6 +2995,7 @@ function evidenceSupersessionIssues(root, evidenceRecords) {
 
 function frozenEvidenceProjection(document) {
   const traceability = document.traceability ?? {};
+  const review = document.review ?? {};
   return {
     evidence_id: document.evidence_id,
     feature_id: document.feature_id,
@@ -1981,6 +3004,7 @@ function frozenEvidenceProjection(document) {
     business_description: document.business_description,
     sources: list(document.sources).map(({ verification_status, observed_at, ...source }) => source),
     classification: document.classification,
+    governance: document.governance,
     disposition: document.disposition,
     traceability: {
       aggregate_ids: traceability.aggregate_ids,
@@ -1995,13 +3019,79 @@ function frozenEvidenceProjection(document) {
     data_and_trust: document.data_and_trust,
     unknown_handling: document.unknown_handling,
     scenarios: document.scenarios,
+    review: {
+      author_role: review.author_role,
+      reviewer_roles: review.reviewer_roles,
+      independent_review: review.independent_review,
+      status: review.status,
+      reproduction_commands: review.reproduction_commands,
+      findings: review.findings,
+    },
     lifecycle: {
       goal_scope: document.lifecycle?.goal_scope,
       first_gate: document.lifecycle?.first_gate,
       acceptance_gate: document.lifecycle?.acceptance_gate,
+      created_at: document.lifecycle?.created_at,
       supersedes: document.lifecycle?.supersedes,
     },
   };
+}
+
+function evidenceHistoryEdgeIssues(label, previous, current) {
+  const issues = [];
+  const previousLifecycle = previous?.lifecycle?.status;
+  if (!FROZEN_EVIDENCE_STATUSES.includes(previousLifecycle)) return issues;
+  const currentLifecycle = current?.lifecycle?.status;
+  if (!FROZEN_EVIDENCE_STATUSES.includes(currentLifecycle)) {
+    return [`${label}: frozen evidence history contains a deletion or draft downgrade`];
+  }
+  if (!EVIDENCE_LIFECYCLE_TRANSITIONS[previousLifecycle]?.has(currentLifecycle)) {
+    issues.push(
+      `${label}: frozen evidence lifecycle cannot regress from ${previousLifecycle} to ${currentLifecycle}`,
+    );
+  }
+  if (
+    Number.isFinite(Date.parse(previous.lifecycle?.updated_at ?? "")) &&
+    Number.isFinite(Date.parse(current.lifecycle?.updated_at ?? "")) &&
+    Date.parse(current.lifecycle.updated_at) < Date.parse(previous.lifecycle.updated_at)
+  ) {
+    issues.push(`${label}: frozen evidence updated_at cannot move backwards`);
+  }
+  const currentSources = new Map(
+    list(current.sources).map((source) => [source?.source_id, source]),
+  );
+  for (const previousSource of list(previous.sources)) {
+    const currentSource = currentSources.get(previousSource?.source_id);
+    if (!currentSource) continue;
+    if (
+      !SOURCE_VERIFICATION_TRANSITIONS[previousSource?.verification_status]?.has(
+        currentSource?.verification_status,
+      )
+    ) {
+      issues.push(
+        `${label}: source ${previousSource?.source_id} verification cannot change in place from ${previousSource?.verification_status} to ${currentSource?.verification_status}; create a successor card instead`,
+      );
+    }
+  }
+  const currentReviewReferences = new Set(list(current.review?.evidence_refs));
+  for (const reference of list(previous.review?.evidence_refs)) {
+    if (!currentReviewReferences.has(reference)) {
+      issues.push(
+        `${label}: frozen review evidence reference cannot be removed in place ${reference}`,
+      );
+    }
+  }
+  for (const field of ["implementation_refs", "artifact_refs"]) {
+    const currentReferences = new Set(list(current.traceability?.[field]));
+    for (const reference of list(previous.traceability?.[field])) {
+      if (!currentReferences.has(reference)) {
+        issues.push(
+          `${label}: frozen traceability ${field} reference cannot be removed in place ${reference}`,
+        );
+      }
+    }
+  }
+  return issues;
 }
 
 function frozenEvidenceHistoryIssues(root, record) {
@@ -2015,100 +3105,83 @@ function frozenEvidenceHistoryIssues(root, record) {
   const label = relative(root, record.file);
   const expectedPath = `docs/provenance/cards/${document.evidence_id}.yaml`;
   const issues = [];
+  const metadata = lstatSync(record.file);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    return [`${label}: frozen evidence must be a regular non-symlink repository file`];
+  }
   if (label !== expectedPath) {
-    issues.push(`${label}: frozen evidence must use stable path ${expectedPath}`);
-    return issues;
+    return [`${label}: frozen evidence must use stable path ${expectedPath}`];
   }
   if (!existsSync(join(root, ".git"))) {
-    issues.push(`${label}: frozen evidence history cannot be verified without Git`);
-    return issues;
+    return [`${label}: frozen evidence history cannot be verified without Git`];
   }
   try {
     const commits = execFileSync(
       "git",
-      ["log", "--format=%H", "--reverse", "--", label],
+      ["rev-list", "--full-history", "--topo-order", "--reverse", "HEAD", "--", label],
       { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     )
       .split("\n")
       .filter(Boolean);
-    let firstFrozen;
-    let lifecycleDowngrade = false;
-    const highLifecycleHistory = [];
-    for (const commit of commits) {
-      let historical;
+    const snapshots = new Map();
+    const snapshotAt = (commit) => {
+      if (snapshots.has(commit)) return snapshots.get(commit);
+      let snapshot = null;
       try {
         const content = execFileSync("git", ["show", `${commit}:${label}`], {
           cwd: root,
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
         });
-        historical = extname(label) === ".json" ? parseJsonStrict(content) : YAML.parse(content);
+        snapshot = extname(label) === ".json" ? parseJsonStrict(content) : YAML.parse(content);
       } catch {
-        if (firstFrozen) lifecycleDowngrade = true;
-        continue;
+        // A deletion, malformed snapshot, or missing path is represented as null.
       }
+      snapshots.set(commit, snapshot);
+      return snapshot;
+    };
+    let firstFrozen;
+    const highLifecycleHistory = [];
+    for (const commit of commits) {
+      const historical = snapshotAt(commit);
       if (FROZEN_EVIDENCE_STATUSES.includes(historical?.lifecycle?.status)) {
         firstFrozen ??= historical;
         highLifecycleHistory.push(historical);
-      } else if (firstFrozen) {
-        lifecycleDowngrade = true;
+      }
+      const parents = execFileSync("git", ["show", "-s", "--format=%P", commit], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      for (const parent of parents) {
+        issues.push(...evidenceHistoryEdgeIssues(label, snapshotAt(parent), historical));
       }
     }
     if (!firstFrozen) {
       issues.push(`${label}: frozen evidence has no committed first-freeze snapshot`);
-    } else {
-      if (lifecycleDowngrade) {
-        issues.push(`${label}: frozen evidence history contains a deletion or draft downgrade`);
-      }
-      if (
-        highLifecycleHistory.some(
-          (snapshot) =>
-            canonicalJson(frozenEvidenceProjection(snapshot)) !==
-            canonicalJson(frozenEvidenceProjection(firstFrozen)),
-        )
-      ) {
-        issues.push(
-          `${label}: frozen evidence history contains an in-place decision rewrite`,
-        );
-      }
-      const snapshots = [...highLifecycleHistory, document];
-      for (let index = 1; index < snapshots.length; index += 1) {
-        const previous = snapshots[index - 1];
-        const current = snapshots[index];
-        const previousLifecycle = previous.lifecycle?.status;
-        const currentLifecycle = current.lifecycle?.status;
-        if (!EVIDENCE_LIFECYCLE_TRANSITIONS[previousLifecycle]?.has(currentLifecycle)) {
-          issues.push(
-            `${label}: frozen evidence lifecycle cannot regress from ${previousLifecycle} to ${currentLifecycle}`,
-          );
-        }
-        const currentSources = new Map(
-          list(current.sources).map((source) => [source?.source_id, source]),
-        );
-        for (const previousSource of list(previous.sources)) {
-          const currentSource = currentSources.get(previousSource?.source_id);
-          if (!currentSource) continue;
-          if (
-            !SOURCE_VERIFICATION_TRANSITIONS[previousSource?.verification_status]?.has(
-              currentSource?.verification_status,
-            )
-          ) {
-            issues.push(
-              `${label}: source ${previousSource?.source_id} verification cannot regress from ${previousSource?.verification_status} to ${currentSource?.verification_status}`,
-            );
-          }
-        }
-      }
-      if (firstFrozen.evidence_id !== document.evidence_id) {
-        issues.push(`${label}: stable evidence path was previously frozen for another evidence id`);
-      } else if (
-        canonicalJson(frozenEvidenceProjection(firstFrozen)) !==
-        canonicalJson(frozenEvidenceProjection(document))
-      ) {
-        issues.push(
-          `${label}: frozen evidence decision changed in place; create a successor card instead`,
-        );
-      }
+      return issues;
+    }
+    if (
+      highLifecycleHistory.some(
+        (snapshot) =>
+          canonicalJson(frozenEvidenceProjection(snapshot)) !==
+          canonicalJson(frozenEvidenceProjection(firstFrozen)),
+      )
+    ) {
+      issues.push(`${label}: frozen evidence history contains an in-place decision rewrite`);
+    }
+    const headSnapshot = snapshotAt("HEAD");
+    issues.push(...evidenceHistoryEdgeIssues(label, headSnapshot, document));
+    if (firstFrozen.evidence_id !== document.evidence_id) {
+      issues.push(`${label}: stable evidence path was previously frozen for another evidence id`);
+    } else if (
+      canonicalJson(frozenEvidenceProjection(firstFrozen)) !==
+      canonicalJson(frozenEvidenceProjection(document))
+    ) {
+      issues.push(`${label}: frozen evidence decision changed in place; create a successor card instead`);
     }
   } catch {
     issues.push(`${label}: frozen evidence Git history could not be verified`);
@@ -2133,9 +3206,11 @@ function frozenEvidenceInventoryIssues(root, evidenceRecords) {
         "git",
         [
           "log",
+          "--full-history",
           "--pretty=format:",
           "--name-only",
           "--diff-filter=AM",
+          "HEAD",
           "--",
           "docs/provenance/cards",
         ],
@@ -2152,7 +3227,7 @@ function frozenEvidenceInventoryIssues(root, evidenceRecords) {
       ) {
         continue;
       }
-      const commits = execFileSync("git", ["log", "--format=%H", "--reverse", "--", path], {
+      const commits = execFileSync("git", ["rev-list", "--full-history", "--topo-order", "--reverse", "HEAD", "--", path], {
         cwd: root,
         encoding: "utf8",
       })
@@ -2181,6 +3256,260 @@ function frozenEvidenceInventoryIssues(root, evidenceRecords) {
     }
   } catch {
     issues.push("docs/provenance/cards: frozen evidence inventory history could not be verified");
+  }
+  return issues;
+}
+
+function frozenInventoryHistoryIssues(root, record) {
+  const document = record.document;
+  if (document.lifecycle?.status !== "frozen" || !existsSync(record.file)) return [];
+  const label = relative(root, record.file);
+  const expectedPath = "docs/provenance/inventory.g0.json";
+  const issues = [];
+  const metadata = lstatSync(record.file);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    return [`${label}: frozen G0 Evidence Inventory must be a regular non-symlink repository file`];
+  }
+  if (label !== expectedPath) {
+    return [`${label}: frozen G0 Evidence Inventory must use stable path ${expectedPath}`];
+  }
+  if (!existsSync(join(root, ".git"))) {
+    return [`${label}: frozen inventory history cannot be verified without Git`];
+  }
+  try {
+    const commits = execFileSync(
+      "git",
+      ["rev-list", "--full-history", "--topo-order", "--reverse", "HEAD", "--", label],
+      { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    )
+      .split("\n")
+      .filter(Boolean);
+    const snapshots = new Map();
+    const snapshotAt = (commit) => {
+      if (snapshots.has(commit)) return snapshots.get(commit);
+      let snapshot = null;
+      try {
+        snapshot = parseJsonStrict(
+          execFileSync("git", ["show", `${commit}:${label}`], {
+            cwd: root,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }),
+        );
+      } catch {
+        // Missing, deleted, or malformed snapshots remain null and fail on a frozen parent edge.
+      }
+      snapshots.set(commit, snapshot);
+      return snapshot;
+    };
+    let firstFrozen = null;
+    let downgradedOrDeleted = false;
+    let rewritten = false;
+    for (const commit of commits) {
+      const historical = snapshotAt(commit);
+      if (historical?.lifecycle?.status === "frozen") {
+        firstFrozen ??= historical;
+        if (canonicalJson(historical) !== canonicalJson(firstFrozen)) rewritten = true;
+      }
+      const parents = execFileSync("git", ["show", "-s", "--format=%P", commit], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      for (const parent of parents) {
+        const previous = snapshotAt(parent);
+        if (previous?.lifecycle?.status !== "frozen") continue;
+        if (historical?.lifecycle?.status !== "frozen") {
+          downgradedOrDeleted = true;
+        } else if (canonicalJson(previous) !== canonicalJson(historical)) {
+          rewritten = true;
+        }
+      }
+    }
+    if (!firstFrozen) {
+      issues.push(`${label}: frozen inventory has no committed first-freeze snapshot`);
+    } else {
+      if (downgradedOrDeleted) {
+        issues.push(`${label}: frozen inventory history contains a deletion or draft downgrade`);
+      }
+      if (rewritten) {
+        issues.push(`${label}: frozen inventory history contains an in-place rewrite`);
+      }
+      if (firstFrozen.inventory_id !== document.inventory_id) {
+        issues.push(`${label}: stable inventory path was previously frozen for another inventory id`);
+      } else if (canonicalJson(firstFrozen) !== canonicalJson(document)) {
+        issues.push(`${label}: frozen inventory changed in place; reopen G0 through reviewed policy`);
+      }
+    }
+  } catch {
+    issues.push(`${label}: frozen inventory Git history could not be verified`);
+  }
+  return issues;
+}
+
+function frozenInventorySetIssues(root, inventoryRecords) {
+  if (!existsSync(join(root, ".git"))) return [];
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, stdio: "ignore" });
+  } catch {
+    return [];
+  }
+  const expectedPath = "docs/provenance/inventory.g0.json";
+  const current = inventoryRecords.find((record) => relative(root, record.file) === expectedPath);
+  if (current?.document.lifecycle?.status === "frozen") return [];
+  try {
+    const commits = execFileSync(
+      "git",
+      ["rev-list", "--full-history", "--topo-order", "--reverse", "HEAD", "--", expectedPath],
+      { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    )
+      .split("\n")
+      .filter(Boolean);
+    for (const commit of commits) {
+      try {
+        const historical = parseJsonStrict(
+          execFileSync("git", ["show", `${commit}:${expectedPath}`], {
+            cwd: root,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }),
+        );
+        if (historical?.lifecycle?.status === "frozen") {
+          return [
+            current
+              ? `${expectedPath}: frozen inventory cannot return to draft status`
+              : `${expectedPath}: frozen inventory cannot be removed or renamed`,
+          ];
+        }
+      } catch {
+        // Continue to the first committed blob that can prove the freeze.
+      }
+    }
+  } catch {
+    return [`${expectedPath}: frozen inventory set could not be verified`];
+  }
+  return [];
+}
+
+function immutableDeviationHistoryIssues(root, deviationRecords) {
+  const issues = [];
+  const currentByPath = new Map();
+  for (const record of deviationRecords) {
+    const label = relative(root, record.file);
+    const expectedPath = `docs/governance/decisions/${record.document.decision_id}.json`;
+    if (label !== expectedPath) {
+      issues.push(`${label}: deviation approval must use stable path ${expectedPath}`);
+      continue;
+    }
+    if (!existsSync(record.file)) {
+      issues.push(`${label}: deviation approval file is missing`);
+      continue;
+    }
+    const metadata = lstatSync(record.file);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      issues.push(`${label}: frozen deviation approval must be a regular non-symlink file`);
+      continue;
+    }
+    currentByPath.set(label, record);
+  }
+  if (!existsSync(join(root, ".git"))) return issues;
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, stdio: "ignore" });
+  } catch {
+    return issues;
+  }
+  try {
+    const historicalPaths = new Set(
+      execFileSync(
+        "git",
+        [
+          "log",
+          "--full-history",
+          "--pretty=format:",
+          "--name-only",
+          "--diff-filter=AM",
+          "HEAD",
+          "--",
+          "docs/governance/decisions",
+        ],
+        { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      )
+        .split("\n")
+        .filter(
+          (path) => path.startsWith("docs/governance/decisions/") && path.endsWith(".json"),
+        ),
+    );
+    for (const path of historicalPaths) {
+      const commits = execFileSync("git", ["rev-list", "--full-history", "--topo-order", "--reverse", "HEAD", "--", path], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+        .split("\n")
+        .filter(Boolean);
+      const snapshots = new Map();
+      const snapshotAt = (commit) => {
+        if (snapshots.has(commit)) return snapshots.get(commit);
+        let snapshot = null;
+        try {
+          snapshot = parseJsonStrict(
+            execFileSync("git", ["show", `${commit}:${path}`], {
+              cwd: root,
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+            }),
+          );
+        } catch {
+          // Missing, deleted, or malformed snapshots remain null for edge validation.
+        }
+        snapshots.set(commit, snapshot);
+        return snapshot;
+      };
+      const isApproval = (document) =>
+        document?.decision_kind === "scope_deviation" &&
+        document?.lifecycle?.status === "frozen";
+      let firstApproval;
+      let rewritten = false;
+      for (const commit of commits) {
+        const historical = snapshotAt(commit);
+        if (isApproval(historical)) {
+          firstApproval ??= historical;
+          if (canonicalJson(historical) !== canonicalJson(firstApproval)) rewritten = true;
+        }
+        const parents = execFileSync("git", ["show", "-s", "--format=%P", commit], {
+          cwd: root,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        for (const parent of parents) {
+          const previous = snapshotAt(parent);
+          if (
+            isApproval(previous) &&
+            (!isApproval(historical) || canonicalJson(previous) !== canonicalJson(historical))
+          ) {
+            rewritten = true;
+          }
+        }
+      }
+      if (!firstApproval) continue;
+      const current = currentByPath.get(path);
+      if (!current) {
+        issues.push(`${path}: frozen deviation approval cannot be removed or renamed`);
+      } else if (
+        rewritten ||
+        canonicalJson(firstApproval) !== canonicalJson(current.document)
+      ) {
+        issues.push(`${path}: frozen deviation approval cannot be rewritten in place`);
+      }
+    }
+  } catch {
+    issues.push("docs/governance/decisions: frozen deviation history could not be verified");
   }
   return issues;
 }
@@ -2269,7 +3598,7 @@ function immutableGateReportHistoryIssues(root, gateRecords) {
     const historicalPaths = new Set(
       execFileSync(
         "git",
-        ["log", "--pretty=format:", "--name-only", "--diff-filter=AM", "--", "docs/gates/reports"],
+        ["log", "--full-history", "--pretty=format:", "--name-only", "--diff-filter=AM", "HEAD", "--", "docs/gates/reports"],
         { cwd: root, encoding: "utf8" },
       )
         .split("\n")
@@ -2278,43 +3607,155 @@ function immutableGateReportHistoryIssues(root, gateRecords) {
         ),
     );
     for (const path of historicalPaths) {
-      const commits = execFileSync("git", ["log", "--format=%H", "--reverse", "--", path], {
+      const commits = execFileSync("git", ["rev-list", "--full-history", "--topo-order", "--reverse", "HEAD", "--", path], {
         cwd: root,
         encoding: "utf8",
       })
         .split("\n")
         .filter(Boolean);
-      let firstReport;
+      const snapshots = new Map();
+      const snapshotAt = (commit) => {
+        if (snapshots.has(commit)) return snapshots.get(commit);
+        let snapshot = { isReport: false, bytes: null };
+        try {
+          const entry = execFileSync("git", ["ls-tree", commit, "--", path], {
+            cwd: root,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }).trim();
+          if (!/^100(?:644|755) blob [0-9a-f]{40,64}\t[^\n]+$/.test(entry)) {
+            snapshots.set(commit, snapshot);
+            return snapshot;
+          }
+          const bytes = execFileSync("git", ["show", `${commit}:${path}`], {
+            cwd: root,
+            maxBuffer: 16 * 1024 * 1024,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          const historical = parseYamlStrict(bytes.toString("utf8"));
+          if (historical?.report_id && historical?.gate) {
+            snapshot = { isReport: true, bytes };
+          }
+        } catch {
+          // Missing, non-regular, or malformed snapshots are not valid reports.
+        }
+        snapshots.set(commit, snapshot);
+        return snapshot;
+      };
+      const origins = [];
+      const reportSnapshots = [];
       let changedInHistory = false;
       for (const commit of commits) {
-        try {
-          const historical = parseYamlStrict(
-            execFileSync("git", ["show", `${commit}:${path}`], {
-              cwd: root,
-              encoding: "utf8",
-              stdio: ["ignore", "pipe", "pipe"],
-            }),
-          );
-          if (!historical?.report_id || !historical?.gate) continue;
-          if (!firstReport) firstReport = historical;
-          else if (canonicalJson(firstReport) !== canonicalJson(historical)) changedInHistory = true;
-        } catch {
-          if (firstReport) changedInHistory = true;
+        const historical = snapshotAt(commit);
+        const parents = execFileSync("git", ["show", "-s", "--format=%P", commit], {
+          cwd: root,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        const reportParents = parents
+          .map((parent) => snapshotAt(parent))
+          .filter((snapshot) => snapshot.isReport);
+        if (historical.isReport) {
+          reportSnapshots.push(historical);
+          if (reportParents.length === 0) origins.push({ commit, snapshot: historical });
+          if (reportParents.some((parent) => !parent.bytes.equals(historical.bytes))) {
+            changedInHistory = true;
+          }
+        } else if (reportParents.length > 0) {
+          changedInHistory = true;
         }
       }
-      if (!firstReport) continue;
+      if (reportSnapshots.length === 0) continue;
+      if (origins.length !== 1) changedInHistory = true;
+      const originBytes = origins[0]?.snapshot.bytes ?? reportSnapshots[0].bytes;
+      if (reportSnapshots.some((snapshot) => !snapshot.bytes.equals(originBytes))) {
+        changedInHistory = true;
+      }
       const current = currentByPath.get(path);
       if (!current) {
         issues.push(`${path}: committed Gate report cannot be removed or renamed`);
-      } else if (
-        changedInHistory ||
-        canonicalJson(firstReport) !== canonicalJson(current.document)
-      ) {
-        issues.push(`${path}: committed Gate report is append-only and cannot change in place`);
+      } else {
+        let currentBytes = null;
+        try {
+          const metadata = lstatSync(current.file);
+          if (!metadata.isSymbolicLink() && metadata.isFile()) {
+            currentBytes = readFileSync(current.file);
+          }
+        } catch {
+          // A missing or non-regular working-tree report fails the byte comparison.
+        }
+        if (changedInHistory || !currentBytes?.equals(originBytes)) {
+          issues.push(`${path}: committed Gate report is append-only and cannot change in place`);
+        }
       }
     }
   } catch {
     issues.push("docs/gates/reports: Gate report inventory history could not be verified");
+  }
+  return issues;
+}
+
+function gitHistoryCompletenessIssues(root) {
+  if (!existsSync(join(root, ".git"))) return [];
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, stdio: "ignore" });
+  } catch {
+    return [];
+  }
+  const issues = [];
+  const replacementBase = process.env.GIT_REPLACE_REF_BASE;
+  if (replacementBase !== undefined && replacementBase !== "refs/replace/") {
+    issues.push(
+      "git.history: non-default GIT_REPLACE_REF_BASE is forbidden during normative history validation",
+    );
+  }
+  try {
+    const shallow = execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    if (shallow !== "false") {
+      issues.push("git.history: full reachable history is required; shallow repositories fail closed");
+    }
+  } catch {
+    issues.push("git.history: repository history completeness could not be verified");
+  }
+  try {
+    const replacements = execFileSync(
+      "git",
+      ["for-each-ref", "--format=%(refname)", "refs/replace/"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    )
+      .split("\n")
+      .filter(Boolean);
+    if (replacements.length > 0) {
+      issues.push("git.history: replace refs are forbidden during normative history validation");
+    }
+  } catch {
+    issues.push("git.history: replace-ref state could not be verified");
+  }
+  try {
+    const graftPath = execFileSync("git", ["rev-parse", "--git-path", "info/grafts"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    try {
+      lstatSync(resolve(root, graftPath));
+      issues.push("git.history: legacy graft files are forbidden during normative history validation");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  } catch {
+    issues.push("git.history: graft state could not be verified");
   }
   return issues;
 }
@@ -2420,6 +3861,122 @@ function gitDocumentSnapshotIssues(root, commit, file, label) {
   }
 }
 
+function gitPathOriginCommit(root, repositoryPath) {
+  const commits = execFileSync(
+    "git",
+    [
+      "rev-list",
+      "--full-history",
+      "--topo-order",
+      "--reverse",
+      "HEAD",
+      "--",
+      repositoryPath,
+    ],
+    { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  )
+    .split("\n")
+    .filter(Boolean);
+  const origins = [];
+  const isRegularAt = (commit) => {
+    try {
+      const entry = execFileSync("git", ["ls-tree", commit, "--", repositoryPath], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+      return /^100(?:644|755) blob [0-9a-f]{40,64}\t[^\n]+$/.test(entry);
+    } catch {
+      return false;
+    }
+  };
+  for (const commit of commits) {
+    if (!isRegularAt(commit)) continue;
+    const parents = execFileSync("git", ["show", "-s", "--format=%P", commit], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (parents.every((parent) => !isRegularAt(parent))) origins.push(commit);
+  }
+  if (origins.length !== 1) {
+    throw new Error(`expected one immutable path origin, found ${origins.length}`);
+  }
+  return origins[0];
+}
+
+function gitProjectVersionIssues(root, commit, declaredVersion, label) {
+  const issues = [];
+  const bytesByPath = new Map();
+  for (const repositoryPath of ["VERSION", "package.json", "README.md", "CHANGELOG.md"]) {
+    try {
+      const entry = execFileSync("git", ["ls-tree", commit, "--", repositoryPath], {
+        cwd: root,
+        encoding: "utf8",
+      }).trim();
+      if (!/^100(?:644|755) blob [0-9a-f]{40,64}\t[^\n]+$/.test(entry)) {
+        throw new Error("not a regular blob");
+      }
+      bytesByPath.set(
+        repositoryPath,
+        execFileSync("git", ["show", `${commit}:${repositoryPath}`], {
+          cwd: root,
+          maxBuffer: 4 * 1024 * 1024,
+        }),
+      );
+    } catch {
+      issues.push(`${label}.${repositoryPath}: subject commit must contain a regular version artifact`);
+    }
+  }
+  if (issues.length > 0) return issues;
+
+  const versionBytes = bytesByPath.get("VERSION").toString("utf8");
+  const versionMatch = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\n$/.exec(
+    versionBytes,
+  );
+  if (!versionMatch) {
+    return [`${label}.VERSION: subject commit has noncanonical project-version bytes`];
+  }
+  const subjectVersion = versionMatch[1];
+  if (declaredVersion !== subjectVersion) {
+    issues.push(
+      `${label}.project_version: declared ${declaredVersion ?? "missing"} does not match subject VERSION ${subjectVersion}`,
+    );
+  }
+  try {
+    const packageDocument = parseJsonStrict(bytesByPath.get("package.json").toString("utf8"));
+    if (packageDocument.version !== subjectVersion) {
+      issues.push(`${label}.package.json: subject package version does not match VERSION`);
+    }
+  } catch (error) {
+    issues.push(`${label}.package.json: subject package version cannot be parsed: ${error.message}`);
+  }
+  const readmeLines = bytesByPath.get("README.md").toString("utf8").split("\n");
+  if (
+    readmeLines.filter((line) => line === `Current project version: \`${subjectVersion}\`.`)
+      .length !== 1
+  ) {
+    issues.push(`${label}.README.md: subject README version does not match VERSION`);
+  }
+  const escapedVersion = subjectVersion.replaceAll(".", "\\.");
+  const changelogHeading = new RegExp(
+    `^## \\[${escapedVersion}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$`,
+  );
+  if (
+    !bytesByPath
+      .get("CHANGELOG.md")
+      .toString("utf8")
+      .split("\n")
+      .some((line) => changelogHeading.test(line))
+  ) {
+    issues.push(`${label}.CHANGELOG.md: subject changelog version does not match VERSION`);
+  }
+  return issues;
+}
+
 function parseYamlStrict(text) {
   const parsed = YAML.parseDocument(text, { uniqueKeys: true });
   if (parsed.errors.length > 0) {
@@ -2428,7 +3985,7 @@ function parseYamlStrict(text) {
   return parsed.toJS({ maxAliasCount: 0 });
 }
 
-function gitEvidenceManifestIssues(root, commit, gateDocument, label) {
+function gitEvidenceManifestSnapshot(root, commit, gateDocument, label) {
   const issues = [];
   const gateIndex = GATE_INDEX.get(gateDocument.gate);
   const declaredArtifacts = list(gateDocument.feature_evidence?.card_artifacts);
@@ -2507,7 +4064,13 @@ function gitEvidenceManifestIssues(root, commit, gateDocument, label) {
         `${artifactLabel}.acceptance_evidence`,
       ),
     );
-    declaredByReference.set(artifact.reference, historical);
+    declaredByReference.set(artifact.reference, {
+      artifact,
+      artifactIndex: index,
+      repositoryPath,
+      bytes,
+      document: historical,
+    });
   }
 
   let historicalPaths = [];
@@ -2522,14 +4085,24 @@ function gitEvidenceManifestIssues(root, commit, gateDocument, label) {
       .filter(Boolean);
   } catch {
     issues.push(`${label}.feature_evidence: report-commit Evidence inventory could not be listed`);
-    return issues;
+    return { issues, cards: [...declaredByReference.values()], repositoryCards: [] };
   }
 
   const expected = [];
+  const repositoryCards = [];
   for (const repositoryPath of historicalPaths) {
+    const referenceIssues = gitRepositoryReferenceIssues(
+      root,
+      commit,
+      [`repo:${repositoryPath}`],
+      `${label}.feature_evidence.report_commit_cards.${repositoryPath}`,
+    );
+    issues.push(...referenceIssues);
+    if (referenceIssues.length > 0) continue;
+    let bytes;
     let historical;
     try {
-      const bytes = execFileSync("git", ["show", `${commit}:${repositoryPath}`], {
+      bytes = execFileSync("git", ["show", `${commit}:${repositoryPath}`], {
         cwd: root,
         maxBuffer: 16 * 1024 * 1024,
       });
@@ -2540,7 +4113,9 @@ function gitEvidenceManifestIssues(root, commit, gateDocument, label) {
       issues.push(`${label}.feature_evidence: unparseable report-commit card ${repositoryPath}`);
       continue;
     }
-    if (!historical?.evidence_id || historical?.lifecycle?.goal_scope !== "current_goal") continue;
+    if (!historical?.evidence_id) continue;
+    repositoryCards.push({ repositoryPath, bytes, document: historical });
+    if (historical?.lifecycle?.goal_scope !== "current_goal") continue;
     if (historical.lifecycle?.status === "superseded") continue;
     if (GATE_INDEX.get(historical.lifecycle?.first_gate) > gateIndex) continue;
     expected.push({ reference: `repo:${repositoryPath}`, document: historical });
@@ -2596,12 +4171,191 @@ function gitEvidenceManifestIssues(root, commit, gateDocument, label) {
       issues.push(`${label}.feature_evidence.${key}: does not match the report-commit Evidence inventory`);
     }
   }
+  return { issues, cards: [...declaredByReference.values()], repositoryCards };
+}
+
+function gitGateDeviationApprovalIssues(root, commit, cards, repositoryCards, label) {
+  const issues = [];
+  const approvals = new Map();
+  for (const card of cards) {
+    const document = card.document;
+    const ownerDecisionSources = list(document.sources).filter(
+      (source) => source?.source_type === "owner_decision",
+    );
+    issues.push(
+      ...gitRepositoryContentDigestIssues(
+        root,
+        commit,
+        ownerDecisionSources,
+        `${label}.owner_decisions.${document.evidence_id}`,
+      ),
+    );
+    const decisionId = document.governance?.approved_deviation_id;
+    if (!decisionId) continue;
+    const sourceMatches = list(document.sources).filter(
+      (source) =>
+        source?.source_id === decisionId && source?.source_type === "owner_decision",
+    );
+    const cardLabel = `${label}.approved_deviations.${document.evidence_id}`;
+    if (sourceMatches.length !== 1) {
+      issues.push(`${cardLabel}: captured card needs exactly one matching Owner decision source`);
+      continue;
+    }
+    const source = sourceMatches[0];
+    const expectedReference = `repo:docs/governance/decisions/${decisionId}.json`;
+    if (
+      source.reference !== expectedReference ||
+      !["frozen", "verified"].includes(source.verification_status)
+    ) {
+      issues.push(`${cardLabel}: captured Owner decision source is not a frozen exact-path approval`);
+      continue;
+    }
+    const projection = canonicalJson({
+      reference: source.reference,
+      content_digest: source.content_digest,
+    });
+    const existing = approvals.get(decisionId);
+    if (existing && existing.projection !== projection) {
+      issues.push(`${cardLabel}: captured deviation ${decisionId} resolves inconsistently`);
+      continue;
+    }
+    if (existing) {
+      existing.featureIds.add(document.feature_id);
+      continue;
+    }
+    approvals.set(decisionId, {
+      projection,
+      source,
+      featureIds: new Set([document.feature_id]),
+    });
+  }
+
+  const reportCommitBindings = new Map();
+  for (const card of repositoryCards) {
+    const document = card.document;
+    const decisionId = document.governance?.approved_deviation_id;
+    if (!decisionId || !approvals.has(decisionId)) continue;
+    const cardLabel = `${label}.approved_deviations.${decisionId}.cards.${document.evidence_id}`;
+    const expectedPath = `docs/provenance/cards/${document.evidence_id}.yaml`;
+    if (card.repositoryPath !== expectedPath) {
+      issues.push(`${cardLabel}: deviation-bound card must use stable path ${expectedPath}`);
+    }
+    for (const validationIssue of validateDocument("evidence", document)) {
+      issues.push(`${cardLabel}: report-commit deviation-bound card is invalid: ${validationIssue}`);
+    }
+    const matchingSources = list(document.sources).filter(
+      (source) => source?.source_id === decisionId && source?.source_type === "owner_decision",
+    );
+    const expectedReference = `repo:docs/governance/decisions/${decisionId}.json`;
+    if (
+      matchingSources.length !== 1 ||
+      matchingSources[0]?.reference !== expectedReference ||
+      !["frozen", "verified"].includes(matchingSources[0]?.verification_status)
+    ) {
+      issues.push(`${cardLabel}: needs one exact frozen Owner decision source`);
+      continue;
+    }
+    issues.push(
+      ...gitRepositoryContentDigestIssues(
+        root,
+        commit,
+        matchingSources,
+        `${cardLabel}.owner_decision`,
+      ),
+    );
+    const bindings = reportCommitBindings.get(decisionId) ?? new Set();
+    bindings.add(document.feature_id);
+    reportCommitBindings.set(decisionId, bindings);
+  }
+
+  let reportCommitTime = Number.NaN;
+  try {
+    reportCommitTime = Number(
+      execFileSync("git", ["show", "-s", "--format=%ct", commit], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim(),
+    ) * 1000;
+  } catch {
+    issues.push(`${label}.approved_deviations: report commit timestamp could not be verified`);
+  }
+
+  for (const [decisionId, approval] of approvals) {
+    const approvalLabel = `${label}.approved_deviations.${decisionId}`;
+    const repositoryPath = approval.source.reference.slice("repo:".length);
+    let bytes;
+    let document;
+    try {
+      const entry = execFileSync("git", ["ls-tree", commit, "--", repositoryPath], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+      if (!/^100(?:644|755) blob [0-9a-f]{40,64}\t[^\n]+$/.test(entry)) {
+        throw new Error("not a regular blob");
+      }
+      bytes = execFileSync("git", ["show", `${commit}:${repositoryPath}`], {
+        cwd: root,
+        maxBuffer: 4 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      document = parseJsonStrict(bytes.toString("utf8"));
+    } catch (error) {
+      issues.push(`${approvalLabel}: approval was not a regular typed file in the report commit: ${error.message}`);
+      continue;
+    }
+    if (approval.source.content_digest !== sha256Bytes(bytes)) {
+      issues.push(`${approvalLabel}: source digest does not match report-commit approval bytes`);
+    }
+    for (const validationIssue of validateDocument("deviation", document)) {
+      issues.push(`${approvalLabel}: captured deviation approval is invalid: ${validationIssue}`);
+    }
+    if (document.decision_id !== decisionId) {
+      issues.push(`${approvalLabel}: captured approval decision_id does not match its source`);
+    }
+    for (const featureId of approval.featureIds) {
+      if (!list(document.feature_ids).includes(featureId)) {
+        issues.push(`${approvalLabel}: captured approval does not authorize feature ${featureId}`);
+      }
+    }
+    const declaredFeatureIds = new Set(list(document.feature_ids));
+    const boundFeatureIds = reportCommitBindings.get(decisionId) ?? new Set();
+    if (
+      canonicalJson([...declaredFeatureIds].sort()) !==
+      canonicalJson([...boundFeatureIds].sort())
+    ) {
+      issues.push(
+        `${approvalLabel}.feature_ids: must exactly match every deviation-bound card in the report commit`,
+      );
+    }
+    issues.push(
+      ...gitRepositoryContentDigestIssues(
+        root,
+        commit,
+        [document.scope_binding?.public_summary],
+        `${approvalLabel}.scope_binding.public_summary`,
+      ),
+    );
+    if (Number.isFinite(reportCommitTime)) {
+      for (const [field, value] of [
+        ["recorded_at", document.recorded_at],
+        ["lifecycle.frozen_at", document.lifecycle?.frozen_at],
+      ]) {
+        const timestamp = Date.parse(value ?? "");
+        if (Number.isFinite(timestamp) && timestamp > reportCommitTime + VALIDATION_CLOCK_SKEW_MS) {
+          issues.push(`${approvalLabel}.${field}: cannot be later than the report commit`);
+        }
+      }
+    }
+  }
   return issues;
 }
 
 function isCanonicalEvidenceTemplate(document) {
   const zeroDigest = `sha256:${"0".repeat(64)}`;
   return (
+    document?.schema_version === "1.1.0" &&
     document?.evidence_id === "EV-TEMPLATE-0001" &&
     document?.feature_id === "FEATURE-TEMPLATE-0001" &&
     document?.classification?.status === "unknown" &&
@@ -2609,6 +4363,10 @@ function isCanonicalEvidenceTemplate(document) {
     list(document?.disposition?.targets).length === 1 &&
     document.disposition.targets[0] === "exclude" &&
     list(document?.sources).every((source) => source?.verification_status === "unknown") &&
+    document?.governance?.scope_summary?.reference === TRUSTED_SCOPE_SUMMARY_REFERENCE &&
+    document?.governance?.scope_summary?.content_digest === TRUSTED_SCOPE_SUMMARY_DIGEST &&
+    document?.governance?.private_scope_record_digest === TRUSTED_PRIVATE_SCOPE_RECORD_DIGEST &&
+    document?.governance?.approved_deviation_id === null &&
     document?.review?.status === "pending" &&
     document?.review?.independent_review === false &&
     document?.lifecycle?.status === "draft" &&
@@ -2687,12 +4445,11 @@ function goalSourceFreezeIssues(root, evidenceRecords) {
   try {
     const scopePath = join(root, "docs", "governance", "scope-summary.json");
     const metadata = lstatSync(scopePath);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error("scope summary must be a regular non-symlink file");
+    }
     const scope = parseJsonStrict(readFileSync(scopePath, "utf8"));
-    if (
-      metadata.isSymbolicLink() ||
-      !metadata.isFile() ||
-      scope?.governing_prompt_sha256 !== TRUSTED_GOAL_SOURCE_SHA256
-    ) {
+    if (scope?.governing_prompt_sha256 !== TRUSTED_GOAL_SOURCE_SHA256) {
       throw new Error("scope summary does not match the trusted goal digest");
     }
   } catch (error) {
@@ -2725,6 +4482,162 @@ function goalSourceFreezeIssues(root, evidenceRecords) {
       if (!["frozen", "verified"].includes(source?.verification_status)) {
         issues.push(`${sourceLabel}.verification_status: frozen evidence needs a frozen goal source`);
       }
+    }
+  }
+  return issues;
+}
+
+function normalizedDisposition(disposition) {
+  return {
+    targets: [...list(disposition?.targets)].sort(),
+    module_ids: [...list(disposition?.module_ids)].sort(),
+    provider_capability_ids: [...list(disposition?.provider_capability_ids)].sort(),
+    configuration_keys: [...list(disposition?.configuration_keys)].sort(),
+    exclusion_assertion_ids: [...list(disposition?.exclusion_assertion_ids)].sort(),
+  };
+}
+
+function evidenceInventoryCrossIssues(root, inventoryRecords, evidenceRecords) {
+  const issues = [];
+  if (inventoryRecords.length > 1) {
+    issues.push(
+      `${relative(root, inventoryRecords[1].file)}: G0 permits exactly one active Evidence Inventory`,
+    );
+  }
+
+  const activeCards = evidenceRecords.filter(
+    (record) =>
+      record.document.lifecycle?.goal_scope === "current_goal" &&
+      record.document.lifecycle?.status !== "superseded",
+  );
+  const inventoryRecord = inventoryRecords[0];
+  if (!inventoryRecord) {
+    if (activeCards.length > 0) {
+      issues.push(
+        `${relative(root, activeCards[0].file)}: active current-goal Evidence Cards require one G0 Evidence Inventory`,
+      );
+    }
+    return issues;
+  }
+
+  const inventory = inventoryRecord.document;
+  const inventoryLabel = relative(root, inventoryRecord.file);
+  issues.push(
+    ...repositoryContentDigestIssues(
+      root,
+      [inventory.scope_binding?.public_summary],
+      `${inventoryLabel}.scope_binding.public_summary`,
+      inventoryRecord.file,
+    ),
+  );
+  if (inventory.review?.status === "passed") {
+    issues.push(
+      ...repositoryReferenceIssues(
+        root,
+        inventory.review?.evidence_refs,
+        `${inventoryLabel}.review.evidence_refs`,
+        true,
+      ),
+    );
+  }
+
+  const cardByEvidenceId = new Map(
+    activeCards
+      .filter((record) => record.document.evidence_id)
+      .map((record) => [record.document.evidence_id, record]),
+  );
+  const features = list(inventory.features);
+  const featureByEvidenceId = new Map(
+    features.filter((feature) => feature?.evidence_id).map((feature) => [feature.evidence_id, feature]),
+  );
+
+  for (const feature of features) {
+    const label = `${inventoryLabel}.features.${feature?.feature_id ?? "unknown"}`;
+    const cardRecord = cardByEvidenceId.get(feature?.evidence_id);
+    if (!cardRecord) {
+      issues.push(`${label}: missing active Evidence Card ${feature?.evidence_id}`);
+      continue;
+    }
+    const card = cardRecord.document;
+    if (card.feature_id !== feature.feature_id) {
+      issues.push(`${label}: Evidence Card feature_id mismatch`);
+    }
+    if (card.title !== feature.title) {
+      issues.push(`${label}: Evidence Card title mismatch`);
+    }
+    if (card.priority !== feature.priority) {
+      issues.push(`${label}: Evidence Card priority mismatch`);
+    }
+    if (card.classification?.status !== feature.classification) {
+      issues.push(`${label}: Evidence Card classification mismatch`);
+    }
+    if (
+      canonicalJson(normalizedDisposition(card.disposition)) !==
+      canonicalJson(normalizedDisposition(feature.disposition))
+    ) {
+      issues.push(`${label}: Evidence Card disposition mismatch`);
+    }
+    if (
+      card.lifecycle?.first_gate !== feature.first_gate ||
+      card.lifecycle?.acceptance_gate !== feature.acceptance_gate
+    ) {
+      issues.push(`${label}: Evidence Card Gate lifecycle mismatch`);
+    }
+    const policy = feature.classification_policy ?? {};
+    if ((card.governance?.approved_deviation_id ?? null) !== policy.approved_deviation_id) {
+      issues.push(`${label}: Evidence Card approved deviation mismatch`);
+    }
+    if ((card.classification?.fail_safe_behavior ?? null) !== policy.fail_safe_behavior) {
+      issues.push(`${label}: Evidence Card fail-safe behavior mismatch`);
+    }
+    if (
+      canonicalJson([...list(card.classification?.negative_test_refs)].sort()) !==
+      canonicalJson([...list(policy.negative_test_refs)].sort())
+    ) {
+      issues.push(`${label}: Evidence Card negative-test policy mismatch`);
+    }
+    if (
+      canonicalJson(card.unknown_handling ?? null) !==
+      canonicalJson(policy.unknown_handling ?? null)
+    ) {
+      issues.push(`${label}: Evidence Card unknown handling mismatch`);
+    }
+    const goalSources = list(card.sources).filter(
+      (source) => source?.source_type === "goal_specification",
+    );
+    const normalizeGoalAnchor = (entry) => ({
+      reference: entry?.reference,
+      line_start: entry?.line_start,
+      line_end: entry?.line_end,
+    });
+    const expectedAnchors = list(feature.goal_anchors)
+      .map(normalizeGoalAnchor)
+      .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    const actualAnchors = goalSources
+      .map(normalizeGoalAnchor)
+      .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    if (canonicalJson(actualAnchors) !== canonicalJson(expectedAnchors)) {
+      issues.push(`${label}: Evidence Card goal anchor set mismatch`);
+    }
+    for (const source of goalSources) {
+      if (
+        source.content_digest !== `sha256:${TRUSTED_GOAL_SOURCE_SHA256}` ||
+        source.authority_rank !== 1 ||
+        source.reference !==
+          `goal://${TRUSTED_GOAL_SOURCE_ID}#L${source.line_start}-L${source.line_end}` ||
+        !["frozen", "verified"].includes(source.verification_status)
+      ) {
+        issues.push(`${label}: Evidence Card goal source is not trust-anchor frozen`);
+      }
+    }
+  }
+
+  for (const cardRecord of activeCards) {
+    const card = cardRecord.document;
+    if (!featureByEvidenceId.has(card.evidence_id)) {
+      issues.push(
+        `${relative(root, cardRecord.file)}: active Evidence Card ${card.evidence_id} is extra to the G0 inventory`,
+      );
     }
   }
   return issues;
@@ -2836,7 +4749,7 @@ function g0RequiredInventoryIssues(byKind, label) {
 }
 
 export function globalSpecificationIssues(root, records) {
-  const issues = [];
+  const issues = [...gitHistoryCompletenessIssues(root)];
   const templatePolicies = new Map([
     [
       resolve(root, "docs/provenance/evidence-card.template.yaml"),
@@ -2930,6 +4843,7 @@ export function globalSpecificationIssues(root, records) {
   }
   const registries = {
     evidence: new Map(),
+    deviation: new Map(),
     aggregate: new Map(),
     command: new Map(),
     transition: new Map(),
@@ -2954,14 +4868,139 @@ export function globalSpecificationIssues(root, records) {
     });
 
   const evidenceRecords = byKind("evidence");
+  const inventoryRecords = byKind("inventory");
+  const deviationRecords = byKind("deviation");
   for (const record of evidenceRecords) add(registries.evidence, record.document.evidence_id, record.file);
+  for (const record of deviationRecords) {
+    add(registries.deviation, record.document.decision_id, record.file);
+    issues.push(
+      ...repositoryContentDigestIssues(
+        root,
+        [record.document.scope_binding?.public_summary],
+        `${relative(root, record.file)}.scope_binding.public_summary`,
+        record.file,
+      ),
+    );
+  }
+  issues.push(...immutableDeviationHistoryIssues(root, deviationRecords));
   const supersessionIssues = evidenceSupersessionIssues(root, evidenceRecords);
   issues.push(...supersessionIssues);
   for (const record of evidenceRecords) {
     issues.push(...frozenEvidenceHistoryIssues(root, record));
   }
+  for (const record of inventoryRecords) {
+    issues.push(...frozenInventoryHistoryIssues(root, record));
+  }
   issues.push(...frozenEvidenceInventoryIssues(root, evidenceRecords));
+  issues.push(...frozenInventorySetIssues(root, inventoryRecords));
   issues.push(...goalSourceFreezeIssues(root, evidenceRecords));
+  issues.push(...evidenceInventoryCrossIssues(root, inventoryRecords, evidenceRecords));
+  const deviationDecisions = new Map();
+  const deviationById = new Map(
+    deviationRecords
+      .filter((record) => record.document.decision_id)
+      .map((record) => [record.document.decision_id, record]),
+  );
+  const deviationFeatureBindings = new Map();
+  for (const record of evidenceRecords) {
+    const approvedDeviationId = record.document.governance?.approved_deviation_id;
+    const approvedDeviationSources = list(record.document.sources).filter(
+      (source) =>
+        approvedDeviationId &&
+        source?.source_id === approvedDeviationId &&
+        source?.source_type === "owner_decision",
+    );
+    for (const source of approvedDeviationSources) {
+      const projection = canonicalJson({
+        reference: source?.reference,
+        content_digest: source?.content_digest,
+      });
+      const existing = deviationDecisions.get(approvedDeviationId);
+      if (existing && existing.projection !== projection) {
+        issues.push(
+          `${relative(root, record.file)}.governance.approved_deviation: ${approvedDeviationId} resolves inconsistently with ${existing.label}`,
+        );
+      } else if (!existing) {
+        deviationDecisions.set(approvedDeviationId, {
+          projection,
+          label: relative(root, record.file),
+        });
+      }
+    }
+    if (approvedDeviationId) {
+      const decisionRecord = deviationById.get(approvedDeviationId);
+      const expectedReference = `repo:docs/governance/decisions/${approvedDeviationId}.json`;
+      if (approvedDeviationSources.length !== 1) {
+        issues.push(
+          `${relative(root, record.file)}.governance.approved_deviation: needs exactly one matching owner decision source`,
+        );
+      }
+      if (!decisionRecord) {
+        issues.push(
+          `${relative(root, record.file)}.governance.approved_deviation: missing typed approval record ${approvedDeviationId}`,
+        );
+      } else {
+        const decision = decisionRecord.document;
+        if (
+          decision.decision_kind !== "scope_deviation" ||
+          decision.outcome !== "approved" ||
+          decision.owner_role !== "project_owner" ||
+          decision.authorization_basis !== "explicit_goal_owner_decision" ||
+          decision.lifecycle?.status !== "frozen"
+        ) {
+          issues.push(
+            `${relative(root, record.file)}.governance.approved_deviation: ${approvedDeviationId} is not a frozen Owner approval`,
+          );
+        }
+        if (!list(decision.feature_ids).includes(record.document.feature_id)) {
+          issues.push(
+            `${relative(root, record.file)}.governance.approved_deviation: ${approvedDeviationId} does not authorize feature ${record.document.feature_id}`,
+          );
+        }
+        const bound = deviationFeatureBindings.get(approvedDeviationId) ?? new Set();
+        bound.add(record.document.feature_id);
+        deviationFeatureBindings.set(approvedDeviationId, bound);
+      }
+      if (approvedDeviationSources[0]?.reference !== expectedReference) {
+        issues.push(
+          `${relative(root, record.file)}.governance.approved_deviation: source must reference ${expectedReference}`,
+        );
+      }
+    }
+    issues.push(
+      ...repositoryContentDigestIssues(
+        root,
+        [record.document.governance?.scope_summary],
+        `${relative(root, record.file)}.governance.scope_summary`,
+        record.file,
+      ),
+      ...repositoryContentDigestIssues(
+        root,
+        approvedDeviationSources,
+        `${relative(root, record.file)}.governance.approved_deviation`,
+        record.file,
+      ),
+    );
+  }
+  for (const record of deviationRecords) {
+    const decisionId = record.document.decision_id;
+    const declaredFeatures = new Set(list(record.document.feature_ids));
+    const boundFeatures = deviationFeatureBindings.get(decisionId) ?? new Set();
+    for (const featureId of declaredFeatures) {
+      if (!boundFeatures.has(featureId)) {
+        issues.push(
+          `${relative(root, record.file)}.feature_ids: ${featureId} has no Evidence Card bound to ${decisionId}`,
+        );
+      }
+    }
+    for (const featureId of boundFeatures) {
+      if (!declaredFeatures.has(featureId)) {
+        issues.push(
+          `${relative(root, record.file)}.feature_ids: missing bound feature ${featureId}`,
+        );
+      }
+    }
+  }
   for (const record of concrete) {
     if (record.document.review?.status !== "passed") continue;
     const artifacts = record.document.review.evidence_refs ?? record.document.review.artifact_refs;
@@ -3207,6 +5246,12 @@ export function globalSpecificationIssues(root, records) {
         const passedRecords = oracleRecords.filter(
           (oracleRecord) => oracleRecord.document.review?.status === "passed",
         );
+        const frozenRecords =
+          policy.recordKind === "inventory"
+            ? passedRecords.filter(
+                (oracleRecord) => oracleRecord.document.lifecycle?.status === "frozen",
+              )
+            : passedRecords;
         const declared = document.g0_oracles?.[category] ?? {};
         if (declared.document_count !== oracleRecords.length) {
           issues.push(
@@ -3215,7 +5260,7 @@ export function globalSpecificationIssues(root, records) {
         }
         if (
           declared.passed_count !== passedRecords.length ||
-          declared.frozen_count !== passedRecords.length
+          declared.frozen_count !== frozenRecords.length
         ) {
           issues.push(
             `${label}.g0_oracles.${category}: passed/frozen counts do not match independently reviewed documents`,
@@ -3229,6 +5274,24 @@ export function globalSpecificationIssues(root, records) {
               `${label}.g0_oracles.${category}: missing schema-backed oracle artifact ${requiredReference}`,
             );
           }
+        }
+      }
+      const inventoryRecord = byKind("inventory")[0];
+      if (inventoryRecord) {
+        const expectedInventoryReference = `repo:${relative(root, inventoryRecord.file)}`;
+        if (document.feature_evidence?.matrix_artifact !== expectedInventoryReference) {
+          issues.push(
+            `${label}.feature_evidence.matrix_artifact: G0 must bind the active Evidence Inventory`,
+          );
+        }
+        if (
+          inventoryRecord.document.classification_counts?.total_features !==
+            expectedCounts.total ||
+          inventoryRecord.document.classification_counts?.retained !==
+            expectedCounts.retained_total ||
+          inventoryRecord.document.priority_counts?.P0 !== expectedCounts.p0_total
+        ) {
+          issues.push(`${label}.feature_evidence: Gate counts do not match the Evidence Inventory`);
         }
       }
     }
@@ -3261,7 +5324,7 @@ export function globalSpecificationIssues(root, records) {
         `${label}.g0_oracles`,
       ]);
       gateReferenceSets.push([
-        ["state", "guard", "ledger"].flatMap((kind) =>
+        ["inventory", "state", "guard", "ledger"].flatMap((kind) =>
           byKind(kind).flatMap((oracleRecord) =>
             list(
               oracleRecord.document.review?.artifact_refs ??
@@ -3300,11 +5363,7 @@ export function globalSpecificationIssues(root, records) {
       // The explicit regular-file issue above is already fail-closed. Never follow a symlink here.
     } else {
       try {
-        const reportCommit = execFileSync(
-          "git",
-          ["log", "-1", "--format=%H", "--", relative(root, record.file)],
-          { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-        ).trim();
+        const reportCommit = gitPathOriginCommit(root, relative(root, record.file));
         const snapshotIssues = gitDocumentSnapshotIssues(
           root,
           reportCommit,
@@ -3313,7 +5372,22 @@ export function globalSpecificationIssues(root, records) {
         );
         issues.push(...snapshotIssues);
         if (snapshotIssues.length > 0) throw new Error("report snapshot mismatch");
-        issues.push(...gitEvidenceManifestIssues(root, reportCommit, document, label));
+        const evidenceManifest = gitEvidenceManifestSnapshot(
+          root,
+          reportCommit,
+          document,
+          label,
+        );
+        issues.push(
+          ...evidenceManifest.issues,
+          ...gitGateDeviationApprovalIssues(
+            root,
+            reportCommit,
+            evidenceManifest.cards,
+            evidenceManifest.repositoryCards,
+            label,
+          ),
+        );
         const parentFields = execFileSync("git", ["rev-list", "--parents", "-n", "1", reportCommit], {
           cwd: root,
           encoding: "utf8",
@@ -3323,6 +5397,14 @@ export function globalSpecificationIssues(root, records) {
         if (parentFields.length !== 2) throw new Error("report commit must have exactly one parent");
         const subjectCommit = parentFields[1];
         if (subjectCommit !== document.release_identity?.source_commit) throw new Error("parent mismatch");
+        issues.push(
+          ...gitProjectVersionIssues(
+            root,
+            subjectCommit,
+            document.release_identity?.project_version,
+            `${label}.release_identity`,
+          ),
+        );
         const changedFiles = execFileSync(
           "git",
           ["diff", "--name-only", subjectCommit, reportCommit, "--"],
@@ -3343,7 +5425,7 @@ export function globalSpecificationIssues(root, records) {
           );
         }
         if (document.gate === "G0") {
-          for (const oracleRecord of ["state", "guard", "ledger", "oracle"].flatMap(
+          for (const oracleRecord of ["inventory", "state", "guard", "ledger", "oracle"].flatMap(
             (kind) => byKind(kind),
           )) {
             const oracleSnapshotIssues = gitDocumentSnapshotIssues(
@@ -3361,6 +5443,16 @@ export function globalSpecificationIssues(root, records) {
                 reportCommit,
                 oracleRecord.document.normative_artifacts,
                 `${label}.g0_oracle_artifacts.${oracleRecord.document.oracle_id}`,
+              ),
+            );
+          }
+          for (const inventoryRecord of byKind("inventory")) {
+            issues.push(
+              ...gitRepositoryContentDigestIssues(
+                root,
+                reportCommit,
+                [inventoryRecord.document.scope_binding?.public_summary],
+                `${label}.g0_inventory_scope.${inventoryRecord.document.inventory_id}`,
               ),
             );
           }
@@ -3438,6 +5530,11 @@ export function validateRepository(root = DEFAULT_ROOT) {
   const schemaPaths = new Set(Object.values(SCHEMA_FILES).map((file) => resolve(root, file)));
   for (const file of walk(join(root, "docs"))) {
     if (schemaPaths.has(resolve(file)) || ![".json", ".yaml", ".yml"].includes(extname(file))) continue;
+    const metadata = lstatSync(file);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      issues.push(`${relative(root, file)}: normative document must be a regular non-symlink file`);
+      continue;
+    }
     let document;
     try {
       document = parseDocument(file);
@@ -3449,7 +5546,12 @@ export function validateRepository(root = DEFAULT_ROOT) {
     if (!kind) {
       const repositoryPath = relative(root, file);
       if (
-        ["docs/provenance/", "docs/specifications/", "docs/gates/"].some((prefix) =>
+        [
+          "docs/provenance/",
+          "docs/specifications/",
+          "docs/gates/",
+          "docs/governance/decisions/",
+        ].some((prefix) =>
           repositoryPath.startsWith(prefix),
         )
       ) {

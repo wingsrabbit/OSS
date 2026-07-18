@@ -11,3 +11,4 @@ Agent review is engineering evidence and must never be described as independent 
 ## Records
 
 - [Initial bootstrap role-separated review](bootstrap/initial-bootstrap-review.md)
+- [G0 policy-foundation role-separated review](g0/g0-policy-review.md)

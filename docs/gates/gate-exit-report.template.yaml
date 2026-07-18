@@ -8,7 +8,7 @@ gate: G0
 recorded_at: "2026-07-18T00:00:00Z"
 
 release_identity:
-  project_version: 0.0.0
+  project_version: 0.1.0
   source_commit: "0000000000000000000000000000000000000000"
   image_digests: []
   schema_version: not-applicable
@@ -33,9 +33,14 @@ feature_evidence:
   coverage_complete: false
   due_acceptance_complete: false
   card_artifacts: []
-  matrix_artifact: repo:docs/provenance/matrix.example.json
+  matrix_artifact: repo:docs/provenance/inventory.g0.json
 
 g0_oracles:
+  evidence_inventories:
+    document_count: 0
+    passed_count: 0
+    frozen_count: 0
+    artifact_refs: []
   state_transition_tables:
     document_count: 0
     passed_count: 0
