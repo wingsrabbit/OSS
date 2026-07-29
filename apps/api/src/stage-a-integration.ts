@@ -2441,7 +2441,7 @@ const secondReceiptAfterManual = await submitPaymentFact({
   currency: "USD",
   occurredAt: new Date(Date.now() + 60_000).toISOString(),
 });
-assert.equal(secondReceiptAfterManual.status, 200);
+assert.equal(secondReceiptAfterManual.status, 202);
 assert.equal(secondReceiptAfterManual.body.status, "unclaimed");
 const stillManualAfterSecondReceipt = await request<AddFundsStatus>(
   `/api/v1/billing/add-funds/${partialManual.commandId}`,
@@ -2498,7 +2498,7 @@ const disabledPolicyReceipt = await submitPaymentFact({
   currency: "USD",
   occurredAt: new Date().toISOString(),
 });
-assert.equal(disabledPolicyReceipt.status, 200);
+assert.equal(disabledPolicyReceipt.status, 202);
 assert.equal(disabledPolicyReceipt.body.status, "unclaimed");
 const disabledPolicyManual = await waitForAddFunds(
   disabledPolicy.command.commandId,
@@ -2572,7 +2572,7 @@ try {
   );
   await revocationClient.query("COMMIT");
   const revokedReceipt = await callbackPromise;
-  assert.equal(revokedReceipt.status, 200);
+  assert.equal(revokedReceipt.status, 202);
   assert.equal(revokedReceipt.body.status, "unclaimed");
 } catch (error) {
   await revocationClient.query("ROLLBACK").catch(() => undefined);
