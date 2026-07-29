@@ -6,11 +6,28 @@ All notable project changes will be documented here. Project release numbering a
 
 ## [Unreleased]
 
-### Planned
+### Added
 
-- PostgreSQL integration validation and browser acceptance for the Stage A journey.
-- Staff re-authentication and manual fulfillment.
-- Remaining billing, customer-operations, plugin, and two-VPS laboratory stages.
+- Append-only per-account Credit movements, invoice Credit allocations, and
+  balanced journals for audited administrator adjustments and customer use.
+- Versioned payment-method configuration with immutable invoice payment Quotes.
+- Credit plus external Mock payment and Credit-only invoice settlement paths.
+- Card/Alipay-style percentage fees calculated only from the external non-fee
+  amount, with USDT-style zero-fee configuration in the TermRat laboratory seed.
+
+### Security
+
+- Credit writes serialize on the Client Account and Credit Account, reject
+  negative balances, and bind every command to a request fingerprint.
+- Payment confirmation rejects expired Quotes and any changed invoice,
+  allocation, Credit balance, payment-method policy, or active unknown result.
+- Payment fees become invoice and ledger facts only after verified Provider
+  settlement; failed and cancelled attempts do not mutate historical invoices.
+
+### Still planned
+
+- Remaining Add Funds, renewal, suspension, cancellation, refund, customer
+  operations, plugin, and two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 

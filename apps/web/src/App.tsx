@@ -43,6 +43,9 @@ type OrderDetail = {
     currency: string;
     totalMinor: string;
     allocatedMinor: string;
+    paymentAllocatedMinor: string;
+    creditAppliedMinor: string;
+    paymentFeeMinor: string;
     dueMinor: string;
     status: string;
   };
@@ -72,6 +75,20 @@ type ManualItem = {
   paidMinor: string;
   totalMinor: string;
   submittedAt: string;
+};
+type BillingSummary = {
+  currency: string;
+  creditBalanceMinor: string;
+  paymentMethods: Array<{ code: string; name: string; feeBasisPoints: number }>;
+};
+type PaymentQuote = {
+  quoteId: string;
+  method: string;
+  creditToApplyMinor: string;
+  externalNonFeeMinor: string;
+  feeMinor: string;
+  externalDueMinor: string;
+  expiresAt: string;
 };
 
 const words = {
@@ -136,11 +153,17 @@ export function App() {
   const [notice, setNotice] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [paymentScenario, setPaymentScenario] = useState("success");
+  const [paymentMethod, setPaymentMethod] = useState("card");
+  const [applyCredit, setApplyCredit] = useState(true);
+  const [billing, setBilling] = useState<BillingSummary | null>(null);
+  const [paymentQuote, setPaymentQuote] = useState<PaymentQuote | null>(null);
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
   const [adminPassword, setAdminPassword] = useState("");
   const [manualReason, setManualReason] = useState("");
+  const [creditAdjustmentMinor, setCreditAdjustmentMinor] = useState("5000");
+  const [creditAdjustmentReason, setCreditAdjustmentReason] = useState("");
   const [bootstrapToken, setBootstrapToken] = useState("");
   const text = words[locale];
 
@@ -151,6 +174,14 @@ export function App() {
       setMe(null);
     }
   }, []);
+
+  const refreshBilling = useCallback(async () => {
+    if (!me) {
+      setBilling(null);
+      return;
+    }
+    setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
+  }, [me]);
 
   useEffect(() => {
     void Promise.all([
@@ -163,6 +194,26 @@ export function App() {
       setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
     );
   }, [locale, refreshMe]);
+
+  useEffect(() => {
+    void refreshBilling().catch(() => undefined);
+  }, [refreshBilling]);
+
+  useEffect(() => {
+    if (!order || order.invoice.status === "paid" || !me?.eligible) {
+      setPaymentQuote(null);
+      return;
+    }
+    void api<PaymentQuote>(`/api/v1/invoices/${order.invoice.id}/payment-quotes`, {
+      method: "POST",
+      body: JSON.stringify({ paymentMethod, applyCredit }),
+    })
+      .then(setPaymentQuote)
+      .catch((caught: unknown) => {
+        setPaymentQuote(null);
+        setError(caught instanceof Error ? caught.message : "Payment quote is unavailable");
+      });
+  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod]);
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("token");
@@ -283,14 +334,22 @@ export function App() {
     if (!order) return;
     setError("");
     try {
+      const quote =
+        paymentQuote ??
+        (await api<PaymentQuote>(`/api/v1/invoices/${order.invoice.id}/payment-quotes`, {
+          method: "POST",
+          body: JSON.stringify({ paymentMethod, applyCredit }),
+        }));
       await api(`/api/v1/invoices/${order.invoice.id}/payments`, {
         method: "POST",
         body: JSON.stringify({
+          quoteId: quote.quoteId,
           scenario: paymentScenario,
           idempotencyKey: crypto.randomUUID(),
         }),
       });
       setOrder(await api<OrderDetail>(`/api/v1/orders/${order.order.id}`));
+      await refreshBilling();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Payment could not start");
     }
@@ -341,6 +400,32 @@ export function App() {
       setNotice("Manual service marked Ready for Service with an audited activation time.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Manual fulfillment failed");
+    }
+  }
+
+  async function adjustCredit(direction: "increase" | "decrease") {
+    if (!me?.staff) return;
+    setError("");
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      await api(`/api/v1/admin/client-accounts/${me.clientAccountId}/credit-adjustments`, {
+        method: "POST",
+        body: JSON.stringify({
+          direction,
+          amountMinor: creditAdjustmentMinor,
+          currency: "USD",
+          reason: creditAdjustmentReason,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      });
+      await refreshBilling();
+      setNotice(`Credit ${direction} recorded with a balanced journal and audit event.`);
+      setCreditAdjustmentReason("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
     }
   }
 
@@ -470,20 +555,57 @@ export function App() {
         {me?.staff && (
           <section className="admin-panel">
             <div>
-              <p className="eyebrow">Administrator · manual fulfillment</p>
-              <h2>Paid services waiting for a human Ready decision</h2>
+              <p className="eyebrow">Administrator · audited billing and fulfillment</p>
+              <h2>Credit adjustment and human Ready decisions</h2>
             </div>
+            <div className="inline-form admin-confirm">
+              <input
+                type="password"
+                value={adminPassword}
+                onChange={(event) => setAdminPassword(event.target.value)}
+                placeholder="Re-enter password (15-minute fixed window)"
+              />
+              <input
+                inputMode="numeric"
+                value={creditAdjustmentMinor}
+                onChange={(event) => setCreditAdjustmentMinor(event.target.value)}
+                placeholder="Credit amount in cents"
+              />
+              <input
+                value={creditAdjustmentReason}
+                onChange={(event) => setCreditAdjustmentReason(event.target.value)}
+                placeholder="Credit adjustment reason (10+ characters)"
+              />
+              <button
+                className="primary"
+                disabled={
+                  adminPassword.length === 0 ||
+                  !/^[1-9]\d*$/.test(creditAdjustmentMinor) ||
+                  creditAdjustmentReason.trim().length < 10
+                }
+                onClick={() => adjustCredit("increase")}
+              >
+                Increase Credit
+              </button>
+              <button
+                disabled={
+                  adminPassword.length === 0 ||
+                  !/^[1-9]\d*$/.test(creditAdjustmentMinor) ||
+                  creditAdjustmentReason.trim().length < 10
+                }
+                onClick={() => adjustCredit("decrease")}
+              >
+                Decrease Credit
+              </button>
+            </div>
+            <p>
+              Current customer Credit: <strong>{usd(billing?.creditBalanceMinor ?? "0")}</strong>
+            </p>
             {manualItems.length === 0 ? (
               <p className="muted">No paid manual services are waiting.</p>
             ) : (
               <>
                 <div className="inline-form admin-confirm">
-                  <input
-                    type="password"
-                    value={adminPassword}
-                    onChange={(event) => setAdminPassword(event.target.value)}
-                    placeholder="Re-enter password (15-minute fixed window)"
-                  />
                   <input
                     value={manualReason}
                     onChange={(event) => setManualReason(event.target.value)}
@@ -529,11 +651,32 @@ export function App() {
             </div>
             <div className="invoice-summary">
               <span>Total {usd(order.invoice.totalMinor)}</span>
-              <span>Allocated {usd(order.invoice.allocatedMinor)}</span>
+              <span>External paid {usd(order.invoice.paymentAllocatedMinor)}</span>
+              <span>Credit applied {usd(order.invoice.creditAppliedMinor)}</span>
+              <span>Payment fee charged {usd(order.invoice.paymentFeeMinor)}</span>
               <strong>Due {usd(order.invoice.dueMinor)}</strong>
             </div>
             {order.invoice.status !== "paid" && (
               <div className="payment-controls">
+                <select
+                  aria-label="Payment method"
+                  value={paymentMethod}
+                  onChange={(event) => setPaymentMethod(event.target.value)}
+                >
+                  {(billing?.paymentMethods ?? []).map((method) => (
+                    <option key={method.code} value={method.code}>
+                      {method.name} · {(method.feeBasisPoints / 100).toFixed(2)}%
+                    </option>
+                  ))}
+                </select>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={applyCredit}
+                    onChange={(event) => setApplyCredit(event.target.checked)}
+                  />
+                  Apply available Credit ({usd(billing?.creditBalanceMinor ?? "0")})
+                </label>
                 <select
                   value={paymentScenario}
                   onChange={(event) => setPaymentScenario(event.target.value)}
@@ -544,7 +687,19 @@ export function App() {
                   <option value="timeout_success">Timeout but actually settled</option>
                   <option value="duplicate_out_of_order">Duplicate + out of order</option>
                 </select>
-                <button className="primary" disabled={!me?.eligible} onClick={startPayment}>
+                {paymentQuote && (
+                  <div className="quote-summary">
+                    <span>Credit this payment: {usd(paymentQuote.creditToApplyMinor)}</span>
+                    <span>External non-fee amount: {usd(paymentQuote.externalNonFeeMinor)}</span>
+                    <span>Payment fee: {usd(paymentQuote.feeMinor)}</span>
+                    <strong>External amount due: {usd(paymentQuote.externalDueMinor)}</strong>
+                  </div>
+                )}
+                <button
+                  className="primary"
+                  disabled={!me?.eligible || !paymentQuote}
+                  onClick={startPayment}
+                >
                   {text.pay}
                 </button>
               </div>

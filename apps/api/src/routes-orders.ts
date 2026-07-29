@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { randomUUID } from "node:crypto";
 import {
   buildPriceSnapshot,
   jsonMoney,
@@ -13,6 +14,7 @@ import { assertEligible, requireUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import { advancePaidInvoice } from "./invoice-settlement.js";
 
 const checkoutSchema = z.object({
   priceId: z.uuid(),
@@ -23,6 +25,7 @@ const checkoutSchema = z.object({
 });
 
 const paymentSchema = z.object({
+  quoteId: z.uuid(),
   scenario: z
     .enum(["success", "failed", "cancelled", "timeout_success", "duplicate_out_of_order"])
     .default("success"),
@@ -419,6 +422,9 @@ export async function registerOrderRoutes(
       invoice_id: string;
       invoice_total_minor: string;
       allocated_minor: string;
+      payment_allocated_minor: string;
+      credit_allocated_minor: string;
+      payment_fee_minor: string;
       service_id: string;
       service_status: string;
       activated_at: Date | null;
@@ -435,7 +441,10 @@ export async function registerOrderRoutes(
          o.total_minor,
          i.id AS invoice_id,
          i.total_minor AS invoice_total_minor,
-         COALESCE(alloc.allocated_minor, 0)::text AS allocated_minor,
+         alloc.allocated_minor::text,
+         alloc.payment_minor::text AS payment_allocated_minor,
+         alloc.credit_minor::text AS credit_allocated_minor,
+         COALESCE(fee.amount_minor, 0)::text AS payment_fee_minor,
          s.id AS service_id,
          s.status AS service_status,
          s.activated_at,
@@ -447,11 +456,12 @@ export async function registerOrderRoutes(
        JOIN invoices i ON i.order_id = o.id
        JOIN order_items oi ON oi.order_id = o.id
        JOIN services s ON s.order_item_id = oi.id
+       JOIN invoice_allocation_totals alloc ON alloc.invoice_id = i.id
        LEFT JOIN LATERAL (
-         SELECT COALESCE(sum(pa.amount_minor), 0) AS allocated_minor
-         FROM payment_allocations pa
-         WHERE pa.invoice_id = i.id
-       ) alloc ON true
+         SELECT COALESCE(sum(amount_minor), 0) AS amount_minor
+         FROM invoice_lines
+         WHERE invoice_id = i.id AND kind = 'payment_fee'
+       ) fee ON true
        LEFT JOIN LATERAL (
          SELECT status
          FROM payment_attempts pa
@@ -480,6 +490,9 @@ export async function registerOrderRoutes(
         currency: row.currency,
         totalMinor: total.toString(),
         allocatedMinor: allocated.toString(),
+        paymentAllocatedMinor: row.payment_allocated_minor,
+        creditAppliedMinor: row.credit_allocated_minor,
+        paymentFeeMinor: row.payment_fee_minor,
         dueMinor: (total - allocated).toString(),
         status: allocated === 0n ? "open" : allocated < total ? "partially_paid" : "paid",
       },
@@ -500,8 +513,9 @@ export async function registerOrderRoutes(
     assertEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = paymentSchema.parse(request.body);
-    const fingerprint = requestFingerprint("payments.create:v1", {
+    const fingerprint = requestFingerprint("payments.create:v2", {
       invoiceId: params.invoiceId,
+      quoteId: body.quoteId,
       scenario: body.scenario,
     });
 
@@ -509,19 +523,21 @@ export async function registerOrderRoutes(
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
-      const idempotentAttempt = await client.query<{
+      const idempotentCommand = await client.query<{
         id: string;
         invoice_id: string;
+        payment_attempt_id: string | null;
         status: string;
         request_fingerprint: string;
+        result: Record<string, unknown> | null;
       }>(
-        `SELECT id, invoice_id, status, request_fingerprint
-         FROM payment_attempts
+        `SELECT id, invoice_id, payment_attempt_id, status, request_fingerprint, result
+         FROM invoice_payment_commands
          WHERE client_account_id = $1 AND idempotency_key = $2
          FOR UPDATE`,
         [user.clientAccountId, body.idempotencyKey],
       );
-      const previous = idempotentAttempt.rows[0];
+      const previous = idempotentCommand.rows[0];
       if (previous) {
         if (
           previous.invoice_id !== params.invoiceId ||
@@ -532,12 +548,69 @@ export async function registerOrderRoutes(
             code: "IDEMPOTENCY_CONFLICT",
           });
         }
-        return { paymentAttemptId: previous.id, status: previous.status, replayed: true };
+        return {
+          commandId: previous.id,
+          paymentAttemptId: previous.payment_attempt_id,
+          status: previous.status,
+          result: previous.result,
+          replayed: true,
+        };
       }
 
       await assertEligibilityLocked(client, user.userId, user.clientAccountId);
-      const invoiceResult = await client.query<{ total_minor: string }>(
-        `SELECT total_minor
+      const quoteResult = await client.query<{
+        id: string;
+        payment_method_code: string;
+        provider_installation_id: string;
+        enabled: boolean;
+        current_fee_basis_points: number;
+        fee_basis_points: number;
+        currency: string;
+        invoice_total_minor: string;
+        payment_allocated_minor: string;
+        credit_allocated_minor: string;
+        available_credit_minor: string;
+        credit_to_apply_minor: string;
+        external_non_fee_minor: string;
+        fee_minor: string;
+        external_due_minor: string;
+        expires_at: Date;
+      }>(
+        `SELECT
+           q.id, q.payment_method_code, pm.provider_installation_id, pm.enabled,
+           pm.fee_basis_points AS current_fee_basis_points, q.fee_basis_points,
+           q.currency, q.invoice_total_minor::text,
+           q.payment_allocated_minor::text, q.credit_allocated_minor::text,
+           q.available_credit_minor::text, q.credit_to_apply_minor::text,
+           q.external_non_fee_minor::text, q.fee_minor::text,
+           q.external_due_minor::text, q.expires_at
+         FROM invoice_payment_quotes q
+         JOIN payment_methods pm ON pm.code = q.payment_method_code
+         WHERE q.id = $1
+           AND q.invoice_id = $2
+           AND q.client_account_id = $3
+         FOR SHARE OF q, pm`,
+        [body.quoteId, params.invoiceId, user.clientAccountId],
+      );
+      const quote = quoteResult.rows[0];
+      if (!quote) throw Object.assign(new Error("Payment quote not found"), { statusCode: 404 });
+      if (quote.expires_at.getTime() <= Date.now()) {
+        throw Object.assign(new Error("Payment quote expired; request a new quote"), {
+          statusCode: 409,
+          code: "QUOTE_EXPIRED",
+        });
+      }
+      if (
+        !quote.enabled ||
+        quote.current_fee_basis_points !== quote.fee_basis_points
+      ) {
+        throw Object.assign(new Error("Payment method configuration changed; request a new quote"), {
+          statusCode: 409,
+          code: "QUOTE_STALE",
+        });
+      }
+      const invoiceResult = await client.query<{ total_minor: string; currency: string }>(
+        `SELECT total_minor::text, currency
          FROM invoices
          WHERE id = $1 AND client_account_id = $2
          FOR UPDATE`,
@@ -545,15 +618,32 @@ export async function registerOrderRoutes(
       );
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
-      const allocationResult = await client.query<{ allocated_minor: string }>(
-        `SELECT COALESCE(sum(amount_minor), 0)::text AS allocated_minor
-         FROM payment_allocations
+      const allocationResult = await client.query<{
+        payment_minor: string;
+        credit_minor: string;
+      }>(
+        `SELECT payment_minor::text, credit_minor::text
+         FROM invoice_allocation_totals
          WHERE invoice_id = $1`,
         [params.invoiceId],
       );
-      const dueMinor =
-        BigInt(invoice.total_minor) - BigInt(allocationResult.rows[0]?.allocated_minor ?? "0");
-      if (dueMinor <= 0n) {
+      const allocations = allocationResult.rows[0];
+      if (!allocations) throw new Error("Invoice allocation summary is unavailable");
+      if (
+        invoice.currency !== quote.currency ||
+        invoice.total_minor !== quote.invoice_total_minor ||
+        allocations.payment_minor !== quote.payment_allocated_minor ||
+        allocations.credit_minor !== quote.credit_allocated_minor
+      ) {
+        throw Object.assign(new Error("Invoice changed; request a new payment quote"), {
+          statusCode: 409,
+          code: "QUOTE_STALE",
+        });
+      }
+      if (
+        BigInt(allocations.payment_minor) + BigInt(allocations.credit_minor) >=
+        BigInt(invoice.total_minor)
+      ) {
         throw Object.assign(new Error("Invoice is already paid"), { statusCode: 409 });
       }
       const activeAttempt = await client.query<{ id: string; status: string; idempotency_key: string }>(
@@ -573,19 +663,136 @@ export async function registerOrderRoutes(
         });
       }
 
+      const creditAccount = await client.query<{ id: string }>(
+        `SELECT id
+         FROM credit_accounts
+         WHERE client_account_id = $1 AND currency = $2
+         FOR UPDATE`,
+        [user.clientAccountId, quote.currency],
+      );
+      const creditAccountId = creditAccount.rows[0]?.id;
+      const creditBalanceResult = creditAccountId
+        ? await client.query<{ balance_minor: string }>(
+            `SELECT COALESCE(sum(credit_minor - debit_minor), 0)::text AS balance_minor
+             FROM credit_transactions
+             WHERE credit_account_id = $1`,
+            [creditAccountId],
+          )
+        : { rows: [{ balance_minor: "0" }] };
+      const creditBalance = creditBalanceResult.rows[0]?.balance_minor ?? "0";
+      if (creditBalance !== quote.available_credit_minor) {
+        throw Object.assign(new Error("Credit balance changed; request a new payment quote"), {
+          statusCode: 409,
+          code: "CREDIT_CHANGED",
+        });
+      }
+
+      const commandId = randomUUID();
+      await client.query(
+        `INSERT INTO invoice_payment_commands(
+           id, client_account_id, invoice_id, quote_id, status,
+           idempotency_key, request_fingerprint
+         ) VALUES ($1, $2, $3, $4, 'created', $5, $6)`,
+        [
+          commandId,
+          user.clientAccountId,
+          params.invoiceId,
+          quote.id,
+          body.idempotencyKey,
+          fingerprint,
+        ],
+      );
+
+      const creditToApply = BigInt(quote.credit_to_apply_minor);
+      if (creditToApply > 0n) {
+        if (!creditAccountId) throw new Error("Payment quote references unavailable Credit");
+        const creditTransactionId = randomUUID();
+        await client.query(
+          `INSERT INTO credit_transactions(
+             id, credit_account_id, kind, credit_minor, debit_minor,
+             source_type, source_id, actor_type, actor_id, reason,
+             idempotency_key, request_fingerprint
+           ) VALUES (
+             $1, $2, 'invoice_application', 0, $3,
+             'invoice_payment_command', $1, 'user', $4,
+             'Credit applied to invoice payment', $5, $6
+           )`,
+          [
+            creditTransactionId,
+            creditAccountId,
+            quote.credit_to_apply_minor,
+            user.userId,
+            `invoice-credit:${commandId}`,
+            fingerprint,
+          ],
+        );
+        await client.query(
+          `INSERT INTO credit_allocations(credit_transaction_id, invoice_id, amount_minor)
+           VALUES ($1, $2, $3)`,
+          [creditTransactionId, params.invoiceId, quote.credit_to_apply_minor],
+        );
+        const creditJournal = await client.query<{ id: string }>(
+          `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+           VALUES ('invoice_credit_application', $1, $2, 'Credit applied to invoice')
+           RETURNING id`,
+          [creditTransactionId, quote.currency],
+        );
+        const journalId = creditJournal.rows[0]?.id;
+        if (!journalId) throw new Error("Unable to create Credit application journal");
+        await client.query(
+          `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+           VALUES
+             ($1, 'client_credit_liability', $2, 0),
+             ($1, 'accounts_receivable', 0, $2)`,
+          [journalId, quote.credit_to_apply_minor],
+        );
+      }
+
+      if (BigInt(quote.external_due_minor) === 0n) {
+        const settlement = await advancePaidInvoice(client, params.invoiceId);
+        const commandResult = {
+          invoiceStatus: settlement.invoiceStatus,
+          orderStatus: settlement.orderStatus ?? null,
+          creditAppliedMinor: quote.credit_to_apply_minor,
+          externalDueMinor: "0",
+        };
+        await client.query(
+          `UPDATE invoice_payment_commands
+           SET status = 'succeeded', result = $2, updated_at = now()
+           WHERE id = $1`,
+          [commandId, commandResult],
+        );
+        return {
+          commandId,
+          paymentAttemptId: null,
+          status: "succeeded",
+          result: commandResult,
+          replayed: false,
+        };
+      }
+
       const paymentResult = await client.query<{ id: string }>(
          `INSERT INTO payment_attempts(
            client_account_id, invoice_id, provider_installation_id, status,
-           amount_minor, currency, scenario, idempotency_key, request_fingerprint
-         ) VALUES ($1, $2, 'mock-payment-v1', 'created', $3, 'USD', $4, $5, $6)
+           amount_minor, principal_minor, fee_basis_points, fee_minor,
+           currency, scenario, idempotency_key, request_fingerprint,
+           payment_method_code, payment_quote_id
+         ) VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          RETURNING id`,
         [
           user.clientAccountId,
           params.invoiceId,
-          dueMinor.toString(),
+          quote.provider_installation_id,
+          quote.external_due_minor,
+          quote.external_non_fee_minor,
+          quote.fee_basis_points,
+          quote.fee_minor,
+          quote.currency,
           body.scenario,
           body.idempotencyKey,
           fingerprint,
+          quote.payment_method_code,
+          quote.id,
         ],
       );
       const paymentAttemptId = paymentResult.rows[0]?.id;
@@ -593,11 +800,11 @@ export async function registerOrderRoutes(
       const operationResult = await client.query<{ id: string }>(
         `INSERT INTO provider_operations(
            provider_installation_id, kind, subject_type, subject_id, stable_key, status
-         ) VALUES ('mock-payment-v1', 'payment_create', 'payment', $1, $2, 'queued')
+         ) VALUES ($1, 'payment_create', 'payment', $2, $3, 'queued')
          ON CONFLICT (provider_installation_id, kind, stable_key) DO UPDATE
            SET updated_at = provider_operations.updated_at
          RETURNING id`,
-        [paymentAttemptId, `payment:${paymentAttemptId}`],
+        [quote.provider_installation_id, paymentAttemptId, `payment:${paymentAttemptId}`],
       );
       const operationId = operationResult.rows[0]?.id;
       if (!operationId) throw new Error("Unable to create provider operation");
@@ -610,8 +817,26 @@ export async function registerOrderRoutes(
           { paymentAttemptId, providerOperationId: operationId },
         ],
       );
-      return { paymentAttemptId, status: "created", replayed: false };
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET payment_attempt_id = $2, status = 'processing', updated_at = now()
+         WHERE id = $1`,
+        [commandId, paymentAttemptId],
+      );
+      return {
+        commandId,
+        paymentAttemptId,
+        status: "processing",
+        result: {
+          creditAppliedMinor: quote.credit_to_apply_minor,
+          externalDueMinor: quote.external_due_minor,
+          feeMinor: quote.fee_minor,
+        },
+        replayed: false,
+      };
     });
-    return reply.code(result.replayed ? 200 : 202).send(result);
+    return reply
+      .code(result.replayed || result.paymentAttemptId === null ? 200 : 202)
+      .send(result);
   });
 }

@@ -5,6 +5,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertProviderSignature } from "./provider-signature.js";
 
 const paymentEventSchema = z.object({
@@ -175,10 +176,16 @@ export async function registerProviderEventRoutes(
         invoice_id: string;
         status: PaymentStatus;
         amount_minor: string;
+        principal_minor: string | null;
+        fee_basis_points: number;
+        fee_minor: string;
+        payment_method_code: string | null;
         currency: string;
         provider_occurred_at: Date | null;
       }>(
-        `SELECT id, client_account_id, invoice_id, status, amount_minor, currency,
+        `SELECT id, client_account_id, invoice_id, status, amount_minor,
+                principal_minor::text, fee_basis_points, fee_minor::text,
+                payment_method_code, currency,
                 provider_occurred_at
          FROM payment_attempts
          WHERE id = $1
@@ -242,6 +249,16 @@ export async function registerProviderEventRoutes(
             body.status === "processing" ? "running" : "failed",
             body.externalPaymentId,
             occurredAt,
+          ],
+        );
+        await client.query(
+          `UPDATE invoice_payment_commands
+           SET status = $2, result = $3, updated_at = now()
+           WHERE payment_attempt_id = $1`,
+          [
+            attempt.id,
+            body.status === "processing" ? "processing" : "failed",
+            { paymentStatus: body.status },
           ],
         );
         return { accepted: true, status: body.status };
@@ -330,9 +347,69 @@ export async function registerProviderEventRoutes(
       );
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw new Error("Payment is linked to an invalid invoice");
+      const feeMinor = BigInt(attempt.fee_minor);
+      if (feeMinor > 0n) {
+        if (
+          !attempt.principal_minor ||
+          !attempt.payment_method_code ||
+          BigInt(attempt.amount_minor) !== BigInt(attempt.principal_minor) + feeMinor
+        ) {
+          throw new Error("Payment fee snapshot is inconsistent");
+        }
+        const feeLine = await client.query<{ id: string }>(
+          `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+           VALUES ($1, 'payment_fee', $2, $3)
+           RETURNING id`,
+          [
+            attempt.invoice_id,
+            `Payment fee (${attempt.payment_method_code})`,
+            feeMinor.toString(),
+          ],
+        );
+        const feeLineId = feeLine.rows[0]?.id;
+        if (!feeLineId) throw new Error("Unable to create payment fee line");
+        await client.query(
+          `INSERT INTO invoice_fee_charges(
+             invoice_id, payment_attempt_id, invoice_line_id, payment_method_code,
+             basis_minor, basis_points, amount_minor
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            attempt.invoice_id,
+            attempt.id,
+            feeLineId,
+            attempt.payment_method_code,
+            attempt.principal_minor,
+            attempt.fee_basis_points,
+            feeMinor.toString(),
+          ],
+        );
+        await client.query(
+          `UPDATE invoices
+           SET total_minor = total_minor + $2
+           WHERE id = $1`,
+          [attempt.invoice_id, feeMinor.toString()],
+        );
+        const feeJournal = await client.query<{ id: string }>(
+          `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+           VALUES ('invoice_payment_fee', $1, $2, 'External payment fee charged')
+           RETURNING id`,
+          [feeLineId, attempt.currency],
+        );
+        const feeJournalId = feeJournal.rows[0]?.id;
+        if (!feeJournalId) throw new Error("Unable to create payment fee journal");
+        await client.query(
+          `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+           VALUES
+             ($1, 'accounts_receivable', $2, 0),
+             ($1, 'payment_fee_revenue', 0, $2)`,
+          [feeJournalId, feeMinor.toString()],
+        );
+        invoice.total_minor = (BigInt(invoice.total_minor) + feeMinor).toString();
+      }
       const allocationResult = await client.query<{ allocated_minor: string }>(
-        `SELECT COALESCE(sum(amount_minor), 0)::text AS allocated_minor
-         FROM payment_allocations
+        `SELECT allocated_minor::text
+         FROM invoice_allocation_totals
          WHERE invoice_id = $1`,
         [attempt.invoice_id],
       );
@@ -377,116 +454,27 @@ export async function registerProviderEventRoutes(
         [attempt.id, body.externalPaymentId, occurredAt],
       );
 
-      const allocatedAfter = allocatedBefore + allocationMinor;
-      if (!invoice.order_id || allocatedAfter < BigInt(invoice.total_minor)) {
-        return { accepted: true, status: "succeeded", invoiceStatus: "partially_paid" };
-      }
+      const settlement = await advancePaidInvoice(client, attempt.invoice_id);
       await client.query(
-        `INSERT INTO outbox(event_type, unique_key, payload)
-         VALUES ('invoice.paid', $1, $2)
-         ON CONFLICT (event_type, unique_key) DO NOTHING`,
-        [`invoice:${attempt.invoice_id}`, { invoiceId: attempt.invoice_id, orderId: invoice.order_id }],
-      );
-
-      const orderResult = await client.query<{
-        id: string;
-        status: string;
-        submitted_by_user_id: string;
-        client_account_id: string;
-        fulfillment_mode: "automatic" | "review" | "manual" | "quote";
-        service_id: string;
-        email_verified_at: Date | null;
-        user_restricted_at: Date | null;
-        account_restricted_at: Date | null;
-        removed_at: Date | null;
-      }>(
-        `SELECT
-           o.id, o.status, o.submitted_by_user_id, o.client_account_id,
-           oi.fulfillment_mode, s.id AS service_id,
-           u.email_verified_at, u.restricted_at AS user_restricted_at,
-           ca.restricted_at AS account_restricted_at, cm.removed_at
-         FROM orders o
-         JOIN order_items oi ON oi.order_id = o.id
-         JOIN services s ON s.order_item_id = oi.id
-         JOIN users u ON u.id = o.submitted_by_user_id
-         JOIN client_accounts ca ON ca.id = o.client_account_id
-         JOIN client_memberships cm
-           ON cm.client_account_id = o.client_account_id
-          AND cm.user_id = o.submitted_by_user_id
-         WHERE o.id = $1
-         FOR UPDATE OF o, s, u, ca, cm`,
-        [invoice.order_id],
-      );
-      const order = orderResult.rows[0];
-      if (!order) throw new Error("Payment is linked to an invalid order");
-      if (["completed", "cancelled", "rejected"].includes(order.status)) {
-        await auditProvider(
-          client,
-          "payment.paid_order_terminal",
-          "order",
-          order.id,
-          "invoice became paid after the order entered a terminal state",
-          { status: order.status, receiptId: receipt.id },
-        );
-        return { accepted: true, status: "succeeded", orderStatus: order.status };
-      }
-
-      const eligible =
-        Boolean(order.email_verified_at) &&
-        !order.user_restricted_at &&
-        !order.account_restricted_at &&
-        !order.removed_at;
-      if (!eligible) {
-        await client.query(
-          `UPDATE orders
-           SET status = 'on_hold', updated_at = now(), version = version + 1
-           WHERE id = $1 AND status IN ('waiting_payment', 'accepted', 'awaiting_manual', 'fulfilling')`,
-          [order.id],
-        );
-        return { accepted: true, status: "succeeded", orderStatus: "on_hold" };
-      }
-
-      if (order.fulfillment_mode === "manual" || order.fulfillment_mode === "review") {
-        await client.query(
-          `UPDATE orders
-           SET status = 'awaiting_manual', updated_at = now(), version = version + 1
-           WHERE id = $1 AND status = 'waiting_payment'`,
-          [order.id],
-        );
-        return { accepted: true, status: "succeeded", orderStatus: "awaiting_manual" };
-      }
-
-      const accepted = await client.query(
-        `UPDATE orders
-         SET status = 'accepted', updated_at = now(), version = version + 1
-         WHERE id = $1 AND status = 'waiting_payment'
-         RETURNING id`,
-        [order.id],
-      );
-      if (accepted.rowCount !== 1) {
-        return { accepted: true, status: "succeeded", orderStatus: order.status };
-      }
-      const operationResult = await client.query<{ id: string }>(
-        `INSERT INTO provider_operations(
-           provider_installation_id, kind, subject_type, subject_id, stable_key, status
-         ) VALUES ('mock-provisioning-v1', 'resource_create', 'service', $1, $2, 'queued')
-         ON CONFLICT (provider_installation_id, kind, stable_key) DO UPDATE
-           SET updated_at = provider_operations.updated_at
-         RETURNING id`,
-        [order.service_id, `service:${order.service_id}`],
-      );
-      const operationId = operationResult.rows[0]?.id;
-      if (!operationId) throw new Error("Unable to create provisioning operation");
-      await client.query(
-        `INSERT INTO durable_jobs(job_type, unique_key, payload)
-         VALUES ('provision.start', $1, $2)
-         ON CONFLICT (job_type, unique_key) DO NOTHING`,
+        `UPDATE invoice_payment_commands
+         SET status = 'succeeded', result = $2, updated_at = now()
+         WHERE payment_attempt_id = $1`,
         [
-          `service:${order.service_id}`,
-          { serviceId: order.service_id, providerOperationId: operationId },
+          attempt.id,
+          {
+            paymentStatus: "succeeded",
+            invoiceStatus: settlement.invoiceStatus,
+            orderStatus: settlement.orderStatus ?? null,
+            feeMinor: attempt.fee_minor,
+          },
         ],
       );
-      return { accepted: true, status: "succeeded", orderStatus: "accepted" };
+      return {
+        accepted: true,
+        status: "succeeded",
+        invoiceStatus: settlement.invoiceStatus,
+        orderStatus: settlement.orderStatus,
+      };
     });
     return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
   });

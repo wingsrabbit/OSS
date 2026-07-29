@@ -39,7 +39,15 @@ type Legal = {
 };
 type OrderDetail = {
   order: { id: string; status: string };
-  invoice: { id: string; status: string; dueMinor: string };
+  invoice: {
+    id: string;
+    status: string;
+    totalMinor: string;
+    dueMinor: string;
+    paymentAllocatedMinor: string;
+    creditAppliedMinor: string;
+    paymentFeeMinor: string;
+  };
   payment: { status: string | null };
   provisioning: { status: string | null };
   service: {
@@ -155,15 +163,37 @@ async function createOrder(priceId: string, legal: Legal): Promise<OrderDetail> 
   return request<OrderDetail>(`/api/v1/orders/${created.orderId}`);
 }
 
+async function createPaymentQuote(
+  invoiceId: string,
+  paymentMethod = "card",
+  applyCredit = false,
+): Promise<{
+  quoteId: string;
+  creditToApplyMinor: string;
+  externalNonFeeMinor: string;
+  feeMinor: string;
+  externalDueMinor: string;
+}> {
+  return request(
+    `/api/v1/invoices/${invoiceId}/payment-quotes`,
+    {
+      method: "POST",
+      body: JSON.stringify({ paymentMethod, applyCredit }),
+    },
+    201,
+  );
+}
+
 async function pay(
   order: OrderDetail,
   scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order",
 ): Promise<OrderDetail> {
+  const quote = await createPaymentQuote(order.invoice.id);
   await request(
     `/api/v1/invoices/${order.invoice.id}/payments`,
     {
       method: "POST",
-      body: JSON.stringify({ scenario, idempotencyKey: randomUUID() }),
+      body: JSON.stringify({ quoteId: quote.quoteId, scenario, idempotencyKey: randomUUID() }),
     },
     202,
   );
@@ -420,11 +450,16 @@ assert.equal(
 const paymentConflictOrderA = await createOrder(automaticPrice.id, legal);
 const paymentConflictOrderB = await createOrder(automaticPrice.id, legal);
 const paymentConflictKey = randomUUID();
+const paymentConflictQuoteA = await createPaymentQuote(paymentConflictOrderA.invoice.id);
 await request(
   `/api/v1/invoices/${paymentConflictOrderA.invoice.id}/payments`,
   {
     method: "POST",
-    body: JSON.stringify({ scenario: "failed", idempotencyKey: paymentConflictKey }),
+    body: JSON.stringify({
+      quoteId: paymentConflictQuoteA.quoteId,
+      scenario: "failed",
+      idempotencyKey: paymentConflictKey,
+    }),
   },
   202,
 );
@@ -437,7 +472,11 @@ const crossInvoiceReplay = await rawCoreRequest(
   `/api/v1/invoices/${paymentConflictOrderB.invoice.id}/payments`,
   {
     method: "POST",
-    body: JSON.stringify({ scenario: "failed", idempotencyKey: paymentConflictKey }),
+    body: JSON.stringify({
+      quoteId: (await createPaymentQuote(paymentConflictOrderB.invoice.id)).quoteId,
+      scenario: "failed",
+      idempotencyKey: paymentConflictKey,
+    }),
   },
 );
 assert.equal(crossInvoiceReplay.status, 409);
@@ -611,11 +650,16 @@ await corePool.query(`
   FOR EACH ROW EXECUTE FUNCTION integration_delay_payment_start();
 `);
 const staleLeaseOrder = await createOrder(automaticPrice.id, legal);
+const staleLeaseQuote = await createPaymentQuote(staleLeaseOrder.invoice.id);
 const staleLeasePayment = await request<{ paymentAttemptId: string }>(
   `/api/v1/invoices/${staleLeaseOrder.invoice.id}/payments`,
   {
     method: "POST",
-    body: JSON.stringify({ scenario: "success", idempotencyKey: randomUUID() }),
+    body: JSON.stringify({
+      quoteId: staleLeaseQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
   },
   202,
 );
@@ -704,6 +748,134 @@ await request(
 const activeManual = await request<OrderDetail>(`/api/v1/orders/${paidManual.order.id}`);
 assert.equal(activeManual.service.status, "active");
 assert.equal(activeManual.service.activatedAt, activeManual.service.termStart);
+
+const staffMe = await request<{ clientAccountId: string }>("/api/v1/auth/me");
+const creditAdjustmentKey = randomUUID();
+const creditAdjustmentBody = {
+  direction: "increase",
+  amountMinor: "200",
+  currency: "USD",
+  reason: "Synthetic Stage B mixed-payment Credit grant",
+  idempotencyKey: creditAdjustmentKey,
+};
+const creditGranted = await request<{ balanceMinor: string }>(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  { method: "POST", body: JSON.stringify(creditAdjustmentBody) },
+  201,
+);
+assert.equal(creditGranted.balanceMinor, "200");
+const creditReplay = await request<{ balanceMinor: string }>(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  { method: "POST", body: JSON.stringify(creditAdjustmentBody) },
+  200,
+);
+assert.equal(creditReplay.balanceMinor, "200");
+
+const mixedPaymentOrder = await createOrder(automaticPrice.id, legal);
+const mixedCardPreview = await createPaymentQuote(mixedPaymentOrder.invoice.id, "card", true);
+assert.equal(mixedCardPreview.creditToApplyMinor, "200");
+assert.equal(mixedCardPreview.externalNonFeeMinor, "300");
+assert.equal(mixedCardPreview.feeMinor, "11");
+assert.equal(mixedCardPreview.externalDueMinor, "311");
+const mixedUsdtPreview = await createPaymentQuote(mixedPaymentOrder.invoice.id, "usdt", true);
+assert.equal(mixedUsdtPreview.creditToApplyMinor, "200");
+assert.equal(mixedUsdtPreview.feeMinor, "0");
+assert.equal(mixedUsdtPreview.externalDueMinor, "300");
+const mixedFinalQuote = await createPaymentQuote(mixedPaymentOrder.invoice.id, "card", true);
+await request(
+  `/api/v1/invoices/${mixedPaymentOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: mixedFinalQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+const mixedActive = await waitFor(
+  "Credit plus external payment to activate one service",
+  () => request<OrderDetail>(`/api/v1/orders/${mixedPaymentOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+assert.equal(mixedActive.invoice.totalMinor, "511");
+assert.equal(mixedActive.invoice.creditAppliedMinor, "200");
+assert.equal(mixedActive.invoice.paymentAllocatedMinor, "311");
+assert.equal(mixedActive.invoice.paymentFeeMinor, "11");
+assert.equal(mixedActive.invoice.status, "paid");
+const mixedCreditFacts = await corePool.query<{
+  balance_minor: string;
+  applications: string;
+  fee_charges: string;
+}>(
+  `SELECT
+     (SELECT COALESCE(sum(ct.credit_minor - ct.debit_minor), 0)::text
+        FROM credit_accounts ca
+        LEFT JOIN credit_transactions ct ON ct.credit_account_id = ca.id
+       WHERE ca.client_account_id = $1 AND ca.currency = 'USD') AS balance_minor,
+     (SELECT count(*)::text
+        FROM credit_allocations ca
+       WHERE ca.invoice_id = $2) AS applications,
+     (SELECT count(*)::text
+        FROM invoice_fee_charges ifc
+       WHERE ifc.invoice_id = $2) AS fee_charges`,
+  [staffMe.clientAccountId, mixedPaymentOrder.invoice.id],
+);
+assert.equal(mixedCreditFacts.rows[0]?.balance_minor, "0");
+assert.equal(mixedCreditFacts.rows[0]?.applications, "1");
+assert.equal(mixedCreditFacts.rows[0]?.fee_charges, "1");
+
+await request(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      direction: "increase",
+      amountMinor: "500",
+      currency: "USD",
+      reason: "Synthetic Stage B full-Credit payment grant",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+const fullCreditOrder = await createOrder(automaticPrice.id, legal);
+const fullCreditQuote = await createPaymentQuote(fullCreditOrder.invoice.id, "card", true);
+assert.equal(fullCreditQuote.creditToApplyMinor, "500");
+assert.equal(fullCreditQuote.feeMinor, "0");
+assert.equal(fullCreditQuote.externalDueMinor, "0");
+await request(
+  `/api/v1/invoices/${fullCreditOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: fullCreditQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  200,
+);
+const fullCreditActive = await waitFor(
+  "full-Credit invoice to activate without a Payment Provider operation",
+  () => request<OrderDetail>(`/api/v1/orders/${fullCreditOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+assert.equal(fullCreditActive.invoice.status, "paid");
+assert.equal(fullCreditActive.invoice.paymentFeeMinor, "0");
+assert.equal(fullCreditActive.payment.status, null);
+const fullCreditPaymentFacts = await corePool.query<{ attempts: string; operations: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM payment_attempts WHERE invoice_id = $1) AS attempts,
+     (SELECT count(*)::text
+        FROM provider_operations po
+        JOIN payment_attempts pa ON pa.id = po.subject_id
+       WHERE po.subject_type = 'payment' AND pa.invoice_id = $1) AS operations`,
+  [fullCreditOrder.invoice.id],
+);
+assert.equal(fullCreditPaymentFacts.rows[0]?.attempts, "0");
+assert.equal(fullCreditPaymentFacts.rows[0]?.operations, "0");
 
 await corePool.query("UPDATE users SET restricted_at = now() WHERE email = $1", [email]);
 await request(

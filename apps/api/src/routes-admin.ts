@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { randomUUID } from "node:crypto";
 import { addBillingCycle, type BillingCycle } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireUser, type AuthenticatedUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
 
 const manualCompletionSchema = z.object({
   reason: z.string().trim().min(10).max(1_000),
+});
+
+const creditAdjustmentSchema = z.object({
+  direction: z.enum(["increase", "decrease"]),
+  amountMinor: z.string().regex(/^[1-9]\d*$/),
+  currency: z.literal("USD"),
+  reason: z.string().trim().min(10).max(1_000),
+  idempotencyKey: z.string().min(8).max(128),
 });
 
 async function requireStaffPermission(
@@ -105,6 +115,175 @@ export async function registerAdminRoutes(
   pool: DatabasePool,
   config: Config,
 ): Promise<void> {
+  app.post(
+    "/api/v1/admin/client-accounts/:clientAccountId/credit-adjustments",
+    async (request, reply) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "billing.credit_adjust");
+      await requireRecentReauth(pool, user);
+      const params = z.object({ clientAccountId: z.uuid() }).parse(request.params);
+      const body = creditAdjustmentSchema.parse(request.body);
+      const fingerprint = requestFingerprint("admin.credit-adjustment:v1", {
+        clientAccountId: params.clientAccountId,
+        direction: body.direction,
+        amountMinor: body.amountMinor,
+        currency: body.currency,
+        reason: body.reason,
+      });
+
+      const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "billing.credit_adjust");
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `credit-adjustment:${params.clientAccountId}:${body.currency}:${body.idempotencyKey}`,
+        ]);
+        const target = await client.query<{ id: string }>(
+          "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+          [params.clientAccountId],
+        );
+        if (!target.rows[0]) {
+          throw Object.assign(new Error("Client account not found"), { statusCode: 404 });
+        }
+        const accountResult = await client.query<{ id: string }>(
+          `INSERT INTO credit_accounts(client_account_id, currency)
+           VALUES ($1, $2)
+           ON CONFLICT (client_account_id, currency) DO NOTHING
+           RETURNING id`,
+          [params.clientAccountId, body.currency],
+        );
+        const existingAccount = accountResult.rows[0]
+          ? accountResult
+          : await client.query<{ id: string }>(
+              `SELECT id
+               FROM credit_accounts
+               WHERE client_account_id = $1 AND currency = $2
+               FOR UPDATE`,
+              [params.clientAccountId, body.currency],
+            );
+        const creditAccountId = existingAccount.rows[0]?.id;
+        if (!creditAccountId) throw new Error("Unable to establish Credit account");
+        await client.query("SELECT id FROM credit_accounts WHERE id = $1 FOR UPDATE", [
+          creditAccountId,
+        ]);
+
+        const previous = await client.query<{
+          id: string;
+          request_fingerprint: string;
+        }>(
+          `SELECT id, request_fingerprint
+           FROM credit_transactions
+           WHERE credit_account_id = $1 AND idempotency_key = $2
+           FOR UPDATE`,
+          [creditAccountId, body.idempotencyKey],
+        );
+        if (previous.rows[0]) {
+          if (previous.rows[0].request_fingerprint !== fingerprint) {
+            throw Object.assign(
+              new Error("The idempotency key was used for a different Credit adjustment"),
+              { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
+            );
+          }
+          const balance = await client.query<{ balance_minor: string }>(
+            `SELECT COALESCE(sum(credit_minor - debit_minor), 0)::text AS balance_minor
+             FROM credit_transactions
+             WHERE credit_account_id = $1`,
+            [creditAccountId],
+          );
+          return {
+            transactionId: previous.rows[0].id,
+            balanceMinor: balance.rows[0]?.balance_minor ?? "0",
+            replayed: true,
+          };
+        }
+
+        const amount = BigInt(body.amountMinor);
+        const current = await client.query<{ balance_minor: string }>(
+          `SELECT COALESCE(sum(credit_minor - debit_minor), 0)::text AS balance_minor
+           FROM credit_transactions
+           WHERE credit_account_id = $1`,
+          [creditAccountId],
+        );
+        const currentBalance = BigInt(current.rows[0]?.balance_minor ?? "0");
+        if (body.direction === "decrease" && amount > currentBalance) {
+          throw Object.assign(new Error("Credit adjustment would make the balance negative"), {
+            statusCode: 409,
+            code: "INSUFFICIENT_CREDIT",
+          });
+        }
+        const transactionId = randomUUID();
+        await client.query(
+          `INSERT INTO credit_transactions(
+             id, credit_account_id, kind, credit_minor, debit_minor,
+             source_type, source_id, actor_type, actor_id, reason,
+             idempotency_key, request_fingerprint
+           ) VALUES (
+             $1, $2, 'manual_adjustment', $3, $4,
+             'admin_credit_adjustment', $1, 'staff', $5, $6, $7, $8
+           )`,
+          [
+            transactionId,
+            creditAccountId,
+            body.direction === "increase" ? body.amountMinor : "0",
+            body.direction === "decrease" ? body.amountMinor : "0",
+            user.userId,
+            body.reason,
+            body.idempotencyKey,
+            fingerprint,
+          ],
+        );
+        const journal = await client.query<{ id: string }>(
+          `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+           VALUES ('credit_manual_adjustment', $1, $2, 'Audited manual Credit adjustment')
+           RETURNING id`,
+          [transactionId, body.currency],
+        );
+        const journalId = journal.rows[0]?.id;
+        if (!journalId) throw new Error("Unable to create Credit journal");
+        if (body.direction === "increase") {
+          await client.query(
+            `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+             VALUES
+               ($1, 'credit_adjustment_expense', $2, 0),
+               ($1, 'client_credit_liability', 0, $2)`,
+            [journalId, body.amountMinor],
+          );
+        } else {
+          await client.query(
+            `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+             VALUES
+               ($1, 'client_credit_liability', $2, 0),
+               ($1, 'credit_adjustment_recovery', 0, $2)`,
+            [journalId, body.amountMinor],
+          );
+        }
+        await client.query(
+          `INSERT INTO audit_events(
+             actor_type, actor_id, action, target_type, target_id, reason, metadata
+           ) VALUES ('staff', $1, 'billing.credit_adjusted', 'client_account', $2, $3, $4)`,
+          [
+            user.userId,
+            params.clientAccountId,
+            body.reason,
+            {
+              transactionId,
+              direction: body.direction,
+              amountMinor: body.amountMinor,
+              currency: body.currency,
+            },
+          ],
+        );
+        return {
+          transactionId,
+          balanceMinor:
+            body.direction === "increase"
+              ? (currentBalance + amount).toString()
+              : (currentBalance - amount).toString(),
+          replayed: false,
+        };
+      });
+      return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+    },
+  );
+
   app.get("/api/v1/admin/manual-fulfillment", async (request) => {
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "services.manual_fulfillment");
@@ -124,7 +303,7 @@ export async function registerAdminRoutes(
          oi.product_name,
          oi.billing_cycle,
          ca.name AS client_account_name,
-         COALESCE(alloc.paid_minor, 0)::text AS paid_minor,
+         COALESCE(alloc.allocated_minor, 0)::text AS paid_minor,
          i.total_minor,
          o.submitted_at
        FROM orders o
@@ -132,11 +311,7 @@ export async function registerAdminRoutes(
        JOIN order_items oi ON oi.order_id = o.id
        JOIN services s ON s.order_item_id = oi.id
        JOIN invoices i ON i.order_id = o.id
-       LEFT JOIN LATERAL (
-         SELECT COALESCE(sum(pa.amount_minor), 0) AS paid_minor
-         FROM payment_allocations pa
-         WHERE pa.invoice_id = i.id
-       ) alloc ON true
+       LEFT JOIN invoice_allocation_totals alloc ON alloc.invoice_id = i.id
        WHERE o.status = 'awaiting_manual'
        ORDER BY o.submitted_at`,
     );
@@ -219,8 +394,8 @@ export async function registerAdminRoutes(
         });
       }
       const allocationResult = await client.query<{ allocated_minor: string }>(
-        `SELECT COALESCE(sum(amount_minor), 0)::text AS allocated_minor
-         FROM payment_allocations
+        `SELECT allocated_minor::text
+         FROM invoice_allocation_totals
          WHERE invoice_id = $1`,
         [service.invoice_id],
       );

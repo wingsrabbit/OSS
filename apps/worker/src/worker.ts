@@ -405,6 +405,8 @@ async function preflightPayment(
     const result = await client.query<{
       payment_status: string;
       amount_minor: string;
+      principal_minor: string | null;
+      fee_minor: string;
       payment_currency: string;
       scenario: string;
       payment_client_account_id: string;
@@ -425,7 +427,8 @@ async function preflightPayment(
       operation_attempt_count: number;
     }>(
       `SELECT
-         pa.status AS payment_status, pa.amount_minor::text, pa.currency AS payment_currency,
+         pa.status AS payment_status, pa.amount_minor::text, pa.principal_minor::text,
+         pa.fee_minor::text, pa.currency AS payment_currency,
          pa.scenario, pa.client_account_id AS payment_client_account_id, pa.invoice_id,
          i.total_minor::text AS invoice_total_minor, i.currency AS invoice_currency,
          i.client_account_id AS invoice_client_account_id,
@@ -548,8 +551,8 @@ async function preflightPayment(
     }
 
     const allocationResult = await client.query<{ allocated_minor: string }>(
-      `SELECT COALESCE(sum(amount_minor), 0)::text AS allocated_minor
-       FROM payment_allocations
+      `SELECT allocated_minor::text
+       FROM invoice_allocation_totals
        WHERE invoice_id = $1`,
       [payment.invoice_id],
     );
@@ -582,7 +585,12 @@ async function preflightPayment(
         "payment result may be outstanding but the invoice no longer has an allocatable balance",
       );
     }
-    if (dueMinor !== BigInt(payment.amount_minor)) {
+    const principalMinor = BigInt(payment.principal_minor ?? payment.amount_minor);
+    const feeMinor = BigInt(payment.fee_minor);
+    if (
+      dueMinor !== principalMinor ||
+      BigInt(payment.amount_minor) !== principalMinor + feeMinor
+    ) {
       return holdPaymentWithClient(
         client,
         job,
@@ -795,8 +803,8 @@ async function preflightProvision(
       service.invoice_client_account_id === service.order_client_account_id;
 
     const allocationResult = await client.query<{ allocated_minor: string }>(
-      `SELECT COALESCE(sum(amount_minor), 0)::text AS allocated_minor
-       FROM payment_allocations
+      `SELECT allocated_minor::text
+       FROM invoice_allocation_totals
        WHERE invoice_id = $1`,
       [service.invoice_id],
     );
