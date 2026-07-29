@@ -46,7 +46,7 @@ export async function buildApp(
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   });
   await app.register(rateLimit, {
-    max: 120,
+    max: config.GLOBAL_RATE_LIMIT_MAX,
     timeWindow: "1 minute",
   });
 

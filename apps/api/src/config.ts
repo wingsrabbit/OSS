@@ -8,6 +8,7 @@ const schema = z.object({
   OSS_PUBLIC_URL: z.url(),
   API_HOST: z.string().default("0.0.0.0"),
   API_PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
+  GLOBAL_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
   SESSION_COOKIE_NAME: z.string().default("oss_session"),
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
   VERIFICATION_TTL_MINUTES: z.coerce.number().int().positive().default(30),
