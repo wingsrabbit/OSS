@@ -404,6 +404,8 @@ async function startAddFunds(
     | "cancelled"
     | "timeout_success"
     | "duplicate_out_of_order"
+    | "partial_then_reject"
+    | "partial_then_timeout"
     | "partial"
     | "wrong_currency"
     | "expired_late"
@@ -2475,6 +2477,118 @@ assert.match(
   /previous funds require manual review/,
 );
 
+const callbackBeforeRejectQuote = await createAddFundsQuote("5000", "card");
+const callbackBeforeReject = await startAddFunds(
+  callbackBeforeRejectQuote.quoteId,
+  "partial_then_reject",
+);
+await waitForAddFunds(callbackBeforeReject.command.commandId, "manual");
+await waitFor(
+  "Worker to preserve partial funds after the create response rejects",
+  async () => {
+    const state = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      receipts: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         (
+           SELECT count(*)::text
+           FROM fund_receipts receipt
+           WHERE receipt.reported_add_funds_attempt_id = attempt.id
+             AND receipt.disposition = 'unclaimed'
+         ) AS receipts
+       FROM add_funds_commands command
+       JOIN add_funds_attempts attempt ON attempt.id = command.add_funds_attempt_id
+       JOIN provider_operations operation
+         ON operation.subject_type = 'add_funds'
+        AND operation.subject_id = attempt.id
+       JOIN durable_jobs job
+         ON job.job_type = 'add_funds.start'
+        AND job.payload->>'addFundsAttemptId' = attempt.id::text
+       WHERE command.id = $1`,
+      [callbackBeforeReject.command.commandId],
+    );
+    return state.rows[0];
+  },
+  (state) =>
+    state?.command_status === "manual" &&
+    state.attempt_status === "unknown" &&
+    state.operation_status === "unknown" &&
+    state.job_status === "completed" &&
+    state.receipts === "1",
+);
+const preservedCallbackBeforeReject = await request<AddFundsStatus>(
+  `/api/v1/billing/add-funds/${callbackBeforeReject.command.commandId}`,
+);
+assert.equal(preservedCallbackBeforeReject.status, "manual");
+assert.match(
+  String(preservedCallbackBeforeReject.result?.reason),
+  /does not match the Add Funds snapshot/,
+);
+
+const callbackBeforeTimeoutQuote = await createAddFundsQuote("5000", "card");
+const callbackBeforeTimeout = await startAddFunds(
+  callbackBeforeTimeoutQuote.quoteId,
+  "partial_then_timeout",
+);
+await waitForAddFunds(callbackBeforeTimeout.command.commandId, "manual");
+await waitFor(
+  "Worker to preserve partial funds after the create request times out",
+  async () => {
+    const state = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      receipts: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         (
+           SELECT count(*)::text
+           FROM fund_receipts receipt
+           WHERE receipt.reported_add_funds_attempt_id = attempt.id
+             AND receipt.disposition = 'unclaimed'
+         ) AS receipts
+       FROM add_funds_commands command
+       JOIN add_funds_attempts attempt ON attempt.id = command.add_funds_attempt_id
+       JOIN provider_operations operation
+         ON operation.subject_type = 'add_funds'
+        AND operation.subject_id = attempt.id
+       JOIN durable_jobs job
+         ON job.job_type = 'add_funds.start'
+        AND job.payload->>'addFundsAttemptId' = attempt.id::text
+       WHERE command.id = $1`,
+      [callbackBeforeTimeout.command.commandId],
+    );
+    return state.rows[0];
+  },
+  (state) =>
+    state?.command_status === "manual" &&
+    state.attempt_status === "unknown" &&
+    state.operation_status === "unknown" &&
+    state.job_status === "completed" &&
+    state.receipts === "1",
+);
+const preservedCallbackBeforeTimeout = await request<AddFundsStatus>(
+  `/api/v1/billing/add-funds/${callbackBeforeTimeout.command.commandId}`,
+);
+assert.equal(preservedCallbackBeforeTimeout.status, "manual");
+assert.match(
+  String(preservedCallbackBeforeTimeout.result?.reason),
+  /does not match the Add Funds snapshot/,
+);
+
 const recoveryMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_add_funds_security()
@@ -2622,6 +2736,52 @@ await corePool.query(
   [revokedMembership.command.addFundsAttemptId],
 );
 
+const expiryBoundaryQuote = await createAddFundsQuote("5000", "card");
+const expiryBoundary = await startAddFunds(expiryBoundaryQuote.quoteId, "success");
+const expiryBoundaryOperation = await corePool.query<{ id: string }>(
+  `UPDATE provider_operations
+   SET status = 'running', attempt_count = 1
+   WHERE subject_type = 'add_funds' AND subject_id = $1
+   RETURNING id`,
+  [expiryBoundary.command.addFundsAttemptId],
+);
+const expiryBoundaryOperationId = expiryBoundaryOperation.rows[0]?.id;
+assert.ok(expiryBoundaryOperationId);
+const exactExpiry = new Date(Date.now() + 60_000);
+await corePool.query(
+  `UPDATE add_funds_attempts
+   SET status = 'processing', expires_at = $2
+   WHERE id = $1`,
+  [expiryBoundary.command.addFundsAttemptId, exactExpiry],
+);
+const expiryBoundaryReceipt = await submitPaymentFact({
+  eventId: `add-funds-expiry-boundary:${randomUUID()}`,
+  providerOperationId: expiryBoundaryOperationId,
+  paymentAttemptId: expiryBoundary.command.addFundsAttemptId,
+  externalPaymentId: `mock-add-funds-expiry-boundary-${randomUUID()}`,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: exactExpiry.toISOString(),
+});
+assert.equal(expiryBoundaryReceipt.status, 202);
+assert.equal(expiryBoundaryReceipt.body.status, "unclaimed");
+const expiryBoundaryManual = await waitForAddFunds(
+  expiryBoundary.command.commandId,
+  "manual",
+);
+assert.match(
+  String(expiryBoundaryManual.result?.reason),
+  /settlement occurred after the Add Funds attempt expired/,
+);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed'
+   WHERE job_type = 'add_funds.start'
+     AND payload->>'addFundsAttemptId' = $1`,
+  [expiryBoundary.command.addFundsAttemptId],
+);
+
 const expiredKnownUnsentQuote = await createAddFundsQuote("5000", "card");
 const expiredKnownUnsent = await startAddFunds(expiredKnownUnsentQuote.quoteId, "success");
 await corePool.query(
@@ -2664,7 +2824,7 @@ const beforeCapRace = await corePool.query<{ balance_minor: string; unclaimed: s
   [recoveryMe.clientAccountId],
 );
 assert.equal(beforeCapRace.rows[0]?.balance_minor, "10000");
-assert.equal(beforeCapRace.rows[0]?.unclaimed, "7");
+assert.equal(beforeCapRace.rows[0]?.unclaimed, "10");
 
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_add_funds_start()
@@ -2743,8 +2903,15 @@ await corePool.query(
      AND payload->>'addFundsAttemptId' = $1`,
   [capRace.command.addFundsAttemptId],
 );
-const capRaceManual = await waitForAddFunds(capRace.command.commandId, "manual");
-assert.match(String(capRaceManual.result?.reason), /balance cap would be exceeded/);
+const capRaceRejected = await waitForAddFunds(capRace.command.commandId, "failed");
+assert.match(String(capRaceRejected.result?.reason), /balance cap/);
+const capRaceProviderCalls = await providerPool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM mock_payment_operations
+   WHERE payment_attempt_id = $1`,
+  [capRace.command.addFundsAttemptId],
+);
+assert.equal(capRaceProviderCalls.rows[0]?.count, "0");
 await corePool.query(`
   DROP TRIGGER IF EXISTS integration_delay_add_funds_start ON durable_jobs;
   DROP FUNCTION IF EXISTS integration_delay_add_funds_start();
@@ -2773,7 +2940,7 @@ const afterCapRace = await corePool.query<{
   [recoveryMe.clientAccountId],
 );
 assert.equal(afterCapRace.rows[0]?.balance_minor, "996000");
-assert.equal(afterCapRace.rows[0]?.unclaimed, "8");
+assert.equal(afterCapRace.rows[0]?.unclaimed, "10");
 assert.equal(afterCapRace.rows[0]?.add_funds_credits, "2");
 
 cookie = staffCookie;
@@ -2811,6 +2978,28 @@ try {
   ledgerClient.release();
 }
 assert.equal(rejectedUnbalanced, true, "database must reject an unbalanced ledger journal");
+
+const receiptFactClient = await corePool.connect();
+let rejectedReceiptFactMutation = false;
+try {
+  await receiptFactClient.query("BEGIN");
+  await receiptFactClient.query(
+    `UPDATE fund_receipts
+     SET amount_minor = amount_minor + 1
+     WHERE reported_add_funds_attempt_id IS NOT NULL`,
+  );
+  await receiptFactClient.query("COMMIT");
+} catch {
+  rejectedReceiptFactMutation = true;
+  await receiptFactClient.query("ROLLBACK");
+} finally {
+  receiptFactClient.release();
+}
+assert.equal(
+  rejectedReceiptFactMutation,
+  true,
+  "database must reject mutation of original fund receipt facts",
+);
 
 await corePool.end();
 await providerPool.end();

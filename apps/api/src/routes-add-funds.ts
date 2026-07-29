@@ -24,6 +24,8 @@ const commandSchema = z.object({
       "timeout_success",
       "duplicate_out_of_order",
       "definitive_reject",
+      "partial_then_reject",
+      "partial_then_timeout",
       "partial",
       "wrong_currency",
       "expired_late",
@@ -480,6 +482,7 @@ export async function registerAddFundsRoutes(
 
   app.get("/api/v1/billing/add-funds/:commandId", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    assertEligible(user);
     if (user.membershipRole !== "owner" && user.membershipRole !== "billing") {
       return reply.code(403).send({ error: "Billing permission is required" });
     }

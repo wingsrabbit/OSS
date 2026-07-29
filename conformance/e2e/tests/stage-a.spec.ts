@@ -78,7 +78,8 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(addFunds.getByText("External amount due: $51.75", { exact: true })).toBeVisible();
   await addFunds.getByRole("button", { name: "Start Mock Add Funds" }).click();
   const addFundsStatus = addFunds.getByTestId("add-funds-status");
-  await expect(addFundsStatus.getByText("succeeded", { exact: true })).toBeVisible({
+  const addFundsCommandStatus = addFundsStatus.getByTestId("status-add-funds");
+  await expect(addFundsCommandStatus.getByText("succeeded", { exact: true })).toBeVisible({
     timeout: 30_000,
   });
   await expect(addFundsStatus.getByText("credited $50.00", { exact: true })).toBeVisible();

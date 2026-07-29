@@ -3,6 +3,11 @@
 ALTER TABLE payment_methods
   ADD COLUMN IF NOT EXISTS add_funds_enabled boolean NOT NULL DEFAULT false;
 
+UPDATE provider_inbox
+SET payload = jsonb_set(payload, '{callbackCapability}', '"[REDACTED]"'::jsonb)
+WHERE payload ? 'callbackCapability'
+  AND payload->>'callbackCapability' <> '[REDACTED]';
+
 CREATE TABLE IF NOT EXISTS add_funds_policies (
   currency text PRIMARY KEY CHECK (currency ~ '^[A-Z]{3}$'),
   enabled boolean NOT NULL DEFAULT false,
@@ -106,6 +111,35 @@ ALTER TABLE fund_receipts
     (reported_payment_attempt_id IS NOT NULL) <>
     (reported_add_funds_attempt_id IS NOT NULL)
   );
+
+CREATE OR REPLACE FUNCTION opensales_guard_fund_receipt_fact_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'Fund receipt external facts are append-only';
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.provider_installation_id IS DISTINCT FROM OLD.provider_installation_id
+     OR NEW.external_payment_id IS DISTINCT FROM OLD.external_payment_id
+     OR NEW.reported_payment_attempt_id IS DISTINCT FROM OLD.reported_payment_attempt_id
+     OR NEW.reported_add_funds_attempt_id IS DISTINCT FROM OLD.reported_add_funds_attempt_id
+     OR NEW.client_account_id IS DISTINCT FROM OLD.client_account_id
+     OR NEW.amount_minor IS DISTINCT FROM OLD.amount_minor
+     OR NEW.currency IS DISTINCT FROM OLD.currency
+     OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'Fund receipt external facts are append-only';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS fund_receipts_external_facts_append_only ON fund_receipts;
+CREATE TRIGGER fund_receipts_external_facts_append_only
+BEFORE UPDATE OR DELETE ON fund_receipts
+FOR EACH ROW EXECUTE FUNCTION opensales_guard_fund_receipt_fact_mutation();
 
 CREATE TABLE IF NOT EXISTS add_funds_settlements (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

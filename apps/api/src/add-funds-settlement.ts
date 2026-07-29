@@ -324,7 +324,7 @@ export async function handleAddFundsPaymentEvent(
   const terminalBeforeSuccess = ["failed", "cancelled", "expired", "succeeded"].includes(
     attempt.status,
   );
-  const expiredAtProviderOccurrence = occurredAt.getTime() > attempt.expires_at.getTime();
+  const expiredAtProviderOccurrence = occurredAt.getTime() >= attempt.expires_at.getTime();
   const snapshotMatches =
     attempt.amount_minor === body.amountMinor && attempt.currency === body.currency;
   const eligible =
@@ -371,7 +371,9 @@ export async function handleAddFundsPaymentEvent(
     !capacityAllows
   ) {
     const reason =
-      attempt.command_status === "manual" || attempt.has_prior_receipt
+      attempt.status === "succeeded"
+        ? "additional settlement arrived after Add Funds was already credited"
+      : attempt.command_status === "manual" || attempt.has_prior_receipt
         ? "additional settlement arrived while previous funds require manual review"
         : terminalBeforeSuccess
       ? `settlement arrived after Add Funds became ${attempt.status}`

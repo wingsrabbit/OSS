@@ -726,6 +726,12 @@ export function App() {
                   <option value="timeout_success">Timeout but actually settled</option>
                   <option value="duplicate_out_of_order">Duplicate + out of order</option>
                   <option value="partial">Partial arrival — manual review</option>
+                  <option value="partial_then_reject">
+                    Partial callback then rejected response — manual review
+                  </option>
+                  <option value="partial_then_timeout">
+                    Partial callback then timeout — manual review
+                  </option>
                   <option value="wrong_currency">Wrong currency — manual review</option>
                   <option value="expired_late">Late after expiry — manual review</option>
                   <option value="late_success">Success occurred after expiry — manual review</option>
@@ -1076,7 +1082,7 @@ export function App() {
 
 function Status({ label, value }: { label: string; value: string }) {
   return (
-    <div>
+    <div data-testid={`status-${label.toLowerCase().replaceAll(" ", "-")}`}>
       <span>{label}</span>
       <strong>{value.replaceAll("_", " ")}</strong>
     </div>

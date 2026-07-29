@@ -245,7 +245,7 @@ async function recoverStaleJobs(): Promise<number> {
             `UPDATE add_funds_commands
              SET status = 'unknown', result = $2, updated_at = now()
              WHERE add_funds_attempt_id = $1
-               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+               AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
             [
               subjectId,
               {
@@ -414,7 +414,7 @@ async function markUnknown(
         `UPDATE add_funds_commands
          SET status = 'unknown', result = $2, updated_at = now()
          WHERE add_funds_attempt_id = $1
-           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+           AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
         [subjectId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
       );
     } else {
@@ -1375,23 +1375,136 @@ async function failKnownUnsentAddFunds(
   addFundsAttemptId: string,
   reason: string,
 ): Promise<void> {
+  const currentResult = await client.query<{
+    command_status: string;
+    attempt_status: string;
+    operation_status: string;
+    has_receipt: boolean;
+  }>(
+    `SELECT command.status AS command_status,
+            attempt.status AS attempt_status,
+            operation.status AS operation_status,
+            EXISTS (
+              SELECT 1
+              FROM fund_receipts receipt
+              WHERE receipt.reported_add_funds_attempt_id = $1
+            ) AS has_receipt
+     FROM add_funds_commands command
+     JOIN add_funds_attempts attempt
+       ON attempt.id = command.add_funds_attempt_id
+     JOIN provider_operations operation
+       ON operation.id = $2
+      AND operation.subject_type = 'add_funds'
+      AND operation.subject_id = attempt.id
+     WHERE command.add_funds_attempt_id = $1
+     FOR UPDATE OF command, attempt, operation`,
+    [addFundsAttemptId, operationId],
+  );
+  const current = currentResult.rows[0];
+  if (!current) {
+    await manualJobWithClient(
+      client,
+      job.id,
+      "Add Funds Provider outcome references inconsistent Core records",
+    );
+    return;
+  }
+  if (
+    current.command_status === "succeeded" ||
+    current.command_status === "manual" ||
+    current.has_receipt
+  ) {
+    if (current.command_status !== "succeeded") {
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status <> 'succeeded'`,
+        [
+          operationId,
+          "Provider response contradicted an already-recorded funds receipt; manual review preserved",
+        ],
+      );
+    }
+    await client.query(
+      `INSERT INTO audit_events(
+         actor_type, actor_id, action, target_type, target_id, reason, metadata
+       ) VALUES ('system', $1, 'add_funds.provider_outcome_conflict',
+                 'add_funds_attempt', $2, $3, $4)`,
+      [
+        config.WORKER_ID,
+        addFundsAttemptId,
+        "Provider response arrived after Core recorded funds; original manual result was preserved",
+        { providerOperationId: operationId, workerReason: reason.slice(0, 1_000) },
+      ],
+    );
+    await completeJobWithClient(client, job.id);
+    return;
+  }
+  const recordedTerminal =
+    ["failed", "cancelled", "expired"].includes(current.command_status) ||
+    ["failed", "cancelled", "expired"].includes(current.attempt_status) ||
+    current.operation_status === "failed";
+  if (recordedTerminal) {
+    await completeJobWithClient(client, job.id);
+    return;
+  }
+  const definitiveFailureCanClose =
+    ["created", "processing"].includes(current.command_status) &&
+    ["created", "processing"].includes(current.attempt_status) &&
+    ["queued", "running"].includes(current.operation_status);
+  if (!definitiveFailureCanClose) {
+    const conflictReason =
+      "Provider rejection raced with an unknown Add Funds outcome; reconciliation is required";
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [operationId, conflictReason],
+    );
+    await client.query(
+      `UPDATE add_funds_attempts
+       SET status = 'unknown', updated_at = now(), version = version + 1
+       WHERE id = $1
+         AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+      [addFundsAttemptId],
+    );
+    await client.query(
+      `UPDATE add_funds_commands
+       SET status = 'unknown', result = $2, updated_at = now()
+       WHERE add_funds_attempt_id = $1
+         AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
+      [
+        addFundsAttemptId,
+        { paymentStatus: "unknown", reason: conflictReason },
+      ],
+    );
+    await enqueueReconcileWithClient(
+      client,
+      "add_funds.reconcile",
+      job.unique_key,
+      { ...job.payload, operationId },
+      config.RECONCILE_BASE_DELAY_SECONDS,
+    );
+    await completeJobWithClient(client, job.id);
+    return;
+  }
   await client.query(
     `UPDATE provider_operations
      SET status = 'failed', last_error = $2, updated_at = now()
-     WHERE id = $1 AND status <> 'succeeded'`,
+     WHERE id = $1 AND status IN ('queued', 'running')`,
     [operationId, reason.slice(0, 1_000)],
   );
   await client.query(
      `UPDATE add_funds_attempts
      SET status = 'failed', updated_at = now(), version = version + 1
-     WHERE id = $1 AND status <> 'succeeded'`,
+     WHERE id = $1 AND status IN ('created', 'processing')`,
     [addFundsAttemptId],
   );
   await client.query(
     `UPDATE add_funds_commands
      SET status = 'failed', result = $2, updated_at = now()
      WHERE add_funds_attempt_id = $1
-       AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+       AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
     [
       addFundsAttemptId,
       { paymentStatus: "failed", reason: reason.slice(0, 1_000) },
@@ -1445,6 +1558,7 @@ async function preflightAddFunds(
       policy_enabled: boolean;
       min_principal_minor: string;
       max_principal_minor: string;
+      balance_cap_minor: string;
       email_verified_at: Date | null;
       user_restricted_at: Date | null;
       account_restricted_at: Date | null;
@@ -1474,6 +1588,7 @@ async function preflightAddFunds(
          pm.enabled AS method_enabled, pm.add_funds_enabled,
          afp.enabled AS policy_enabled,
          afp.min_principal_minor::text, afp.max_principal_minor::text,
+         afp.balance_cap_minor::text,
          u.email_verified_at, u.restricted_at AS user_restricted_at,
          ca.restricted_at AS account_restricted_at, cm.removed_at,
          cm.role AS membership_role,
@@ -1602,7 +1717,7 @@ async function preflightAddFunds(
         `UPDATE add_funds_commands
          SET status = 'unknown', result = $2, updated_at = now()
          WHERE add_funds_attempt_id = $1
-           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+           AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
         [addFundsAttemptId, { paymentStatus: "unknown", reason }],
       );
       await enqueueReconcileWithClient(
@@ -1650,6 +1765,58 @@ async function preflightAddFunds(
         !eligible
           ? "Customer eligibility was revoked before Add Funds left Core"
           : "Add Funds policy or payment method changed before Provider create",
+      );
+      return { kind: "halted" };
+    }
+    const creditAccount = await client.query<{ id: string }>(
+      `SELECT id
+       FROM credit_accounts
+       WHERE client_account_id = $1 AND currency = $2
+       FOR UPDATE`,
+      [attempt.client_account_id, attempt.currency],
+    );
+    const creditAccountId = creditAccount.rows[0]?.id;
+    if (!creditAccountId) {
+      await failKnownUnsentAddFunds(
+        client,
+        job,
+        providerOperationId,
+        addFundsAttemptId,
+        "Add Funds Credit account disappeared before Provider create",
+      );
+      return { kind: "halted" };
+    }
+    const capacity = await client.query<{
+      balance_minor: string;
+      reserved_minor: string;
+    }>(
+      `SELECT
+         COALESCE((
+           SELECT sum(credit_minor - debit_minor)
+           FROM credit_transactions
+           WHERE credit_account_id = $1
+         ), 0)::text AS balance_minor,
+         COALESCE((
+           SELECT sum(principal_minor)
+           FROM add_funds_attempts
+           WHERE client_account_id = $2
+             AND currency = $3
+             AND status IN ('created', 'processing', 'unknown')
+         ), 0)::text AS reserved_minor`,
+      [creditAccountId, attempt.client_account_id, attempt.currency],
+    );
+    const available = capacity.rows[0];
+    if (
+      !available ||
+      BigInt(available.balance_minor) + BigInt(available.reserved_minor) >
+        BigInt(attempt.balance_cap_minor)
+    ) {
+      await failKnownUnsentAddFunds(
+        client,
+        job,
+        providerOperationId,
+        addFundsAttemptId,
+        "Credit balance and in-flight Add Funds would exceed the configured balance cap",
       );
       return { kind: "halted" };
     }
@@ -2067,7 +2234,7 @@ async function delayReconcile(
            FROM provider_operations
            WHERE id = $1 AND subject_type = 'add_funds'
          )
-           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+           AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
         [operationId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
       );
     }

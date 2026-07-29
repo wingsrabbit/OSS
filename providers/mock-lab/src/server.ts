@@ -33,6 +33,8 @@ const paymentCreateSchema = z.object({
     "timeout_success",
     "duplicate_out_of_order",
     "definitive_reject",
+    "partial_then_reject",
+    "partial_then_timeout",
     "partial",
     "wrong_currency",
     "expired_late",
@@ -316,7 +318,9 @@ app.post("/v1/payments", async (request, reply) => {
     externalPaymentId: operation.external_payment_id,
     status: operation.status,
     amountMinor:
-      body.scenario === "partial"
+      body.scenario === "partial" ||
+      body.scenario === "partial_then_reject" ||
+      body.scenario === "partial_then_timeout"
         ? (BigInt(body.amountMinor) / 2n || 1n).toString()
         : body.amountMinor,
     currency: body.scenario === "wrong_currency" ? "EUR" : body.currency,
@@ -357,6 +361,14 @@ app.post("/v1/payments", async (request, reply) => {
       60,
       callbackSecret,
     );
+  } else if (body.scenario === "partial_then_reject") {
+    await callback("/api/v1/provider-events/payment", event, callbackSecret);
+    return reply.code(400).send({
+      error: "synthetic rejection after Provider already reported partial funds",
+    });
+  } else if (body.scenario === "partial_then_timeout") {
+    await callback("/api/v1/provider-events/payment", event, callbackSecret);
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
   } else {
     scheduleCallback(
       "/api/v1/provider-events/payment",
@@ -399,7 +411,9 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
     externalPaymentId: row.external_payment_id,
     status: row.status,
     amountMinor:
-      row.scenario === "partial"
+      row.scenario === "partial" ||
+      row.scenario === "partial_then_reject" ||
+      row.scenario === "partial_then_timeout"
         ? (BigInt(row.amount_minor) / 2n || 1n).toString()
         : row.amount_minor,
     currency: row.scenario === "wrong_currency" ? "EUR" : row.currency,
