@@ -61,11 +61,14 @@ async function request<T>(
     },
     redirect: "error",
   });
-  assert.equal(
-    response.status,
-    expectedStatus,
-    `${init.method ?? "GET"} ${path} expected ${expectedStatus}, received ${response.status}: ${await response.text()}`,
-  );
+  if (response.status !== expectedStatus) {
+    const responseBody = await response.text();
+    assert.equal(
+      response.status,
+      expectedStatus,
+      `${init.method ?? "GET"} ${path} expected ${expectedStatus}, received ${response.status}: ${responseBody}`,
+    );
+  }
   const setCookie = response.headers.get("set-cookie");
   if (setCookie) cookie = setCookie.split(";", 1)[0] ?? "";
   if (response.status === 204) return undefined as T;
