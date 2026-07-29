@@ -240,6 +240,17 @@ export function App() {
   }, [refreshBilling]);
 
   useEffect(() => {
+    const allowedMethods =
+      billing?.paymentMethods.filter((method) => method.addFundsEnabled) ?? [];
+    if (
+      allowedMethods.length > 0 &&
+      !allowedMethods.some((method) => method.code === addFundsMethod)
+    ) {
+      setAddFundsMethod(allowedMethods[0]!.code);
+    }
+  }, [addFundsMethod, billing?.paymentMethods]);
+
+  useEffect(() => {
     if (
       !me?.eligible ||
       !billing?.addFunds.enabled ||
@@ -485,6 +496,13 @@ export function App() {
         `/api/v1/billing/add-funds/${created.commandId}`,
       );
       setAddFundsCommand(command);
+      if (
+        ["succeeded", "failed", "cancelled", "expired", "manual"].includes(
+          command.status,
+        )
+      ) {
+        await refreshBilling();
+      }
       setNotice(
         "Mock Add Funds started. Provider settlement is separate from usable Credit.",
       );

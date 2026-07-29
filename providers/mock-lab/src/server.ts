@@ -403,7 +403,10 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
         ? (BigInt(row.amount_minor) / 2n || 1n).toString()
         : row.amount_minor,
     currency: row.scenario === "wrong_currency" ? "EUR" : row.currency,
-    occurredAt: row.occurred_at.toISOString(),
+    occurredAt:
+      row.scenario === "late_success"
+        ? new Date(row.occurred_at.getTime() + 31 * 60 * 1_000).toISOString()
+        : row.occurred_at.toISOString(),
   };
 });
 

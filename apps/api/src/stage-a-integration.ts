@@ -2428,6 +2428,29 @@ for (const scenario of [
         ? /settlement occurred after the Add Funds attempt expired/
       : /does not match the Add Funds snapshot/,
   );
+  if (scenario === "late_success") {
+    const reconciledFactResponse: Response = await fetch(
+      new URL(`/v1/payments/${manual.providerOperationId}`, providerUrl),
+      {
+        headers: { Authorization: `Bearer ${paymentProviderToken}` },
+      },
+    );
+    assert.equal(reconciledFactResponse.status, 200);
+    const reconciledFact = (await reconciledFactResponse.json()) as {
+      occurredAt: string;
+    };
+    const callbackFact = await corePool.query<{ provider_occurred_at: Date }>(
+      `SELECT provider_occurred_at
+       FROM add_funds_attempts
+       WHERE id = $1`,
+      [manual.addFundsAttemptId],
+    );
+    assert.equal(
+      reconciledFact.occurredAt,
+      callbackFact.rows[0]?.provider_occurred_at.toISOString(),
+      "Mock Provider webhook and reconciliation must report the same occurrence time",
+    );
+  }
   if (scenario === "partial") partialManual = manual;
 }
 assert.ok(partialManual);
