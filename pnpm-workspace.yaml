@@ -13,7 +13,11 @@ saveExact: true
 strictPeerDependencies: true
 autoInstallPeers: false
 verifyStoreIntegrity: true
+verifyDepsBeforeRun: error
 sharedWorkspaceLockfile: true
 minimumReleaseAge: 1440
 trustLockfile: false
 blockExoticSubdeps: true
+allowBuilds:
+  "@node-rs/argon2": true
+  esbuild: true

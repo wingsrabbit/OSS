@@ -10,6 +10,7 @@ playwright-report/
 test-results/
 artifacts/
 *.log
+*.tsbuildinfo
 
 # Runtime configuration and secrets
 .env

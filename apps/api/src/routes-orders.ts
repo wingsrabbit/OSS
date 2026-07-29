@@ -1,0 +1,617 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import {
+  buildPriceSnapshot,
+  jsonMoney,
+  type BillingCycle,
+  type FulfillmentMode,
+  type PriceComponent,
+} from "@opensales/core";
+import type { FastifyInstance } from "fastify";
+import { z } from "zod";
+import { assertEligible, requireUser } from "./auth.js";
+import type { Config } from "./config.js";
+import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
+
+const checkoutSchema = z.object({
+  priceId: z.uuid(),
+  configuration: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({}),
+  termsVersion: z.string().min(1).max(64),
+  aupVersion: z.string().min(1).max(64),
+  idempotencyKey: z.string().min(8).max(128),
+});
+
+const paymentSchema = z.object({
+  scenario: z
+    .enum(["success", "failed", "cancelled", "timeout_success", "duplicate_out_of_order"])
+    .default("success"),
+  idempotencyKey: z.string().min(8).max(128),
+});
+
+function buildOptionComponents(
+  optionSchema: unknown,
+  configuration: Record<string, string | number | boolean>,
+): PriceComponent[] {
+  if (!Array.isArray(optionSchema)) {
+    if (Object.keys(configuration).length > 0) {
+      throw Object.assign(new Error("This product does not accept configuration options"), {
+        statusCode: 400,
+        code: "INVALID_CONFIGURATION",
+      });
+    }
+    return [];
+  }
+  const components: PriceComponent[] = [];
+  const acceptedKeys = new Set<string>();
+  for (const rawOption of optionSchema) {
+    if (typeof rawOption !== "object" || rawOption === null) {
+      throw new Error("Product option schema is invalid");
+    }
+    const option = rawOption as Record<string, unknown>;
+    if (typeof option.code !== "string" || option.code.length === 0) {
+      throw new Error("Product option schema has no code");
+    }
+    if (acceptedKeys.has(option.code)) throw new Error(`Product option schema repeats ${option.code}`);
+    acceptedKeys.add(option.code);
+    const configured = Object.prototype.hasOwnProperty.call(configuration, option.code);
+    if (option.required === true && !configured) {
+      throw Object.assign(new Error(`${option.code} is required`), {
+        statusCode: 400,
+        code: "INVALID_CONFIGURATION",
+      });
+    }
+    if (!configured) continue;
+
+    if (option.type === "quantity" && typeof option.recurringUnitMinor === "number") {
+      const rawQuantity = configuration[option.code];
+      const quantity =
+        typeof rawQuantity === "number"
+          ? rawQuantity
+          : typeof rawQuantity === "string" && /^-?\d+$/.test(rawQuantity)
+            ? Number(rawQuantity)
+            : Number.NaN;
+      const minimum = typeof option.min === "number" ? option.min : 1;
+      const maximum = typeof option.max === "number" ? option.max : Number.MAX_SAFE_INTEGER;
+      const step = typeof option.step === "number" ? option.step : 1;
+      if (
+        !Number.isSafeInteger(quantity) ||
+        !Number.isSafeInteger(minimum) ||
+        !Number.isSafeInteger(maximum) ||
+        !Number.isSafeInteger(step) ||
+        step <= 0 ||
+        quantity < minimum ||
+        quantity > maximum ||
+        (quantity - minimum) % step !== 0
+      ) {
+        throw Object.assign(new Error(`${option.code} is outside its allowed quantity range`), {
+          statusCode: 400,
+          code: "INVALID_CONFIGURATION",
+        });
+      }
+      components.push({
+        code: option.code,
+        label: option.code,
+        quantity,
+        oneTimeMinor: 0n,
+        recurringMinor: BigInt(option.recurringUnitMinor),
+      });
+      continue;
+    }
+
+    if (option.type === "text" || option.type === "password" || option.type === "textarea") {
+      const value = configuration[option.code];
+      const minimum = typeof option.minLength === "number" ? option.minLength : 0;
+      const maximum = typeof option.maxLength === "number" ? option.maxLength : 4096;
+      if (typeof value !== "string" || value.length < minimum || value.length > maximum) {
+        throw Object.assign(new Error(`${option.code} is not valid text`), {
+          statusCode: 400,
+          code: "INVALID_CONFIGURATION",
+        });
+      }
+      continue;
+    }
+
+    throw new Error(`Product option type ${String(option.type)} is not supported safely`);
+  }
+  for (const key of Object.keys(configuration)) {
+    if (!acceptedKeys.has(key)) {
+      throw Object.assign(new Error(`Unknown product option ${key}`), {
+        statusCode: 400,
+        code: "INVALID_CONFIGURATION",
+      });
+    }
+  }
+  return components;
+}
+
+function jsonPriceSnapshot(snapshot: ReturnType<typeof buildPriceSnapshot>) {
+  return {
+    ...snapshot,
+    oneTimeSubtotalMinor: jsonMoney(snapshot.oneTimeSubtotalMinor),
+    setupMinor: jsonMoney(snapshot.setupMinor),
+    recurringSubtotalMinor: jsonMoney(snapshot.recurringSubtotalMinor),
+    invoiceTotalMinor: jsonMoney(snapshot.invoiceTotalMinor),
+    components: snapshot.components.map((component) => ({
+      ...component,
+      oneTimeMinor: jsonMoney(component.oneTimeMinor),
+      recurringMinor: jsonMoney(component.recurringMinor),
+    })),
+  };
+}
+
+async function assertEligibilityLocked(
+  client: DatabaseClient,
+  userId: string,
+  clientAccountId: string,
+): Promise<void> {
+  const result = await client.query<{
+    email_verified_at: Date | null;
+    user_restricted_at: Date | null;
+    account_restricted_at: Date | null;
+    removed_at: Date | null;
+  }>(
+    `SELECT
+       u.email_verified_at,
+       u.restricted_at AS user_restricted_at,
+       ca.restricted_at AS account_restricted_at,
+       cm.removed_at
+     FROM users u
+     JOIN client_memberships cm ON cm.user_id = u.id AND cm.client_account_id = $2
+     JOIN client_accounts ca ON ca.id = cm.client_account_id
+     WHERE u.id = $1
+     FOR UPDATE OF u, cm, ca`,
+    [userId, clientAccountId],
+  );
+  const state = result.rows[0];
+  if (
+    !state?.email_verified_at ||
+    state.user_restricted_at ||
+    state.account_restricted_at ||
+    state.removed_at
+  ) {
+    throw Object.assign(new Error("Account is not eligible for this operation"), {
+      statusCode: 403,
+      code: "ACCOUNT_NOT_ELIGIBLE",
+    });
+  }
+}
+
+export async function registerOrderRoutes(
+  app: FastifyInstance,
+  pool: DatabasePool,
+  config: Config,
+): Promise<void> {
+  app.post("/api/v1/orders", async (request, reply) => {
+    const user = await requireUser(request, pool, config);
+    assertEligible(user);
+    const body = checkoutSchema.parse(request.body);
+    const fingerprint = requestFingerprint("orders.create:v1", {
+      priceId: body.priceId,
+      configuration: body.configuration,
+      termsVersion: body.termsVersion,
+      aupVersion: body.aupVersion,
+    });
+
+    const created = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `order:${user.clientAccountId}:${body.idempotencyKey}`,
+      ]);
+      const existing = await client.query<{
+        id: string;
+        request_fingerprint: string;
+      }>(
+        `SELECT id, request_fingerprint
+         FROM orders
+         WHERE client_account_id = $1 AND idempotency_key = $2
+         FOR UPDATE`,
+        [user.clientAccountId, body.idempotencyKey],
+      );
+      const previous = existing.rows[0];
+      if (previous) {
+        if (previous.request_fingerprint !== fingerprint) {
+          throw Object.assign(new Error("The idempotency key was used for a different order"), {
+            statusCode: 409,
+            code: "IDEMPOTENCY_CONFLICT",
+          });
+        }
+        return { orderId: previous.id, replayed: true };
+      }
+
+      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
+      const priceResult = await client.query<{
+        id: string;
+        product_id: string;
+        revision: number;
+        currency: string;
+        billing_cycle: BillingCycle;
+        one_time_minor: string;
+        setup_minor: string;
+        recurring_minor: string;
+        fulfillment_mode: FulfillmentMode;
+        names: Record<string, string>;
+        option_schema: unknown;
+        active: boolean;
+        hidden: boolean;
+      }>(
+        `SELECT
+           pp.id, pp.product_id, pp.revision, pp.currency, pp.billing_cycle,
+           pp.one_time_minor, pp.setup_minor, pp.recurring_minor,
+           p.fulfillment_mode, p.names, p.option_schema, p.active, p.hidden
+         FROM product_prices pp
+         JOIN products p ON p.id = pp.product_id
+         WHERE pp.id = $1
+           AND pp.active
+           AND pp.valid_from <= now()
+           AND (pp.valid_until IS NULL OR pp.valid_until > now())
+         FOR SHARE OF pp, p`,
+        [body.priceId],
+      );
+      const price = priceResult.rows[0];
+      if (!price || !price.active || price.hidden) {
+        throw Object.assign(new Error("Product is not available"), { statusCode: 409 });
+      }
+      if (price.fulfillment_mode === "quote") {
+        throw Object.assign(new Error("This product requires a confirmed quote before ordering"), {
+          statusCode: 409,
+          code: "QUOTE_REQUIRED",
+        });
+      }
+
+      const productName = price.names[user.locale] ?? price.names.en ?? price.product_id;
+      const snapshot = buildPriceSnapshot({
+        productId: price.product_id,
+        productName,
+        currency: price.currency,
+        billingCycle: price.billing_cycle,
+        fulfillmentMode: price.fulfillment_mode,
+        baseOneTimeMinor: BigInt(price.one_time_minor),
+        setupMinor: BigInt(price.setup_minor),
+        baseRecurringMinor: BigInt(price.recurring_minor),
+        optionComponents: buildOptionComponents(price.option_schema, body.configuration),
+      });
+      const serializedSnapshot = jsonPriceSnapshot(snapshot);
+
+      const legalResult = await client.query<{ id: string; kind: "terms" | "aup" }>(
+        `SELECT id, kind
+         FROM legal_documents
+         WHERE locale = $1
+           AND ((kind = 'terms' AND version = $2) OR (kind = 'aup' AND version = $3))
+         ORDER BY kind`,
+        [user.locale, body.termsVersion, body.aupVersion],
+      );
+      if (
+        legalResult.rows.length !== 2 ||
+        !legalResult.rows.some((document) => document.kind === "terms") ||
+        !legalResult.rows.some((document) => document.kind === "aup")
+      ) {
+        throw Object.assign(new Error("The selected legal document version is not available"), {
+          statusCode: 409,
+        });
+      }
+
+      const orderResult = await client.query<{ id: string }>(
+        `INSERT INTO orders(
+           client_account_id, submitted_by_user_id, status, currency, price_snapshot,
+           one_time_minor, setup_minor, recurring_minor, total_minor, idempotency_key,
+           request_fingerprint
+         ) VALUES ($1, $2, 'waiting_payment', $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id`,
+        [
+          user.clientAccountId,
+          user.userId,
+          snapshot.currency,
+          serializedSnapshot,
+          snapshot.oneTimeSubtotalMinor.toString(),
+          snapshot.setupMinor.toString(),
+          snapshot.recurringSubtotalMinor.toString(),
+          snapshot.invoiceTotalMinor.toString(),
+          body.idempotencyKey,
+          fingerprint,
+        ],
+      );
+      const orderId = orderResult.rows[0]?.id;
+      if (!orderId) throw new Error("Unable to create order");
+
+      for (const legalDocument of legalResult.rows) {
+        await client.query(
+          `INSERT INTO legal_acceptances(client_account_id, user_id, document_id)
+           VALUES ($1, $2, $3)`,
+          [user.clientAccountId, user.userId, legalDocument.id],
+        );
+      }
+
+      const orderItemResult = await client.query<{ id: string }>(
+        `INSERT INTO order_items(
+           order_id, product_id, product_name, fulfillment_mode, billing_cycle,
+           configuration, price_snapshot
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id`,
+        [
+          orderId,
+          snapshot.productId,
+          snapshot.productName,
+          snapshot.fulfillmentMode,
+          snapshot.billingCycle,
+          body.configuration,
+          serializedSnapshot,
+        ],
+      );
+      const orderItemId = orderItemResult.rows[0]?.id;
+      if (!orderItemId) throw new Error("Unable to create order item");
+
+      const invoiceResult = await client.query<{ id: string }>(
+        `INSERT INTO invoices(client_account_id, order_id, currency, total_minor, due_at)
+         VALUES ($1, $2, $3, $4, now() + interval '7 days')
+         RETURNING id`,
+        [
+          user.clientAccountId,
+          orderId,
+          snapshot.currency,
+          snapshot.invoiceTotalMinor.toString(),
+        ],
+      );
+      const invoiceId = invoiceResult.rows[0]?.id;
+      if (!invoiceId) throw new Error("Unable to create invoice");
+
+      const journalResult = await client.query<{ id: string }>(
+        `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+         VALUES ('invoice_issuance', $1, $2, 'Invoice issued')
+         RETURNING id`,
+        [invoiceId, snapshot.currency],
+      );
+      const invoiceJournalId = journalResult.rows[0]?.id;
+      if (!invoiceJournalId) throw new Error("Unable to create invoice journal");
+      if (snapshot.invoiceTotalMinor > 0n) {
+        await client.query(
+          `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+           VALUES
+             ($1, 'accounts_receivable', $2, 0),
+             ($1, 'deferred_service_revenue', 0, $2)`,
+          [invoiceJournalId, snapshot.invoiceTotalMinor.toString()],
+        );
+      }
+
+      const invoiceLines = [
+        ["one_time", `${snapshot.productName} one-time`, snapshot.oneTimeSubtotalMinor],
+        ["setup", `${snapshot.productName} setup`, snapshot.setupMinor],
+        ["recurring", `${snapshot.productName} ${snapshot.billingCycle}`, snapshot.recurringSubtotalMinor],
+      ] as const;
+      for (const [kind, description, amount] of invoiceLines) {
+        if (amount > 0n) {
+          await client.query(
+            `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+             VALUES ($1, $2, $3, $4)`,
+            [invoiceId, kind, description, amount.toString()],
+          );
+        }
+      }
+
+      const serviceResult = await client.query<{ id: string }>(
+        `INSERT INTO services(client_account_id, order_item_id, status, billing_cycle)
+         VALUES ($1, $2, 'pending', $3)
+         RETURNING id`,
+        [user.clientAccountId, orderItemId, snapshot.billingCycle],
+      );
+      const serviceId = serviceResult.rows[0]?.id;
+      if (!serviceId) throw new Error("Unable to create service");
+
+      await client.query(
+        `INSERT INTO outbox(event_type, unique_key, payload)
+         VALUES ('order.submitted', $1, $2)`,
+        [`order:${orderId}`, { orderId, invoiceId, clientAccountId: user.clientAccountId }],
+      );
+      return { orderId, invoiceId, serviceId, replayed: false };
+    });
+
+    return reply.code(created.replayed ? 200 : 201).send(created);
+  });
+
+  app.get("/api/v1/orders/:orderId", async (request, reply) => {
+    const user = await requireUser(request, pool, config);
+    const params = z.object({ orderId: z.uuid() }).parse(request.params);
+    const result = await pool.query<{
+      order_id: string;
+      order_status: string;
+      currency: string;
+      price_snapshot: unknown;
+      total_minor: string;
+      invoice_id: string;
+      invoice_total_minor: string;
+      allocated_minor: string;
+      service_id: string;
+      service_status: string;
+      activated_at: Date | null;
+      term_start: Date | null;
+      term_end: Date | null;
+      payment_status: string | null;
+      provider_operation_status: string | null;
+    }>(
+      `SELECT
+         o.id AS order_id,
+         o.status AS order_status,
+         o.currency,
+         o.price_snapshot,
+         o.total_minor,
+         i.id AS invoice_id,
+         i.total_minor AS invoice_total_minor,
+         COALESCE(alloc.allocated_minor, 0)::text AS allocated_minor,
+         s.id AS service_id,
+         s.status AS service_status,
+         s.activated_at,
+         s.term_start,
+         s.term_end,
+         pay.status AS payment_status,
+         provision.status AS provider_operation_status
+       FROM orders o
+       JOIN invoices i ON i.order_id = o.id
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN services s ON s.order_item_id = oi.id
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(sum(pa.amount_minor), 0) AS allocated_minor
+         FROM payment_allocations pa
+         WHERE pa.invoice_id = i.id
+       ) alloc ON true
+       LEFT JOIN LATERAL (
+         SELECT status
+         FROM payment_attempts pa
+         WHERE pa.invoice_id = i.id
+         ORDER BY pa.created_at DESC
+         LIMIT 1
+       ) pay ON true
+       LEFT JOIN LATERAL (
+         SELECT status
+         FROM provider_operations po
+         WHERE po.subject_type = 'service' AND po.subject_id = s.id
+         ORDER BY po.created_at DESC
+         LIMIT 1
+       ) provision ON true
+       WHERE o.id = $1 AND o.client_account_id = $2`,
+      [params.orderId, user.clientAccountId],
+    );
+    const row = result.rows[0];
+    if (!row) return reply.code(404).send({ error: "Order not found" });
+    const total = BigInt(row.invoice_total_minor);
+    const allocated = BigInt(row.allocated_minor);
+    return {
+      order: { id: row.order_id, status: row.order_status, price: row.price_snapshot },
+      invoice: {
+        id: row.invoice_id,
+        currency: row.currency,
+        totalMinor: total.toString(),
+        allocatedMinor: allocated.toString(),
+        dueMinor: (total - allocated).toString(),
+        status: allocated === 0n ? "open" : allocated < total ? "partially_paid" : "paid",
+      },
+      payment: { status: row.payment_status },
+      provisioning: { status: row.provider_operation_status },
+      service: {
+        id: row.service_id,
+        status: row.service_status,
+        activatedAt: row.activated_at?.toISOString() ?? null,
+        termStart: row.term_start?.toISOString() ?? null,
+        termEnd: row.term_end?.toISOString() ?? null,
+      },
+    };
+  });
+
+  app.post("/api/v1/invoices/:invoiceId/payments", async (request, reply) => {
+    const user = await requireUser(request, pool, config);
+    assertEligible(user);
+    const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
+    const body = paymentSchema.parse(request.body);
+    const fingerprint = requestFingerprint("payments.create:v1", {
+      invoiceId: params.invoiceId,
+      scenario: body.scenario,
+    });
+
+    const result = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `payment:${user.clientAccountId}:${body.idempotencyKey}`,
+      ]);
+      const idempotentAttempt = await client.query<{
+        id: string;
+        invoice_id: string;
+        status: string;
+        request_fingerprint: string;
+      }>(
+        `SELECT id, invoice_id, status, request_fingerprint
+         FROM payment_attempts
+         WHERE client_account_id = $1 AND idempotency_key = $2
+         FOR UPDATE`,
+        [user.clientAccountId, body.idempotencyKey],
+      );
+      const previous = idempotentAttempt.rows[0];
+      if (previous) {
+        if (
+          previous.invoice_id !== params.invoiceId ||
+          previous.request_fingerprint !== fingerprint
+        ) {
+          throw Object.assign(new Error("The idempotency key was used for a different payment"), {
+            statusCode: 409,
+            code: "IDEMPOTENCY_CONFLICT",
+          });
+        }
+        return { paymentAttemptId: previous.id, status: previous.status, replayed: true };
+      }
+
+      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
+      const invoiceResult = await client.query<{ total_minor: string }>(
+        `SELECT total_minor
+         FROM invoices
+         WHERE id = $1 AND client_account_id = $2
+         FOR UPDATE`,
+        [params.invoiceId, user.clientAccountId],
+      );
+      const invoice = invoiceResult.rows[0];
+      if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
+      const allocationResult = await client.query<{ allocated_minor: string }>(
+        `SELECT COALESCE(sum(amount_minor), 0)::text AS allocated_minor
+         FROM payment_allocations
+         WHERE invoice_id = $1`,
+        [params.invoiceId],
+      );
+      const dueMinor =
+        BigInt(invoice.total_minor) - BigInt(allocationResult.rows[0]?.allocated_minor ?? "0");
+      if (dueMinor <= 0n) {
+        throw Object.assign(new Error("Invoice is already paid"), { statusCode: 409 });
+      }
+      const activeAttempt = await client.query<{ id: string; status: string; idempotency_key: string }>(
+        `SELECT id, status, idempotency_key
+         FROM payment_attempts
+         WHERE invoice_id = $1 AND status IN ('created', 'processing', 'unknown')
+         ORDER BY created_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [params.invoiceId],
+      );
+      const existingActive = activeAttempt.rows[0];
+      if (existingActive) {
+        throw Object.assign(new Error("A payment result is still being confirmed"), {
+          statusCode: 409,
+          code: "PAYMENT_RESULT_UNKNOWN",
+        });
+      }
+
+      const paymentResult = await client.query<{ id: string }>(
+         `INSERT INTO payment_attempts(
+           client_account_id, invoice_id, provider_installation_id, status,
+           amount_minor, currency, scenario, idempotency_key, request_fingerprint
+         ) VALUES ($1, $2, 'mock-payment-v1', 'created', $3, 'USD', $4, $5, $6)
+         RETURNING id`,
+        [
+          user.clientAccountId,
+          params.invoiceId,
+          dueMinor.toString(),
+          body.scenario,
+          body.idempotencyKey,
+          fingerprint,
+        ],
+      );
+      const paymentAttemptId = paymentResult.rows[0]?.id;
+      if (!paymentAttemptId) throw new Error("Unable to create payment attempt");
+      const operationResult = await client.query<{ id: string }>(
+        `INSERT INTO provider_operations(
+           provider_installation_id, kind, subject_type, subject_id, stable_key, status
+         ) VALUES ('mock-payment-v1', 'payment_create', 'payment', $1, $2, 'queued')
+         ON CONFLICT (provider_installation_id, kind, stable_key) DO UPDATE
+           SET updated_at = provider_operations.updated_at
+         RETURNING id`,
+        [paymentAttemptId, `payment:${paymentAttemptId}`],
+      );
+      const operationId = operationResult.rows[0]?.id;
+      if (!operationId) throw new Error("Unable to create provider operation");
+      await client.query(
+        `INSERT INTO durable_jobs(job_type, unique_key, payload)
+         VALUES ('payment.start', $1, $2)
+         ON CONFLICT (job_type, unique_key) DO NOTHING`,
+        [
+          `payment:${paymentAttemptId}`,
+          { paymentAttemptId, providerOperationId: operationId },
+        ],
+      );
+      return { paymentAttemptId, status: "created", replayed: false };
+    });
+    return reply.code(result.replayed ? 200 : 202).send(result);
+  });
+}

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+:8082 {
+	@mailbox {
+		method POST
+		path /v1/mailbox/query
+	}
+	handle @mailbox {
+		reverse_proxy provider-mailbox:4000
+	}
+
+	handle {
+		respond 404
+	}
+}
