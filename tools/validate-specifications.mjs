@@ -2568,7 +2568,7 @@ function validateGitHubPolicy(root) {
     workflowFiles.some((file) => !reviewedWorkflows.has(resolve(file)))
   ) {
     issues.push(
-      ".github/workflows: bootstrap phase permits only bootstrap-policy.yml",
+      ".github/workflows: only reviewed bootstrap-policy.yml and product-ci.yml are permitted",
     );
   }
   if (actionFiles.length > 0) {
