@@ -1627,8 +1627,15 @@ async function manualProvisionReconcile(
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
-    const result = await client.query<{ order_id: string }>(
-      `SELECT customer_order.id AS order_id
+    const result = await client.query<{
+      order_id: string;
+      service_status: string;
+      operation_status: string;
+    }>(
+      `SELECT
+         customer_order.id AS order_id,
+         service.status AS service_status,
+         operation.status AS operation_status
        FROM services service
        JOIN order_items item ON item.id = service.order_item_id
        JOIN orders customer_order ON customer_order.id = item.order_id
@@ -1640,8 +1647,8 @@ async function manualProvisionReconcile(
        FOR UPDATE OF service, customer_order, operation`,
       [serviceId, operationId],
     );
-    const orderId = result.rows[0]?.order_id;
-    if (!orderId) {
+    const current = result.rows[0];
+    if (!current) {
       await manualJobWithClient(
         client,
         job.id,
@@ -1649,6 +1656,16 @@ async function manualProvisionReconcile(
       );
       return;
     }
+    if (
+      current.operation_status === "succeeded" ||
+      current.operation_status === "failed" ||
+      current.service_status === "active" ||
+      current.service_status === "terminated"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return;
+    }
+    const orderId = current.order_id;
     await client.query(
       `UPDATE provider_operations
        SET status = 'unknown', last_error = $2, updated_at = now()
