@@ -30,7 +30,17 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
     await page.waitForTimeout(250);
   }
   await expect(verificationLink).toBeVisible();
+  const verificationResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/api/v1/auth/verify-email") &&
+      response.request().method() === "POST",
+  );
   await verificationLink.click();
+  const verificationResponse = await verificationResponsePromise;
+  expect(
+    verificationResponse.status(),
+    `Verification API response: ${await verificationResponse.text()}`,
+  ).toBe(200);
   await expect(page.getByText(/Email verification: verified/)).toBeVisible();
   await expect(page.getByText(/Email verified — account is eligible/)).toBeVisible();
 
