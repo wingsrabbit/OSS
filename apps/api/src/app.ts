@@ -8,6 +8,7 @@ import Fastify from "fastify";
 import { ZodError } from "zod";
 import type { Config } from "./config.js";
 import { createPool, type DatabasePool } from "./database.js";
+import { registerAddFundsRoutes } from "./routes-add-funds.js";
 import { registerAuthRoutes } from "./routes-auth.js";
 import { registerAdminRoutes } from "./routes-admin.js";
 import { registerCatalogRoutes } from "./routes-catalog.js";
@@ -120,6 +121,7 @@ export async function buildApp(
   await registerAuthRoutes(app, pool, config);
   await registerAdminRoutes(app, pool, config);
   await registerBillingRoutes(app, pool, config);
+  await registerAddFundsRoutes(app, pool, config);
   await registerCatalogRoutes(app, pool);
   await registerOrderRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);

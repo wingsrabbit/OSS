@@ -27,12 +27,25 @@ export async function registerBillingRoutes(
       code: string;
       display_name: Record<string, string>;
       fee_basis_points: number;
+      add_funds_enabled: boolean;
     }>(
-      `SELECT code, display_name, fee_basis_points
+      `SELECT code, display_name, fee_basis_points, add_funds_enabled
        FROM payment_methods
        WHERE enabled
-       ORDER BY code`,
+      ORDER BY code`,
     );
+    const addFundsPolicy = await pool.query<{
+      enabled: boolean;
+      min_principal_minor: string;
+      max_principal_minor: string;
+      balance_cap_minor: string;
+    }>(
+      `SELECT enabled, min_principal_minor::text, max_principal_minor::text,
+              balance_cap_minor::text
+       FROM add_funds_policies
+       WHERE currency = 'USD'`,
+    );
+    const policy = addFundsPolicy.rows[0];
     return {
       warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
       currency: "USD",
@@ -41,7 +54,23 @@ export async function registerBillingRoutes(
         code: method.code,
         name: method.display_name[user.locale] ?? method.display_name.en ?? method.code,
         feeBasisPoints: method.fee_basis_points,
+        addFundsEnabled: method.add_funds_enabled,
       })),
+      addFunds: policy
+        ? {
+            enabled: policy.enabled,
+            minimumMinor: policy.min_principal_minor,
+            maximumMinor: policy.max_principal_minor,
+            balanceCapMinor: policy.balance_cap_minor,
+            allowed: user.membershipRole === "owner" || user.membershipRole === "billing",
+          }
+        : {
+            enabled: false,
+            minimumMinor: "0",
+            maximumMinor: "0",
+            balanceCapMinor: "0",
+            allowed: false,
+          },
     };
   });
 

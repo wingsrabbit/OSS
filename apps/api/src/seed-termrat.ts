@@ -169,16 +169,30 @@ await transaction(pool, async (client) => {
 
   await client.query(
     `INSERT INTO payment_methods(
-       code, display_name, provider_installation_id, fee_basis_points, enabled
+       code, display_name, provider_installation_id, fee_basis_points, enabled,
+       add_funds_enabled
      ) VALUES
-       ('card', '{"en":"Card (Mock)","zh-CN":"银行卡（Mock）"}', 'mock-payment-v1', 350, true),
-       ('alipay', '{"en":"Alipay (Mock)","zh-CN":"支付宝（Mock）"}', 'mock-payment-v1', 350, true),
-       ('usdt', '{"en":"USDT-style asset (Mock)","zh-CN":"USDT 风格资产（Mock）"}', 'mock-payment-v1', 0, true)
+       ('card', '{"en":"Card (Mock)","zh-CN":"银行卡（Mock）"}', 'mock-payment-v1', 350, true, true),
+       ('alipay', '{"en":"Alipay (Mock)","zh-CN":"支付宝（Mock）"}', 'mock-payment-v1', 350, true, true),
+       ('usdt', '{"en":"USDT-style asset (Mock)","zh-CN":"USDT 风格资产（Mock）"}', 'mock-payment-v1', 0, true, true)
      ON CONFLICT (code) DO UPDATE SET
        display_name = EXCLUDED.display_name,
        provider_installation_id = EXCLUDED.provider_installation_id,
        fee_basis_points = EXCLUDED.fee_basis_points,
        enabled = EXCLUDED.enabled,
+       add_funds_enabled = EXCLUDED.add_funds_enabled,
+       updated_at = now()`,
+  );
+
+  await client.query(
+    `INSERT INTO add_funds_policies(
+       currency, enabled, min_principal_minor, max_principal_minor, balance_cap_minor
+     ) VALUES ('USD', true, 5000, 500000, 1000000)
+     ON CONFLICT (currency) DO UPDATE SET
+       enabled = EXCLUDED.enabled,
+       min_principal_minor = EXCLUDED.min_principal_minor,
+       max_principal_minor = EXCLUDED.max_principal_minor,
+       balance_cap_minor = EXCLUDED.balance_cap_minor,
        updated_at = now()`,
   );
 

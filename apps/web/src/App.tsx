@@ -79,7 +79,19 @@ type ManualItem = {
 type BillingSummary = {
   currency: string;
   creditBalanceMinor: string;
-  paymentMethods: Array<{ code: string; name: string; feeBasisPoints: number }>;
+  paymentMethods: Array<{
+    code: string;
+    name: string;
+    feeBasisPoints: number;
+    addFundsEnabled: boolean;
+  }>;
+  addFunds: {
+    enabled: boolean;
+    allowed: boolean;
+    minimumMinor: string;
+    maximumMinor: string;
+    balanceCapMinor: string;
+  };
 };
 type PaymentQuote = {
   quoteId: string;
@@ -89,6 +101,29 @@ type PaymentQuote = {
   feeMinor: string;
   externalDueMinor: string;
   expiresAt: string;
+};
+type AddFundsQuote = {
+  quoteId: string;
+  currency: string;
+  paymentMethod: string;
+  principalMinor: string;
+  feeBasisPoints: number;
+  feeMinor: string;
+  externalDueMinor: string;
+  creditBalanceMinor: string;
+  pendingPrincipalMinor: string;
+  balanceCapMinor: string;
+  expiresAt: string;
+};
+type AddFundsCommand = {
+  commandId: string;
+  status: string;
+  attemptStatus: string;
+  providerOperationStatus: string | null;
+  principalMinor: string;
+  feeMinor: string;
+  externalDueMinor: string;
+  result: Record<string, unknown> | null;
 };
 
 const words = {
@@ -157,6 +192,11 @@ export function App() {
   const [applyCredit, setApplyCredit] = useState(true);
   const [billing, setBilling] = useState<BillingSummary | null>(null);
   const [paymentQuote, setPaymentQuote] = useState<PaymentQuote | null>(null);
+  const [addFundsPrincipalMinor, setAddFundsPrincipalMinor] = useState("5000");
+  const [addFundsMethod, setAddFundsMethod] = useState("card");
+  const [addFundsScenario, setAddFundsScenario] = useState("success");
+  const [addFundsQuote, setAddFundsQuote] = useState<AddFundsQuote | null>(null);
+  const [addFundsCommand, setAddFundsCommand] = useState<AddFundsCommand | null>(null);
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
@@ -198,6 +238,89 @@ export function App() {
   useEffect(() => {
     void refreshBilling().catch(() => undefined);
   }, [refreshBilling]);
+
+  useEffect(() => {
+    const allowedMethods =
+      billing?.paymentMethods.filter((method) => method.addFundsEnabled) ?? [];
+    if (
+      allowedMethods.length > 0 &&
+      !allowedMethods.some((method) => method.code === addFundsMethod)
+    ) {
+      setAddFundsMethod(allowedMethods[0]!.code);
+    }
+  }, [addFundsMethod, billing?.paymentMethods]);
+
+  useEffect(() => {
+    if (
+      !me?.eligible ||
+      !billing?.addFunds.enabled ||
+      !billing.addFunds.allowed ||
+      !/^[1-9]\d*$/.test(addFundsPrincipalMinor)
+    ) {
+      setAddFundsQuote(null);
+      return;
+    }
+    const principal = BigInt(addFundsPrincipalMinor);
+    if (
+      principal < BigInt(billing.addFunds.minimumMinor) ||
+      principal > BigInt(billing.addFunds.maximumMinor)
+    ) {
+      setAddFundsQuote(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void api<AddFundsQuote>("/api/v1/billing/add-funds/quotes", {
+        method: "POST",
+        body: JSON.stringify({
+          principalMinor: addFundsPrincipalMinor,
+          paymentMethod: addFundsMethod,
+        }),
+      })
+        .then(setAddFundsQuote)
+        .catch((caught: unknown) => {
+          setAddFundsQuote(null);
+          setError(caught instanceof Error ? caught.message : "Add Funds quote is unavailable");
+        });
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [
+    addFundsMethod,
+    addFundsPrincipalMinor,
+    billing?.addFunds.allowed,
+    billing?.addFunds.enabled,
+    billing?.addFunds.maximumMinor,
+    billing?.addFunds.minimumMinor,
+    billing?.creditBalanceMinor,
+    me?.eligible,
+  ]);
+
+  useEffect(() => {
+    if (
+      !addFundsCommand ||
+      ["succeeded", "failed", "cancelled", "expired", "manual"].includes(
+        addFundsCommand.status,
+      )
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void api<AddFundsCommand>(
+        `/api/v1/billing/add-funds/${addFundsCommand.commandId}`,
+      )
+        .then(async (command) => {
+          setAddFundsCommand(command);
+          if (
+            ["succeeded", "failed", "cancelled", "expired", "manual"].includes(
+              command.status,
+            )
+          ) {
+            await refreshBilling();
+          }
+        })
+        .catch(() => undefined);
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [addFundsCommand, refreshBilling]);
 
   useEffect(() => {
     if (!order || order.invoice.status === "paid" || !me?.eligible) {
@@ -352,6 +475,39 @@ export function App() {
       await refreshBilling();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Payment could not start");
+    }
+  }
+
+  async function startAddFunds() {
+    if (!addFundsQuote) return;
+    setError("");
+    try {
+      const created = await api<{
+        commandId: string;
+      }>("/api/v1/billing/add-funds", {
+        method: "POST",
+        body: JSON.stringify({
+          quoteId: addFundsQuote.quoteId,
+          scenario: addFundsScenario,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      });
+      const command = await api<AddFundsCommand>(
+        `/api/v1/billing/add-funds/${created.commandId}`,
+      );
+      setAddFundsCommand(command);
+      if (
+        ["succeeded", "failed", "cancelled", "expired", "manual"].includes(
+          command.status,
+        )
+      ) {
+        await refreshBilling();
+      }
+      setNotice(
+        "Mock Add Funds started. Provider settlement is separate from usable Credit.",
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Add Funds could not start");
     }
   }
 
@@ -523,6 +679,122 @@ export function App() {
             )}
           </div>
         </section>
+
+        {me?.eligible && billing?.addFunds.enabled && (
+          <section className="order-panel" aria-label="Add Funds">
+            <div>
+              <p className="eyebrow">Customer billing · Mock Add Funds</p>
+              <h2>Add usable Credit after verified settlement</h2>
+              <p>
+                Current Credit <strong>{usd(billing.creditBalanceMinor)}</strong> · configured cap{" "}
+                <strong>{usd(billing.addFunds.balanceCapMinor)}</strong>. Funds that arrive late,
+                partially or with different facts require staff review and are not spendable.
+              </p>
+            </div>
+            {billing.addFunds.allowed ? (
+              <div className="payment-controls">
+                <label>
+                  Principal amount
+                  <input
+                    aria-label="Add Funds principal in cents"
+                    inputMode="numeric"
+                    value={addFundsPrincipalMinor}
+                    onChange={(event) => setAddFundsPrincipalMinor(event.target.value)}
+                  />
+                </label>
+                <select
+                  aria-label="Add Funds payment method"
+                  value={addFundsMethod}
+                  onChange={(event) => setAddFundsMethod(event.target.value)}
+                >
+                  {billing.paymentMethods
+                    .filter((method) => method.addFundsEnabled)
+                    .map((method) => (
+                      <option key={method.code} value={method.code}>
+                        {method.name} · {(method.feeBasisPoints / 100).toFixed(2)}%
+                      </option>
+                    ))}
+                </select>
+                <select
+                  aria-label="Add Funds Provider scenario"
+                  value={addFundsScenario}
+                  onChange={(event) => setAddFundsScenario(event.target.value)}
+                >
+                  <option value="success">Success</option>
+                  <option value="failed">Failure</option>
+                  <option value="cancelled">Cancelled</option>
+                  <option value="timeout_success">Timeout but actually settled</option>
+                  <option value="duplicate_out_of_order">Duplicate + out of order</option>
+                  <option value="partial">Partial arrival — manual review</option>
+                  <option value="partial_then_reject">
+                    Partial callback then rejected response — manual review
+                  </option>
+                  <option value="partial_then_timeout">
+                    Partial callback then timeout — manual review
+                  </option>
+                  <option value="wrong_currency">Wrong currency — manual review</option>
+                  <option value="expired_late">Late after expiry — manual review</option>
+                  <option value="late_success">Success occurred after expiry — manual review</option>
+                </select>
+                {addFundsQuote ? (
+                  <div className="quote-summary" data-testid="add-funds-quote">
+                    <span>Principal added to Credit: {usd(addFundsQuote.principalMinor)}</span>
+                    <span>Payment fee: {usd(addFundsQuote.feeMinor)}</span>
+                    <strong>External amount due: {usd(addFundsQuote.externalDueMinor)}</strong>
+                    <span>Quote expires {new Date(addFundsQuote.expiresAt).toLocaleTimeString()}</span>
+                  </div>
+                ) : (
+                  <p className="muted">
+                    Enter {usd(billing.addFunds.minimumMinor)} to{" "}
+                    {usd(billing.addFunds.maximumMinor)} without exceeding the balance cap.
+                  </p>
+                )}
+                <button
+                  className="primary"
+                  disabled={!addFundsQuote}
+                  onClick={startAddFunds}
+                >
+                  Start Mock Add Funds
+                </button>
+                {addFundsCommand && (
+                  <div data-testid="add-funds-status">
+                    <div className="journey">
+                      <Status label="Add Funds" value={addFundsCommand.status} />
+                      <Status label="Payment" value={addFundsCommand.attemptStatus} />
+                      <Status
+                        label="Provider"
+                        value={addFundsCommand.providerOperationStatus ?? "queued"}
+                      />
+                      <Status
+                        label="Credit result"
+                        value={
+                          addFundsCommand.status === "succeeded"
+                            ? `credited ${usd(addFundsCommand.principalMinor)}`
+                            : addFundsCommand.status === "manual"
+                              ? "needs review"
+                              : "not credited"
+                        }
+                      />
+                    </div>
+                    {addFundsCommand.status === "manual" && (
+                      <p className="notice error">
+                        Funds received but not credited. Staff review is required.
+                        {typeof addFundsCommand.result?.reason === "string"
+                          ? ` ${addFundsCommand.result.reason}`
+                          : ""}
+                        {typeof addFundsCommand.result?.receiptId === "string"
+                          ? ` Receipt ${addFundsCommand.result.receiptId}`
+                          : ""}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p>Billing or Owner permission is required to add funds.</p>
+            )}
+          </section>
+        )}
 
         {me?.eligible && !me.staff && (
           <section className="bootstrap-panel">
@@ -810,7 +1082,7 @@ export function App() {
 
 function Status({ label, value }: { label: string; value: string }) {
   return (
-    <div>
+    <div data-testid={`status-${label.toLowerCase().replaceAll(" ", "-")}`}>
       <span>{label}</span>
       <strong>{value.replaceAll("_", " ")}</strong>
     </div>

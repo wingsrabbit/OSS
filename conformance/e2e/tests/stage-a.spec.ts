@@ -50,15 +50,15 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
   await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
 
-  const journey = page.locator(".order-panel");
+  const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await expect(journey.getByText("waiting payment", { exact: true })).toBeVisible();
   await expect(journey.getByText("pending", { exact: true })).toBeVisible();
   await expect(journey.getByText("Payment fee: $0.18", { exact: true })).toBeVisible();
   await expect(journey.getByText("External amount due: $5.18", { exact: true })).toBeVisible();
-  await journey.getByLabel("Payment method").selectOption("usdt");
+  await journey.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await expect(journey.getByText("Payment fee: $0.00", { exact: true })).toBeVisible();
   await expect(journey.getByText("External amount due: $5.00", { exact: true })).toBeVisible();
-  await journey.getByLabel("Payment method").selectOption("card");
+  await journey.getByLabel("Payment method", { exact: true }).selectOption("card");
   await expect(journey.getByText("Payment fee: $0.18", { exact: true })).toBeVisible();
   await journey.getByRole("button", { name: "Start mock payment" }).click();
 
@@ -67,4 +67,21 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(journey.getByText("active", { exact: true })).toBeVisible({ timeout: 30_000 });
   await expect(journey.getByText(/Ready for service:/)).toBeVisible();
   await expect(journey.getByText(/Service term:/)).toBeVisible();
+
+  const addFunds = page.locator('section[aria-label="Add Funds"]');
+  await expect(addFunds.getByRole("heading", { name: "Add usable Credit after verified settlement" }))
+    .toBeVisible();
+  await addFunds.getByLabel("Add Funds principal in cents").fill("5000");
+  await addFunds.getByLabel("Add Funds payment method").selectOption("card");
+  await expect(addFunds.getByText("Principal added to Credit: $50.00")).toBeVisible();
+  await expect(addFunds.getByText("Payment fee: $1.75", { exact: true })).toBeVisible();
+  await expect(addFunds.getByText("External amount due: $51.75", { exact: true })).toBeVisible();
+  await addFunds.getByRole("button", { name: "Start Mock Add Funds" }).click();
+  const addFundsStatus = addFunds.getByTestId("add-funds-status");
+  const addFundsCommandStatus = addFundsStatus.getByTestId("status-add-funds");
+  await expect(addFundsCommandStatus.getByText("succeeded", { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await expect(addFundsStatus.getByText("credited $50.00", { exact: true })).toBeVisible();
+  await expect(addFunds.getByText(/Current Credit/)).toContainText("$50.00");
 });
