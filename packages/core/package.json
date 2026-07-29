@@ -8,6 +8,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./provider-capability": {
+      "types": "./dist/provider-capability.d.ts",
+      "default": "./dist/provider-capability.js"
     }
   },
   "scripts": {

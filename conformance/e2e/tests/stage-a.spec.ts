@@ -53,9 +53,17 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   const journey = page.locator(".order-panel");
   await expect(journey.getByText("waiting payment", { exact: true })).toBeVisible();
   await expect(journey.getByText("pending", { exact: true })).toBeVisible();
+  await expect(journey.getByText("Payment fee: $0.18", { exact: true })).toBeVisible();
+  await expect(journey.getByText("External amount due: $5.18", { exact: true })).toBeVisible();
+  await journey.getByLabel("Payment method").selectOption("usdt");
+  await expect(journey.getByText("Payment fee: $0.00", { exact: true })).toBeVisible();
+  await expect(journey.getByText("External amount due: $5.00", { exact: true })).toBeVisible();
+  await journey.getByLabel("Payment method").selectOption("card");
+  await expect(journey.getByText("Payment fee: $0.18", { exact: true })).toBeVisible();
   await journey.getByRole("button", { name: "Start mock payment" }).click();
 
   await expect(journey.getByText("paid", { exact: true })).toBeVisible();
+  await expect(journey.getByText("Payment fee charged $0.18", { exact: true })).toBeVisible();
   await expect(journey.getByText("active", { exact: true })).toBeVisible({ timeout: 30_000 });
   await expect(journey.getByText(/Ready for service:/)).toBeVisible();
   await expect(journey.getByText(/Service term:/)).toBeVisible();

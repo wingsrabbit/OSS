@@ -167,6 +167,21 @@ await transaction(pool, async (client) => {
      ON CONFLICT (kind, locale, version) DO NOTHING`,
   );
 
+  await client.query(
+    `INSERT INTO payment_methods(
+       code, display_name, provider_installation_id, fee_basis_points, enabled
+     ) VALUES
+       ('card', '{"en":"Card (Mock)","zh-CN":"银行卡（Mock）"}', 'mock-payment-v1', 350, true),
+       ('alipay', '{"en":"Alipay (Mock)","zh-CN":"支付宝（Mock）"}', 'mock-payment-v1', 350, true),
+       ('usdt', '{"en":"USDT-style asset (Mock)","zh-CN":"USDT 风格资产（Mock）"}', 'mock-payment-v1', 0, true)
+     ON CONFLICT (code) DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       provider_installation_id = EXCLUDED.provider_installation_id,
+       fee_basis_points = EXCLUDED.fee_basis_points,
+       enabled = EXCLUDED.enabled,
+       updated_at = now()`,
+  );
+
   for (const product of products) {
     await client.query(
       `INSERT INTO products(

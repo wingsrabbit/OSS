@@ -6,11 +6,41 @@ All notable project changes will be documented here. Project release numbering a
 
 ## [Unreleased]
 
-### Planned
+### Added
 
-- PostgreSQL integration validation and browser acceptance for the Stage A journey.
-- Staff re-authentication and manual fulfillment.
-- Remaining billing, customer-operations, plugin, and two-VPS laboratory stages.
+- Append-only per-account Credit movements, invoice Credit allocations, and
+  balanced journals for audited administrator adjustments and customer use.
+- Versioned payment-method configuration with immutable invoice payment Quotes.
+- Credit plus external Mock payment and Credit-only invoice settlement paths.
+- Card/Alipay-style percentage fees calculated only from the external non-fee
+  amount, with USDT-style zero-fee configuration in the TermRat laboratory seed.
+
+### Security
+
+- Credit writes serialize on the Client Account and Credit Account, reject
+  negative balances, and bind every command to a request fingerprint.
+- Payment confirmation rejects expired Quotes and any changed invoice,
+  allocation, Credit balance, payment-method policy, or active unknown result.
+- Payment fees become invoice and ledger facts only after verified Provider
+  settlement; failed and cancelled attempts do not mutate historical invoices.
+- Payment and provisioning callbacks bind the authenticated installation, exact
+  Provider Operation, a started outbound attempt, and a Core-only-derived
+  per-operation capability disclosed only in that outbound request.
+  Reconciliation accepts only the same capability echoed from an operation the
+  Provider actually stored; invalid provisioning proof enters an audited manual
+  Hold without activating or mapping a resource.
+- Provider webhook HMACs use recursively key-sorted canonical JSON so equivalent
+  payloads cannot fail authentication merely because object keys were reordered.
+- Rejected capability and not-started events cannot reserve an inbox event ID
+  ahead of the legitimate Provider callback.
+- Known-unsent and definitively rejected payments close their commands and
+  restore applied Credit through append-only compensating entries; mismatched
+  settlements remain visible as manual, unclaimed-funds cases.
+
+### Still planned
+
+- Remaining Add Funds, renewal, suspension, cancellation, refund, customer
+  operations, plugin, and two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 

@@ -149,3 +149,12 @@ export function addBillingCycle(start: Date, cycle: BillingCycle): Date | null {
 export function jsonMoney(value: bigint): string {
   return value.toString();
 }
+
+export function percentageFeeMinor(nonFeeBaseMinor: bigint, basisPoints: number): bigint {
+  assertMinorUnits(nonFeeBaseMinor);
+  if (!Number.isInteger(basisPoints) || basisPoints < 0 || basisPoints > 10_000) {
+    throw new Error("Fee basis points must be an integer from 0 through 10000");
+  }
+  if (nonFeeBaseMinor === 0n || basisPoints === 0) return 0n;
+  return (nonFeeBaseMinor * BigInt(basisPoints) + 5_000n) / 10_000n;
+}

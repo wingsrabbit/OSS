@@ -23,14 +23,23 @@ const config = z
 const paymentCreateSchema = z.object({
   operationId: z.uuid(),
   paymentAttemptId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   amountMinor: z.string().regex(/^[1-9]\d*$/),
   currency: z.string().regex(/^[A-Z]{3}$/),
-  scenario: z.enum(["success", "failed", "cancelled", "timeout_success", "duplicate_out_of_order"]),
+  scenario: z.enum([
+    "success",
+    "failed",
+    "cancelled",
+    "timeout_success",
+    "duplicate_out_of_order",
+    "definitive_reject",
+  ]),
 });
 
 const resourceCreateSchema = z.object({
   operationId: z.uuid(),
   serviceId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   scenario: z.enum(["success", "failed", "timeout_existing"]),
 });
 
@@ -73,6 +82,7 @@ await pool.query(`
     currency text NOT NULL,
     scenario text NOT NULL,
     status text NOT NULL,
+    callback_capability text NOT NULL,
     occurred_at timestamptz NOT NULL DEFAULT now(),
     create_calls integer NOT NULL DEFAULT 1,
     request_fingerprint text NOT NULL
@@ -81,6 +91,7 @@ await pool.query(`
     operation_id uuid PRIMARY KEY,
     service_id uuid NOT NULL,
     external_resource_id text UNIQUE,
+    callback_capability text NOT NULL,
     scenario text NOT NULL,
     status text NOT NULL,
     ready_at timestamptz,
@@ -103,6 +114,13 @@ await pool.query(`
   );
   ALTER TABLE mock_payment_operations
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  ALTER TABLE mock_payment_operations
+    ADD COLUMN IF NOT EXISTS callback_capability text;
+  UPDATE mock_payment_operations
+  SET callback_capability = 'legacy-disabled'
+  WHERE callback_capability IS NULL;
+  ALTER TABLE mock_payment_operations
+    ALTER COLUMN callback_capability SET NOT NULL;
   UPDATE mock_payment_operations
   SET request_fingerprint = 'legacy:' || operation_id::text
   WHERE request_fingerprint IS NULL;
@@ -110,6 +128,13 @@ await pool.query(`
     ALTER COLUMN request_fingerprint SET NOT NULL;
   ALTER TABLE mock_resource_operations
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS callback_capability text;
+  UPDATE mock_resource_operations
+  SET callback_capability = repeat('A', 43)
+  WHERE callback_capability IS NULL;
+  ALTER TABLE mock_resource_operations
+    ALTER COLUMN callback_capability SET NOT NULL;
   UPDATE mock_resource_operations
   SET request_fingerprint = 'legacy:' || operation_id::text
   WHERE request_fingerprint IS NULL;
@@ -164,8 +189,29 @@ app.addHook("onSend", async (_request, reply) => {
 
 function signature(timestamp: string, body: unknown, secret: string): string {
   return createHmac("sha256", secret)
-    .update(`${timestamp}.${JSON.stringify(body)}`, "utf8")
+    .update(`${timestamp}.${canonicalProviderJson(body)}`, "utf8")
     .digest("hex");
+}
+
+function canonicalProviderJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Provider payload contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalProviderJson(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalProviderJson(record[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("Provider payload contains an unsupported value");
 }
 
 async function callback(path: string, body: unknown, secret: string): Promise<void> {
@@ -216,6 +262,9 @@ app.post("/v1/payments", async (request, reply) => {
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
+  if (body.scenario === "definitive_reject") {
+    return reply.code(400).send({ error: "synthetic definitive payment rejection" });
+  }
   const externalPaymentId = `mock-pay-${body.operationId}`;
   const fingerprint = requestFingerprint("payment.create:v1", body);
   const status =
@@ -231,9 +280,9 @@ app.post("/v1/payments", async (request, reply) => {
   }>(
     `INSERT INTO mock_payment_operations(
        operation_id, payment_attempt_id, external_payment_id,
-       amount_minor, currency, scenario, status
+       amount_minor, currency, scenario, status, callback_capability
        , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_payment_operations.create_calls + 1
        WHERE mock_payment_operations.request_fingerprint = EXCLUDED.request_fingerprint
@@ -246,6 +295,7 @@ app.post("/v1/payments", async (request, reply) => {
       body.currency,
       body.scenario,
       status,
+      body.callbackCapability,
       fingerprint,
     ],
   );
@@ -256,7 +306,9 @@ app.post("/v1/payments", async (request, reply) => {
 
   const event = {
     eventId: `payment:${body.operationId}:${operation.status}`,
+    providerOperationId: body.operationId,
     paymentAttemptId: body.paymentAttemptId,
+    callbackCapability: body.callbackCapability,
     externalPaymentId: operation.external_payment_id,
     status: operation.status,
     amountMinor: body.amountMinor,
@@ -298,13 +350,14 @@ app.post("/v1/payments", async (request, reply) => {
 app.get("/v1/payments/:operationId", async (request, reply) => {
   const params = z.object({ operationId: z.uuid() }).parse(request.params);
   const result = await pool.query<{
+    callback_capability: string;
     external_payment_id: string;
     status: "succeeded" | "failed" | "cancelled";
     amount_minor: string;
     currency: string;
     occurred_at: Date;
   }>(
-    `SELECT external_payment_id, status, amount_minor, currency, occurred_at
+    `SELECT callback_capability, external_payment_id, status, amount_minor, currency, occurred_at
      FROM mock_payment_operations
      WHERE operation_id = $1`,
     [params.operationId],
@@ -312,6 +365,7 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
   const row = result.rows[0];
   if (!row) return reply.code(404).send({ error: "operation not found" });
   return {
+    callbackCapability: row.callback_capability,
     externalPaymentId: row.external_payment_id,
     status: row.status,
     amountMinor: row.amount_minor,
@@ -340,9 +394,9 @@ app.post("/v1/resources", async (request, reply) => {
     occurred_at: Date;
   }>(
     `INSERT INTO mock_resource_operations(
-       operation_id, service_id, external_resource_id, scenario, status, ready_at
-       , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       operation_id, service_id, external_resource_id, callback_capability,
+       scenario, status, ready_at, request_fingerprint
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_resource_operations.create_calls + 1
        WHERE mock_resource_operations.request_fingerprint = EXCLUDED.request_fingerprint
@@ -351,6 +405,7 @@ app.post("/v1/resources", async (request, reply) => {
       body.operationId,
       body.serviceId,
       externalResourceId,
+      body.callbackCapability,
       body.scenario,
       status,
       readyAt,
@@ -364,6 +419,7 @@ app.post("/v1/resources", async (request, reply) => {
   const event = {
     eventId: `resource:${body.operationId}:${operation.status}`,
     providerOperationId: body.operationId,
+    callbackCapability: body.callbackCapability,
     status: operation.status,
     ...(operation.external_resource_id
       ? { externalResourceId: operation.external_resource_id }
@@ -386,12 +442,13 @@ app.post("/v1/resources", async (request, reply) => {
 app.get("/v1/resources/:operationId", async (request, reply) => {
   const params = z.object({ operationId: z.uuid() }).parse(request.params);
   const result = await pool.query<{
+    callback_capability: string;
     external_resource_id: string | null;
     status: "succeeded" | "failed";
     ready_at: Date | null;
     occurred_at: Date;
   }>(
-    `SELECT external_resource_id, status, ready_at, occurred_at
+    `SELECT callback_capability, external_resource_id, status, ready_at, occurred_at
      FROM mock_resource_operations
      WHERE operation_id = $1`,
     [params.operationId],
@@ -399,6 +456,7 @@ app.get("/v1/resources/:operationId", async (request, reply) => {
   const row = result.rows[0];
   if (!row) return reply.code(404).send({ error: "operation not found" });
   return {
+    callbackCapability: row.callback_capability,
     status: row.status,
     ...(row.external_resource_id ? { externalResourceId: row.external_resource_id } : {}),
     ...(row.ready_at ? { readyAt: row.ready_at.toISOString() } : {}),
