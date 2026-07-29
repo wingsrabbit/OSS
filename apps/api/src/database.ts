@@ -2,6 +2,7 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { Config } from "./config.js";
 
@@ -41,7 +42,7 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   await pool.query(
     "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
   );
-  const migrationsDirectory = resolve(process.cwd(), "apps/api/migrations");
+  const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
   const migrationFiles = (await readdir(migrationsDirectory))
     .filter((file) => /^\d{3}_[a-z0-9_]+\.sql$/.test(file))
     .sort();
