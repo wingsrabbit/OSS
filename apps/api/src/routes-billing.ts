@@ -63,8 +63,9 @@ export async function registerBillingRoutes(
       const methodResult = await client.query<{
         code: string;
         fee_basis_points: number;
+        provider_installation_id: string;
       }>(
-        `SELECT code, fee_basis_points
+        `SELECT code, fee_basis_points, provider_installation_id
          FROM payment_methods
          WHERE code = $1 AND enabled
          FOR SHARE`,
@@ -121,13 +122,14 @@ export async function registerBillingRoutes(
       const feeMinor = percentageFeeMinor(externalNonFeeMinor, method.fee_basis_points);
       const inserted = await client.query<{ id: string; expires_at: Date }>(
         `INSERT INTO invoice_payment_quotes(
-           client_account_id, invoice_id, payment_method_code, currency,
+           client_account_id, invoice_id, payment_method_code,
+           provider_installation_id, currency,
            invoice_total_minor, payment_allocated_minor, credit_allocated_minor,
            available_credit_minor, credit_to_apply_minor, external_non_fee_minor,
            fee_basis_points, fee_minor, external_due_minor, request_fingerprint,
            expires_at
          ) VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
            now() + interval '10 minutes'
          )
          RETURNING id, expires_at`,
@@ -135,6 +137,7 @@ export async function registerBillingRoutes(
           user.clientAccountId,
           params.invoiceId,
           method.code,
+          method.provider_installation_id,
           invoice.currency,
           invoice.total_minor,
           allocations.payment_minor,

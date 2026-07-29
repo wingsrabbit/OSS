@@ -409,6 +409,7 @@ async function preflightPayment(
       fee_minor: string;
       payment_currency: string;
       scenario: string;
+      payment_provider_installation_id: string;
       payment_client_account_id: string;
       invoice_id: string;
       invoice_total_minor: string;
@@ -423,20 +424,24 @@ async function preflightPayment(
       user_restricted_at: Date | null;
       account_restricted_at: Date | null;
       operation_status: string;
+      operation_provider_installation_id: string;
       operation_kind: string;
       operation_attempt_count: number;
     }>(
       `SELECT
          pa.status AS payment_status, pa.amount_minor::text, pa.principal_minor::text,
          pa.fee_minor::text, pa.currency AS payment_currency,
-         pa.scenario, pa.client_account_id AS payment_client_account_id, pa.invoice_id,
+         pa.scenario, pa.provider_installation_id AS payment_provider_installation_id,
+         pa.client_account_id AS payment_client_account_id, pa.invoice_id,
          i.total_minor::text AS invoice_total_minor, i.currency AS invoice_currency,
          i.client_account_id AS invoice_client_account_id,
          o.id AS order_id, o.status AS order_status, o.currency AS order_currency,
          o.client_account_id AS order_client_account_id, o.submitted_by_user_id,
          u.email_verified_at, u.restricted_at AS user_restricted_at,
          ca.restricted_at AS account_restricted_at,
-         po.status AS operation_status, po.kind AS operation_kind,
+         po.status AS operation_status,
+         po.provider_installation_id AS operation_provider_installation_id,
+         po.kind AS operation_kind,
          po.attempt_count AS operation_attempt_count
        FROM payment_attempts pa
        JOIN invoices i ON i.id = pa.invoice_id
@@ -524,8 +529,12 @@ async function preflightPayment(
     const consistentOwnership =
       payment.payment_client_account_id === payment.invoice_client_account_id &&
       payment.invoice_client_account_id === payment.order_client_account_id;
+    const consistentProvider =
+      payment.payment_provider_installation_id ===
+        payment.operation_provider_installation_id &&
+      payment.payment_provider_installation_id === "mock-payment-v1";
 
-    if (!eligible || !consistentOwnership) {
+    if (!eligible || !consistentOwnership || !consistentProvider) {
       return holdPaymentWithClient(
         client,
         job,
@@ -533,7 +542,9 @@ async function preflightPayment(
         payment.order_id,
         !eligible
           ? "payment provider call blocked because the user, account, or membership is not eligible"
-          : "payment provider call blocked because Core ownership records are inconsistent",
+          : !consistentOwnership
+            ? "payment provider call blocked because Core ownership records are inconsistent"
+            : "payment provider call blocked because Provider ownership records are inconsistent",
       );
     }
     if (

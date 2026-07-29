@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS invoice_payment_quotes (
   client_account_id uuid NOT NULL REFERENCES client_accounts(id),
   invoice_id uuid NOT NULL REFERENCES invoices(id),
   payment_method_code text NOT NULL REFERENCES payment_methods(code),
+  provider_installation_id text NOT NULL,
   currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
   invoice_total_minor bigint NOT NULL CHECK (invoice_total_minor >= 0),
   payment_allocated_minor bigint NOT NULL CHECK (payment_allocated_minor >= 0),

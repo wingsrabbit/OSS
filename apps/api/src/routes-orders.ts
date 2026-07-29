@@ -562,6 +562,7 @@ export async function registerOrderRoutes(
         id: string;
         payment_method_code: string;
         provider_installation_id: string;
+        current_provider_installation_id: string;
         enabled: boolean;
         current_fee_basis_points: number;
         fee_basis_points: number;
@@ -577,7 +578,8 @@ export async function registerOrderRoutes(
         expires_at: Date;
       }>(
         `SELECT
-           q.id, q.payment_method_code, pm.provider_installation_id, pm.enabled,
+           q.id, q.payment_method_code, q.provider_installation_id,
+           pm.provider_installation_id AS current_provider_installation_id, pm.enabled,
            pm.fee_basis_points AS current_fee_basis_points, q.fee_basis_points,
            q.currency, q.invoice_total_minor::text,
            q.payment_allocated_minor::text, q.credit_allocated_minor::text,
@@ -602,6 +604,7 @@ export async function registerOrderRoutes(
       }
       if (
         !quote.enabled ||
+        quote.current_provider_installation_id !== quote.provider_installation_id ||
         quote.current_fee_basis_points !== quote.fee_basis_points
       ) {
         throw Object.assign(new Error("Payment method configuration changed; request a new quote"), {
