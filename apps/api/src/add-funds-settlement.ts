@@ -163,7 +163,11 @@ export async function handleAddFundsPaymentEvent(
      ) VALUES ($1, $2, 'add_funds.payment_status', $3)
      ON CONFLICT (provider_installation_id, external_event_id) DO NOTHING
      RETURNING id`,
-    [PROVIDER_INSTALLATION_ID, body.eventId, body],
+    [
+      PROVIDER_INSTALLATION_ID,
+      body.eventId,
+      { ...body, callbackCapability: "[REDACTED]" },
+    ],
   );
   if (inbox.rowCount !== 1) return { duplicate: true };
 

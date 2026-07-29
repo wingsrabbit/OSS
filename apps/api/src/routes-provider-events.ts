@@ -51,13 +51,17 @@ async function insertInbox(
   eventType: string,
   payload: unknown,
 ): Promise<boolean> {
+  const storedPayload =
+    typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? { ...(payload as Record<string, unknown>), callbackCapability: "[REDACTED]" }
+      : payload;
   const result = await client.query(
     `INSERT INTO provider_inbox(
        provider_installation_id, external_event_id, event_type, payload
      ) VALUES ($1, $2, $3, $4)
      ON CONFLICT (provider_installation_id, external_event_id) DO NOTHING
      RETURNING id`,
-    [providerInstallationId, eventId, eventType, payload],
+    [providerInstallationId, eventId, eventType, storedPayload],
   );
   return result.rowCount === 1;
 }
