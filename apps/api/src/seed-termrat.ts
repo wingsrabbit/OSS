@@ -188,7 +188,7 @@ await transaction(pool, async (client) => {
         },
         product.fulfillment,
         product.repeatable ?? false,
-        product.optionSchema ?? [],
+        JSON.stringify(product.optionSchema ?? []),
       ],
     );
 
