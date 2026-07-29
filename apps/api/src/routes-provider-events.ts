@@ -7,6 +7,7 @@ import {
   type BillingCycle,
   type PaymentStatus,
 } from "@opensales/core";
+import { providerOperationCapabilityMatches } from "@opensales/core/provider-capability";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { Config } from "./config.js";
@@ -16,7 +17,9 @@ import { assertProviderSignature } from "./provider-signature.js";
 
 const paymentEventSchema = z.object({
   eventId: z.string().min(1).max(160),
+  providerOperationId: z.uuid(),
   paymentAttemptId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   externalPaymentId: z.string().min(1).max(160),
   status: z.enum(["processing", "succeeded", "failed", "cancelled", "expired"]),
   amountMinor: z.string().regex(/^[1-9]\d*$/),
@@ -311,11 +314,16 @@ export async function registerProviderEventRoutes(
            ON po.subject_type = 'payment'
           AND po.subject_id = pa.id
           AND po.kind = 'payment_create'
+          AND po.id = $3
           AND po.provider_installation_id = $2
          WHERE pa.id = $1
            AND pa.provider_installation_id = $2
          FOR UPDATE OF pa, po`,
-        [body.paymentAttemptId, MOCK_PAYMENT_INSTALLATION_ID],
+        [
+          body.paymentAttemptId,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          body.providerOperationId,
+        ],
       );
       const attempt = attemptResult.rows[0];
       if (!attempt) {
@@ -329,6 +337,25 @@ export async function registerProviderEventRoutes(
           { eventId: body.eventId, externalPaymentId: body.externalPaymentId },
         );
         return { rejected: true, reason: "provider_ownership_mismatch" };
+      }
+      if (
+        !providerOperationCapabilityMatches(
+          body.callbackCapability,
+          config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          attempt.operation_id,
+        )
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "payment.event_rejected",
+          "payment",
+          attempt.id,
+          "payment callback capability is invalid for the Provider operation",
+          { eventId: body.eventId, providerOperationId: attempt.operation_id },
+        );
+        return { rejected: true, reason: "invalid_operation_capability" };
       }
       if (attempt.operation_attempt_count === 0) {
         await auditProvider(
@@ -466,6 +493,20 @@ export async function registerProviderEventRoutes(
            SET status = 'unknown', last_error = $2, provider_occurred_at = $3, updated_at = now()
            WHERE id = $1 AND status <> 'succeeded'`,
           [attempt.operation_id, reason, occurredAt],
+        );
+        await client.query(
+          `UPDATE invoice_payment_commands
+           SET status = 'manual', result = $2, updated_at = now()
+           WHERE payment_attempt_id = $1
+             AND status NOT IN ('succeeded', 'failed')`,
+          [
+            attempt.id,
+            {
+              paymentStatus: "unknown",
+              receiptId: receipt.id,
+              reason,
+            },
+          ],
         );
         await auditProvider(
           client,

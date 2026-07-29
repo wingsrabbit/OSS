@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
 
 const coreUrl = process.env.CORE_TEST_URL ?? "http://127.0.0.1:3000";
@@ -10,12 +11,14 @@ const providerDatabaseUrl = process.env.PROVIDER_DATABASE_URL;
 const providerUrl = process.env.MOCK_PAYMENT_PROVIDER_URL;
 const paymentProviderToken = process.env.MOCK_PAYMENT_PROVIDER_TOKEN;
 const paymentWebhookSecret = process.env.MOCK_PAYMENT_WEBHOOK_SECRET;
+const paymentCapabilitySecret = process.env.PAYMENT_OPERATION_CAPABILITY_SECRET;
 if (
   !databaseUrl ||
   !providerDatabaseUrl ||
   !providerUrl ||
   !paymentProviderToken ||
-  !paymentWebhookSecret
+  !paymentWebhookSecret ||
+  !paymentCapabilitySecret
 ) {
   throw new Error("Database and Mock Payment Provider test configuration are required");
 }
@@ -130,9 +133,35 @@ async function submitPaymentFact(
   body: Record<string, unknown>,
   secret = paymentWebhookSecret!,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
+  const paymentAttemptId = String(body.paymentAttemptId);
+  const operationResult = await corePool.query<{ id: string }>(
+    `SELECT id
+     FROM provider_operations
+     WHERE subject_type = 'payment' AND subject_id = $1
+     ORDER BY created_at
+     LIMIT 1`,
+    [paymentAttemptId],
+  );
+  const providerOperationId =
+    typeof body.providerOperationId === "string"
+      ? body.providerOperationId
+      : operationResult.rows[0]?.id;
+  assert.ok(providerOperationId, "payment fact requires a Provider operation");
+  const signedBody = {
+    ...body,
+    providerOperationId,
+    callbackCapability:
+      typeof body.callbackCapability === "string"
+        ? body.callbackCapability
+        : providerOperationCapability(
+            paymentCapabilitySecret!,
+            "mock-payment-v1",
+            providerOperationId,
+          ),
+  };
   const timestamp = Date.now().toString();
   const signature = createHmac("sha256", secret)
-    .update(`${timestamp}.${JSON.stringify(body)}`, "utf8")
+    .update(`${timestamp}.${JSON.stringify(signedBody)}`, "utf8")
     .digest("hex");
   return rawCoreRequest("/api/v1/provider-events/payment", {
     method: "POST",
@@ -140,7 +169,7 @@ async function submitPaymentFact(
       "X-OSS-Timestamp": timestamp,
       "X-OSS-Signature": signature,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(signedBody),
   });
 }
 
@@ -1326,6 +1355,146 @@ const reconcileOwnershipClosed = await waitFor(
 );
 assert.equal(reconcileOwnershipClosed?.job_status, "manual");
 
+const mismatchOrder = await createOrder(automaticPrice.id, legal);
+const mismatchQuote = await createPaymentQuote(mismatchOrder.invoice.id, "card", false);
+const mismatchCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${mismatchOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: mismatchQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(mismatchCommand.paymentAttemptId);
+const mismatchRecords = await readPaymentRecords(mismatchCommand.commandId);
+await corePool.query("UPDATE payment_attempts SET status = 'processing' WHERE id = $1", [
+  mismatchCommand.paymentAttemptId,
+]);
+await corePool.query(
+  `UPDATE provider_operations
+   SET status = 'running', attempt_count = 1
+   WHERE id = $1`,
+  [mismatchRecords.operation_id],
+);
+const mismatchExternalId = `mock-wrong-amount-${randomUUID()}`;
+const mismatchAmountMinor = (BigInt(mismatchRecords.amount_minor) + 1n).toString();
+const mismatchCallback = await submitPaymentFact({
+  eventId: `wrong-amount:${randomUUID()}`,
+  paymentAttemptId: mismatchCommand.paymentAttemptId,
+  externalPaymentId: mismatchExternalId,
+  status: "succeeded",
+  amountMinor: mismatchAmountMinor,
+  currency: mismatchRecords.currency,
+  occurredAt: new Date().toISOString(),
+});
+assert.equal(mismatchCallback.status, 202);
+assert.equal(mismatchCallback.body.status, "unclaimed");
+const mismatchCoreState = await corePool.query<{
+  command_status: string;
+  attempt_status: string;
+  operation_status: string;
+  receipt_disposition: string;
+}>(
+  `SELECT
+     command.status AS command_status,
+     attempt.status AS attempt_status,
+     operation.status AS operation_status,
+     receipt.disposition AS receipt_disposition
+   FROM invoice_payment_commands command
+   JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+   JOIN provider_operations operation
+     ON operation.subject_type = 'payment'
+    AND operation.subject_id = attempt.id
+   JOIN fund_receipts receipt ON receipt.reported_payment_attempt_id = attempt.id
+   WHERE command.id = $1`,
+  [mismatchCommand.commandId],
+);
+assert.equal(mismatchCoreState.rows[0]?.command_status, "manual");
+assert.equal(mismatchCoreState.rows[0]?.attempt_status, "unknown");
+assert.equal(mismatchCoreState.rows[0]?.operation_status, "unknown");
+assert.equal(mismatchCoreState.rows[0]?.receipt_disposition, "unclaimed");
+const mismatchCapability = providerOperationCapability(
+  paymentCapabilitySecret,
+  "mock-payment-v1",
+  mismatchRecords.operation_id,
+);
+await providerPool.query(
+  `INSERT INTO mock_payment_operations(
+     operation_id, payment_attempt_id, external_payment_id,
+     amount_minor, currency, scenario, status, callback_capability,
+     request_fingerprint
+   ) VALUES ($1, $2, $3, $4, $5, 'success', 'succeeded', $6, $7)`,
+  [
+    mismatchRecords.operation_id,
+    mismatchCommand.paymentAttemptId,
+    mismatchExternalId,
+    mismatchAmountMinor,
+    mismatchRecords.currency,
+    mismatchCapability,
+    createHash("sha256").update(randomUUID()).digest("hex"),
+  ],
+);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL
+   WHERE job_type = 'payment.start'
+     AND payload->>'paymentAttemptId' = $1`,
+  [mismatchCommand.paymentAttemptId],
+);
+await corePool.query(
+  `INSERT INTO durable_jobs(job_type, unique_key, payload)
+   VALUES ('payment.reconcile', $1, $2)`,
+  [
+    `wrong-amount:${mismatchCommand.paymentAttemptId}`,
+    {
+      paymentAttemptId: mismatchCommand.paymentAttemptId,
+      operationId: mismatchRecords.operation_id,
+    },
+  ],
+);
+const mismatchReconciled = await waitFor(
+  "duplicate mismatched receipt reconciliation to preserve manual command state",
+  async () => {
+    const result = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      receipts: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         (SELECT count(*)::text
+            FROM fund_receipts
+           WHERE reported_payment_attempt_id = attempt.id) AS receipts
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN provider_operations operation ON operation.id = $2
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.reconcile'
+        AND job.payload->>'paymentAttemptId' = attempt.id::text
+       WHERE command.id = $1`,
+      [mismatchCommand.commandId, mismatchRecords.operation_id],
+    );
+    return result.rows[0];
+  },
+  (value) =>
+    value?.command_status === "manual" &&
+    value.attempt_status === "unknown" &&
+    value.operation_status === "unknown" &&
+    value.job_status === "completed" &&
+    value.receipts === "1",
+  8_000,
+);
+assert.equal(mismatchReconciled?.command_status, "manual");
+
 const callbackRaceOrder = await createOrder(automaticPrice.id, legal);
 const callbackRaceQuote = await createPaymentQuote(callbackRaceOrder.invoice.id, "card", false);
 const callbackRaceCommand = await request<PaymentCommand>(
@@ -1362,6 +1531,37 @@ const callbackRaceFact = {
   currency: callbackRaceRecords.currency,
   occurredAt: new Date().toISOString(),
 };
+const preOutboundForgery = await submitPaymentFact({
+  ...callbackRaceFact,
+  eventId: `pre-outbound-forgery:${randomUUID()}`,
+  externalPaymentId: `mock-forged-before-outbound-${randomUUID()}`,
+  callbackCapability: "A".repeat(43),
+});
+assert.equal(preOutboundForgery.status, 202);
+assert.equal(preOutboundForgery.body.rejected, true);
+assert.equal(preOutboundForgery.body.reason, "invalid_operation_capability");
+const preOutboundProviderFacts = await providerPool.query<{ operations: string }>(
+  `SELECT count(*)::text AS operations
+   FROM mock_payment_operations
+   WHERE operation_id = $1`,
+  [callbackRaceRecords.operation_id],
+);
+const preOutboundFacts = await corePool.query<{
+  receipts: string;
+  fee_charges: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+        FROM fund_receipts
+       WHERE reported_payment_attempt_id = $1) AS receipts,
+     (SELECT count(*)::text
+        FROM invoice_fee_charges
+       WHERE payment_attempt_id = $1) AS fee_charges`,
+  [callbackRaceCommand.paymentAttemptId],
+);
+assert.equal(preOutboundProviderFacts.rows[0]?.operations, "0");
+assert.equal(preOutboundFacts.rows[0]?.receipts, "0");
+assert.equal(preOutboundFacts.rows[0]?.fee_charges, "0");
 const [callbackRaceResult, competingConfirmation] = await Promise.all([
   submitPaymentFact(callbackRaceFact),
   rawCoreRequest(`/api/v1/invoices/${callbackRaceOrder.invoice.id}/payments`, {

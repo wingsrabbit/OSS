@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHmac, randomUUID } from "node:crypto";
+import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
 import { z } from "zod";
 
@@ -13,6 +14,7 @@ const config = z
     MOCK_PAYMENT_PROVIDER_TOKEN: z.string().min(32),
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
+    PAYMENT_OPERATION_CAPABILITY_SECRET: z.string().min(32),
     MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
     MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
     CORE_INTERNAL_URL: z.url().default("http://api:3000"),
@@ -1304,6 +1306,11 @@ async function startPayment(job: Job): Promise<void> {
   const preflight = await preflightPayment(job, paymentAttemptId, providerOperationId, "start");
   if (preflight.kind === "halted") return;
   const payment = preflight.value;
+  const callbackCapability = providerOperationCapability(
+    config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+    "mock-payment-v1",
+    providerOperationId,
+  );
   try {
     const response = await providerRequest(
       config.MOCK_PAYMENT_PROVIDER_URL,
@@ -1315,6 +1322,7 @@ async function startPayment(job: Job): Promise<void> {
         body: JSON.stringify({
           operationId: providerOperationId,
           paymentAttemptId,
+          callbackCapability,
           amountMinor: payment.amountMinor,
           currency: payment.currency,
           scenario: payment.scenario,
@@ -1639,7 +1647,13 @@ async function reconcilePayment(job: Job): Promise<void> {
     "/api/v1/provider-events/payment",
     {
       eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      providerOperationId: operationId,
       paymentAttemptId,
+      callbackCapability: providerOperationCapability(
+        config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+        "mock-payment-v1",
+        operationId,
+      ),
       ...fact,
     },
     config.MOCK_PAYMENT_WEBHOOK_SECRET,

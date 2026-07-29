@@ -23,6 +23,7 @@ const config = z
 const paymentCreateSchema = z.object({
   operationId: z.uuid(),
   paymentAttemptId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   amountMinor: z.string().regex(/^[1-9]\d*$/),
   currency: z.string().regex(/^[A-Z]{3}$/),
   scenario: z.enum([
@@ -80,6 +81,7 @@ await pool.query(`
     currency text NOT NULL,
     scenario text NOT NULL,
     status text NOT NULL,
+    callback_capability text NOT NULL,
     occurred_at timestamptz NOT NULL DEFAULT now(),
     create_calls integer NOT NULL DEFAULT 1,
     request_fingerprint text NOT NULL
@@ -110,6 +112,13 @@ await pool.query(`
   );
   ALTER TABLE mock_payment_operations
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  ALTER TABLE mock_payment_operations
+    ADD COLUMN IF NOT EXISTS callback_capability text;
+  UPDATE mock_payment_operations
+  SET callback_capability = 'legacy-disabled'
+  WHERE callback_capability IS NULL;
+  ALTER TABLE mock_payment_operations
+    ALTER COLUMN callback_capability SET NOT NULL;
   UPDATE mock_payment_operations
   SET request_fingerprint = 'legacy:' || operation_id::text
   WHERE request_fingerprint IS NULL;
@@ -241,9 +250,9 @@ app.post("/v1/payments", async (request, reply) => {
   }>(
     `INSERT INTO mock_payment_operations(
        operation_id, payment_attempt_id, external_payment_id,
-       amount_minor, currency, scenario, status
+       amount_minor, currency, scenario, status, callback_capability
        , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_payment_operations.create_calls + 1
        WHERE mock_payment_operations.request_fingerprint = EXCLUDED.request_fingerprint
@@ -256,6 +265,7 @@ app.post("/v1/payments", async (request, reply) => {
       body.currency,
       body.scenario,
       status,
+      body.callbackCapability,
       fingerprint,
     ],
   );
@@ -266,7 +276,9 @@ app.post("/v1/payments", async (request, reply) => {
 
   const event = {
     eventId: `payment:${body.operationId}:${operation.status}`,
+    providerOperationId: body.operationId,
     paymentAttemptId: body.paymentAttemptId,
+    callbackCapability: body.callbackCapability,
     externalPaymentId: operation.external_payment_id,
     status: operation.status,
     amountMinor: body.amountMinor,

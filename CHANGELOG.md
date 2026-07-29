@@ -23,6 +23,12 @@ All notable project changes will be documented here. Project release numbering a
   allocation, Credit balance, payment-method policy, or active unknown result.
 - Payment fees become invoice and ledger facts only after verified Provider
   settlement; failed and cancelled attempts do not mutate historical invoices.
+- Payment callbacks bind the authenticated installation, exact Provider
+  Operation, and a Core-only-derived per-operation capability that is disclosed
+  only in the outbound request.
+- Known-unsent and definitively rejected payments close their commands and
+  restore applied Credit through append-only compensating entries; mismatched
+  settlements remain visible as manual, unclaimed-funds cases.
 
 ### Still planned
 
