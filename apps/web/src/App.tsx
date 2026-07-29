@@ -659,20 +659,25 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
-      await api(`/api/v1/admin/funds/${item.receiptId}/resolutions`, {
-        method: "POST",
-        body: JSON.stringify({
-          action,
-          amountMinor: fundResolutionMinor,
-          invoiceId,
-          reason,
-          idempotencyKey,
-        }),
-      });
+      const resolution = await api<{ replayed: boolean }>(
+        `/api/v1/admin/funds/${item.receiptId}/resolutions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            amountMinor: fundResolutionMinor,
+            invoiceId,
+            reason,
+            idempotencyKey,
+          }),
+        },
+      );
       setNotice(
-        action === "convert_to_credit"
-          ? "Unclaimed funds converted to Credit with a balanced journal."
-          : "Unclaimed funds allocated to the matching invoice with a balanced journal.",
+        resolution.replayed
+          ? "This exact fund resolution was already recorded; no second money movement occurred."
+          : action === "convert_to_credit"
+            ? "Unclaimed funds converted to Credit with a balanced journal."
+            : "Unclaimed funds allocated to the matching invoice with a balanced journal.",
       );
       setFundResolutionMinor("");
       setFundResolutionReason("");

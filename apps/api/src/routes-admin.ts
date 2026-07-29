@@ -22,11 +22,13 @@ const creditAdjustmentSchema = z.object({
   idempotencyKey: z.string().min(8).max(128),
 });
 
+const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
+
 const fundResolutionSchema = z
   .object({
     action: z.enum(["convert_to_credit", "allocate_invoice"]),
     amountMinor: z.string().regex(/^[1-9]\d*$/),
-    invoiceId: z.uuid().nullable().default(null),
+    invoiceId: canonicalUuid.nullable().default(null),
     reason: z.string().trim().min(10).max(1_000),
     idempotencyKey: z.string().min(8).max(128),
   })
@@ -207,7 +209,7 @@ export async function registerAdminRoutes(
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "billing.unclaimed_manage");
     await requireRecentReauth(pool, user);
-    const params = z.object({ receiptId: z.uuid() }).parse(request.params);
+    const params = z.object({ receiptId: canonicalUuid }).parse(request.params);
     const body = fundResolutionSchema.parse(request.body);
     const fingerprint = requestFingerprint("admin.fund-receipt-resolution:v1", {
       receiptId: params.receiptId,
@@ -225,27 +227,26 @@ export async function registerAdminRoutes(
       for (const lock of resolutionLocks) {
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [lock]);
       }
-      const previous = await client.query<{
+      const requestReplayResult = await client.query<{
         fund_receipt_id: string;
-        idempotency_key: string;
         request_fingerprint: string;
         result: Record<string, unknown>;
       }>(
-        `SELECT fund_receipt_id, idempotency_key, request_fingerprint, result
-         FROM fund_receipt_resolutions
-         WHERE idempotency_key = $1
-            OR (fund_receipt_id = $2 AND request_fingerprint = $3)
-         ORDER BY CASE WHEN idempotency_key = $1 THEN 0 ELSE 1 END
-         LIMIT 1
-         FOR UPDATE`,
-        [body.idempotencyKey, params.receiptId, fingerprint],
+        `SELECT
+           request.fund_receipt_id,
+           request.request_fingerprint,
+           resolution.result
+         FROM fund_receipt_resolution_requests request
+         JOIN fund_receipt_resolutions resolution ON resolution.id = request.resolution_id
+         WHERE request.idempotency_key = $1
+         FOR UPDATE OF request, resolution`,
+        [body.idempotencyKey],
       );
-      const replay = previous.rows[0];
-      if (replay) {
+      const requestReplay = requestReplayResult.rows[0];
+      if (requestReplay) {
         if (
-          replay.idempotency_key === body.idempotencyKey &&
-          (replay.fund_receipt_id !== params.receiptId ||
-            replay.request_fingerprint !== fingerprint)
+          requestReplay.fund_receipt_id !== params.receiptId ||
+          requestReplay.request_fingerprint !== fingerprint
         ) {
           throw Object.assign(
             new Error("The idempotency key was used for a different fund resolution"),
@@ -253,7 +254,30 @@ export async function registerAdminRoutes(
           );
         }
         await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
-        return { ...replay.result, replayed: true };
+        return { ...requestReplay.result, replayed: true };
+      }
+
+      const semanticReplayResult = await client.query<{
+        id: string;
+        result: Record<string, unknown>;
+      }>(
+        `SELECT id, result
+         FROM fund_receipt_resolutions
+         WHERE fund_receipt_id = $1
+           AND request_fingerprint = $2
+         FOR UPDATE`,
+        [params.receiptId, fingerprint],
+      );
+      const semanticReplay = semanticReplayResult.rows[0];
+      if (semanticReplay) {
+        await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+        await client.query(
+          `INSERT INTO fund_receipt_resolution_requests(
+             idempotency_key, fund_receipt_id, request_fingerprint, resolution_id
+           ) VALUES ($1, $2, $3, $4)`,
+          [body.idempotencyKey, params.receiptId, fingerprint, semanticReplay.id],
+        );
+        return { ...semanticReplay.result, replayed: true };
       }
 
       let invoice:
@@ -496,6 +520,12 @@ export async function registerAdminRoutes(
         );
       }
 
+      await client.query(
+        `INSERT INTO fund_receipt_resolution_requests(
+           idempotency_key, fund_receipt_id, request_fingerprint, resolution_id
+         ) VALUES ($1, $2, $3, $4)`,
+        [body.idempotencyKey, receipt.id, fingerprint, resolutionId],
+      );
       await client.query(
         `UPDATE fund_receipts
          SET allocated_minor = allocated_minor + $2,

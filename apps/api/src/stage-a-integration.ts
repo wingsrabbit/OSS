@@ -3082,19 +3082,37 @@ const allocationReplay = await request<{
 );
 assert.equal(allocationReplay.resolutionId, allocatedUnclaimed.resolutionId);
 assert.equal(allocationReplay.replayed, true);
+const allocationAfterReloadKey = randomUUID();
 const allocationAfterReload = await request<{
   resolutionId: string;
   replayed: boolean;
 }>(
-  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  `/api/v1/admin/funds/${resolutionReceiptId.toUpperCase()}/resolutions`,
   {
     method: "POST",
-    body: JSON.stringify({ ...allocationBody, idempotencyKey: randomUUID() }),
+    body: JSON.stringify({
+      ...allocationBody,
+      invoiceId: resolutionOrder.invoice.id.toUpperCase(),
+      idempotencyKey: allocationAfterReloadKey,
+    }),
   },
   200,
 );
 assert.equal(allocationAfterReload.resolutionId, allocatedUnclaimed.resolutionId);
 assert.equal(allocationAfterReload.replayed, true);
+const allocationAliasConflict = await request<{ code: string }>(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...allocationBody,
+      amountMinor: "1",
+      idempotencyKey: allocationAfterReloadKey,
+    }),
+  },
+  409,
+);
+assert.equal(allocationAliasConflict.code, "IDEMPOTENCY_CONFLICT");
 await request(
   `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
   {
@@ -3181,6 +3199,7 @@ const resolvedReceiptFacts = await corePool.query<{
   amount_minor: string;
   disposition: string;
   resolutions: string;
+  requests: string;
   allocations: string;
   journals: string;
 }>(
@@ -3193,6 +3212,11 @@ const resolvedReceiptFacts = await corePool.query<{
        FROM fund_receipt_resolutions resolution
        WHERE resolution.fund_receipt_id = receipt.id
      ) AS resolutions,
+     (
+       SELECT count(*)::text
+       FROM fund_receipt_resolution_requests request
+       WHERE request.fund_receipt_id = receipt.id
+     ) AS requests,
      (
        SELECT count(*)::text
        FROM fund_receipt_allocations allocation
@@ -3215,6 +3239,7 @@ assert.equal(
 );
 assert.equal(resolvedReceiptFacts.rows[0]?.disposition, "allocated");
 assert.equal(resolvedReceiptFacts.rows[0]?.resolutions, "2");
+assert.equal(resolvedReceiptFacts.rows[0]?.requests, "4");
 assert.equal(resolvedReceiptFacts.rows[0]?.allocations, "1");
 assert.equal(resolvedReceiptFacts.rows[0]?.journals, "2");
 const noLongerUnclaimed = await request<{

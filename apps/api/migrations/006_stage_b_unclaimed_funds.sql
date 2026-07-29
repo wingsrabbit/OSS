@@ -52,6 +52,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS fund_receipt_resolutions_semantic_unique
 CREATE INDEX IF NOT EXISTS fund_receipt_allocations_invoice_idx
   ON fund_receipt_allocations (invoice_id);
 
+CREATE TABLE IF NOT EXISTS fund_receipt_resolution_requests (
+  idempotency_key text PRIMARY KEY CHECK (length(idempotency_key) BETWEEN 8 AND 128),
+  fund_receipt_id uuid NOT NULL REFERENCES fund_receipts(id),
+  request_fingerprint text NOT NULL,
+  resolution_id uuid NOT NULL REFERENCES fund_receipt_resolutions(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS fund_receipt_resolution_requests_resolution_idx
+  ON fund_receipt_resolution_requests (resolution_id);
+
+INSERT INTO fund_receipt_resolution_requests(
+  idempotency_key, fund_receipt_id, request_fingerprint, resolution_id, created_at
+)
+SELECT
+  resolution.idempotency_key,
+  resolution.fund_receipt_id,
+  resolution.request_fingerprint,
+  resolution.id,
+  resolution.created_at
+FROM fund_receipt_resolutions resolution
+ON CONFLICT (idempotency_key) DO NOTHING;
+
 CREATE OR REPLACE FUNCTION opensales_validate_fund_receipt_resolution()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -115,6 +138,37 @@ $$;
 DROP TRIGGER IF EXISTS fund_receipt_resolutions_append_only ON fund_receipt_resolutions;
 CREATE TRIGGER fund_receipt_resolutions_append_only
 BEFORE UPDATE OR DELETE ON fund_receipt_resolutions
+FOR EACH ROW EXECUTE FUNCTION opensales_reject_fund_resolution_mutation();
+
+CREATE OR REPLACE FUNCTION opensales_validate_fund_resolution_request()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  resolution_row record;
+BEGIN
+  SELECT fund_receipt_id, request_fingerprint
+  INTO resolution_row
+  FROM fund_receipt_resolutions
+  WHERE id = NEW.resolution_id;
+
+  IF resolution_row IS NULL
+     OR NEW.fund_receipt_id <> resolution_row.fund_receipt_id
+     OR NEW.request_fingerprint <> resolution_row.request_fingerprint THEN
+    RAISE EXCEPTION 'fund resolution request does not match its immutable resolution';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS fund_resolution_request_guard ON fund_receipt_resolution_requests;
+CREATE TRIGGER fund_resolution_request_guard
+BEFORE INSERT ON fund_receipt_resolution_requests
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_fund_resolution_request();
+
+DROP TRIGGER IF EXISTS fund_resolution_requests_append_only ON fund_receipt_resolution_requests;
+CREATE TRIGGER fund_resolution_requests_append_only
+BEFORE UPDATE OR DELETE ON fund_receipt_resolution_requests
 FOR EACH ROW EXECUTE FUNCTION opensales_reject_fund_resolution_mutation();
 
 DROP TRIGGER IF EXISTS fund_receipt_allocations_append_only ON fund_receipt_allocations;
