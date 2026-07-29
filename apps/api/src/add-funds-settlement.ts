@@ -71,6 +71,7 @@ export async function handleAddFundsPaymentEvent(
     client_account_id: string;
     submitted_by_user_id: string;
     command_id: string;
+    command_status: string;
     status: PaymentStatus;
     amount_minor: string;
     principal_minor: string;
@@ -85,17 +86,25 @@ export async function handleAddFundsPaymentEvent(
     membership_role: string | null;
     removed_at: Date | null;
     balance_cap_minor: string;
+    policy_enabled: boolean;
+    has_prior_receipt: boolean;
   }>(
     `SELECT
        afa.id, po.id AS operation_id, po.attempt_count AS operation_attempt_count,
        afa.client_account_id, afa.submitted_by_user_id,
-       afc.id AS command_id, afa.status, afa.amount_minor::text,
+       afc.id AS command_id, afc.status AS command_status,
+       afa.status, afa.amount_minor::text,
        afa.principal_minor::text, afa.fee_minor::text, afa.currency,
        afa.external_payment_id, afa.provider_occurred_at, afa.expires_at,
        u.email_verified_at, u.restricted_at AS user_restricted_at,
        ca.restricted_at AS account_restricted_at,
        cm.role AS membership_role, cm.removed_at,
-       afp.balance_cap_minor::text
+       afp.balance_cap_minor::text, afp.enabled AS policy_enabled,
+       EXISTS (
+         SELECT 1
+         FROM fund_receipts prior_receipt
+         WHERE prior_receipt.reported_add_funds_attempt_id = afa.id
+       ) AS has_prior_receipt
      FROM add_funds_attempts afa
      JOIN add_funds_commands afc ON afc.add_funds_attempt_id = afa.id
      JOIN users u ON u.id = afa.submitted_by_user_id
@@ -112,7 +121,8 @@ export async function handleAddFundsPaymentEvent(
       AND po.provider_installation_id = $2
      WHERE afa.id = $1
        AND afa.provider_installation_id = $2
-     FOR UPDATE OF afa, afc, po, u, ca`,
+     FOR UPDATE OF afa, afc, po, u, ca
+     FOR SHARE OF afp`,
     [body.paymentAttemptId, PROVIDER_INSTALLATION_ID, body.providerOperationId],
   );
   const attempt = attemptResult.rows[0];
@@ -156,6 +166,17 @@ export async function handleAddFundsPaymentEvent(
     );
     return { rejected: true, reason: "provider_operation_not_started" };
   }
+  const lockedMembership = await client.query<{
+    role: string;
+    removed_at: Date | null;
+  }>(
+    `SELECT role, removed_at
+     FROM client_memberships
+     WHERE user_id = $1 AND client_account_id = $2
+     FOR UPDATE`,
+    [attempt.submitted_by_user_id, attempt.client_account_id],
+  );
+  const membership = lockedMembership.rows[0];
 
   const inbox = await client.query(
     `INSERT INTO provider_inbox(
@@ -201,6 +222,9 @@ export async function handleAddFundsPaymentEvent(
 
   const occurredAt = new Date(body.occurredAt);
   if (body.status !== "succeeded") {
+    if (attempt.command_status === "manual" || attempt.has_prior_receipt) {
+      return { ignored: true, reason: "funds_receipt_requires_manual_review" };
+    }
     if (
       attempt.provider_occurred_at &&
       occurredAt.getTime() <= attempt.provider_occurred_at.getTime()
@@ -300,14 +324,15 @@ export async function handleAddFundsPaymentEvent(
   const terminalBeforeSuccess = ["failed", "cancelled", "expired", "succeeded"].includes(
     attempt.status,
   );
+  const expiredAtProviderOccurrence = occurredAt.getTime() > attempt.expires_at.getTime();
   const snapshotMatches =
     attempt.amount_minor === body.amountMinor && attempt.currency === body.currency;
   const eligible =
     Boolean(attempt.email_verified_at) &&
     !attempt.user_restricted_at &&
     !attempt.account_restricted_at &&
-    attempt.removed_at === null &&
-    (attempt.membership_role === "owner" || attempt.membership_role === "billing");
+    membership?.removed_at === null &&
+    (membership?.role === "owner" || membership?.role === "billing");
 
   await client.query(
     `INSERT INTO credit_accounts(client_account_id, currency)
@@ -335,13 +360,29 @@ export async function handleAddFundsPaymentEvent(
     BigInt(balanceMinor) + BigInt(attempt.principal_minor) <=
     BigInt(attempt.balance_cap_minor);
 
-  if (terminalBeforeSuccess || !snapshotMatches || !eligible || !capacityAllows) {
-    const reason = terminalBeforeSuccess
+  if (
+    terminalBeforeSuccess ||
+    attempt.command_status === "manual" ||
+    attempt.has_prior_receipt ||
+    expiredAtProviderOccurrence ||
+    !snapshotMatches ||
+    !eligible ||
+    !attempt.policy_enabled ||
+    !capacityAllows
+  ) {
+    const reason =
+      attempt.command_status === "manual" || attempt.has_prior_receipt
+        ? "additional settlement arrived while previous funds require manual review"
+        : terminalBeforeSuccess
       ? `settlement arrived after Add Funds became ${attempt.status}`
+      : expiredAtProviderOccurrence
+        ? "settlement occurred after the Add Funds attempt expired"
       : !snapshotMatches
         ? "Provider amount or currency does not match the Add Funds snapshot"
         : !eligible
           ? "customer eligibility was revoked before Add Funds settlement"
+          : !attempt.policy_enabled
+            ? "Add Funds policy was paused before settlement"
           : "Credit balance cap would be exceeded";
     await client.query(
       `UPDATE fund_receipts

@@ -27,8 +27,9 @@ export async function registerBillingRoutes(
       code: string;
       display_name: Record<string, string>;
       fee_basis_points: number;
+      add_funds_enabled: boolean;
     }>(
-      `SELECT code, display_name, fee_basis_points
+      `SELECT code, display_name, fee_basis_points, add_funds_enabled
        FROM payment_methods
        WHERE enabled
       ORDER BY code`,
@@ -53,6 +54,7 @@ export async function registerBillingRoutes(
         code: method.code,
         name: method.display_name[user.locale] ?? method.display_name.en ?? method.code,
         feeBasisPoints: method.fee_basis_points,
+        addFundsEnabled: method.add_funds_enabled,
       })),
       addFunds: policy
         ? {

@@ -27,6 +27,7 @@ const commandSchema = z.object({
       "partial",
       "wrong_currency",
       "expired_late",
+      "late_success",
     ])
     .default("success"),
   idempotencyKey: z.string().min(8).max(128),

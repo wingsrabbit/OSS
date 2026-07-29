@@ -79,7 +79,12 @@ type ManualItem = {
 type BillingSummary = {
   currency: string;
   creditBalanceMinor: string;
-  paymentMethods: Array<{ code: string; name: string; feeBasisPoints: number }>;
+  paymentMethods: Array<{
+    code: string;
+    name: string;
+    feeBasisPoints: number;
+    addFundsEnabled: boolean;
+  }>;
   addFunds: {
     enabled: boolean;
     allowed: boolean;
@@ -684,11 +689,13 @@ export function App() {
                   value={addFundsMethod}
                   onChange={(event) => setAddFundsMethod(event.target.value)}
                 >
-                  {billing.paymentMethods.map((method) => (
-                    <option key={method.code} value={method.code}>
-                      {method.name} · {(method.feeBasisPoints / 100).toFixed(2)}%
-                    </option>
-                  ))}
+                  {billing.paymentMethods
+                    .filter((method) => method.addFundsEnabled)
+                    .map((method) => (
+                      <option key={method.code} value={method.code}>
+                        {method.name} · {(method.feeBasisPoints / 100).toFixed(2)}%
+                      </option>
+                    ))}
                 </select>
                 <select
                   aria-label="Add Funds Provider scenario"
@@ -703,6 +710,7 @@ export function App() {
                   <option value="partial">Partial arrival — manual review</option>
                   <option value="wrong_currency">Wrong currency — manual review</option>
                   <option value="expired_late">Late after expiry — manual review</option>
+                  <option value="late_success">Success occurred after expiry — manual review</option>
                 </select>
                 {addFundsQuote ? (
                   <div className="quote-summary" data-testid="add-funds-quote">
@@ -725,23 +733,36 @@ export function App() {
                   Start Mock Add Funds
                 </button>
                 {addFundsCommand && (
-                  <div className="journey" data-testid="add-funds-status">
-                    <Status label="Add Funds" value={addFundsCommand.status} />
-                    <Status label="Payment" value={addFundsCommand.attemptStatus} />
-                    <Status
-                      label="Provider"
-                      value={addFundsCommand.providerOperationStatus ?? "queued"}
-                    />
-                    <Status
-                      label="Credit result"
-                      value={
-                        addFundsCommand.status === "succeeded"
-                          ? `credited ${usd(addFundsCommand.principalMinor)}`
-                          : addFundsCommand.status === "manual"
-                            ? "needs review"
-                            : "not credited"
-                      }
-                    />
+                  <div data-testid="add-funds-status">
+                    <div className="journey">
+                      <Status label="Add Funds" value={addFundsCommand.status} />
+                      <Status label="Payment" value={addFundsCommand.attemptStatus} />
+                      <Status
+                        label="Provider"
+                        value={addFundsCommand.providerOperationStatus ?? "queued"}
+                      />
+                      <Status
+                        label="Credit result"
+                        value={
+                          addFundsCommand.status === "succeeded"
+                            ? `credited ${usd(addFundsCommand.principalMinor)}`
+                            : addFundsCommand.status === "manual"
+                              ? "needs review"
+                              : "not credited"
+                        }
+                      />
+                    </div>
+                    {addFundsCommand.status === "manual" && (
+                      <p className="notice error">
+                        Funds received but not credited. Staff review is required.
+                        {typeof addFundsCommand.result?.reason === "string"
+                          ? ` ${addFundsCommand.result.reason}`
+                          : ""}
+                        {typeof addFundsCommand.result?.receiptId === "string"
+                          ? ` Receipt ${addFundsCommand.result.receiptId}`
+                          : ""}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

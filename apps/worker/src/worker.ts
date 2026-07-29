@@ -1378,7 +1378,7 @@ async function failKnownUnsentAddFunds(
   await client.query(
     `UPDATE provider_operations
      SET status = 'failed', last_error = $2, updated_at = now()
-     WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+     WHERE id = $1 AND status <> 'succeeded'`,
     [operationId, reason.slice(0, 1_000)],
   );
   await client.query(
@@ -1421,6 +1421,7 @@ async function preflightAddFunds(
   return transaction(async (client) => {
     const result = await client.query<{
       status: string;
+      expires_at: Date;
       amount_minor: string;
       principal_minor: string;
       fee_minor: string;
@@ -1457,7 +1458,7 @@ async function preflightAddFunds(
       operation_subject_id: string;
     }>(
       `SELECT
-         afa.status, afa.amount_minor::text, afa.principal_minor::text,
+         afa.status, afa.expires_at, afa.amount_minor::text, afa.principal_minor::text,
          afa.fee_minor::text, afa.currency, afa.scenario,
          afa.provider_installation_id, afa.client_account_id,
          afa.submitted_by_user_id,
@@ -1491,7 +1492,8 @@ async function preflightAddFunds(
        JOIN add_funds_policies afp ON afp.currency = afa.currency
        JOIN provider_operations po ON po.id = $2
        WHERE afa.id = $1
-       FOR UPDATE OF afa, afc, u, ca, po`,
+       FOR UPDATE OF afa, afc, u, ca, po
+       FOR SHARE OF pm, afp`,
       [addFundsAttemptId, providerOperationId],
     );
     const attempt = result.rows[0];
@@ -1503,6 +1505,17 @@ async function preflightAddFunds(
       );
       return { kind: "halted" };
     }
+    const lockedMembership = await client.query<{
+      role: string;
+      removed_at: Date | null;
+    }>(
+      `SELECT role, removed_at
+       FROM client_memberships
+       WHERE user_id = $1 AND client_account_id = $2
+       FOR UPDATE`,
+      [attempt.submitted_by_user_id, attempt.client_account_id],
+    );
+    const membership = lockedMembership.rows[0];
     if (
       attempt.operation_status === "succeeded" ||
       attempt.operation_status === "failed" ||
@@ -1603,12 +1616,22 @@ async function preflightAddFunds(
       return { kind: "halted" };
     }
 
+    if (attempt.expires_at.getTime() <= Date.now()) {
+      await failKnownUnsentAddFunds(
+        client,
+        job,
+        providerOperationId,
+        addFundsAttemptId,
+        "Add Funds attempt expired before Provider create left Core",
+      );
+      return { kind: "halted" };
+    }
     const eligible =
       Boolean(attempt.email_verified_at) &&
       !attempt.user_restricted_at &&
       !attempt.account_restricted_at &&
-      attempt.removed_at === null &&
-      (attempt.membership_role === "owner" || attempt.membership_role === "billing");
+      membership?.removed_at === null &&
+      (membership?.role === "owner" || membership?.role === "billing");
     const configurationCurrent =
       attempt.provider_installation_id === "mock-payment-v1" &&
       attempt.method_enabled &&

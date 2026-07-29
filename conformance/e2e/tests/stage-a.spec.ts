@@ -50,15 +50,15 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
   await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
 
-  const journey = page.locator(".order-panel");
+  const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await expect(journey.getByText("waiting payment", { exact: true })).toBeVisible();
   await expect(journey.getByText("pending", { exact: true })).toBeVisible();
   await expect(journey.getByText("Payment fee: $0.18", { exact: true })).toBeVisible();
   await expect(journey.getByText("External amount due: $5.18", { exact: true })).toBeVisible();
-  await journey.getByLabel("Payment method").selectOption("usdt");
+  await journey.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await expect(journey.getByText("Payment fee: $0.00", { exact: true })).toBeVisible();
   await expect(journey.getByText("External amount due: $5.00", { exact: true })).toBeVisible();
-  await journey.getByLabel("Payment method").selectOption("card");
+  await journey.getByLabel("Payment method", { exact: true }).selectOption("card");
   await expect(journey.getByText("Payment fee: $0.18", { exact: true })).toBeVisible();
   await journey.getByRole("button", { name: "Start mock payment" }).click();
 

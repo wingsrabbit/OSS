@@ -171,8 +171,15 @@ BEGIN
     settlement.principal_minor,
     settlement.fee_minor,
     settlement.currency,
+    settlement.add_funds_attempt_id,
+    command.add_funds_attempt_id AS command_attempt_id,
     attempt.client_account_id,
+    attempt.principal_minor AS attempt_principal_minor,
+    attempt.fee_minor AS attempt_fee_minor,
+    attempt.amount_minor AS attempt_amount_minor,
+    attempt.currency AS attempt_currency,
     receipt.client_account_id AS receipt_client_account_id,
+    receipt.reported_add_funds_attempt_id,
     receipt.currency AS receipt_currency,
     receipt.amount_minor,
     receipt.disposition,
@@ -180,6 +187,8 @@ BEGIN
     account.currency AS credit_currency
   INTO settlement_row
   FROM add_funds_settlements settlement
+  JOIN add_funds_commands command
+    ON command.id = settlement.command_id
   JOIN add_funds_attempts attempt
     ON attempt.id = settlement.add_funds_attempt_id
   JOIN fund_receipts receipt
@@ -190,6 +199,13 @@ BEGIN
 
   IF settlement_row IS NULL
      OR NEW.credit_minor <> settlement_row.principal_minor
+     OR settlement_row.add_funds_attempt_id <> settlement_row.command_attempt_id
+     OR settlement_row.add_funds_attempt_id <>
+          settlement_row.reported_add_funds_attempt_id
+     OR settlement_row.principal_minor <> settlement_row.attempt_principal_minor
+     OR settlement_row.fee_minor <> settlement_row.attempt_fee_minor
+     OR settlement_row.amount_minor <> settlement_row.attempt_amount_minor
+     OR settlement_row.currency <> settlement_row.attempt_currency
      OR settlement_row.client_account_id <> settlement_row.receipt_client_account_id
      OR settlement_row.client_account_id <> settlement_row.credit_client_account_id
      OR settlement_row.currency <> settlement_row.receipt_currency
@@ -235,7 +251,7 @@ BEGIN
     SELECT balance_cap_minor
     INTO cap_minor
     FROM add_funds_policies
-    WHERE currency = account_currency AND enabled;
+    WHERE currency = account_currency;
     IF cap_minor IS NULL
        OR available_minor + NEW.credit_minor - NEW.debit_minor > cap_minor THEN
       RAISE EXCEPTION 'Add Funds would exceed the configured Credit balance cap';

@@ -36,6 +36,7 @@ const paymentCreateSchema = z.object({
     "partial",
     "wrong_currency",
     "expired_late",
+    "late_success",
   ]),
 });
 
@@ -319,7 +320,10 @@ app.post("/v1/payments", async (request, reply) => {
         ? (BigInt(body.amountMinor) / 2n || 1n).toString()
         : body.amountMinor,
     currency: body.scenario === "wrong_currency" ? "EUR" : body.currency,
-    occurredAt: operation.occurred_at.toISOString(),
+    occurredAt:
+      body.scenario === "late_success"
+        ? new Date(operation.occurred_at.getTime() + 31 * 60 * 1_000).toISOString()
+        : operation.occurred_at.toISOString(),
   };
   if (body.scenario === "expired_late") {
     scheduleCallback(

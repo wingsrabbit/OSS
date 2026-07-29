@@ -406,7 +406,8 @@ async function startAddFunds(
     | "duplicate_out_of_order"
     | "partial"
     | "wrong_currency"
-    | "expired_late",
+    | "expired_late"
+    | "late_success",
   idempotencyKey = randomUUID(),
 ): Promise<{ command: AddFundsCommand; idempotencyKey: string }> {
   const command = await request<AddFundsCommand>(
@@ -2409,7 +2410,13 @@ const settledTimeoutAddFunds = await waitForAddFunds(
 );
 assert.equal(settledTimeoutAddFunds.result?.principalCreditedMinor, "5000");
 
-for (const scenario of ["partial", "wrong_currency", "expired_late"] as const) {
+let partialManual: AddFundsStatus | null = null;
+for (const scenario of [
+  "partial",
+  "wrong_currency",
+  "expired_late",
+  "late_success",
+] as const) {
   const quote = await createAddFundsQuote("5000", "card");
   const started = await startAddFunds(quote.quoteId, scenario);
   const manual = await waitForAddFunds(started.command.commandId, "manual");
@@ -2417,11 +2424,208 @@ for (const scenario of ["partial", "wrong_currency", "expired_late"] as const) {
     String(manual.result?.reason),
     scenario === "expired_late"
       ? /settlement arrived after Add Funds became expired/
+      : scenario === "late_success"
+        ? /settlement occurred after the Add Funds attempt expired/
       : /does not match the Add Funds snapshot/,
   );
+  if (scenario === "partial") partialManual = manual;
 }
+assert.ok(partialManual);
+const secondReceiptAfterManual = await submitPaymentFact({
+  eventId: `add-funds-second-receipt:${randomUUID()}`,
+  providerOperationId: partialManual.providerOperationId,
+  paymentAttemptId: partialManual.addFundsAttemptId,
+  externalPaymentId: `mock-add-funds-second-${randomUUID()}`,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date(Date.now() + 60_000).toISOString(),
+});
+assert.equal(secondReceiptAfterManual.status, 200);
+assert.equal(secondReceiptAfterManual.body.status, "unclaimed");
+const stillManualAfterSecondReceipt = await request<AddFundsStatus>(
+  `/api/v1/billing/add-funds/${partialManual.commandId}`,
+);
+assert.equal(stillManualAfterSecondReceipt.status, "manual");
+assert.match(
+  String(stillManualAfterSecondReceipt.result?.reason),
+  /previous funds require manual review/,
+);
 
-const recoveryMe = await request<{ clientAccountId: string }>("/api/v1/auth/me");
+const recoveryMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
+await corePool.query(`
+  CREATE OR REPLACE FUNCTION integration_delay_add_funds_security()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF NEW.job_type = 'add_funds.start' THEN
+      NEW.available_at = now() + interval '1 hour';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS integration_delay_add_funds_security ON durable_jobs;
+  CREATE TRIGGER integration_delay_add_funds_security
+  BEFORE INSERT ON durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION integration_delay_add_funds_security();
+`);
+const disabledPolicyQuote = await createAddFundsQuote("5000", "card");
+const disabledPolicy = await startAddFunds(disabledPolicyQuote.quoteId, "success");
+const disabledPolicyOperation = await corePool.query<{ id: string }>(
+  `UPDATE provider_operations
+   SET status = 'running', attempt_count = 1
+   WHERE subject_type = 'add_funds' AND subject_id = $1
+   RETURNING id`,
+  [disabledPolicy.command.addFundsAttemptId],
+);
+const disabledPolicyOperationId = disabledPolicyOperation.rows[0]?.id;
+assert.ok(disabledPolicyOperationId);
+await corePool.query(
+  `UPDATE add_funds_attempts
+   SET status = 'processing'
+   WHERE id = $1`,
+  [disabledPolicy.command.addFundsAttemptId],
+);
+await corePool.query("UPDATE add_funds_policies SET enabled = false WHERE currency = 'USD'");
+const disabledPolicyReceipt = await submitPaymentFact({
+  eventId: `add-funds-policy-disabled:${randomUUID()}`,
+  providerOperationId: disabledPolicyOperationId,
+  paymentAttemptId: disabledPolicy.command.addFundsAttemptId,
+  externalPaymentId: `mock-add-funds-disabled-policy-${randomUUID()}`,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date().toISOString(),
+});
+assert.equal(disabledPolicyReceipt.status, 200);
+assert.equal(disabledPolicyReceipt.body.status, "unclaimed");
+const disabledPolicyManual = await waitForAddFunds(
+  disabledPolicy.command.commandId,
+  "manual",
+);
+assert.match(String(disabledPolicyManual.result?.reason), /policy was paused/);
+await corePool.query("UPDATE add_funds_policies SET enabled = true WHERE currency = 'USD'");
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed'
+   WHERE job_type = 'add_funds.start'
+     AND payload->>'addFundsAttemptId' = $1`,
+  [disabledPolicy.command.addFundsAttemptId],
+);
+
+const revokedMembershipQuote = await createAddFundsQuote("5000", "card");
+const revokedMembership = await startAddFunds(revokedMembershipQuote.quoteId, "success");
+const revokedMembershipOperation = await corePool.query<{ id: string }>(
+  `UPDATE provider_operations
+   SET status = 'running', attempt_count = 1
+   WHERE subject_type = 'add_funds' AND subject_id = $1
+   RETURNING id`,
+  [revokedMembership.command.addFundsAttemptId],
+);
+const revokedMembershipOperationId = revokedMembershipOperation.rows[0]?.id;
+assert.ok(revokedMembershipOperationId);
+await corePool.query(
+  `UPDATE add_funds_attempts SET status = 'processing' WHERE id = $1`,
+  [revokedMembership.command.addFundsAttemptId],
+);
+const revocationClient = await corePool.connect();
+try {
+  await revocationClient.query("BEGIN");
+  await revocationClient.query(
+    `SELECT role
+     FROM client_memberships
+     WHERE user_id = $1 AND client_account_id = $2
+     FOR UPDATE`,
+    [recoveryMe.id, recoveryMe.clientAccountId],
+  );
+  const callbackPromise = submitPaymentFact({
+    eventId: `add-funds-membership-revoked:${randomUUID()}`,
+    providerOperationId: revokedMembershipOperationId,
+    paymentAttemptId: revokedMembership.command.addFundsAttemptId,
+    externalPaymentId: `mock-add-funds-revoked-membership-${randomUUID()}`,
+    status: "succeeded",
+    amountMinor: "5175",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+  await waitFor(
+    "Add Funds callback to wait on the Membership authorization lock",
+    async () => {
+      const blocked = await corePool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM pg_stat_activity
+         WHERE datname = current_database()
+           AND pid <> pg_backend_pid()
+           AND wait_event_type = 'Lock'
+           AND query LIKE '%FROM client_memberships%'`,
+      );
+      return Number(blocked.rows[0]?.count ?? "0");
+    },
+    (count) => count > 0,
+  );
+  await revocationClient.query(
+    `UPDATE client_memberships
+     SET removed_at = now()
+     WHERE user_id = $1 AND client_account_id = $2`,
+    [recoveryMe.id, recoveryMe.clientAccountId],
+  );
+  await revocationClient.query("COMMIT");
+  const revokedReceipt = await callbackPromise;
+  assert.equal(revokedReceipt.status, 200);
+  assert.equal(revokedReceipt.body.status, "unclaimed");
+} catch (error) {
+  await revocationClient.query("ROLLBACK").catch(() => undefined);
+  throw error;
+} finally {
+  revocationClient.release();
+}
+await corePool.query(
+  `UPDATE client_memberships
+   SET removed_at = NULL
+   WHERE user_id = $1 AND client_account_id = $2`,
+  [recoveryMe.id, recoveryMe.clientAccountId],
+);
+const revokedMembershipManual = await waitForAddFunds(
+  revokedMembership.command.commandId,
+  "manual",
+);
+assert.match(String(revokedMembershipManual.result?.reason), /eligibility was revoked/);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed'
+   WHERE job_type = 'add_funds.start'
+     AND payload->>'addFundsAttemptId' = $1`,
+  [revokedMembership.command.addFundsAttemptId],
+);
+
+const expiredKnownUnsentQuote = await createAddFundsQuote("5000", "card");
+const expiredKnownUnsent = await startAddFunds(expiredKnownUnsentQuote.quoteId, "success");
+await corePool.query(
+  `UPDATE add_funds_attempts
+   SET expires_at = now() - interval '1 second'
+   WHERE id = $1`,
+  [expiredKnownUnsent.command.addFundsAttemptId],
+);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET available_at = now()
+   WHERE job_type = 'add_funds.start'
+     AND payload->>'addFundsAttemptId' = $1`,
+  [expiredKnownUnsent.command.addFundsAttemptId],
+);
+await waitForAddFunds(expiredKnownUnsent.command.commandId, "failed");
+const expiredKnownUnsentProviderCalls = await providerPool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM mock_payment_operations
+   WHERE payment_attempt_id = $1`,
+  [expiredKnownUnsent.command.addFundsAttemptId],
+);
+assert.equal(expiredKnownUnsentProviderCalls.rows[0]?.count, "0");
+await corePool.query(`
+  DROP TRIGGER IF EXISTS integration_delay_add_funds_security ON durable_jobs;
+  DROP FUNCTION IF EXISTS integration_delay_add_funds_security();
+`);
 const beforeCapRace = await corePool.query<{ balance_minor: string; unclaimed: string }>(
   `SELECT
      (SELECT COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text
@@ -2437,7 +2641,7 @@ const beforeCapRace = await corePool.query<{ balance_minor: string; unclaimed: s
   [recoveryMe.clientAccountId],
 );
 assert.equal(beforeCapRace.rows[0]?.balance_minor, "10000");
-assert.equal(beforeCapRace.rows[0]?.unclaimed, "3");
+assert.equal(beforeCapRace.rows[0]?.unclaimed, "7");
 
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_add_funds_start()
@@ -2546,7 +2750,7 @@ const afterCapRace = await corePool.query<{
   [recoveryMe.clientAccountId],
 );
 assert.equal(afterCapRace.rows[0]?.balance_minor, "996000");
-assert.equal(afterCapRace.rows[0]?.unclaimed, "4");
+assert.equal(afterCapRace.rows[0]?.unclaimed, "8");
 assert.equal(afterCapRace.rows[0]?.add_funds_credits, "2");
 
 cookie = staffCookie;
