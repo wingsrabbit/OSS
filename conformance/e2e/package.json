@@ -1,0 +1,16 @@
+{
+  "name": "@opensales/e2e",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0",
+    "@types/node": "24.10.13",
+    "typescript": "7.0.2"
+  }
+}
