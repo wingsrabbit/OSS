@@ -349,30 +349,65 @@ async function dropPaymentStartDelay(): Promise<void> {
   `);
 }
 
-async function installProviderInboxLockOrderDelay(): Promise<void> {
+const providerInboxReceiptLockGate = "integration:provider-inbox-receipt-lock-order";
+
+async function installProviderInboxReceiptLockGate(): Promise<void> {
   await corePool.query(`
-    DROP TRIGGER IF EXISTS integration_delay_provider_inbox_lock_order ON provider_inbox;
-    CREATE OR REPLACE FUNCTION integration_delay_provider_inbox_lock_order()
+    DROP TRIGGER IF EXISTS integration_gate_provider_inbox_receipt_lock ON provider_inbox;
+    CREATE OR REPLACE FUNCTION integration_gate_provider_inbox_receipt_lock()
     RETURNS trigger
     LANGUAGE plpgsql
     AS $$
     BEGIN
       IF NEW.external_event_id LIKE 'lock-order:%' THEN
-        PERFORM pg_sleep(1.5);
+        PERFORM pg_advisory_xact_lock(
+          hashtextextended('integration:provider-inbox-receipt-lock-order', 0)
+        );
       END IF;
       RETURN NEW;
     END;
     $$;
-    CREATE TRIGGER integration_delay_provider_inbox_lock_order
+    CREATE TRIGGER integration_gate_provider_inbox_receipt_lock
     BEFORE INSERT ON provider_inbox
-    FOR EACH ROW EXECUTE FUNCTION integration_delay_provider_inbox_lock_order();
+    FOR EACH ROW EXECUTE FUNCTION integration_gate_provider_inbox_receipt_lock();
   `);
 }
 
-async function dropProviderInboxLockOrderDelay(): Promise<void> {
+async function dropProviderInboxReceiptLockGate(): Promise<void> {
   await corePool.query(`
-    DROP TRIGGER IF EXISTS integration_delay_provider_inbox_lock_order ON provider_inbox;
-    DROP FUNCTION IF EXISTS integration_delay_provider_inbox_lock_order();
+    DROP TRIGGER IF EXISTS integration_gate_provider_inbox_receipt_lock ON provider_inbox;
+    DROP FUNCTION IF EXISTS integration_gate_provider_inbox_receipt_lock();
+  `);
+}
+
+const providerInboxAccountLockGate = "integration:provider-inbox-account-lock-order";
+
+async function installProviderInboxAccountLockGate(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_gate_provider_inbox_account_lock ON provider_inbox;
+    CREATE OR REPLACE FUNCTION integration_gate_provider_inbox_account_lock()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.external_event_id LIKE 'account-lock-order:%' THEN
+        PERFORM pg_advisory_xact_lock(
+          hashtextextended('integration:provider-inbox-account-lock-order', 0)
+        );
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER integration_gate_provider_inbox_account_lock
+    BEFORE INSERT ON provider_inbox
+    FOR EACH ROW EXECUTE FUNCTION integration_gate_provider_inbox_account_lock();
+  `);
+}
+
+async function dropProviderInboxAccountLockGate(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_gate_provider_inbox_account_lock ON provider_inbox;
+    DROP FUNCTION IF EXISTS integration_gate_provider_inbox_account_lock();
   `);
 }
 
@@ -3047,6 +3082,19 @@ const allocationReplay = await request<{
 );
 assert.equal(allocationReplay.resolutionId, allocatedUnclaimed.resolutionId);
 assert.equal(allocationReplay.replayed, true);
+const allocationAfterReload = await request<{
+  resolutionId: string;
+  replayed: boolean;
+}>(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({ ...allocationBody, idempotencyKey: randomUUID() }),
+  },
+  200,
+);
+assert.equal(allocationAfterReload.resolutionId, allocatedUnclaimed.resolutionId);
+assert.equal(allocationAfterReload.replayed, true);
 await request(
   `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
   {
@@ -3081,12 +3129,21 @@ const competingCreditResolutions = await Promise.all([
 ]);
 assert.deepEqual(
   competingCreditResolutions.map((response) => response.status).sort(),
-  [201, 409],
+  [200, 201],
 );
 const successfulCreditResolution = competingCreditResolutions.find(
   (response) => response.status === 201,
 );
 assert.ok(successfulCreditResolution);
+const replayedCompetingCreditResolution = competingCreditResolutions.find(
+  (response) => response.status === 200,
+);
+assert.ok(replayedCompetingCreditResolution);
+assert.equal(
+  replayedCompetingCreditResolution.body.resolutionId,
+  successfulCreditResolution.body.resolutionId,
+);
+assert.equal(replayedCompetingCreditResolution.body.replayed, true);
 const successfulCreditResolutionKey =
   successfulCreditResolution === competingCreditResolutions[0]
     ? creditResolutionKey
@@ -3194,8 +3251,16 @@ let lockOrderRace:
       { status: number; body: Record<string, unknown> },
     ]
   | undefined;
-await installProviderInboxLockOrderDelay();
+await installProviderInboxReceiptLockGate();
+const receiptGateClient = await corePool.connect();
+let receiptGateOpen = false;
 try {
+  await receiptGateClient.query("BEGIN");
+  receiptGateOpen = true;
+  await receiptGateClient.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+    [providerInboxReceiptLockGate],
+  );
   const repeatedProviderFact = submitPaymentFact({
     eventId: lockOrderEventId,
     providerOperationId: mismatchRecords.operation_id,
@@ -3209,20 +3274,20 @@ try {
   await waitFor(
     "Provider callback to hold the invoice lock before receipt reconciliation",
     async () => {
-      const result = await corePool.query<{ sleeping: string }>(
-        `SELECT count(*)::text AS sleeping
+      const result = await corePool.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
          FROM pg_stat_activity
          WHERE state = 'active'
-           AND wait_event = 'PgSleep'
+           AND wait_event_type = 'Lock'
            AND query ILIKE '%INSERT INTO provider_inbox%'`,
       );
-      return result.rows[0]?.sleeping ?? "0";
+      return result.rows[0]?.waiting ?? "0";
     },
-    (sleeping) => BigInt(sleeping) > 0n,
+    (waiting) => BigInt(waiting) > 0n,
   );
-  lockOrderRace = await Promise.all([
-    repeatedProviderFact,
-    rawCoreRequest(`/api/v1/admin/funds/${lockOrderReceiptId}/resolutions`, {
+  const concurrentFundAllocation = rawCoreRequest(
+    `/api/v1/admin/funds/${lockOrderReceiptId}/resolutions`,
+    {
       method: "POST",
       body: JSON.stringify({
         action: "allocate_invoice",
@@ -3231,10 +3296,42 @@ try {
         reason: "Synthetic concurrent allocation while a duplicate Provider fact reconciles",
         idempotencyKey: randomUUID(),
       }),
-    }),
-  ]);
+    },
+  );
+  await waitFor(
+    "staff allocation to wait for the Provider-held invoice before locking the receipt",
+    async () => {
+      const result = await corePool.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
+         FROM pg_stat_activity
+         WHERE state = 'active'
+           AND wait_event_type = 'Lock'
+           AND query ILIKE '%SELECT id, client_account_id, currency, total_minor::text%'
+           AND query ILIKE '%FROM invoices%'
+           AND query ILIKE '%FOR UPDATE%'`,
+      );
+      return result.rows[0]?.waiting ?? "0";
+    },
+    (waiting) => BigInt(waiting) > 0n,
+  );
+  const unlockedReceipt = await corePool.query<{ id: string }>(
+    `SELECT id
+     FROM fund_receipts
+     WHERE id = $1
+     FOR UPDATE NOWAIT`,
+    [lockOrderReceiptId],
+  );
+  assert.equal(unlockedReceipt.rows[0]?.id, lockOrderReceiptId);
+
+  await receiptGateClient.query("COMMIT");
+  receiptGateOpen = false;
+  lockOrderRace = await Promise.all([repeatedProviderFact, concurrentFundAllocation]);
 } finally {
-  await dropProviderInboxLockOrderDelay();
+  if (receiptGateOpen) {
+    await receiptGateClient.query("ROLLBACK");
+  }
+  receiptGateClient.release();
+  await dropProviderInboxReceiptLockGate();
 }
 assert.ok(lockOrderRace);
 const [repeatedProviderFact, concurrentFundAllocation] = lockOrderRace;
@@ -3270,6 +3367,185 @@ assert.equal(lockOrderFacts.rows[0]?.receipt_allocated_minor, mismatchOrder.invo
 assert.equal(lockOrderFacts.rows[0]?.invoice_allocated_minor, mismatchOrder.invoice.dueMinor);
 assert.equal(lockOrderFacts.rows[0]?.resolutions, "1");
 assert.equal(lockOrderFacts.rows[0]?.allocations, "1");
+
+await installPaymentStartDelay();
+try {
+  const accountLockOrder = await createOrder(automaticPrice.id, legal);
+  const accountLockQuote = await createPaymentQuote(accountLockOrder.invoice.id, "usdt", false);
+  const accountLockCommand = await request<PaymentCommand>(
+    `/api/v1/invoices/${accountLockOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: accountLockQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(accountLockCommand.paymentAttemptId);
+  const accountLockRecords = await readPaymentRecords(accountLockCommand.commandId);
+  await corePool.query("UPDATE payment_attempts SET status = 'processing' WHERE id = $1", [
+    accountLockCommand.paymentAttemptId,
+  ]);
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1
+     WHERE id = $1`,
+    [accountLockRecords.operation_id],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', locked_at = NULL, locked_by = NULL
+     WHERE job_type = 'payment.start'
+       AND payload->>'paymentAttemptId' = $1`,
+    [accountLockCommand.paymentAttemptId],
+  );
+
+  const accountLockUnclaimedExternalId = `account-lock-source-${randomUUID()}`;
+  const accountLockUnclaimedAmount = (
+    BigInt(accountLockRecords.amount_minor) + 1n
+  ).toString();
+  const accountLockUnclaimed = await submitPaymentFact({
+    eventId: `account-lock-source:${randomUUID()}`,
+    providerOperationId: accountLockRecords.operation_id,
+    paymentAttemptId: accountLockCommand.paymentAttemptId,
+    externalPaymentId: accountLockUnclaimedExternalId,
+    status: "succeeded",
+    amountMinor: accountLockUnclaimedAmount,
+    currency: accountLockRecords.currency,
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(accountLockUnclaimed.status, 202);
+  assert.equal(accountLockUnclaimed.body.status, "unclaimed");
+  const accountLockReceiptId = String(accountLockUnclaimed.body.receiptId ?? "");
+  assert.match(accountLockReceiptId, /^[0-9a-f-]{36}$/);
+
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  await installProviderInboxAccountLockGate();
+  const accountGateClient = await corePool.connect();
+  let accountGateOpen = false;
+  let accountLockRace:
+    | [
+        { status: number; body: Record<string, unknown> },
+        { status: number; body: Record<string, unknown> },
+      ]
+    | undefined;
+  try {
+    await accountGateClient.query("BEGIN");
+    accountGateOpen = true;
+    await accountGateClient.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [providerInboxAccountLockGate],
+    );
+    const providerSettlement = submitPaymentFact({
+      eventId: `account-lock-order:${randomUUID()}`,
+      providerOperationId: accountLockRecords.operation_id,
+      paymentAttemptId: accountLockCommand.paymentAttemptId,
+      externalPaymentId: `account-lock-settlement-${randomUUID()}`,
+      status: "succeeded",
+      amountMinor: accountLockRecords.amount_minor,
+      currency: accountLockRecords.currency,
+      occurredAt: new Date().toISOString(),
+    });
+    await waitFor(
+      "successful Provider callback to hold the invoice before account settlement",
+      async () => {
+        const result = await corePool.query<{ waiting: string }>(
+          `SELECT count(*)::text AS waiting
+           FROM pg_stat_activity
+           WHERE state = 'active'
+             AND wait_event_type = 'Lock'
+             AND query ILIKE '%INSERT INTO provider_inbox%'`,
+        );
+        return result.rows[0]?.waiting ?? "0";
+      },
+      (waiting) => BigInt(waiting) > 0n,
+    );
+    const staffAllocation = rawCoreRequest(
+      `/api/v1/admin/funds/${accountLockReceiptId}/resolutions`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          action: "allocate_invoice",
+          amountMinor: accountLockOrder.invoice.dueMinor,
+          invoiceId: accountLockOrder.invoice.id,
+          reason: "Synthetic allocation competing with a successful Provider settlement",
+          idempotencyKey: randomUUID(),
+        }),
+      },
+    );
+    await waitFor(
+      "staff allocation to wait for the Provider-held invoice before locking the account",
+      async () => {
+        const result = await corePool.query<{ waiting: string }>(
+          `SELECT count(*)::text AS waiting
+           FROM pg_stat_activity
+           WHERE state = 'active'
+             AND wait_event_type = 'Lock'
+             AND query ILIKE '%SELECT id, client_account_id, currency, total_minor::text%'
+             AND query ILIKE '%FROM invoices%'
+             AND query ILIKE '%FOR UPDATE%'`,
+        );
+        return result.rows[0]?.waiting ?? "0";
+      },
+      (waiting) => BigInt(waiting) > 0n,
+    );
+    const unlockedStaffAccount = await corePool.query<{ id: string }>(
+      `SELECT id
+       FROM client_accounts
+       WHERE id = $1
+       FOR UPDATE NOWAIT`,
+      [staffMe.clientAccountId],
+    );
+    assert.equal(unlockedStaffAccount.rows[0]?.id, staffMe.clientAccountId);
+
+    await accountGateClient.query("COMMIT");
+    accountGateOpen = false;
+    accountLockRace = await Promise.all([providerSettlement, staffAllocation]);
+  } finally {
+    if (accountGateOpen) {
+      await accountGateClient.query("ROLLBACK");
+    }
+    accountGateClient.release();
+    await dropProviderInboxAccountLockGate();
+  }
+  assert.ok(accountLockRace);
+  const [successfulProviderSettlement, staleStaffAllocation] = accountLockRace;
+  assert.equal(successfulProviderSettlement.status, 202);
+  assert.equal(successfulProviderSettlement.body.status, "succeeded");
+  assert.equal(staleStaffAllocation.status, 409);
+  assert.equal(staleStaffAllocation.body.code, "INVOICE_ALLOCATION_EXCEEDS_DUE");
+  const accountLockFinal = await corePool.query<{
+    source_allocated_minor: string;
+    source_resolutions: string;
+    invoice_allocated_minor: string;
+  }>(
+    `SELECT
+       receipt.allocated_minor::text AS source_allocated_minor,
+       (
+         SELECT count(*)::text
+         FROM fund_receipt_resolutions resolution
+         WHERE resolution.fund_receipt_id = receipt.id
+       ) AS source_resolutions,
+       totals.allocated_minor::text AS invoice_allocated_minor
+     FROM fund_receipts receipt
+     JOIN payment_attempts payment ON payment.id = receipt.reported_payment_attempt_id
+     JOIN invoice_allocation_totals totals ON totals.invoice_id = payment.invoice_id
+     WHERE receipt.id = $1`,
+    [accountLockReceiptId],
+  );
+  assert.equal(accountLockFinal.rows[0]?.source_allocated_minor, "0");
+  assert.equal(accountLockFinal.rows[0]?.source_resolutions, "0");
+  assert.equal(accountLockFinal.rows[0]?.invoice_allocated_minor, accountLockRecords.amount_minor);
+} finally {
+  await dropPaymentStartDelay();
+}
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count

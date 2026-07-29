@@ -193,6 +193,17 @@ function usd(minor: string): string {
   }).format(Number(minor) / 100);
 }
 
+async function fundResolutionIdempotencyKey(requestIdentity: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(requestIdentity),
+  );
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `fund-resolution:${fingerprint}`;
+}
+
 export function App() {
   const [locale, setLocale] = useState<Locale>("en");
   const [products, setProducts] = useState<Product[]>([]);
@@ -223,7 +234,6 @@ export function App() {
   const [fundResolutionMinor, setFundResolutionMinor] = useState("");
   const [fundResolutionInvoiceId, setFundResolutionInvoiceId] = useState("");
   const [fundResolutionReason, setFundResolutionReason] = useState("");
-  const fundResolutionKeys = useRef(new Map<string, string>());
   const fundResolutionInFlight = useRef(new Set<string>());
   const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
     ReadonlySet<string>
@@ -636,11 +646,6 @@ export function App() {
       invoiceId,
       reason,
     });
-    let idempotencyKey = fundResolutionKeys.current.get(requestIdentity);
-    if (!idempotencyKey) {
-      idempotencyKey = crypto.randomUUID();
-      fundResolutionKeys.current.set(requestIdentity, idempotencyKey);
-    }
     fundResolutionInFlight.current.add(item.receiptId);
     setFundResolutionPendingReceiptIds((current) => {
       const next = new Set(current);
@@ -649,6 +654,7 @@ export function App() {
     });
     setError("");
     try {
+      const idempotencyKey = await fundResolutionIdempotencyKey(requestIdentity);
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
@@ -663,7 +669,6 @@ export function App() {
           idempotencyKey,
         }),
       });
-      fundResolutionKeys.current.delete(requestIdentity);
       setNotice(
         action === "convert_to_credit"
           ? "Unclaimed funds converted to Credit with a balanced journal."

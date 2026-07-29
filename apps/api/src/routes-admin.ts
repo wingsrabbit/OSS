@@ -218,32 +218,41 @@ export async function registerAdminRoutes(
     });
 
     const outcome = await transaction(pool, async (client) => {
-      await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-        `fund-receipt-resolution:${body.idempotencyKey}`,
-      ]);
+      const resolutionLocks = [
+        `fund-receipt-resolution:idempotency:${body.idempotencyKey}`,
+        `fund-receipt-resolution:semantic:${params.receiptId}:${fingerprint}`,
+      ].sort();
+      for (const lock of resolutionLocks) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [lock]);
+      }
       const previous = await client.query<{
         fund_receipt_id: string;
+        idempotency_key: string;
         request_fingerprint: string;
         result: Record<string, unknown>;
       }>(
-        `SELECT fund_receipt_id, request_fingerprint, result
+        `SELECT fund_receipt_id, idempotency_key, request_fingerprint, result
          FROM fund_receipt_resolutions
          WHERE idempotency_key = $1
+            OR (fund_receipt_id = $2 AND request_fingerprint = $3)
+         ORDER BY CASE WHEN idempotency_key = $1 THEN 0 ELSE 1 END
+         LIMIT 1
          FOR UPDATE`,
-        [body.idempotencyKey],
+        [body.idempotencyKey, params.receiptId, fingerprint],
       );
       const replay = previous.rows[0];
       if (replay) {
         if (
-          replay.fund_receipt_id !== params.receiptId ||
-          replay.request_fingerprint !== fingerprint
+          replay.idempotency_key === body.idempotencyKey &&
+          (replay.fund_receipt_id !== params.receiptId ||
+            replay.request_fingerprint !== fingerprint)
         ) {
           throw Object.assign(
             new Error("The idempotency key was used for a different fund resolution"),
             { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
           );
         }
+        await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
         return { ...replay.result, replayed: true };
       }
 
@@ -273,6 +282,8 @@ export async function registerAdminRoutes(
           throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
         }
       }
+
+      await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
 
       const receiptResult = await client.query<{
         id: string;

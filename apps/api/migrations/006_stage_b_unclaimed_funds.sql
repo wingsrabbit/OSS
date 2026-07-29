@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS fund_receipt_allocations (
 
 CREATE INDEX IF NOT EXISTS fund_receipt_resolutions_receipt_created_idx
   ON fund_receipt_resolutions (fund_receipt_id, created_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS fund_receipt_resolutions_semantic_unique
+  ON fund_receipt_resolutions (fund_receipt_id, request_fingerprint);
 CREATE INDEX IF NOT EXISTS fund_receipt_allocations_invoice_idx
   ON fund_receipt_allocations (invoice_id);
 
