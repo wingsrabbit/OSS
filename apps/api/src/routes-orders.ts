@@ -27,7 +27,14 @@ const checkoutSchema = z.object({
 const paymentSchema = z.object({
   quoteId: z.uuid(),
   scenario: z
-    .enum(["success", "failed", "cancelled", "timeout_success", "duplicate_out_of_order"])
+    .enum([
+      "success",
+      "failed",
+      "cancelled",
+      "timeout_success",
+      "duplicate_out_of_order",
+      "definitive_reject",
+    ])
     .default("success"),
   idempotencyKey: z.string().min(8).max(128),
 });

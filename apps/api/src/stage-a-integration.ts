@@ -1583,7 +1583,7 @@ const definitiveQuote = await createPaymentQuote(definitiveOrder.invoice.id, "ca
 const definitiveKey = randomUUID();
 const definitiveRequestBody = {
   quoteId: definitiveQuote.quoteId,
-  scenario: "success",
+  scenario: "definitive_reject",
   idempotencyKey: definitiveKey,
 };
 const definitiveCommand = await request<PaymentCommand>(
@@ -1592,10 +1592,6 @@ const definitiveCommand = await request<PaymentCommand>(
   202,
 );
 assert.ok(definitiveCommand.paymentAttemptId);
-await corePool.query(
-  "UPDATE payment_attempts SET scenario = 'synthetic_definitive_400' WHERE id = $1",
-  [definitiveCommand.paymentAttemptId],
-);
 await releasePaymentStart(definitiveCommand.paymentAttemptId);
 const definitivelyRejected = await waitFor(
   "definitive Provider 400 to close the command",

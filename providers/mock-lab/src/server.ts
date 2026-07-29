@@ -25,7 +25,14 @@ const paymentCreateSchema = z.object({
   paymentAttemptId: z.uuid(),
   amountMinor: z.string().regex(/^[1-9]\d*$/),
   currency: z.string().regex(/^[A-Z]{3}$/),
-  scenario: z.enum(["success", "failed", "cancelled", "timeout_success", "duplicate_out_of_order"]),
+  scenario: z.enum([
+    "success",
+    "failed",
+    "cancelled",
+    "timeout_success",
+    "duplicate_out_of_order",
+    "definitive_reject",
+  ]),
 });
 
 const resourceCreateSchema = z.object({
@@ -215,6 +222,9 @@ app.post("/v1/payments", async (request, reply) => {
   if (!callbackSecret) return reply.code(503).send({ error: "payment callback is not configured" });
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
+  }
+  if (body.scenario === "definitive_reject") {
+    return reply.code(400).send({ error: "synthetic definitive payment rejection" });
   }
   const externalPaymentId = `mock-pay-${body.operationId}`;
   const fingerprint = requestFingerprint("payment.create:v1", body);
