@@ -86,7 +86,7 @@ async function waitFor<T>(
   do {
     latest = await read();
     if (predicate(latest)) return latest;
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, 750));
   } while (Date.now() < deadline);
   throw new Error(`Timed out waiting for ${description}: ${JSON.stringify(latest!)}`);
 }
