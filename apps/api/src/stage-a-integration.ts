@@ -877,6 +877,92 @@ const fullCreditPaymentFacts = await corePool.query<{ attempts: string; operatio
 assert.equal(fullCreditPaymentFacts.rows[0]?.attempts, "0");
 assert.equal(fullCreditPaymentFacts.rows[0]?.operations, "0");
 
+await request(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      direction: "increase",
+      amountMinor: "500",
+      currency: "USD",
+      reason: "Synthetic Stage B concurrent Credit contention grant",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+const competingCreditOrderA = await createOrder(automaticPrice.id, legal);
+const competingCreditOrderB = await createOrder(automaticPrice.id, legal);
+const competingCreditQuoteA = await createPaymentQuote(
+  competingCreditOrderA.invoice.id,
+  "card",
+  true,
+);
+const competingCreditQuoteB = await createPaymentQuote(
+  competingCreditOrderB.invoice.id,
+  "card",
+  true,
+);
+const competingCreditResults = await Promise.all([
+  rawCoreRequest(`/api/v1/invoices/${competingCreditOrderA.invoice.id}/payments`, {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: competingCreditQuoteA.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  }),
+  rawCoreRequest(`/api/v1/invoices/${competingCreditOrderB.invoice.id}/payments`, {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: competingCreditQuoteB.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  }),
+]);
+assert.deepEqual(
+  competingCreditResults.map((result) => result.status).sort(),
+  [200, 409],
+);
+assert.equal(
+  competingCreditResults.find((result) => result.status === 409)?.body.code,
+  "CREDIT_CHANGED",
+);
+const competingCreditOrders = await waitFor(
+  "exactly one competing full-Credit invoice to settle",
+  async () =>
+    Promise.all([
+      request<OrderDetail>(`/api/v1/orders/${competingCreditOrderA.order.id}`),
+      request<OrderDetail>(`/api/v1/orders/${competingCreditOrderB.order.id}`),
+    ]),
+  (orders) => orders.filter((order) => order.invoice.status === "paid").length === 1,
+);
+assert.equal(
+  competingCreditOrders.filter((order) => order.invoice.status === "paid").length,
+  1,
+);
+const competingCreditFacts = await corePool.query<{
+  balance_minor: string;
+  allocations: string;
+}>(
+  `SELECT
+     (SELECT COALESCE(sum(ct.credit_minor - ct.debit_minor), 0)::text
+        FROM credit_accounts ca
+        LEFT JOIN credit_transactions ct ON ct.credit_account_id = ca.id
+       WHERE ca.client_account_id = $1 AND ca.currency = 'USD') AS balance_minor,
+     (SELECT count(*)::text
+        FROM credit_allocations ca
+       WHERE ca.invoice_id IN ($2, $3)) AS allocations`,
+  [
+    staffMe.clientAccountId,
+    competingCreditOrderA.invoice.id,
+    competingCreditOrderB.invoice.id,
+  ],
+);
+assert.equal(competingCreditFacts.rows[0]?.balance_minor, "0");
+assert.equal(competingCreditFacts.rows[0]?.allocations, "1");
+
 await corePool.query("UPDATE users SET restricted_at = now() WHERE email = $1", [email]);
 await request(
   "/api/v1/auth/reauth",
