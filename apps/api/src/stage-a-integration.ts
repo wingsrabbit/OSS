@@ -1218,13 +1218,20 @@ async function assertMockSignatureCannotCrossProviderBoundary(
   await corePool.query(
     `UPDATE durable_jobs
      SET status = 'completed', locked_at = NULL, locked_by = NULL
-     WHERE job_type = 'payment.start' AND payload->>'paymentAttemptId' = $1;
-     UPDATE provider_operations SET status = 'failed' WHERE id = $2;
-     UPDATE payment_attempts SET status = 'failed' WHERE id = $1;
-     UPDATE invoice_payment_commands
+     WHERE job_type = 'payment.start' AND payload->>'paymentAttemptId' = $1`,
+    [command.paymentAttemptId],
+  );
+  await corePool.query("UPDATE provider_operations SET status = 'failed' WHERE id = $1", [
+    before.operation_id,
+  ]);
+  await corePool.query("UPDATE payment_attempts SET status = 'failed' WHERE id = $1", [
+    command.paymentAttemptId,
+  ]);
+  await corePool.query(
+    `UPDATE invoice_payment_commands
      SET status = 'failed', result = '{"paymentStatus":"failed","testCleanup":true}'::jsonb
-     WHERE id = $3`,
-    [command.paymentAttemptId, before.operation_id, command.commandId],
+     WHERE id = $1`,
+    [command.commandId],
   );
 }
 
@@ -1255,18 +1262,24 @@ await corePool.query(
   `UPDATE durable_jobs
    SET status = 'completed', locked_at = NULL, locked_by = NULL
    WHERE job_type = 'payment.start'
-     AND payload->>'paymentAttemptId' = $1;
-   UPDATE payment_attempts SET status = 'unknown' WHERE id = $1;
-   UPDATE provider_operations
+     AND payload->>'paymentAttemptId' = $1`,
+  [reconcileOwnershipCommand.paymentAttemptId],
+);
+await corePool.query("UPDATE payment_attempts SET status = 'unknown' WHERE id = $1", [
+  reconcileOwnershipCommand.paymentAttemptId,
+]);
+await corePool.query(
+  `UPDATE provider_operations
    SET provider_installation_id = 'synthetic-reconcile-provider',
        status = 'unknown',
        attempt_count = 1
-   WHERE id = $2;
-   INSERT INTO durable_jobs(job_type, unique_key, payload)
-   VALUES ('payment.reconcile', $3, $4)`,
+   WHERE id = $1`,
+  [reconcileOwnershipRecords.operation_id],
+);
+await corePool.query(
+  `INSERT INTO durable_jobs(job_type, unique_key, payload)
+   VALUES ('payment.reconcile', $1, $2)`,
   [
-    reconcileOwnershipCommand.paymentAttemptId,
-    reconcileOwnershipRecords.operation_id,
     `provider-ownership:${reconcileOwnershipCommand.paymentAttemptId}`,
     {
       paymentAttemptId: reconcileOwnershipCommand.paymentAttemptId,
@@ -1331,11 +1344,14 @@ assert.ok(callbackRaceCommand.paymentAttemptId);
 const callbackRaceRecords = await readPaymentRecords(callbackRaceCommand.commandId);
 const competingQuote = await createPaymentQuote(callbackRaceOrder.invoice.id, "usdt", false);
 await corePool.query(
-  `UPDATE payment_attempts SET status = 'processing' WHERE id = $1;
-   UPDATE provider_operations
+  "UPDATE payment_attempts SET status = 'processing' WHERE id = $1",
+  [callbackRaceCommand.paymentAttemptId],
+);
+await corePool.query(
+  `UPDATE provider_operations
    SET status = 'running', attempt_count = 1
-   WHERE id = $2`,
-  [callbackRaceCommand.paymentAttemptId, callbackRaceRecords.operation_id],
+   WHERE id = $1`,
+  [callbackRaceRecords.operation_id],
 );
 const callbackRaceFact = {
   eventId: `callback-lock-order:${randomUUID()}`,
