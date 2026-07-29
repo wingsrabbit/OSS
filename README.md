@@ -4,47 +4,81 @@
 
 > **NOT FOR PRODUCTION — MOCK PROVIDERS ONLY**
 
-OpenSales System (OSS) is an independent, open-source, self-hosted customer, ordering, billing, support, and service-orchestration platform for a single merchant. It is a clean-room project: it does not copy or implement compatibility with WHMCS code, schemas, routes, templates, module interfaces, or plugins.
+OpenSales System (OSS) is an independent, open-source, self-hosted platform for
+customer accounts, ordering, billing, support, and service orchestration. The
+project is clean-room software: it does not copy or implement compatibility
+with WHMCS code, schemas, routes, templates, module interfaces, or plugins.
 
-Cloud TermRat is the first synthetic deployment profile and laboratory acceptance baseline. It is configuration, not product logic or a hard-coded brand.
+Current project version: `0.1.1`.
 
-## Current status
+## What a laboratory user can do now
 
-Current project version: `0.1.0`.
+The first runnable vertical slice is implemented:
 
-The repository is at bootstrap and G0 specification preparation. It does not yet contain a runnable service, a release candidate, real Provider integration, or production-ready controls. A page opening or a mock happy path will not change that status.
+- a visitor can browse the synthetic TermRat product configuration and see
+  one-time, setup, and recurring prices by billing cycle;
+- a customer can register, sign in while still unverified, receive a
+  one-time verification link through the Mock Mail Provider, and verify the
+  account;
+- an unverified or restricted account is rejected by the server when it tries
+  to order or start a payment;
+- an eligible customer can accept versioned laboratory Terms/AUP, submit a
+  price-snapshotted order, and receive a distinct invoice and pending service;
+- the customer can run Mock payment success, failure, cancellation, timeout,
+  duplicate, and out-of-order scenarios;
+- a settled payment creates one balanced journal and invoice allocation before
+  Core decides whether the order may proceed;
+- automatic products create one stable Provider operation; a timeout becomes
+  `unknown`/`confirming` and is reconciled instead of creating a second resource;
+- a service becomes Active only after a Ready for Service fact, and its term
+  starts at that time.
 
-The project may be described as a Mock-only Laboratory Release Candidate only after every G0–G9 gate has machine-reproducible evidence, role-separated review, and an explicit passing exit report.
+The React customer page shows Order, Invoice, Payment, Provider Operation, and
+Service as separate facts. It never presents payment success as service
+activation.
 
-## Engineering direction
+This code passes strict TypeScript checks, production builds, and initial exact
+money/state tests. The PostgreSQL journey and two-VPS deployment are not yet
+verified, so this version is not the final Laboratory Release Candidate.
 
-- Strict TypeScript with Fastify for the API and React/Vite for the web application.
-- PostgreSQL as the single source of truth, including durable jobs and transactional outbox/inbox delivery.
-- A modular monolith with explicit data ownership and application-level orchestration.
-- Versioned REST/OpenAPI, JSON Schema, events, webhooks, and Provider contracts.
-- Out-of-process Providers with least privilege; Providers never write the Core database, ledger, or business state.
-- Append-only double-entry ledger and exact money representations.
-- Forward-only database migrations and backup/restore-based recovery.
+## Quick start
 
-These constraints are recorded in [architecture decisions](docs/adr/) and the [implementation order](docs/governance/implementation-order.md).
+Use only synthetic identities and data.
 
-## Explicitly outside this laboratory goal
+```bash
+cp .env.example .env
+# Replace every __GENERATE_* placeholder with an independent random value.
+docker compose up --build
+```
 
-- Real payment, provisioning, verification, mail, tax, anti-abuse, or vendor integrations.
-- WHMCS migration, compatibility, dual-write, or retirement.
-- Production DNS, real customers, customer data, or production operations.
-- Multi-merchant SaaS tenancy, microservices, a plugin marketplace, or a general-purpose CMS.
+Then open `http://localhost:8080`. The web port is bound to loopback by
+default. PostgreSQL and Provider databases have no host port. The Provider
+network is separated from the Core data network.
 
-See [LAB_LIMITATIONS.md](LAB_LIMITATIONS.md) for the complete release-claim boundary.
+The repository deliberately has no default administrator password and no real
+Provider credential. Laboratory deployment secrets belong outside Git.
 
-## Evidence-first delivery
+## Repository layout
 
-Requirements are tracked as Feature Evidence Cards. State transitions, authorization guards, ledger postings, transport behavior, Provider trust, data retention, and test vectors are frozen as independent oracles before implementation or Mock behavior. Templates and machine-readable schemas live under [`docs/`](docs/).
+- `apps/api`: Fastify API, forward migration, authentication, checkout, finance,
+  and Provider fact handling.
+- `apps/worker`: PostgreSQL durable job worker and reconciliation flow.
+- `apps/web`: React/Vite customer interface with persistent Mock-only warning.
+- `packages/core`: exact-money pricing and monotonic state rules.
+- `providers/mock-lab`: out-of-process Mock Payment, Provisioning, and Mail
+  Provider with its own database.
+- `compose.yaml`: isolated local laboratory topology.
 
-## Security and contributions
+TermRat names and prices live only in the deployment seed
+`apps/api/src/seed-termrat.ts`; they are not platform-core rules.
 
-Read [SECURITY.md](SECURITY.md) before reporting a vulnerability and [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change. Never include credentials, private infrastructure identifiers, customer data, production logs, or proprietary WHMCS material in an issue, commit, pull request, artifact, screenshot, or fixture.
+## Non-production boundary
 
-## License
+No real payment, cryptocurrency, provisioning, verification, mail, tax, or
+anti-abuse Provider is present. No real customer or legacy WHMCS data is
+permitted. See [LAB_LIMITATIONS.md](LAB_LIMITATIONS.md).
 
-Core, Web, Worker, and core administration tools are licensed under `AGPL-3.0-or-later`. Contracts, schemas, generators, the official TypeScript SDK, and their conformance assets are licensed under `Apache-2.0`. Reference and Mock Providers use `Apache-2.0`. See [LICENSE](LICENSE), [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt), [LICENSES/README.md](LICENSES/README.md), and [NOTICE](NOTICE).
+Core, Web, Worker, and core administration tools are licensed under
+`AGPL-3.0-or-later`. Provider contracts, SDK material, conformance assets, and
+Mock Providers use `Apache-2.0` as described in
+[LICENSES/README.md](LICENSES/README.md).

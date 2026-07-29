@@ -1,0 +1,24 @@
+{
+  "name": "@opensales/worker",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/worker.ts",
+    "start": "node dist/worker.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@opensales/core": "workspace:*",
+    "pg": "8.22.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.13",
+    "@types/pg": "8.20.0",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2"
+  }
+}

@@ -8,7 +8,38 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Planned
 
-- G0 independent specification and threat-model pack.
+- PostgreSQL integration validation and browser acceptance for the Stage A journey.
+- Staff re-authentication and manual fulfillment.
+- Remaining billing, customer-operations, plugin, and two-VPS laboratory stages.
+
+## [0.1.1] - 2026-07-29
+
+### Added
+
+- Runnable Strict TypeScript workspace with Fastify API, React/Vite customer
+  interface, PostgreSQL durable Worker, and an out-of-process Mock Provider Lab.
+- Registration, opaque Sessions, one-time email verification, Client Account
+  ownership, versioned legal acceptance, configured catalog, exact price
+  snapshots, orders, invoice lines, payment attempts, allocations, balanced
+  journals, services, durable jobs, outbox/inbox, and audit events.
+- Mock payment success, failure, cancellation, timeout-success, duplicate, and
+  out-of-order scenarios.
+- Mock provisioning success, failure, and timeout-with-existing-resource
+  reconciliation using stable Provider operation keys.
+- Mock Mail delivery and a laboratory-only, authenticated self-mailbox for the
+  synthetic verification journey.
+- Container build, isolated Compose networks, Caddy security headers, and
+  persistent Mock-only/noindex warnings.
+
+### Security
+
+- Server-side eligibility checks are repeated at checkout, payment creation,
+  payment settlement, and service activation.
+- Provider callbacks require HMAC timestamps, inbox deduplication, amount and
+  currency matching, monotonic transitions, stable external identifiers, and
+  Core-owned state decisions.
+- Dependencies use exact versions, a 24-hour release-age policy, lockfile
+  supply-chain verification, and an explicit install-script allowlist.
 
 ## [0.1.0] - 2026-07-18
 
