@@ -127,6 +127,7 @@ jobs:
           set -euo pipefail
           node providers/mock-lab/dist/server.js > provider.log 2>&1 &
           node apps/api/dist/server.js > api.log 2>&1 &
+          echo "$!" > api.pid
           node apps/worker/dist/worker.js > worker.log 2>&1 &
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
@@ -143,6 +144,33 @@ jobs:
 
       - name: Install pinned Chromium runtime
         run: pnpm --filter @opensales/e2e exec playwright install --with-deps chromium
+
+      - name: Restart API for isolated browser journey
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r api_pid < api.pid
+          kill "${api_pid}"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "${api_pid}" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          if kill -0 "${api_pid}" 2>/dev/null; then
+            echo "API process did not stop cleanly"
+            exit 1
+          fi
+          node apps/api/dist/server.js > api-browser.log 2>&1 &
+          echo "$!" > api.pid
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -n 100 api-browser.log
+          exit 1
 
       - name: Start customer web application
         shell: bash
