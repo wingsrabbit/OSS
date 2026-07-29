@@ -244,7 +244,7 @@ export async function registerProviderEventRoutes(
          JOIN services s ON s.order_item_id = oi.id
          JOIN users u ON u.id = o.submitted_by_user_id
          JOIN client_accounts ca ON ca.id = o.client_account_id
-         LEFT JOIN client_memberships cm
+         JOIN client_memberships cm
            ON cm.client_account_id = o.client_account_id
           AND cm.user_id = o.submitted_by_user_id
          WHERE o.id = $1
@@ -375,7 +375,7 @@ export async function registerProviderEventRoutes(
          JOIN orders o ON o.id = oi.order_id
          JOIN users u ON u.id = o.submitted_by_user_id
          JOIN client_accounts ca ON ca.id = o.client_account_id
-         LEFT JOIN client_memberships cm
+         JOIN client_memberships cm
            ON cm.client_account_id = o.client_account_id
           AND cm.user_id = o.submitted_by_user_id
          WHERE s.id = $1
