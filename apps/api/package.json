@@ -11,6 +11,7 @@
     "migrate": "tsx src/migrate.ts",
     "seed:termrat": "tsx src/seed-termrat.ts",
     "start": "node dist/server.js",
+    "test:integration:stage-a": "node dist/stage-a-integration.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
