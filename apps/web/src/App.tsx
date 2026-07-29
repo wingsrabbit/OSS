@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LAB_BANNER } from "@opensales/core";
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Locale = "en" | "zh-CN";
 type Me = {
@@ -75,6 +75,21 @@ type ManualItem = {
   paidMinor: string;
   totalMinor: string;
   submittedAt: string;
+};
+type UnclaimedFundItem = {
+  receiptId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  providerInstallationId: string;
+  externalPaymentId: string;
+  amountMinor: string;
+  allocatedMinor: string;
+  remainingMinor: string;
+  currency: string;
+  occurredAt: string;
+  disposition: string;
+  reason: string | null;
+  suggestedInvoiceId: string | null;
 };
 type BillingSummary = {
   currency: string;
@@ -178,6 +193,17 @@ function usd(minor: string): string {
   }).format(Number(minor) / 100);
 }
 
+async function fundResolutionIdempotencyKey(requestIdentity: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(requestIdentity),
+  );
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `fund-resolution:${fingerprint}`;
+}
+
 export function App() {
   const [locale, setLocale] = useState<Locale>("en");
   const [products, setProducts] = useState<Product[]>([]);
@@ -200,10 +226,18 @@ export function App() {
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
+  const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [adminPassword, setAdminPassword] = useState("");
   const [manualReason, setManualReason] = useState("");
   const [creditAdjustmentMinor, setCreditAdjustmentMinor] = useState("5000");
   const [creditAdjustmentReason, setCreditAdjustmentReason] = useState("");
+  const [fundResolutionMinor, setFundResolutionMinor] = useState("");
+  const [fundResolutionInvoiceId, setFundResolutionInvoiceId] = useState("");
+  const [fundResolutionReason, setFundResolutionReason] = useState("");
+  const fundResolutionInFlight = useRef(new Set<string>());
+  const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
+    ReadonlySet<string>
+  >(new Set());
   const [bootstrapToken, setBootstrapToken] = useState("");
   const text = words[locale];
 
@@ -380,9 +414,18 @@ export function App() {
     setManualItems(result.items);
   }, [me?.staff]);
 
+  const refreshUnclaimedFunds = useCallback(async () => {
+    if (!me?.staff) {
+      setUnclaimedFunds([]);
+      return;
+    }
+    const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
+    setUnclaimedFunds(result.items);
+  }, [me?.staff]);
+
   useEffect(() => {
-    void refreshManualItems().catch(() => undefined);
-  }, [refreshManualItems]);
+    void Promise.all([refreshManualItems(), refreshUnclaimedFunds()]).catch(() => undefined);
+  }, [refreshManualItems, refreshUnclaimedFunds]);
 
   const groups = useMemo(() => {
     const result = new Map<string, Product[]>();
@@ -582,6 +625,78 @@ export function App() {
       setCreditAdjustmentReason("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
+    }
+  }
+
+  async function resolveUnclaimedFunds(
+    item: UnclaimedFundItem,
+    action: "convert_to_credit" | "allocate_invoice",
+  ) {
+    if (!me?.staff) return;
+    if (fundResolutionInFlight.current.has(item.receiptId)) return;
+    const invoiceId =
+      action === "allocate_invoice"
+        ? fundResolutionInvoiceId || item.suggestedInvoiceId
+        : null;
+    const reason = fundResolutionReason.trim();
+    const requestIdentity = JSON.stringify({
+      receiptId: item.receiptId,
+      action,
+      amountMinor: fundResolutionMinor,
+      invoiceId,
+      reason,
+    });
+    fundResolutionInFlight.current.add(item.receiptId);
+    setFundResolutionPendingReceiptIds((current) => {
+      const next = new Set(current);
+      next.add(item.receiptId);
+      return next;
+    });
+    setError("");
+    try {
+      const idempotencyKey = await fundResolutionIdempotencyKey(requestIdentity);
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      const resolution = await api<{ replayed: boolean }>(
+        `/api/v1/admin/funds/${item.receiptId}/resolutions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            amountMinor: fundResolutionMinor,
+            invoiceId,
+            reason,
+            idempotencyKey,
+          }),
+        },
+      );
+      setNotice(
+        resolution.replayed
+          ? "This exact fund resolution was already recorded; no second money movement occurred."
+          : action === "convert_to_credit"
+            ? "Unclaimed funds converted to Credit with a balanced journal."
+            : "Unclaimed funds allocated to the matching invoice with a balanced journal.",
+      );
+      setFundResolutionMinor("");
+      setFundResolutionReason("");
+      const refreshResults = await Promise.allSettled([
+        refreshUnclaimedFunds(),
+        ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
+      ]);
+      if (refreshResults.some((result) => result.status === "rejected")) {
+        setError("The resolution was saved, but current balances could not be refreshed.");
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Fund resolution failed");
+    } finally {
+      fundResolutionInFlight.current.delete(item.receiptId);
+      setFundResolutionPendingReceiptIds((current) => {
+        const next = new Set(current);
+        next.delete(item.receiptId);
+        return next;
+      });
     }
   }
 
@@ -904,6 +1019,90 @@ export function App() {
                 ))}
               </>
             )}
+            <div className="admin-subsection">
+              <div>
+                <p className="eyebrow">Money received but not yet assigned</p>
+                <h3>Unclaimed funds</h3>
+                <p>
+                  Original Provider facts remain immutable. Each resolution requires password
+                  confirmation, a reason, and creates a separate balanced journal.
+                </p>
+              </div>
+              <button onClick={() => void refreshUnclaimedFunds()}>
+                Refresh unclaimed funds
+              </button>
+              <div className="inline-form admin-confirm">
+                <input
+                  aria-label="Fund resolution amount in cents"
+                  inputMode="numeric"
+                  value={fundResolutionMinor}
+                  onChange={(event) => setFundResolutionMinor(event.target.value)}
+                  placeholder="Resolution amount in cents"
+                />
+                <input
+                  aria-label="Fund resolution invoice ID"
+                  value={fundResolutionInvoiceId}
+                  onChange={(event) => setFundResolutionInvoiceId(event.target.value)}
+                  placeholder="Matching invoice ID (allocation only)"
+                />
+                <input
+                  aria-label="Fund resolution reason"
+                  value={fundResolutionReason}
+                  onChange={(event) => setFundResolutionReason(event.target.value)}
+                  placeholder="Resolution reason (10+ characters)"
+                />
+              </div>
+              {unclaimedFunds.length === 0 ? (
+                <p className="muted">No unclaimed funds are waiting.</p>
+              ) : (
+                <div data-testid="unclaimed-funds-list">
+                  {unclaimedFunds.map((item) => (
+                    <article
+                      className="manual-item"
+                      data-testid="unclaimed-fund-item"
+                      key={item.receiptId}
+                    >
+                      <div>
+                        <strong>
+                          {item.clientAccountName} · remaining {usd(item.remainingMinor)}
+                        </strong>
+                        <span>
+                          Received {usd(item.amountMinor)} via {item.providerInstallationId}
+                        </span>
+                        <span className="mono">{item.externalPaymentId}</span>
+                        <span>{item.reason ?? "Awaiting operator classification"}</span>
+                      </div>
+                      <div className="fund-actions">
+                        <button
+                          className="primary"
+                          disabled={
+                            fundResolutionPendingReceiptIds.has(item.receiptId) ||
+                            adminPassword.length === 0 ||
+                            !/^[1-9]\d*$/.test(fundResolutionMinor) ||
+                            fundResolutionReason.trim().length < 10
+                          }
+                          onClick={() => resolveUnclaimedFunds(item, "convert_to_credit")}
+                        >
+                          Convert amount to Credit
+                        </button>
+                        <button
+                          disabled={
+                            fundResolutionPendingReceiptIds.has(item.receiptId) ||
+                            adminPassword.length === 0 ||
+                            !/^[1-9]\d*$/.test(fundResolutionMinor) ||
+                            fundResolutionReason.trim().length < 10 ||
+                            (!fundResolutionInvoiceId && !item.suggestedInvoiceId)
+                          }
+                          onClick={() => resolveUnclaimedFunds(item, "allocate_invoice")}
+                        >
+                          Allocate amount to invoice
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
           </section>
         )}
 
