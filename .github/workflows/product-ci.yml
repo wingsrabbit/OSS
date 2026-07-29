@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: Product CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  product-static:
+    name: product-static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Install pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable pnpm
+          corepack install
+          test "$(pnpm --version)" = '11.14.0'
+          pnpm install --frozen-lockfile
+
+      - name: Build shared Core declarations
+        run: pnpm --filter @opensales/core build
+
+      - name: Strict TypeScript
+        run: pnpm -r --if-present typecheck
+
+      - name: Production builds
+        run: pnpm -r --if-present build
+
+      - name: Domain tests
+        run: pnpm -r --if-present test
+
+  product-integration:
+    name: product-integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296
+        env:
+          POSTGRES_DB: oss
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d oss"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ADMIN_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/oss
+      PROVIDER_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/provider
+      OSS_ENV: test
+      OSS_PUBLIC_URL: http://127.0.0.1:5173
+      WEB_ORIGIN: http://127.0.0.1:5173
+      MOCK_PROVIDER_URL: http://127.0.0.1:4000
+      CORE_INTERNAL_URL: http://127.0.0.1:3000
+      CORE_CALLBACK_URL: http://127.0.0.1:3000
+      MOCK_PROVIDER_TOKEN: ci-only-mock-provider-token-000000000000
+      MOCK_PROVIDER_WEBHOOK_SECRET: ci-only-webhook-secret-000000000000000
+      MOCK_PROVISION_SCENARIO: timeout_existing
+      LAB_MAILBOX_ENABLED: "true"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Install pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable pnpm
+          corepack install
+          test "$(pnpm --version)" = '11.14.0'
+          pnpm install --frozen-lockfile
+
+      - name: Build applications and conformance code
+        run: pnpm -r --if-present build
+
+      - name: Create isolated Provider database
+        shell: bash
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.ADMIN_DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE DATABASE provider');
+          await client.end();"
+
+      - name: Apply forward migrations and synthetic configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @opensales/api migrate
+          pnpm --filter @opensales/api seed:termrat
+
+      - name: Start API, Worker, and Mock Provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          node providers/mock-lab/dist/server.js > provider.log 2>&1 &
+          node apps/api/dist/server.js > api.log 2>&1 &
+          echo "$!" > api.pid
+          node apps/worker/dist/worker.js > worker.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
+               curl --fail --silent http://127.0.0.1:4000/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -n 100 api.log provider.log worker.log
+          exit 1
+
+      - name: Run PostgreSQL Stage A journey
+        run: pnpm --filter @opensales/api test:integration:stage-a
+
+      - name: Install pinned Chromium runtime
+        run: pnpm --filter @opensales/e2e exec playwright install --with-deps chromium
+
+      - name: Restart API for isolated browser journey
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r api_pid < api.pid
+          kill "${api_pid}"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "${api_pid}" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          if kill -0 "${api_pid}" 2>/dev/null; then
+            echo "API process did not stop cleanly"
+            exit 1
+          fi
+          node apps/api/dist/server.js > api-browser.log 2>&1 &
+          echo "$!" > api.pid
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -n 100 api-browser.log
+          exit 1
+
+      - name: Start customer web application
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @opensales/web dev > web.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:5173/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -n 100 web.log
+          exit 1
+
+      - name: Run browser Stage A journey
+        run: pnpm --filter @opensales/e2e test:e2e

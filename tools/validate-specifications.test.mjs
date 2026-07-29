@@ -4064,7 +4064,7 @@ test("GitHub policy parses YAML keys and rejects mutable actions and privileged 
     hasIssue(issues, "local Dockerfiles are not allowed");
     hasIssue(issues, "normalized bootstrap workflow must match the reviewed fail-closed structure");
     hasIssue(issues, "local actions must live under .github/actions/");
-    hasIssue(issues, "bootstrap phase permits only bootstrap-policy.yml");
+    hasIssue(issues, "only reviewed bootstrap-policy.yml and product-ci.yml are permitted");
     hasIssue(issues, "bootstrap phase does not permit local actions");
     hasIssue(issues, "bootstrap workflows must not reference secrets or github.token");
     hasIssue(issues, "bootstrap workflows cannot use an environment");

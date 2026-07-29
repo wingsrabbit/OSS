@@ -2559,12 +2559,16 @@ function validateGitHubPolicy(root) {
     (file) => ["action.yml", "action.yaml"].includes(file.split(sep).at(-1)),
   );
   const expectedWorkflow = resolve(root, ".github/workflows/bootstrap-policy.yml");
+  const reviewedWorkflows = new Set([
+    expectedWorkflow,
+    resolve(root, ".github/workflows/product-ci.yml"),
+  ]);
   if (
-    workflowFiles.length !== 1 ||
-    resolve(workflowFiles[0] ?? "") !== expectedWorkflow
+    workflowFiles.length !== reviewedWorkflows.size ||
+    workflowFiles.some((file) => !reviewedWorkflows.has(resolve(file)))
   ) {
     issues.push(
-      ".github/workflows: bootstrap phase permits only bootstrap-policy.yml",
+      ".github/workflows: only reviewed bootstrap-policy.yml and product-ci.yml are permitted",
     );
   }
   if (actionFiles.length > 0) {
