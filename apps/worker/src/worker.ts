@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHmac, randomUUID } from "node:crypto";
-import { providerOperationCapability } from "@opensales/core/provider-capability";
+import {
+  providerOperationCapability,
+  providerOperationCapabilityMatches,
+} from "@opensales/core/provider-capability";
 import pg from "pg";
 import { z } from "zod";
 
@@ -1432,8 +1435,29 @@ async function startProvision(job: Job): Promise<void> {
 
 function coreSignature(timestamp: string, body: unknown, secret: string): string {
   return createHmac("sha256", secret)
-    .update(`${timestamp}.${JSON.stringify(body)}`, "utf8")
+    .update(`${timestamp}.${canonicalProviderJson(body)}`, "utf8")
     .digest("hex");
+}
+
+function canonicalProviderJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Provider payload contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalProviderJson(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalProviderJson(record[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("Provider payload contains an unsupported value");
 }
 
 type CoreFactSubmission =
@@ -1618,6 +1642,7 @@ async function reconcilePayment(job: Job): Promise<void> {
     return;
   }
   let fact: {
+    callbackCapability: string;
     externalPaymentId: string;
     status: "processing" | "succeeded" | "failed" | "cancelled" | "expired";
     amountMinor: string;
@@ -1627,6 +1652,7 @@ async function reconcilePayment(job: Job): Promise<void> {
   try {
     fact = z
       .object({
+        callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
         externalPaymentId: z.string(),
         status: z.enum(["processing", "succeeded", "failed", "cancelled", "expired"]),
         amountMinor: z.string(),
@@ -1639,6 +1665,22 @@ async function reconcilePayment(job: Job): Promise<void> {
     await delayReconcile(job, operationId, `payment reconciliation response is invalid: ${message}`);
     return;
   }
+  if (
+    !providerOperationCapabilityMatches(
+      fact.callbackCapability,
+      config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+      "mock-payment-v1",
+      operationId,
+    )
+  ) {
+    await delayReconcile(
+      job,
+      operationId,
+      "payment reconciliation returned an invalid operation capability",
+      true,
+    );
+    return;
+  }
   if (fact.status === "processing") {
     await delayReconcile(job, operationId, "payment operation remains processing at the provider");
     return;
@@ -1649,11 +1691,6 @@ async function reconcilePayment(job: Job): Promise<void> {
       eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
       providerOperationId: operationId,
       paymentAttemptId,
-      callbackCapability: providerOperationCapability(
-        config.PAYMENT_OPERATION_CAPABILITY_SECRET,
-        "mock-payment-v1",
-        operationId,
-      ),
       ...fact,
     },
     config.MOCK_PAYMENT_WEBHOOK_SECRET,

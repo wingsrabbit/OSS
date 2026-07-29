@@ -25,7 +25,10 @@ All notable project changes will be documented here. Project release numbering a
   settlement; failed and cancelled attempts do not mutate historical invoices.
 - Payment callbacks bind the authenticated installation, exact Provider
   Operation, and a Core-only-derived per-operation capability that is disclosed
-  only in the outbound request.
+  only in the outbound request. Reconciliation accepts only the same capability
+  echoed from an operation the Provider actually stored.
+- Provider webhook HMACs use recursively key-sorted canonical JSON so equivalent
+  payloads cannot fail authentication merely because object keys were reordered.
 - Known-unsent and definitively rejected payments close their commands and
   restore applied Credit through append-only compensating entries; mismatched
   settlements remain visible as manual, unclaimed-funds cases.

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
+import { providerSignature } from "./provider-signature.js";
 
 const coreUrl = process.env.CORE_TEST_URL ?? "http://127.0.0.1:3000";
 const databaseUrl = process.env.DATABASE_URL;
@@ -147,22 +148,27 @@ async function submitPaymentFact(
       ? body.providerOperationId
       : operationResult.rows[0]?.id;
   assert.ok(providerOperationId, "payment fact requires a Provider operation");
+  const callbackCapability =
+    typeof body.callbackCapability === "string"
+      ? body.callbackCapability
+      : providerOperationCapability(
+          paymentCapabilitySecret!,
+          "mock-payment-v1",
+          providerOperationId,
+        );
   const signedBody = {
-    ...body,
+    eventId: body.eventId,
     providerOperationId,
-    callbackCapability:
-      typeof body.callbackCapability === "string"
-        ? body.callbackCapability
-        : providerOperationCapability(
-            paymentCapabilitySecret!,
-            "mock-payment-v1",
-            providerOperationId,
-          ),
+    paymentAttemptId: body.paymentAttemptId,
+    callbackCapability,
+    externalPaymentId: body.externalPaymentId,
+    status: body.status,
+    amountMinor: body.amountMinor,
+    currency: body.currency,
+    occurredAt: body.occurredAt,
   };
   const timestamp = Date.now().toString();
-  const signature = createHmac("sha256", secret)
-    .update(`${timestamp}.${JSON.stringify(signedBody)}`, "utf8")
-    .digest("hex");
+  const signature = providerSignature(secret, timestamp, signedBody);
   return rawCoreRequest("/api/v1/provider-events/payment", {
     method: "POST",
     headers: {
@@ -1354,6 +1360,122 @@ const reconcileOwnershipClosed = await waitFor(
   8_000,
 );
 assert.equal(reconcileOwnershipClosed?.job_status, "manual");
+
+const forgedReconcileOrder = await createOrder(automaticPrice.id, legal);
+const forgedReconcileQuote = await createPaymentQuote(
+  forgedReconcileOrder.invoice.id,
+  "card",
+  false,
+);
+const forgedReconcileCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${forgedReconcileOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: forgedReconcileQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(forgedReconcileCommand.paymentAttemptId);
+const forgedReconcileRecords = await readPaymentRecords(forgedReconcileCommand.commandId);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL
+   WHERE job_type = 'payment.start'
+     AND payload->>'paymentAttemptId' = $1`,
+  [forgedReconcileCommand.paymentAttemptId],
+);
+await corePool.query("UPDATE payment_attempts SET status = 'unknown' WHERE id = $1", [
+  forgedReconcileCommand.paymentAttemptId,
+]);
+await corePool.query(
+  `UPDATE provider_operations
+   SET status = 'unknown', attempt_count = 1
+   WHERE id = $1`,
+  [forgedReconcileRecords.operation_id],
+);
+await providerPool.query(
+  `INSERT INTO mock_payment_operations(
+     operation_id, payment_attempt_id, external_payment_id,
+     amount_minor, currency, scenario, status, callback_capability,
+     request_fingerprint
+   ) VALUES ($1, $2, $3, $4, $5, 'success', 'succeeded', $6, $7)`,
+  [
+    forgedReconcileRecords.operation_id,
+    forgedReconcileCommand.paymentAttemptId,
+    `mock-forged-reconcile-${randomUUID()}`,
+    forgedReconcileRecords.amount_minor,
+    forgedReconcileRecords.currency,
+    "A".repeat(43),
+    createHash("sha256").update(randomUUID()).digest("hex"),
+  ],
+);
+await corePool.query(
+  `INSERT INTO durable_jobs(job_type, unique_key, payload)
+   VALUES ('payment.reconcile', $1, $2)`,
+  [
+    `forged-reconcile:${forgedReconcileCommand.paymentAttemptId}`,
+    {
+      paymentAttemptId: forgedReconcileCommand.paymentAttemptId,
+      operationId: forgedReconcileRecords.operation_id,
+    },
+  ],
+);
+const forgedReconcileClosed = await waitFor(
+  "Provider reconciliation without the outbound capability to enter manual review",
+  async () => {
+    const result = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      receipts: string;
+      fee_charges: string;
+      invoice_status: string;
+      service_status: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         (SELECT count(*)::text
+            FROM fund_receipts
+           WHERE reported_payment_attempt_id = attempt.id) AS receipts,
+         (SELECT count(*)::text
+            FROM invoice_fee_charges
+           WHERE payment_attempt_id = attempt.id) AS fee_charges,
+         invoice.status AS invoice_status,
+         service.status AS service_status
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN invoices invoice ON invoice.id = attempt.invoice_id
+       JOIN orders customer_order ON customer_order.id = invoice.order_id
+       JOIN order_items item ON item.order_id = customer_order.id
+       JOIN services service ON service.order_item_id = item.id
+       JOIN provider_operations operation ON operation.id = $2
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.reconcile'
+        AND job.payload->>'paymentAttemptId' = attempt.id::text
+       WHERE command.id = $1`,
+      [forgedReconcileCommand.commandId, forgedReconcileRecords.operation_id],
+    );
+    return result.rows[0];
+  },
+  (value) =>
+    value?.command_status === "manual" &&
+    value.attempt_status === "unknown" &&
+    value.operation_status === "unknown" &&
+    value.job_status === "manual",
+  8_000,
+);
+assert.equal(forgedReconcileClosed?.receipts, "0");
+assert.equal(forgedReconcileClosed?.fee_charges, "0");
+assert.equal(forgedReconcileClosed?.invoice_status, "unpaid");
+assert.equal(forgedReconcileClosed?.service_status, "pending");
 
 const mismatchOrder = await createOrder(automaticPrice.id, legal);
 const mismatchQuote = await createPaymentQuote(mismatchOrder.invoice.id, "card", false);

@@ -180,8 +180,29 @@ app.addHook("onSend", async (_request, reply) => {
 
 function signature(timestamp: string, body: unknown, secret: string): string {
   return createHmac("sha256", secret)
-    .update(`${timestamp}.${JSON.stringify(body)}`, "utf8")
+    .update(`${timestamp}.${canonicalProviderJson(body)}`, "utf8")
     .digest("hex");
+}
+
+function canonicalProviderJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Provider payload contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalProviderJson(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalProviderJson(record[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("Provider payload contains an unsupported value");
 }
 
 async function callback(path: string, body: unknown, secret: string): Promise<void> {
@@ -320,13 +341,14 @@ app.post("/v1/payments", async (request, reply) => {
 app.get("/v1/payments/:operationId", async (request, reply) => {
   const params = z.object({ operationId: z.uuid() }).parse(request.params);
   const result = await pool.query<{
+    callback_capability: string;
     external_payment_id: string;
     status: "succeeded" | "failed" | "cancelled";
     amount_minor: string;
     currency: string;
     occurred_at: Date;
   }>(
-    `SELECT external_payment_id, status, amount_minor, currency, occurred_at
+    `SELECT callback_capability, external_payment_id, status, amount_minor, currency, occurred_at
      FROM mock_payment_operations
      WHERE operation_id = $1`,
     [params.operationId],
@@ -334,6 +356,7 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
   const row = result.rows[0];
   if (!row) return reply.code(404).send({ error: "operation not found" });
   return {
+    callbackCapability: row.callback_capability,
     externalPaymentId: row.external_payment_id,
     status: row.status,
     amountMinor: row.amount_minor,
