@@ -10,6 +10,7 @@ type SeedProduct = {
   zh: string;
   fulfillment: "automatic" | "review" | "manual" | "quote";
   repeatable?: boolean;
+  hidden?: boolean;
   monthlyMinor?: number;
   setupMinor?: number;
   oneTimeMinor?: number;
@@ -113,6 +114,7 @@ const products: SeedProduct[] = [
     zh: "Remote Hands 现场协助",
     fulfillment: "manual",
     repeatable: true,
+    hidden: true,
     oneTimeMinor: 10_000,
   },
   {
@@ -168,14 +170,15 @@ await transaction(pool, async (client) => {
   for (const product of products) {
     await client.query(
       `INSERT INTO products(
-         id, group_id, names, descriptions, fulfillment_mode, repeatable, option_schema
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         id, group_id, names, descriptions, fulfillment_mode, repeatable, hidden, option_schema
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (id) DO UPDATE SET
          group_id = EXCLUDED.group_id,
          names = EXCLUDED.names,
          descriptions = EXCLUDED.descriptions,
          fulfillment_mode = EXCLUDED.fulfillment_mode,
          repeatable = EXCLUDED.repeatable,
+         hidden = EXCLUDED.hidden,
          option_schema = EXCLUDED.option_schema,
          updated_at = now()`,
       [
@@ -188,6 +191,7 @@ await transaction(pool, async (client) => {
         },
         product.fulfillment,
         product.repeatable ?? false,
+        product.hidden ?? false,
         JSON.stringify(product.optionSchema ?? []),
       ],
     );

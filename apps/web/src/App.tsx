@@ -183,7 +183,12 @@ export function App() {
   }, [refreshMe]);
 
   useEffect(() => {
-    if (!order || ["active", "provisioned_hold"].includes(order.service.status)) return;
+    if (
+      !order ||
+      ["active", "provisioned_hold", "provision_failed"].includes(order.service.status)
+    ) {
+      return;
+    }
     const timer = window.setInterval(() => {
       void api<OrderDetail>(`/api/v1/orders/${order.order.id}`)
         .then(setOrder)

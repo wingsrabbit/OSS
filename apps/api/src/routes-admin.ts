@@ -5,7 +5,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireUser, type AuthenticatedUser } from "./auth.js";
 import type { Config } from "./config.js";
-import { transaction, type DatabasePool } from "./database.js";
+import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 
 const manualCompletionSchema = z.object({
   reason: z.string().trim().min(10).max(1_000),
@@ -16,6 +16,9 @@ async function requireStaffPermission(
   user: AuthenticatedUser,
   permission: string,
 ): Promise<void> {
+  if (user.userRestrictedAt || user.clientAccountRestrictedAt || !user.emailVerifiedAt) {
+    throw Object.assign(new Error("Staff account is not eligible"), { statusCode: 403 });
+  }
   const result = await pool.query<{ permissions: unknown }>(
     `SELECT permissions
      FROM staff_members
@@ -28,6 +31,50 @@ async function requireStaffPermission(
     (!permissions.includes("*") && !permissions.includes(permission))
   ) {
     throw Object.assign(new Error("Staff permission is required"), { statusCode: 403 });
+  }
+}
+
+async function requireStaffActionLocked(
+  client: DatabaseClient,
+  user: AuthenticatedUser,
+  permission: string,
+): Promise<void> {
+  const result = await client.query<{ permissions: unknown }>(
+    `SELECT sm.permissions
+     FROM staff_members sm
+     JOIN users u ON u.id = sm.user_id
+     JOIN sessions s ON s.user_id = u.id AND s.id = $2
+     JOIN client_memberships cm
+       ON cm.user_id = u.id
+      AND cm.client_account_id = $3
+      AND cm.removed_at IS NULL
+     JOIN client_accounts ca ON ca.id = cm.client_account_id
+     JOIN reauth_grants rg
+       ON rg.user_id = u.id
+      AND rg.session_id = s.id
+      AND rg.invalidated_at IS NULL
+      AND rg.expires_at > now()
+     WHERE sm.user_id = $1
+       AND sm.active
+       AND u.email_verified_at IS NOT NULL
+       AND u.restricted_at IS NULL
+       AND ca.restricted_at IS NULL
+       AND s.revoked_at IS NULL
+       AND s.expires_at > now()
+     ORDER BY rg.created_at DESC
+     LIMIT 1
+     FOR UPDATE OF sm, u, s, cm, ca, rg`,
+    [user.userId, user.sessionId, user.clientAccountId],
+  );
+  const permissions = result.rows[0]?.permissions;
+  if (
+    !Array.isArray(permissions) ||
+    (!permissions.includes("*") && !permissions.includes(permission))
+  ) {
+    throw Object.assign(new Error("Current permission and password confirmation are required"), {
+      statusCode: 403,
+      code: "STAFF_AUTHORIZATION_REQUIRED",
+    });
   }
 }
 
@@ -116,6 +163,7 @@ export async function registerAdminRoutes(
     const body = manualCompletionSchema.parse(request.body);
 
     const result = await transaction(pool, async (client) => {
+      await requireStaffActionLocked(client, user, "services.manual_fulfillment");
       const serviceResult = await client.query<{
         service_id: string;
         service_status: string;
@@ -205,16 +253,35 @@ export async function registerAdminRoutes(
       }
       const readyAt = new Date();
       const termEnd = addBillingCycle(readyAt, service.billing_cycle);
-      await client.query(
+      const activated = await client.query(
         `UPDATE services
          SET status = 'active', activated_at = $2, term_start = $2, term_end = $3,
              updated_at = now(), version = version + 1
-         WHERE id = $1 AND activated_at IS NULL`,
+         WHERE id = $1
+           AND activated_at IS NULL
+           AND status = 'pending'
+         RETURNING id`,
         [service.service_id, readyAt, termEnd],
       );
-      await client.query("UPDATE orders SET status = 'completed', updated_at = now() WHERE id = $1", [
-        service.order_id,
-      ]);
+      if (activated.rowCount !== 1) {
+        throw Object.assign(new Error("Service state changed; review it again"), {
+          statusCode: 409,
+          code: "STATE_CONFLICT",
+        });
+      }
+      const completed = await client.query(
+        `UPDATE orders
+         SET status = 'completed', updated_at = now(), version = version + 1
+         WHERE id = $1 AND status = 'awaiting_manual'
+         RETURNING id`,
+        [service.order_id],
+      );
+      if (completed.rowCount !== 1) {
+        throw Object.assign(new Error("Order state changed; review it again"), {
+          statusCode: 409,
+          code: "STATE_CONFLICT",
+        });
+      }
       await client.query(
         `INSERT INTO audit_events(
            actor_type, actor_id, action, target_type, target_id, reason, metadata

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import Fastify from "fastify";
 import pg from "pg";
 import { z } from "zod";
@@ -8,8 +8,12 @@ import { z } from "zod";
 const config = z
   .object({
     PROVIDER_DATABASE_URL: z.string().min(1),
-    MOCK_PROVIDER_TOKEN: z.string().min(32),
-    MOCK_PROVIDER_WEBHOOK_SECRET: z.string().min(32),
+    MOCK_PAYMENT_PROVIDER_TOKEN: z.string().min(32).optional(),
+    MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32).optional(),
+    MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32).optional(),
+    LAB_MAILBOX_TOKEN: z.string().min(32).optional(),
+    MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32).optional(),
+    MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32).optional(),
     CORE_CALLBACK_URL: z.url(),
     PROVIDER_HOST: z.string().default("0.0.0.0"),
     PROVIDER_PORT: z.coerce.number().int().min(1).max(65_535).default(4000),
@@ -40,6 +44,18 @@ const mailCreateSchema = z.object({
   sensitive: z.boolean().default(false),
 });
 
+const mailboxQuerySchema = z.object({
+  recipient: z.email(),
+});
+
+function requestFingerprint(scope: string, body: unknown): string {
+  return createHash("sha256")
+    .update(scope)
+    .update("\0")
+    .update(JSON.stringify(body))
+    .digest("hex");
+}
+
 const pool = new pg.Pool({
   connectionString: config.PROVIDER_DATABASE_URL,
   max: 10,
@@ -58,7 +74,8 @@ await pool.query(`
     scenario text NOT NULL,
     status text NOT NULL,
     occurred_at timestamptz NOT NULL DEFAULT now(),
-    create_calls integer NOT NULL DEFAULT 1
+    create_calls integer NOT NULL DEFAULT 1,
+    request_fingerprint text NOT NULL
   );
   CREATE TABLE IF NOT EXISTS mock_resource_operations (
     operation_id uuid PRIMARY KEY,
@@ -68,7 +85,8 @@ await pool.query(`
     status text NOT NULL,
     ready_at timestamptz,
     occurred_at timestamptz NOT NULL DEFAULT now(),
-    create_calls integer NOT NULL DEFAULT 1
+    create_calls integer NOT NULL DEFAULT 1,
+    request_fingerprint text NOT NULL
   );
   CREATE TABLE IF NOT EXISTS mock_mail_messages (
     operation_id uuid PRIMARY KEY,
@@ -80,8 +98,30 @@ await pool.query(`
     sensitive boolean NOT NULL,
     status text NOT NULL DEFAULT 'delivered',
     delivered_at timestamptz NOT NULL DEFAULT now(),
-    delivery_calls integer NOT NULL DEFAULT 1
+    delivery_calls integer NOT NULL DEFAULT 1,
+    request_fingerprint text NOT NULL
   );
+  ALTER TABLE mock_payment_operations
+    ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  UPDATE mock_payment_operations
+  SET request_fingerprint = 'legacy:' || operation_id::text
+  WHERE request_fingerprint IS NULL;
+  ALTER TABLE mock_payment_operations
+    ALTER COLUMN request_fingerprint SET NOT NULL;
+  ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  UPDATE mock_resource_operations
+  SET request_fingerprint = 'legacy:' || operation_id::text
+  WHERE request_fingerprint IS NULL;
+  ALTER TABLE mock_resource_operations
+    ALTER COLUMN request_fingerprint SET NOT NULL;
+  ALTER TABLE mock_mail_messages
+    ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  UPDATE mock_mail_messages
+  SET request_fingerprint = 'legacy:' || operation_id::text
+  WHERE request_fingerprint IS NULL;
+  ALTER TABLE mock_mail_messages
+    ALTER COLUMN request_fingerprint SET NOT NULL;
 `);
 
 const app = Fastify({
@@ -97,8 +137,19 @@ const app = Fastify({
 
 app.addHook("onRequest", async (request, reply) => {
   if (!request.url.startsWith("/v1/")) return;
+  const expectedToken =
+    request.url.startsWith("/v1/payments")
+      ? config.MOCK_PAYMENT_PROVIDER_TOKEN
+      : request.url.startsWith("/v1/resources")
+        ? config.MOCK_PROVISIONING_PROVIDER_TOKEN
+        : request.url.startsWith("/v1/mailbox")
+          ? config.LAB_MAILBOX_TOKEN
+          : request.url === "/v1/mail"
+            ? config.MOCK_MAIL_PROVIDER_TOKEN
+            : undefined;
+  if (!expectedToken) return reply.code(404).send({ error: "capability is not enabled" });
   const authorization = request.headers.authorization;
-  const expected = Buffer.from(`Bearer ${config.MOCK_PROVIDER_TOKEN}`, "utf8");
+  const expected = Buffer.from(`Bearer ${expectedToken}`, "utf8");
   const received = Buffer.from(authorization ?? "", "utf8");
   if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
     return reply.code(401).send({ error: "invalid provider credential" });
@@ -111,20 +162,20 @@ app.addHook("onSend", async (_request, reply) => {
   reply.header("X-Content-Type-Options", "nosniff");
 });
 
-function signature(timestamp: string, body: unknown): string {
-  return createHmac("sha256", config.MOCK_PROVIDER_WEBHOOK_SECRET)
+function signature(timestamp: string, body: unknown, secret: string): string {
+  return createHmac("sha256", secret)
     .update(`${timestamp}.${JSON.stringify(body)}`, "utf8")
     .digest("hex");
 }
 
-async function callback(path: string, body: unknown): Promise<void> {
+async function callback(path: string, body: unknown, secret: string): Promise<void> {
   const timestamp = Date.now().toString();
   const response = await fetch(new URL(path, config.CORE_CALLBACK_URL), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-OSS-Timestamp": timestamp,
-      "X-OSS-Signature": signature(timestamp, body),
+      "X-OSS-Signature": signature(timestamp, body, secret),
     },
     body: JSON.stringify(body),
     redirect: "error",
@@ -133,9 +184,9 @@ async function callback(path: string, body: unknown): Promise<void> {
   if (!response.ok) throw new Error(`Core callback failed with ${response.status}`);
 }
 
-function scheduleCallback(path: string, body: unknown, delayMs: number): void {
+function scheduleCallback(path: string, body: unknown, delayMs: number, secret: string): void {
   setTimeout(() => {
-    void callback(path, body).catch((error: unknown) => {
+    void callback(path, body, secret).catch((error: unknown) => {
       app.log.error(
         { error: error instanceof Error ? error.message : "unknown" },
         "mock callback failed",
@@ -160,10 +211,13 @@ app.get("/health/ready", async (_request, reply) => {
 
 app.post("/v1/payments", async (request, reply) => {
   const body = paymentCreateSchema.parse(request.body);
+  const callbackSecret = config.MOCK_PAYMENT_WEBHOOK_SECRET;
+  if (!callbackSecret) return reply.code(503).send({ error: "payment callback is not configured" });
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
   const externalPaymentId = `mock-pay-${body.operationId}`;
+  const fingerprint = requestFingerprint("payment.create:v1", body);
   const status =
     body.scenario === "failed"
       ? "failed"
@@ -178,9 +232,11 @@ app.post("/v1/payments", async (request, reply) => {
     `INSERT INTO mock_payment_operations(
        operation_id, payment_attempt_id, external_payment_id,
        amount_minor, currency, scenario, status
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       , request_fingerprint
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_payment_operations.create_calls + 1
+       WHERE mock_payment_operations.request_fingerprint = EXCLUDED.request_fingerprint
      RETURNING external_payment_id, status, occurred_at`,
     [
       body.operationId,
@@ -190,10 +246,13 @@ app.post("/v1/payments", async (request, reply) => {
       body.currency,
       body.scenario,
       status,
+      fingerprint,
     ],
   );
   const operation = inserted.rows[0];
-  if (!operation) throw new Error("Unable to persist mock payment operation");
+  if (!operation) {
+    return reply.code(409).send({ error: "idempotency key was reused with a different payment" });
+  }
 
   const event = {
     eventId: `payment:${body.operationId}:${operation.status}`,
@@ -205,22 +264,25 @@ app.post("/v1/payments", async (request, reply) => {
     occurredAt: operation.occurred_at.toISOString(),
   };
   if (body.scenario === "duplicate_out_of_order") {
-    scheduleCallback("/api/v1/provider-events/payment", event, 20);
+    scheduleCallback("/api/v1/provider-events/payment", event, 20, callbackSecret);
     scheduleCallback(
       "/api/v1/provider-events/payment",
       { ...event, eventId: `${event.eventId}:late-failed`, status: "failed" },
       40,
+      callbackSecret,
     );
     scheduleCallback(
       "/api/v1/provider-events/payment",
       { ...event, eventId: `${event.eventId}:duplicate` },
       60,
+      callbackSecret,
     );
   } else {
     scheduleCallback(
       "/api/v1/provider-events/payment",
       event,
       body.scenario === "timeout_success" ? 3_500 : 20,
+      callbackSecret,
     );
   }
   if (body.scenario === "timeout_success") {
@@ -260,10 +322,15 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
 
 app.post("/v1/resources", async (request, reply) => {
   const body = resourceCreateSchema.parse(request.body);
+  const callbackSecret = config.MOCK_PROVISIONING_WEBHOOK_SECRET;
+  if (!callbackSecret) {
+    return reply.code(503).send({ error: "provisioning callback is not configured" });
+  }
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
   const externalResourceId = `mock-resource-${body.operationId}`;
+  const fingerprint = requestFingerprint("resource.create:v1", body);
   const status = body.scenario === "failed" ? "failed" : "succeeded";
   const readyAt = status === "succeeded" ? new Date() : null;
   const inserted = await pool.query<{
@@ -274,14 +341,26 @@ app.post("/v1/resources", async (request, reply) => {
   }>(
     `INSERT INTO mock_resource_operations(
        operation_id, service_id, external_resource_id, scenario, status, ready_at
-     ) VALUES ($1, $2, $3, $4, $5, $6)
+       , request_fingerprint
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_resource_operations.create_calls + 1
+       WHERE mock_resource_operations.request_fingerprint = EXCLUDED.request_fingerprint
      RETURNING external_resource_id, status, ready_at, occurred_at`,
-    [body.operationId, body.serviceId, externalResourceId, body.scenario, status, readyAt],
+    [
+      body.operationId,
+      body.serviceId,
+      externalResourceId,
+      body.scenario,
+      status,
+      readyAt,
+      fingerprint,
+    ],
   );
   const operation = inserted.rows[0];
-  if (!operation) throw new Error("Unable to persist mock resource operation");
+  if (!operation) {
+    return reply.code(409).send({ error: "idempotency key was reused with a different resource" });
+  }
   const event = {
     eventId: `resource:${body.operationId}:${operation.status}`,
     providerOperationId: body.operationId,
@@ -296,6 +375,7 @@ app.post("/v1/resources", async (request, reply) => {
     "/api/v1/provider-events/provisioning",
     event,
     body.scenario === "timeout_existing" ? 3_500 : 20,
+    callbackSecret,
   );
   if (body.scenario === "timeout_existing") {
     await new Promise((resolve) => setTimeout(resolve, 5_000));
@@ -331,12 +411,15 @@ app.post("/v1/mail", async (request, reply) => {
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
+  const fingerprint = requestFingerprint("mail.send:v1", body);
   const result = await pool.query<{ status: string; delivered_at: Date }>(
     `INSERT INTO mock_mail_messages(
        operation_id, recipient, template, locale, subject, body, sensitive
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       , request_fingerprint
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (operation_id) DO UPDATE
        SET delivery_calls = mock_mail_messages.delivery_calls + 1
+       WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
      RETURNING status, delivered_at`,
     [
       body.operationId,
@@ -346,8 +429,12 @@ app.post("/v1/mail", async (request, reply) => {
       body.subject,
       body.body,
       body.sensitive,
+      fingerprint,
     ],
   );
+  if (!result.rows[0]) {
+    return reply.code(409).send({ error: "idempotency key was reused with a different message" });
+  }
   return reply.code(202).send({
     operationId: body.operationId,
     status: result.rows[0]?.status ?? "delivered",
@@ -355,8 +442,8 @@ app.post("/v1/mail", async (request, reply) => {
   });
 });
 
-app.get("/v1/mail", async (request) => {
-  const query = z.object({ recipient: z.email() }).parse(request.query);
+app.post("/v1/mailbox/query", async (request) => {
+  const query = mailboxQuerySchema.parse(request.body);
   const result = await pool.query<{
     operation_id: string;
     template: string;

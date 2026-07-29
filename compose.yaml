@@ -7,11 +7,36 @@ x-core-env: &core-env
   OSS_PUBLIC_URL: ${OSS_PUBLIC_URL:-http://localhost:8080}
   WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
   DATABASE_URL: postgresql://oss:${CORE_DATABASE_PASSWORD:?required}@core-db:5432/oss
-  MOCK_PROVIDER_URL: http://provider:4000
-  CORE_INTERNAL_URL: http://api:3000
-  MOCK_PROVIDER_TOKEN: ${MOCK_PROVIDER_TOKEN:?required}
-  MOCK_PROVIDER_WEBHOOK_SECRET: ${MOCK_PROVIDER_WEBHOOK_SECRET:?required}
+  MOCK_MAILBOX_URL: http://provider-mailbox:4000
+  LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
+  MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
+  MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
   LAB_MAILBOX_ENABLED: ${LAB_MAILBOX_ENABLED:-true}
+
+x-provider-base: &provider-base
+  build:
+    context: .
+    target: runtime
+  command: ["node", "providers/mock-lab/dist/server.js"]
+  restart: unless-stopped
+  depends_on:
+    provider-db:
+      condition: service_healthy
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  security_opt: ["no-new-privileges:true"]
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "node",
+        "-e",
+        "fetch('http://127.0.0.1:4000/health/ready').then(r=>{if(!r.ok)process.exit(1)})",
+      ]
+    interval: 10s
+    timeout: 5s
+    retries: 10
 
 services:
   core-db:
@@ -76,7 +101,9 @@ services:
     depends_on:
       seed:
         condition: service_completed_successfully
-    networks: [core-data, core-app]
+      provider-mailbox:
+        condition: service_healthy
+    networks: [core-data, core-app, provider-app]
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -101,11 +128,22 @@ services:
     restart: unless-stopped
     environment:
       <<: *core-env
+      CORE_INTERNAL_URL: http://api:3000
+      MOCK_PAYMENT_PROVIDER_URL: http://provider-payment:4000
+      MOCK_PROVISIONING_PROVIDER_URL: http://provider-provisioning:4000
+      MOCK_MAIL_PROVIDER_URL: http://provider-mail:4000
+      MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
+      MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
       MOCK_PROVISION_SCENARIO: ${MOCK_PROVISION_SCENARIO:-success}
     depends_on:
       api:
         condition: service_healthy
-      provider:
+      provider-payment:
+        condition: service_healthy
+      provider-provisioning:
+        condition: service_healthy
+      provider-mail:
         condition: service_healthy
     networks: [core-data, core-app, provider-app]
     read_only: true
@@ -113,36 +151,51 @@ services:
       - /tmp:size=32m,mode=1777
     security_opt: ["no-new-privileges:true"]
 
-  provider:
-    build:
-      context: .
-      target: runtime
-    command: ["node", "providers/mock-lab/dist/server.js"]
+  callback-gateway:
+    image: caddy:2.10.2-alpine
     restart: unless-stopped
-    environment:
-      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
-      MOCK_PROVIDER_TOKEN: ${MOCK_PROVIDER_TOKEN:?required}
-      MOCK_PROVIDER_WEBHOOK_SECRET: ${MOCK_PROVIDER_WEBHOOK_SECRET:?required}
-      CORE_CALLBACK_URL: http://api:3000
-    depends_on:
-      provider-db:
-        condition: service_healthy
-    networks: [provider-data, provider-app, core-app]
+    volumes:
+      - ./deploy/Caddyfile.callback:/etc/caddy/Caddyfile:ro
+    networks: [core-app, callback-app]
     read_only: true
     tmpfs:
-      - /tmp:size=32m,mode=1777
+      - /config:size=8m,mode=0700
+      - /data:size=16m,mode=0700
     security_opt: ["no-new-privileges:true"]
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:4000/health/ready').then(r=>{if(!r.ok)process.exit(1)})",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+
+  provider-payment:
+    <<: *provider-base
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
+      MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
+      CORE_CALLBACK_URL: http://callback-gateway:8081
+    networks: [provider-data, provider-app, callback-app]
+
+  provider-provisioning:
+    <<: *provider-base
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
+      CORE_CALLBACK_URL: http://callback-gateway:8081
+    networks: [provider-data, provider-app, callback-app]
+
+  provider-mail:
+    <<: *provider-base
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
+      CORE_CALLBACK_URL: http://127.0.0.1
+    networks: [provider-data, provider-app]
+
+  provider-mailbox:
+    <<: *provider-base
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
+      CORE_CALLBACK_URL: http://127.0.0.1
+    networks: [provider-data, provider-app]
 
   web:
     build:
@@ -171,5 +224,8 @@ networks:
   provider-data:
     internal: true
   core-app:
+    internal: true
   provider-app:
+    internal: true
+  callback-app:
     internal: true

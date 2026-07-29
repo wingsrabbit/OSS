@@ -12,6 +12,7 @@ import { z } from "zod";
 import { assertEligible, requireUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
 
 const checkoutSchema = z.object({
   priceId: z.uuid(),
@@ -32,27 +33,60 @@ function buildOptionComponents(
   optionSchema: unknown,
   configuration: Record<string, string | number | boolean>,
 ): PriceComponent[] {
-  if (!Array.isArray(optionSchema)) return [];
+  if (!Array.isArray(optionSchema)) {
+    if (Object.keys(configuration).length > 0) {
+      throw Object.assign(new Error("This product does not accept configuration options"), {
+        statusCode: 400,
+        code: "INVALID_CONFIGURATION",
+      });
+    }
+    return [];
+  }
   const components: PriceComponent[] = [];
+  const acceptedKeys = new Set<string>();
   for (const rawOption of optionSchema) {
-    if (typeof rawOption !== "object" || rawOption === null) continue;
+    if (typeof rawOption !== "object" || rawOption === null) {
+      throw new Error("Product option schema is invalid");
+    }
     const option = rawOption as Record<string, unknown>;
-    if (
-      option.type === "quantity" &&
-      typeof option.code === "string" &&
-      typeof option.recurringUnitMinor === "number"
-    ) {
+    if (typeof option.code !== "string" || option.code.length === 0) {
+      throw new Error("Product option schema has no code");
+    }
+    if (acceptedKeys.has(option.code)) throw new Error(`Product option schema repeats ${option.code}`);
+    acceptedKeys.add(option.code);
+    const configured = Object.prototype.hasOwnProperty.call(configuration, option.code);
+    if (option.required === true && !configured) {
+      throw Object.assign(new Error(`${option.code} is required`), {
+        statusCode: 400,
+        code: "INVALID_CONFIGURATION",
+      });
+    }
+    if (!configured) continue;
+
+    if (option.type === "quantity" && typeof option.recurringUnitMinor === "number") {
       const rawQuantity = configuration[option.code];
       const quantity =
         typeof rawQuantity === "number"
           ? rawQuantity
-          : typeof rawQuantity === "string"
-            ? Number.parseInt(rawQuantity, 10)
+          : typeof rawQuantity === "string" && /^-?\d+$/.test(rawQuantity)
+            ? Number(rawQuantity)
             : Number.NaN;
       const minimum = typeof option.min === "number" ? option.min : 1;
-      if (!Number.isSafeInteger(quantity) || quantity < minimum) {
-        throw Object.assign(new Error(`${option.code} must be an integer of at least ${minimum}`), {
+      const maximum = typeof option.max === "number" ? option.max : Number.MAX_SAFE_INTEGER;
+      const step = typeof option.step === "number" ? option.step : 1;
+      if (
+        !Number.isSafeInteger(quantity) ||
+        !Number.isSafeInteger(minimum) ||
+        !Number.isSafeInteger(maximum) ||
+        !Number.isSafeInteger(step) ||
+        step <= 0 ||
+        quantity < minimum ||
+        quantity > maximum ||
+        (quantity - minimum) % step !== 0
+      ) {
+        throw Object.assign(new Error(`${option.code} is outside its allowed quantity range`), {
           statusCode: 400,
+          code: "INVALID_CONFIGURATION",
         });
       }
       components.push({
@@ -61,6 +95,30 @@ function buildOptionComponents(
         quantity,
         oneTimeMinor: 0n,
         recurringMinor: BigInt(option.recurringUnitMinor),
+      });
+      continue;
+    }
+
+    if (option.type === "text" || option.type === "password" || option.type === "textarea") {
+      const value = configuration[option.code];
+      const minimum = typeof option.minLength === "number" ? option.minLength : 0;
+      const maximum = typeof option.maxLength === "number" ? option.maxLength : 4096;
+      if (typeof value !== "string" || value.length < minimum || value.length > maximum) {
+        throw Object.assign(new Error(`${option.code} is not valid text`), {
+          statusCode: 400,
+          code: "INVALID_CONFIGURATION",
+        });
+      }
+      continue;
+    }
+
+    throw new Error(`Product option type ${String(option.type)} is not supported safely`);
+  }
+  for (const key of Object.keys(configuration)) {
+    if (!acceptedKeys.has(key)) {
+      throw Object.assign(new Error(`Unknown product option ${key}`), {
+        statusCode: 400,
+        code: "INVALID_CONFIGURATION",
       });
     }
   }
@@ -128,17 +186,38 @@ export async function registerOrderRoutes(
     const user = await requireUser(request, pool, config);
     assertEligible(user);
     const body = checkoutSchema.parse(request.body);
-
-    const existing = await pool.query<{ id: string }>(
-      `SELECT id FROM orders
-       WHERE client_account_id = $1 AND idempotency_key = $2`,
-      [user.clientAccountId, body.idempotencyKey],
-    );
-    if (existing.rows[0]) {
-      return reply.code(200).send({ orderId: existing.rows[0].id, replayed: true });
-    }
+    const fingerprint = requestFingerprint("orders.create:v1", {
+      priceId: body.priceId,
+      configuration: body.configuration,
+      termsVersion: body.termsVersion,
+      aupVersion: body.aupVersion,
+    });
 
     const created = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `order:${user.clientAccountId}:${body.idempotencyKey}`,
+      ]);
+      const existing = await client.query<{
+        id: string;
+        request_fingerprint: string;
+      }>(
+        `SELECT id, request_fingerprint
+         FROM orders
+         WHERE client_account_id = $1 AND idempotency_key = $2
+         FOR UPDATE`,
+        [user.clientAccountId, body.idempotencyKey],
+      );
+      const previous = existing.rows[0];
+      if (previous) {
+        if (previous.request_fingerprint !== fingerprint) {
+          throw Object.assign(new Error("The idempotency key was used for a different order"), {
+            statusCode: 409,
+            code: "IDEMPOTENCY_CONFLICT",
+          });
+        }
+        return { orderId: previous.id, replayed: true };
+      }
+
       await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       const priceResult = await client.query<{
         id: string;
@@ -214,8 +293,9 @@ export async function registerOrderRoutes(
       const orderResult = await client.query<{ id: string }>(
         `INSERT INTO orders(
            client_account_id, submitted_by_user_id, status, currency, price_snapshot,
-           one_time_minor, setup_minor, recurring_minor, total_minor, idempotency_key
-         ) VALUES ($1, $2, 'waiting_payment', $3, $4, $5, $6, $7, $8, $9)
+           one_time_minor, setup_minor, recurring_minor, total_minor, idempotency_key,
+           request_fingerprint
+         ) VALUES ($1, $2, 'waiting_payment', $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id`,
         [
           user.clientAccountId,
@@ -227,6 +307,7 @@ export async function registerOrderRoutes(
           snapshot.recurringSubtotalMinor.toString(),
           snapshot.invoiceTotalMinor.toString(),
           body.idempotencyKey,
+          fingerprint,
         ],
       );
       const orderId = orderResult.rows[0]?.id;
@@ -273,6 +354,24 @@ export async function registerOrderRoutes(
       const invoiceId = invoiceResult.rows[0]?.id;
       if (!invoiceId) throw new Error("Unable to create invoice");
 
+      const journalResult = await client.query<{ id: string }>(
+        `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+         VALUES ('invoice_issuance', $1, $2, 'Invoice issued')
+         RETURNING id`,
+        [invoiceId, snapshot.currency],
+      );
+      const invoiceJournalId = journalResult.rows[0]?.id;
+      if (!invoiceJournalId) throw new Error("Unable to create invoice journal");
+      if (snapshot.invoiceTotalMinor > 0n) {
+        await client.query(
+          `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+           VALUES
+             ($1, 'accounts_receivable', $2, 0),
+             ($1, 'deferred_service_revenue', 0, $2)`,
+          [invoiceJournalId, snapshot.invoiceTotalMinor.toString()],
+        );
+      }
+
       const invoiceLines = [
         ["one_time", `${snapshot.productName} one-time`, snapshot.oneTimeSubtotalMinor],
         ["setup", `${snapshot.productName} setup`, snapshot.setupMinor],
@@ -302,10 +401,10 @@ export async function registerOrderRoutes(
          VALUES ('order.submitted', $1, $2)`,
         [`order:${orderId}`, { orderId, invoiceId, clientAccountId: user.clientAccountId }],
       );
-      return { orderId, invoiceId, serviceId };
+      return { orderId, invoiceId, serviceId, replayed: false };
     });
 
-    return reply.code(201).send({ ...created, replayed: false });
+    return reply.code(created.replayed ? 200 : 201).send(created);
   });
 
   app.get("/api/v1/orders/:orderId", async (request, reply) => {
@@ -401,8 +500,41 @@ export async function registerOrderRoutes(
     assertEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = paymentSchema.parse(request.body);
+    const fingerprint = requestFingerprint("payments.create:v1", {
+      invoiceId: params.invoiceId,
+      scenario: body.scenario,
+    });
 
     const result = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `payment:${user.clientAccountId}:${body.idempotencyKey}`,
+      ]);
+      const idempotentAttempt = await client.query<{
+        id: string;
+        invoice_id: string;
+        status: string;
+        request_fingerprint: string;
+      }>(
+        `SELECT id, invoice_id, status, request_fingerprint
+         FROM payment_attempts
+         WHERE client_account_id = $1 AND idempotency_key = $2
+         FOR UPDATE`,
+        [user.clientAccountId, body.idempotencyKey],
+      );
+      const previous = idempotentAttempt.rows[0];
+      if (previous) {
+        if (
+          previous.invoice_id !== params.invoiceId ||
+          previous.request_fingerprint !== fingerprint
+        ) {
+          throw Object.assign(new Error("The idempotency key was used for a different payment"), {
+            statusCode: 409,
+            code: "IDEMPOTENCY_CONFLICT",
+          });
+        }
+        return { paymentAttemptId: previous.id, status: previous.status, replayed: true };
+      }
+
       await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       const invoiceResult = await client.query<{ total_minor: string }>(
         `SELECT total_minor
@@ -435,9 +567,6 @@ export async function registerOrderRoutes(
       );
       const existingActive = activeAttempt.rows[0];
       if (existingActive) {
-        if (existingActive.idempotency_key === body.idempotencyKey) {
-          return { paymentAttemptId: existingActive.id, status: existingActive.status, replayed: true };
-        }
         throw Object.assign(new Error("A payment result is still being confirmed"), {
           statusCode: 409,
           code: "PAYMENT_RESULT_UNKNOWN",
@@ -445,12 +574,10 @@ export async function registerOrderRoutes(
       }
 
       const paymentResult = await client.query<{ id: string }>(
-        `INSERT INTO payment_attempts(
+         `INSERT INTO payment_attempts(
            client_account_id, invoice_id, provider_installation_id, status,
-           amount_minor, currency, scenario, idempotency_key
-         ) VALUES ($1, $2, 'mock-payment-v1', 'created', $3, 'USD', $4, $5)
-         ON CONFLICT (client_account_id, idempotency_key) DO UPDATE
-           SET updated_at = payment_attempts.updated_at
+           amount_minor, currency, scenario, idempotency_key, request_fingerprint
+         ) VALUES ($1, $2, 'mock-payment-v1', 'created', $3, 'USD', $4, $5, $6)
          RETURNING id`,
         [
           user.clientAccountId,
@@ -458,6 +585,7 @@ export async function registerOrderRoutes(
           dueMinor.toString(),
           body.scenario,
           body.idempotencyKey,
+          fingerprint,
         ],
       );
       const paymentAttemptId = paymentResult.rows[0]?.id;

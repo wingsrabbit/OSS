@@ -27,6 +27,7 @@ export type ServiceStatus =
   | "provisioning"
   | "confirming"
   | "provisioned_hold"
+  | "provision_failed"
   | "active"
   | "suspended"
   | "terminated";

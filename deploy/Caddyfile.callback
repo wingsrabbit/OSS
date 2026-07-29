@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+:8081 {
+	@payment path /api/v1/provider-events/payment
+	handle @payment {
+		reverse_proxy api:3000
+	}
+
+	@provisioning path /api/v1/provider-events/provisioning
+	handle @provisioning {
+		reverse_proxy api:3000
+	}
+
+	handle {
+		respond 404
+	}
+}

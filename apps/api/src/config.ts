@@ -12,9 +12,10 @@ const schema = z.object({
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
   VERIFICATION_TTL_MINUTES: z.coerce.number().int().positive().default(30),
   WEB_ORIGIN: z.url().default("http://localhost:5173"),
-  MOCK_PROVIDER_URL: z.url().default("http://localhost:4000"),
-  MOCK_PROVIDER_TOKEN: z.string().min(32),
-  MOCK_PROVIDER_WEBHOOK_SECRET: z.string().min(32),
+  MOCK_MAILBOX_URL: z.url().default("http://localhost:4000"),
+  LAB_MAILBOX_TOKEN: z.string().min(32),
+  MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
+  MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
   LAB_MAILBOX_ENABLED: z
     .enum(["true", "false"])
     .default("true")

@@ -203,16 +203,45 @@ export async function registerAuthRoutes(
   app.post("/api/v1/auth/reauth", async (request, reply) => {
     const user = await requireUser(request, pool, config);
     const body = reauthSchema.parse(request.body);
-    const result = await pool.query<{ password_hash: string }>(
-      "SELECT password_hash FROM users WHERE id = $1",
-      [user.userId],
-    );
-    const encoded = result.rows[0]?.password_hash;
-    if (!encoded || !(await passwordVerify(encoded, body.password))) {
-      return reply.code(401).send({ error: "Password confirmation failed" });
-    }
     const expiresAt = new Date(Date.now() + 15 * 60_000);
-    await transaction(pool, async (client) => {
+    const granted = await transaction(pool, async (client) => {
+      const principal = await client.query<{
+        password_hash: string;
+        email_verified_at: Date | null;
+        user_restricted_at: Date | null;
+        account_restricted_at: Date | null;
+      }>(
+        `SELECT
+           u.password_hash,
+           u.email_verified_at,
+           u.restricted_at AS user_restricted_at,
+           ca.restricted_at AS account_restricted_at
+         FROM users u
+         JOIN sessions s ON s.user_id = u.id
+         JOIN client_memberships cm
+           ON cm.user_id = u.id
+          AND cm.client_account_id = $3
+          AND cm.removed_at IS NULL
+         JOIN client_accounts ca ON ca.id = cm.client_account_id
+         WHERE u.id = $1
+           AND s.id = $2
+           AND s.revoked_at IS NULL
+           AND s.expires_at > now()
+         FOR UPDATE OF u, s, cm, ca`,
+        [user.userId, user.sessionId, user.clientAccountId],
+      );
+      const current = principal.rows[0];
+      if (
+        !current ||
+        !current.email_verified_at ||
+        current.user_restricted_at ||
+        current.account_restricted_at
+      ) {
+        return "ineligible" as const;
+      }
+      if (!(await passwordVerify(current.password_hash, body.password))) {
+        return "invalid_password" as const;
+      }
       await client.query(
         `UPDATE reauth_grants
          SET invalidated_at = now()
@@ -224,7 +253,14 @@ export async function registerAuthRoutes(
          VALUES ($1, $2, $3)`,
         [user.userId, user.sessionId, expiresAt],
       );
+      return "granted" as const;
     });
+    if (granted === "invalid_password") {
+      return reply.code(401).send({ error: "Password confirmation failed" });
+    }
+    if (granted === "ineligible") {
+      return reply.code(403).send({ error: "Account is not eligible for password confirmation" });
+    }
     return { expiresAt: expiresAt.toISOString(), fixedWindowMinutes: 15 };
   });
 
@@ -235,6 +271,31 @@ export async function registerAuthRoutes(
     }
     const body = bootstrapSchema.parse(request.body);
     const result = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        "opensales:staff-bootstrap",
+      ]);
+      const existingStaff = await client.query("SELECT 1 FROM staff_members LIMIT 1");
+      if (existingStaff.rowCount !== 0) return false;
+      const principal = await client.query(
+        `SELECT 1
+         FROM users u
+         JOIN sessions s ON s.user_id = u.id
+         JOIN client_memberships cm
+           ON cm.user_id = u.id
+          AND cm.client_account_id = $3
+          AND cm.removed_at IS NULL
+         JOIN client_accounts ca ON ca.id = cm.client_account_id
+         WHERE u.id = $1
+           AND s.id = $2
+           AND s.revoked_at IS NULL
+           AND s.expires_at > now()
+           AND u.email_verified_at IS NOT NULL
+           AND u.restricted_at IS NULL
+           AND ca.restricted_at IS NULL
+         FOR UPDATE OF u, s, cm, ca`,
+        [user.userId, user.sessionId, user.clientAccountId],
+      );
+      if (principal.rowCount !== 1) return false;
       const tokenResult = await client.query<{
         id: string;
         used_at: Date | null;
@@ -250,9 +311,9 @@ export async function registerAuthRoutes(
       if (!token || token.used_at || token.expires_at.getTime() <= Date.now()) {
         return false;
       }
-      await client.query("UPDATE staff_bootstrap_tokens SET used_at = now() WHERE id = $1", [
-        token.id,
-      ]);
+      await client.query(
+        "UPDATE staff_bootstrap_tokens SET used_at = now() WHERE used_at IS NULL",
+      );
       await client.query(
         `INSERT INTO staff_members(user_id, roles, permissions)
          VALUES ($1, ARRAY['administrator'], '["*"]'::jsonb)
@@ -289,6 +350,7 @@ export async function registerAuthRoutes(
          FROM email_verification_tokens evt
          JOIN users u ON u.id = evt.user_id
          WHERE evt.token_digest = $1
+           AND evt.invalidated_at IS NULL
          FOR UPDATE OF evt, u`,
         [digestToken(body.token)],
       );
@@ -314,19 +376,115 @@ export async function registerAuthRoutes(
     return result;
   });
 
+  app.post("/api/v1/auth/resend-verification", async (request, reply) => {
+    const user = await requireUser(request, pool, config);
+    if (user.emailVerifiedAt) {
+      return reply.code(200).send({ status: "already_verified" });
+    }
+    const verificationToken = createOpaqueToken();
+    const expiresAt = new Date(Date.now() + config.VERIFICATION_TTL_MINUTES * 60_000);
+    const outcome = await transaction(pool, async (client) => {
+      const current = await client.query<{
+        email: string;
+        locale: string;
+        email_verified_at: Date | null;
+        restricted_at: Date | null;
+        last_created_at: Date | null;
+      }>(
+        `SELECT
+           u.email,
+           u.locale,
+           u.email_verified_at,
+           u.restricted_at,
+           latest.last_created_at
+         FROM users u
+         JOIN sessions s ON s.user_id = u.id
+         LEFT JOIN LATERAL (
+           SELECT max(created_at) AS last_created_at
+           FROM email_verification_tokens
+           WHERE user_id = u.id
+         ) latest ON true
+         WHERE u.id = $1
+           AND s.id = $2
+           AND s.revoked_at IS NULL
+           AND s.expires_at > now()
+         FOR UPDATE OF u, s`,
+        [user.userId, user.sessionId],
+      );
+      const principal = current.rows[0];
+      if (!principal || principal.restricted_at) return { status: "ineligible" as const };
+      if (principal.email_verified_at) return { status: "already_verified" as const };
+      if (
+        principal.last_created_at &&
+        principal.last_created_at.getTime() > Date.now() - 60_000
+      ) {
+        return { status: "rate_limited" as const };
+      }
+      await client.query(
+        `UPDATE email_verification_tokens
+         SET invalidated_at = now()
+         WHERE user_id = $1 AND used_at IS NULL AND invalidated_at IS NULL`,
+        [user.userId],
+      );
+      const tokenResult = await client.query<{ id: string }>(
+        `INSERT INTO email_verification_tokens(user_id, token_digest, expires_at)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [user.userId, digestToken(verificationToken), expiresAt],
+      );
+      const tokenId = tokenResult.rows[0]?.id;
+      if (!tokenId) throw new Error("Unable to create verification token");
+      const outboxResult = await client.query<{ id: string }>(
+        `INSERT INTO outbox(event_type, unique_key, payload)
+         VALUES ('notification.email_verification_requested', $1, $2)
+         RETURNING id`,
+        [
+          `verification:${tokenId}`,
+          {
+            userId: user.userId,
+            email: principal.email,
+            locale: principal.locale,
+            verificationUrl: `${config.OSS_PUBLIC_URL}/verify?token=${verificationToken}`,
+            expiresAt: expiresAt.toISOString(),
+          },
+        ],
+      );
+      const outboxId = outboxResult.rows[0]?.id;
+      if (!outboxId) throw new Error("Unable to create verification notification");
+      await client.query(
+        `INSERT INTO durable_jobs(job_type, unique_key, payload)
+         VALUES ('notification.send', $1, $2)`,
+        [`outbox:${outboxId}`, { outboxId }],
+      );
+      return { status: "resent" as const };
+    });
+    if (outcome.status === "rate_limited") {
+      return reply.code(429).send({ error: "Please wait before requesting another email" });
+    }
+    if (outcome.status === "ineligible") {
+      return reply.code(403).send({ error: "Account is restricted" });
+    }
+    return reply.code(200).send({
+      status: outcome.status,
+      ...(outcome.status === "resent" ? { expiresAt: expiresAt.toISOString() } : {}),
+    });
+  });
+
   app.get("/api/v1/lab/mailbox", async (request, reply) => {
     if (!config.LAB_MAILBOX_ENABLED) {
       return reply.code(404).send({ error: "Laboratory mailbox access is disabled" });
     }
     const user = await requireUser(request, pool, config);
-    const response = await fetch(
-      new URL(`/v1/mail?recipient=${encodeURIComponent(user.email)}`, config.MOCK_PROVIDER_URL),
-      {
-        headers: { Authorization: `Bearer ${config.MOCK_PROVIDER_TOKEN}` },
-        signal: AbortSignal.timeout(5_000),
-        redirect: "error",
+    const response = await fetch(new URL("/v1/mailbox/query", config.MOCK_MAILBOX_URL), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.LAB_MAILBOX_TOKEN}`,
+        "Content-Type": "application/json",
       },
-    );
+      body: JSON.stringify({ recipient: user.email }),
+      signal: AbortSignal.timeout(5_000),
+      redirect: "error",
+    });
     if (!response.ok) {
       throw Object.assign(new Error("Mock Mail Provider is unavailable"), { statusCode: 503 });
     }
