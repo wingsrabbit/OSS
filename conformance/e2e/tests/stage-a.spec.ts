@@ -46,8 +46,9 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
 
   const product = page.locator("article").filter({ hasText: "HKBGP VPS" }).first();
   await product.getByRole("button", { name: /monthly/i }).click();
-  await expect(page.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
-  await page.getByRole("button", { name: "Configure & order" }).click();
+  const checkoutDialog = page.getByRole("dialog");
+  await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
+  await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
 
   const journey = page.locator(".order-panel");
   await expect(journey.getByText("waiting payment", { exact: true })).toBeVisible();
