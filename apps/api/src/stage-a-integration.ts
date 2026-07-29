@@ -624,7 +624,7 @@ const staleLeaseRecord = await corePool.query<{ job_id: string; operation_id: st
    FROM durable_jobs j
    JOIN provider_operations po
      ON po.subject_type = 'payment'
-    AND po.subject_id = $1
+    AND po.subject_id::text = $1
    WHERE j.job_type = 'payment.start'
      AND j.payload->>'paymentAttemptId' = $1`,
   [staleLeasePayment.paymentAttemptId],
