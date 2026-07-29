@@ -12,14 +12,16 @@ const providerDatabaseUrl = process.env.PROVIDER_DATABASE_URL;
 const providerUrl = process.env.MOCK_PAYMENT_PROVIDER_URL;
 const paymentProviderToken = process.env.MOCK_PAYMENT_PROVIDER_TOKEN;
 const paymentWebhookSecret = process.env.MOCK_PAYMENT_WEBHOOK_SECRET;
-const paymentCapabilitySecret = process.env.PAYMENT_OPERATION_CAPABILITY_SECRET;
+const provisioningWebhookSecret = process.env.MOCK_PROVISIONING_WEBHOOK_SECRET;
+const providerCapabilitySecret = process.env.PROVIDER_OPERATION_CAPABILITY_SECRET;
 if (
   !databaseUrl ||
   !providerDatabaseUrl ||
   !providerUrl ||
   !paymentProviderToken ||
   !paymentWebhookSecret ||
-  !paymentCapabilitySecret
+  !provisioningWebhookSecret ||
+  !providerCapabilitySecret
 ) {
   throw new Error("Database and Mock Payment Provider test configuration are required");
 }
@@ -152,7 +154,7 @@ async function submitPaymentFact(
     typeof body.callbackCapability === "string"
       ? body.callbackCapability
       : providerOperationCapability(
-          paymentCapabilitySecret!,
+          providerCapabilitySecret!,
           "mock-payment-v1",
           providerOperationId,
         );
@@ -174,6 +176,41 @@ async function submitPaymentFact(
     headers: {
       "X-OSS-Timestamp": timestamp,
       "X-OSS-Signature": signature,
+    },
+    body: JSON.stringify(signedBody),
+  });
+}
+
+async function submitProvisionFact(
+  body: Record<string, unknown>,
+  secret = provisioningWebhookSecret!,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const providerOperationId = String(body.providerOperationId);
+  const callbackCapability =
+    typeof body.callbackCapability === "string"
+      ? body.callbackCapability
+      : providerOperationCapability(
+          providerCapabilitySecret!,
+          "mock-provisioning-v1",
+          providerOperationId,
+        );
+  const signedBody = {
+    eventId: body.eventId,
+    providerOperationId,
+    callbackCapability,
+    status: body.status,
+    ...(typeof body.externalResourceId === "string"
+      ? { externalResourceId: body.externalResourceId }
+      : {}),
+    ...(typeof body.readyAt === "string" ? { readyAt: body.readyAt } : {}),
+    occurredAt: body.occurredAt,
+  };
+  const timestamp = Date.now().toString();
+  return rawCoreRequest("/api/v1/provider-events/provisioning", {
+    method: "POST",
+    headers: {
+      "X-OSS-Timestamp": timestamp,
+      "X-OSS-Signature": providerSignature(secret, timestamp, signedBody),
     },
     body: JSON.stringify(signedBody),
   });
@@ -676,6 +713,7 @@ assert.equal(crossCapability.status, 401, "payment credential must not authorize
 const wrongCapabilityFact = {
   eventId: `wrong-capability:${randomUUID()}`,
   providerOperationId: randomUUID(),
+  callbackCapability: "A".repeat(43),
   status: "failed",
   occurredAt: new Date().toISOString(),
 };
@@ -716,6 +754,174 @@ await corePool.query(`
   BEFORE INSERT ON durable_jobs
   FOR EACH ROW EXECUTE FUNCTION integration_delay_provision_start();
 `);
+
+const forgedProvisionOrder = await createOrder(automaticPrice.id, legal);
+const paidForgedProvision = await pay(forgedProvisionOrder, "success");
+const forgedProvisionRecord = await corePool.query<{
+  job_id: string;
+  operation_id: string;
+}>(
+  `SELECT job.id AS job_id, operation.id AS operation_id
+   FROM durable_jobs job
+   JOIN provider_operations operation
+     ON operation.subject_type = 'service'
+    AND operation.subject_id = $1
+   WHERE job.job_type = 'provision.start'
+     AND job.payload->>'serviceId' = $1`,
+  [paidForgedProvision.service.id],
+);
+const forgedProvisionPointer = forgedProvisionRecord.rows[0];
+assert.ok(forgedProvisionPointer);
+const forgedProvisionEvent = {
+  eventId: `pre-outbound-resource:${randomUUID()}`,
+  providerOperationId: forgedProvisionPointer.operation_id,
+  status: "succeeded",
+  externalResourceId: `mock-forged-resource-${randomUUID()}`,
+  readyAt: new Date().toISOString(),
+  occurredAt: new Date().toISOString(),
+};
+const invalidDirectProvision = await submitProvisionFact({
+  ...forgedProvisionEvent,
+  callbackCapability: "A".repeat(43),
+});
+assert.equal(invalidDirectProvision.status, 202);
+assert.equal(invalidDirectProvision.body.rejected, true);
+assert.equal(invalidDirectProvision.body.reason, "invalid_operation_capability");
+const unstartedDirectProvision = await submitProvisionFact(forgedProvisionEvent);
+assert.equal(unstartedDirectProvision.status, 202);
+assert.equal(unstartedDirectProvision.body.rejected, true);
+assert.equal(unstartedDirectProvision.body.reason, "provider_operation_not_started");
+const unstartedProvisionState = await corePool.query<{
+  service_status: string;
+  operation_status: string;
+  attempt_count: number;
+}>(
+  `SELECT
+     service.status AS service_status,
+     operation.status AS operation_status,
+     operation.attempt_count
+   FROM services service
+   JOIN provider_operations operation ON operation.id = $2
+   WHERE service.id = $1`,
+  [paidForgedProvision.service.id, forgedProvisionPointer.operation_id],
+);
+assert.equal(unstartedProvisionState.rows[0]?.service_status, "pending");
+assert.equal(unstartedProvisionState.rows[0]?.operation_status, "queued");
+assert.equal(unstartedProvisionState.rows[0]?.attempt_count, 0);
+const unstartedProviderOperations = await providerPool.query<{ count: string }>(
+  "SELECT count(*)::text AS count FROM mock_resource_operations WHERE operation_id = $1",
+  [forgedProvisionPointer.operation_id],
+);
+assert.equal(unstartedProviderOperations.rows[0]?.count, "0");
+
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL
+   WHERE id = $1`,
+  [forgedProvisionPointer.job_id],
+);
+await corePool.query(
+  `UPDATE services
+   SET status = 'provisioning'
+   WHERE id = $1`,
+  [paidForgedProvision.service.id],
+);
+await corePool.query(
+  `UPDATE orders
+   SET status = 'fulfilling'
+   WHERE id = $1`,
+  [paidForgedProvision.order.id],
+);
+await corePool.query(
+  `UPDATE provider_operations
+   SET status = 'running', attempt_count = 1
+   WHERE id = $1`,
+  [forgedProvisionPointer.operation_id],
+);
+await providerPool.query(
+  `INSERT INTO mock_resource_operations(
+     operation_id, service_id, external_resource_id, callback_capability,
+     scenario, status, ready_at, create_calls, request_fingerprint
+   ) VALUES ($1, $2, $3, $4, 'success', 'succeeded', now(), 0, $5)`,
+  [
+    forgedProvisionPointer.operation_id,
+    paidForgedProvision.service.id,
+    forgedProvisionEvent.externalResourceId,
+    "A".repeat(43),
+    createHash("sha256").update(randomUUID()).digest("hex"),
+  ],
+);
+const forgedProvisionReconcileKey = `forged-provision:${paidForgedProvision.service.id}`;
+await corePool.query(
+  `INSERT INTO durable_jobs(job_type, unique_key, payload)
+   VALUES ('provision.reconcile', $1, $2)`,
+  [
+    forgedProvisionReconcileKey,
+    {
+      serviceId: paidForgedProvision.service.id,
+      operationId: forgedProvisionPointer.operation_id,
+    },
+  ],
+);
+const forgedProvisionClosed = await waitFor(
+  "resource reconciliation without the outbound capability to enter manual Hold",
+  async () => {
+    const result = await corePool.query<{
+      order_status: string;
+      service_status: string;
+      operation_status: string;
+      job_status: string;
+      external_resource_id: string | null;
+      activated_at: Date | null;
+      term_start: Date | null;
+      term_end: Date | null;
+      activation_events: string;
+    }>(
+      `SELECT
+         customer_order.status AS order_status,
+         service.status AS service_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         service.external_resource_id,
+         service.activated_at,
+         service.term_start,
+         service.term_end,
+         (SELECT count(*)::text
+            FROM outbox
+           WHERE event_type = 'service.activated'
+             AND payload->>'serviceId' = service.id::text) AS activation_events
+       FROM services service
+       JOIN order_items item ON item.id = service.order_item_id
+       JOIN orders customer_order ON customer_order.id = item.order_id
+       JOIN provider_operations operation ON operation.id = $2
+       JOIN durable_jobs job ON job.unique_key = $3
+       WHERE service.id = $1`,
+      [
+        paidForgedProvision.service.id,
+        forgedProvisionPointer.operation_id,
+        forgedProvisionReconcileKey,
+      ],
+    );
+    return result.rows[0];
+  },
+  (value) =>
+    value?.order_status === "on_hold" &&
+    value.service_status === "confirming" &&
+    value.operation_status === "unknown" &&
+    value.job_status === "manual",
+  8_000,
+);
+assert.equal(forgedProvisionClosed?.external_resource_id, null);
+assert.equal(forgedProvisionClosed?.activated_at, null);
+assert.equal(forgedProvisionClosed?.term_start, null);
+assert.equal(forgedProvisionClosed?.term_end, null);
+assert.equal(forgedProvisionClosed?.activation_events, "0");
+const forgedProvisionProviderState = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_resource_operations WHERE operation_id = $1",
+  [forgedProvisionPointer.operation_id],
+);
+assert.equal(forgedProvisionProviderState.rows[0]?.create_calls, 0);
+
 const restrictedBeforeProvision = await createOrder(automaticPrice.id, legal);
 const paidBeforeRestriction = await pay(restrictedBeforeProvision, "success");
 const heldProvisionOperation = await corePool.query<{ id: string }>(
@@ -1434,7 +1640,7 @@ const forgedReconcileClosed = await waitFor(
       job_status: string;
       receipts: string;
       fee_charges: string;
-      invoice_status: string;
+      allocated_minor: string;
       service_status: string;
     }>(
       `SELECT
@@ -1448,11 +1654,12 @@ const forgedReconcileClosed = await waitFor(
          (SELECT count(*)::text
             FROM invoice_fee_charges
            WHERE payment_attempt_id = attempt.id) AS fee_charges,
-         invoice.status AS invoice_status,
+         allocation.allocated_minor::text,
          service.status AS service_status
        FROM invoice_payment_commands command
        JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
        JOIN invoices invoice ON invoice.id = attempt.invoice_id
+       JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
        JOIN orders customer_order ON customer_order.id = invoice.order_id
        JOIN order_items item ON item.order_id = customer_order.id
        JOIN services service ON service.order_item_id = item.id
@@ -1474,7 +1681,7 @@ const forgedReconcileClosed = await waitFor(
 );
 assert.equal(forgedReconcileClosed?.receipts, "0");
 assert.equal(forgedReconcileClosed?.fee_charges, "0");
-assert.equal(forgedReconcileClosed?.invoice_status, "unpaid");
+assert.equal(forgedReconcileClosed?.allocated_minor, "0");
 assert.equal(forgedReconcileClosed?.service_status, "pending");
 
 const mismatchOrder = await createOrder(automaticPrice.id, legal);
@@ -1540,7 +1747,7 @@ assert.equal(mismatchCoreState.rows[0]?.attempt_status, "unknown");
 assert.equal(mismatchCoreState.rows[0]?.operation_status, "unknown");
 assert.equal(mismatchCoreState.rows[0]?.receipt_disposition, "unclaimed");
 const mismatchCapability = providerOperationCapability(
-  paymentCapabilitySecret,
+  providerCapabilitySecret,
   "mock-payment-v1",
   mismatchRecords.operation_id,
 );
@@ -1655,7 +1862,6 @@ const callbackRaceFact = {
 };
 const preOutboundForgery = await submitPaymentFact({
   ...callbackRaceFact,
-  eventId: `pre-outbound-forgery:${randomUUID()}`,
   externalPaymentId: `mock-forged-before-outbound-${randomUUID()}`,
   callbackCapability: "A".repeat(43),
 });

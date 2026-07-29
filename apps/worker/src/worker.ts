@@ -17,7 +17,7 @@ const config = z
     MOCK_PAYMENT_PROVIDER_TOKEN: z.string().min(32),
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
-    PAYMENT_OPERATION_CAPABILITY_SECRET: z.string().min(32),
+    PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
     MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
     MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
     CORE_INTERNAL_URL: z.url().default("http://api:3000"),
@@ -954,6 +954,7 @@ async function preflightProvision(
       operation_status: string;
       operation_kind: string;
       operation_attempt_count: number;
+      operation_provider_installation_id: string;
     }>(
       `SELECT
          s.status AS service_status, s.client_account_id AS service_client_account_id,
@@ -964,7 +965,8 @@ async function preflightProvision(
          u.email_verified_at, u.restricted_at AS user_restricted_at,
          ca.restricted_at AS account_restricted_at,
          po.status AS operation_status, po.kind AS operation_kind,
-         po.attempt_count AS operation_attempt_count
+         po.attempt_count AS operation_attempt_count,
+         po.provider_installation_id AS operation_provider_installation_id
        FROM services s
        JOIN order_items oi ON oi.id = s.order_item_id
        JOIN orders o ON o.id = oi.order_id
@@ -1009,6 +1011,17 @@ async function preflightProvision(
       return { kind: "halted" };
     }
     if (mode === "reconcile") {
+      if (service.operation_provider_installation_id !== "mock-provisioning-v1") {
+        return holdProvisionWithClient(
+          client,
+          job,
+          providerOperationId,
+          serviceId,
+          service.order_id,
+          potentiallySent,
+          "provision reconciliation blocked because Provider ownership records are inconsistent",
+        );
+      }
       if (!potentiallySent) {
         await manualJobWithClient(
           client,
@@ -1041,6 +1054,8 @@ async function preflightProvision(
     const consistentOwnership =
       service.service_client_account_id === service.invoice_client_account_id &&
       service.invoice_client_account_id === service.order_client_account_id;
+    const consistentProvider =
+      service.operation_provider_installation_id === "mock-provisioning-v1";
 
     const allocationResult = await client.query<{ allocated_minor: string }>(
       `SELECT allocated_minor::text
@@ -1054,6 +1069,7 @@ async function preflightProvision(
     if (
       !eligible ||
       !consistentOwnership ||
+      !consistentProvider ||
       !paid ||
       service.fulfillment_mode !== "automatic" ||
       !["accepted", "fulfilling"].includes(service.order_status) ||
@@ -1071,7 +1087,9 @@ async function preflightProvision(
           ? "provisioning provider call blocked because the user, account, or membership is not eligible"
           : !paid
             ? "provisioning provider call blocked because the linked invoice is not fully allocated"
-            : "provisioning provider call blocked because order, ownership, fulfillment, or operation state changed",
+            : !consistentProvider
+              ? "provisioning provider call blocked because Provider ownership records are inconsistent"
+              : "provisioning provider call blocked because order, ownership, fulfillment, or operation state changed",
       );
     }
 
@@ -1310,7 +1328,7 @@ async function startPayment(job: Job): Promise<void> {
   if (preflight.kind === "halted") return;
   const payment = preflight.value;
   const callbackCapability = providerOperationCapability(
-    config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+    config.PROVIDER_OPERATION_CAPABILITY_SECRET,
     "mock-payment-v1",
     providerOperationId,
   );
@@ -1378,6 +1396,11 @@ async function startProvision(job: Job): Promise<void> {
   if (!serviceId || !providerOperationId) throw new Error("Invalid provision.start payload");
   const preflight = await preflightProvision(job, serviceId, providerOperationId, "start");
   if (preflight.kind === "halted") return;
+  const callbackCapability = providerOperationCapability(
+    config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+    "mock-provisioning-v1",
+    providerOperationId,
+  );
   try {
     const response = await providerRequest(
       config.MOCK_PROVISIONING_PROVIDER_URL,
@@ -1389,6 +1412,7 @@ async function startProvision(job: Job): Promise<void> {
         body: JSON.stringify({
           operationId: providerOperationId,
           serviceId,
+          callbackCapability,
           scenario: config.MOCK_PROVISION_SCENARIO,
         }),
       },
@@ -1596,6 +1620,68 @@ async function delayReconcile(
   });
 }
 
+async function manualProvisionReconcile(
+  job: Job,
+  operationId: string,
+  serviceId: string,
+  reason: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    const result = await client.query<{ order_id: string }>(
+      `SELECT customer_order.id AS order_id
+       FROM services service
+       JOIN order_items item ON item.id = service.order_item_id
+       JOIN orders customer_order ON customer_order.id = item.order_id
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'service'
+        AND operation.subject_id = service.id
+       WHERE service.id = $1
+       FOR UPDATE OF service, customer_order, operation`,
+      [serviceId, operationId],
+    );
+    const orderId = result.rows[0]?.order_id;
+    if (!orderId) {
+      await manualJobWithClient(
+        client,
+        job.id,
+        "provision reconciliation references missing or inconsistent Core records",
+      );
+      return;
+    }
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [operationId, reason.slice(0, 1_000)],
+    );
+    await client.query(
+      `UPDATE services
+       SET status = 'confirming', updated_at = now(), version = version + 1
+       WHERE id = $1 AND status IN ('pending', 'provisioning', 'confirming')`,
+      [serviceId],
+    );
+    await client.query(
+      `UPDATE orders
+       SET status = 'on_hold', updated_at = now(), version = version + 1
+       WHERE id = $1 AND status IN ('accepted', 'fulfilling')`,
+      [orderId],
+    );
+    await client.query(
+      `INSERT INTO audit_events(
+         actor_type, actor_id, action, target_type, target_id, reason, metadata
+       ) VALUES ('system', $1, 'provision.reconcile_proof_rejected', 'service', $2, $3, $4)`,
+      [
+        config.WORKER_ID,
+        serviceId,
+        reason.slice(0, 1_000),
+        { providerOperationId: operationId, orderId },
+      ],
+    );
+    await manualJobWithClient(client, job.id, reason);
+  });
+}
+
 async function reconcilePayment(job: Job): Promise<void> {
   const operationId = job.payload.operationId ?? job.payload.providerOperationId;
   const paymentAttemptId = job.payload.paymentAttemptId;
@@ -1662,13 +1748,18 @@ async function reconcilePayment(job: Job): Promise<void> {
       .parse(await response.json());
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid provider response";
-    await delayReconcile(job, operationId, `payment reconciliation response is invalid: ${message}`);
+    await delayReconcile(
+      job,
+      operationId,
+      `payment reconciliation response is invalid: ${message}`,
+      true,
+    );
     return;
   }
   if (
     !providerOperationCapabilityMatches(
       fact.callbackCapability,
-      config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
       "mock-payment-v1",
       operationId,
     )
@@ -1748,6 +1839,7 @@ async function reconcileProvision(job: Job): Promise<void> {
     return;
   }
   let fact: {
+    callbackCapability: string;
     status: "processing" | "succeeded" | "failed";
     externalResourceId?: string | undefined;
     readyAt?: string | undefined;
@@ -1756,6 +1848,7 @@ async function reconcileProvision(job: Job): Promise<void> {
   try {
     fact = z
       .object({
+        callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
         status: z.enum(["processing", "succeeded", "failed"]),
         externalResourceId: z.string().optional(),
         readyAt: z.string().optional(),
@@ -1764,7 +1857,28 @@ async function reconcileProvision(job: Job): Promise<void> {
       .parse(await response.json());
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid provider response";
-    await delayReconcile(job, operationId, `provision reconciliation response is invalid: ${message}`);
+    await manualProvisionReconcile(
+      job,
+      operationId,
+      serviceId,
+      `provision reconciliation response is invalid: ${message}`,
+    );
+    return;
+  }
+  if (
+    !providerOperationCapabilityMatches(
+      fact.callbackCapability,
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+      "mock-provisioning-v1",
+      operationId,
+    )
+  ) {
+    await manualProvisionReconcile(
+      job,
+      operationId,
+      serviceId,
+      "provision reconciliation returned an invalid operation capability",
+    );
     return;
   }
   if (fact.status === "processing") {

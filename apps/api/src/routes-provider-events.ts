@@ -30,6 +30,7 @@ const paymentEventSchema = z.object({
 const provisioningEventSchema = z.object({
   eventId: z.string().min(1).max(160),
   providerOperationId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   status: z.enum(["succeeded", "failed"]),
   externalResourceId: z.string().min(1).max(200).optional(),
   readyAt: z.iso.datetime().optional(),
@@ -37,6 +38,7 @@ const provisioningEventSchema = z.object({
 });
 
 const MOCK_PAYMENT_INSTALLATION_ID = "mock-payment-v1";
+const MOCK_PROVISIONING_INSTALLATION_ID = "mock-provisioning-v1";
 
 async function insertInbox(
   client: DatabaseClient,
@@ -265,9 +267,6 @@ export async function registerProviderEventRoutes(
     assertProviderSignature(request, config.MOCK_PAYMENT_WEBHOOK_SECRET, body);
 
     const outcome = await transaction(pool, async (client) => {
-      if (!(await insertInbox(client, "mock-payment-v1", body.eventId, "payment.status", body))) {
-        return { duplicate: true };
-      }
       const occurredAt = new Date(body.occurredAt);
       const attemptPointer = await client.query<{ invoice_id: string }>(
         `SELECT invoice_id
@@ -341,7 +340,7 @@ export async function registerProviderEventRoutes(
       if (
         !providerOperationCapabilityMatches(
           body.callbackCapability,
-          config.PAYMENT_OPERATION_CAPABILITY_SECRET,
+          config.PROVIDER_OPERATION_CAPABILITY_SECRET,
           MOCK_PAYMENT_INSTALLATION_ID,
           attempt.operation_id,
         )
@@ -368,6 +367,17 @@ export async function registerProviderEventRoutes(
           { eventId: body.eventId, providerOperationId: attempt.operation_id },
         );
         return { rejected: true, reason: "provider_operation_not_started" };
+      }
+      if (
+        !(await insertInbox(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          body.eventId,
+          "payment.status",
+          body,
+        ))
+      ) {
+        return { duplicate: true };
       }
 
       const externalOwner = await client.query<{ id: string }>(
@@ -674,10 +684,61 @@ export async function registerProviderEventRoutes(
     const body = provisioningEventSchema.parse(request.body);
     assertProviderSignature(request, config.MOCK_PROVISIONING_WEBHOOK_SECRET, body);
     const outcome = await transaction(pool, async (client) => {
+      const occurredAt = new Date(body.occurredAt);
+      const operationResult = await client.query<{
+        id: string;
+        subject_id: string;
+        status: string;
+        attempt_count: number;
+        created_at: Date;
+        provider_occurred_at: Date | null;
+      }>(
+        `SELECT id, subject_id, status, attempt_count, created_at, provider_occurred_at
+         FROM provider_operations
+         WHERE id = $1
+           AND provider_installation_id = $2
+           AND subject_type = 'service'
+           AND kind = 'resource_create'
+         FOR UPDATE`,
+        [body.providerOperationId, MOCK_PROVISIONING_INSTALLATION_ID],
+      );
+      const operation = operationResult.rows[0];
+      if (!operation) return { rejected: true, reason: "unknown_provider_operation" };
+      if (
+        !providerOperationCapabilityMatches(
+          body.callbackCapability,
+          config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          operation.id,
+        )
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "provisioning.event_rejected",
+          "service",
+          operation.subject_id,
+          "provisioning callback capability is invalid for the Provider operation",
+          { eventId: body.eventId, providerOperationId: operation.id },
+        );
+        return { rejected: true, reason: "invalid_operation_capability" };
+      }
+      if (operation.attempt_count === 0) {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "provisioning.event_rejected",
+          "service",
+          operation.subject_id,
+          "Provider reported a resource fact before Core sent the operation",
+          { eventId: body.eventId, providerOperationId: operation.id },
+        );
+        return { rejected: true, reason: "provider_operation_not_started" };
+      }
       if (
         !(await insertInbox(
           client,
-          "mock-provisioning-v1",
+          MOCK_PROVISIONING_INSTALLATION_ID,
           body.eventId,
           "resource.status",
           body,
@@ -685,24 +746,6 @@ export async function registerProviderEventRoutes(
       ) {
         return { duplicate: true };
       }
-      const occurredAt = new Date(body.occurredAt);
-      const operationResult = await client.query<{
-        id: string;
-        subject_id: string;
-        status: string;
-        created_at: Date;
-        provider_occurred_at: Date | null;
-      }>(
-        `SELECT id, subject_id, status, created_at, provider_occurred_at
-         FROM provider_operations
-         WHERE id = $1
-           AND provider_installation_id = 'mock-provisioning-v1'
-           AND kind IN ('resource_create', 'resource_reconcile')
-         FOR UPDATE`,
-        [body.providerOperationId],
-      );
-      const operation = operationResult.rows[0];
-      if (!operation) return { rejected: true, reason: "unknown_provider_operation" };
       if (!isAfter(operation.provider_occurred_at, occurredAt)) {
         return { ignored: true, reason: "stale_provider_fact" };
       }

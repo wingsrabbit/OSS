@@ -15,7 +15,7 @@ const schema = z.object({
   WEB_ORIGIN: z.url().default("http://localhost:5173"),
   MOCK_MAILBOX_URL: z.url().default("http://localhost:4000"),
   LAB_MAILBOX_TOKEN: z.string().min(32),
-  PAYMENT_OPERATION_CAPABILITY_SECRET: z.string().min(32),
+  PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
   MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
   MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
   LAB_MAILBOX_ENABLED: z

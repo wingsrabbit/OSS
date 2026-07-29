@@ -39,6 +39,7 @@ const paymentCreateSchema = z.object({
 const resourceCreateSchema = z.object({
   operationId: z.uuid(),
   serviceId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   scenario: z.enum(["success", "failed", "timeout_existing"]),
 });
 
@@ -90,6 +91,7 @@ await pool.query(`
     operation_id uuid PRIMARY KEY,
     service_id uuid NOT NULL,
     external_resource_id text UNIQUE,
+    callback_capability text NOT NULL,
     scenario text NOT NULL,
     status text NOT NULL,
     ready_at timestamptz,
@@ -126,6 +128,13 @@ await pool.query(`
     ALTER COLUMN request_fingerprint SET NOT NULL;
   ALTER TABLE mock_resource_operations
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
+  ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS callback_capability text;
+  UPDATE mock_resource_operations
+  SET callback_capability = repeat('A', 43)
+  WHERE callback_capability IS NULL;
+  ALTER TABLE mock_resource_operations
+    ALTER COLUMN callback_capability SET NOT NULL;
   UPDATE mock_resource_operations
   SET request_fingerprint = 'legacy:' || operation_id::text
   WHERE request_fingerprint IS NULL;
@@ -385,9 +394,9 @@ app.post("/v1/resources", async (request, reply) => {
     occurred_at: Date;
   }>(
     `INSERT INTO mock_resource_operations(
-       operation_id, service_id, external_resource_id, scenario, status, ready_at
-       , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       operation_id, service_id, external_resource_id, callback_capability,
+       scenario, status, ready_at, request_fingerprint
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_resource_operations.create_calls + 1
        WHERE mock_resource_operations.request_fingerprint = EXCLUDED.request_fingerprint
@@ -396,6 +405,7 @@ app.post("/v1/resources", async (request, reply) => {
       body.operationId,
       body.serviceId,
       externalResourceId,
+      body.callbackCapability,
       body.scenario,
       status,
       readyAt,
@@ -409,6 +419,7 @@ app.post("/v1/resources", async (request, reply) => {
   const event = {
     eventId: `resource:${body.operationId}:${operation.status}`,
     providerOperationId: body.operationId,
+    callbackCapability: body.callbackCapability,
     status: operation.status,
     ...(operation.external_resource_id
       ? { externalResourceId: operation.external_resource_id }
@@ -431,12 +442,13 @@ app.post("/v1/resources", async (request, reply) => {
 app.get("/v1/resources/:operationId", async (request, reply) => {
   const params = z.object({ operationId: z.uuid() }).parse(request.params);
   const result = await pool.query<{
+    callback_capability: string;
     external_resource_id: string | null;
     status: "succeeded" | "failed";
     ready_at: Date | null;
     occurred_at: Date;
   }>(
-    `SELECT external_resource_id, status, ready_at, occurred_at
+    `SELECT callback_capability, external_resource_id, status, ready_at, occurred_at
      FROM mock_resource_operations
      WHERE operation_id = $1`,
     [params.operationId],
@@ -444,6 +456,7 @@ app.get("/v1/resources/:operationId", async (request, reply) => {
   const row = result.rows[0];
   if (!row) return reply.code(404).send({ error: "operation not found" });
   return {
+    callbackCapability: row.callback_capability,
     status: row.status,
     ...(row.external_resource_id ? { externalResourceId: row.external_resource_id } : {}),
     ...(row.ready_at ? { readyAt: row.ready_at.toISOString() } : {}),
