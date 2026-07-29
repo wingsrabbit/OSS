@@ -76,6 +76,21 @@ type ManualItem = {
   totalMinor: string;
   submittedAt: string;
 };
+type UnclaimedFundItem = {
+  receiptId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  providerInstallationId: string;
+  externalPaymentId: string;
+  amountMinor: string;
+  allocatedMinor: string;
+  remainingMinor: string;
+  currency: string;
+  occurredAt: string;
+  disposition: string;
+  reason: string | null;
+  suggestedInvoiceId: string | null;
+};
 type BillingSummary = {
   currency: string;
   creditBalanceMinor: string;
@@ -200,10 +215,14 @@ export function App() {
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
+  const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [adminPassword, setAdminPassword] = useState("");
   const [manualReason, setManualReason] = useState("");
   const [creditAdjustmentMinor, setCreditAdjustmentMinor] = useState("5000");
   const [creditAdjustmentReason, setCreditAdjustmentReason] = useState("");
+  const [fundResolutionMinor, setFundResolutionMinor] = useState("");
+  const [fundResolutionInvoiceId, setFundResolutionInvoiceId] = useState("");
+  const [fundResolutionReason, setFundResolutionReason] = useState("");
   const [bootstrapToken, setBootstrapToken] = useState("");
   const text = words[locale];
 
@@ -380,9 +399,18 @@ export function App() {
     setManualItems(result.items);
   }, [me?.staff]);
 
+  const refreshUnclaimedFunds = useCallback(async () => {
+    if (!me?.staff) {
+      setUnclaimedFunds([]);
+      return;
+    }
+    const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
+    setUnclaimedFunds(result.items);
+  }, [me?.staff]);
+
   useEffect(() => {
-    void refreshManualItems().catch(() => undefined);
-  }, [refreshManualItems]);
+    void Promise.all([refreshManualItems(), refreshUnclaimedFunds()]).catch(() => undefined);
+  }, [refreshManualItems, refreshUnclaimedFunds]);
 
   const groups = useMemo(() => {
     const result = new Map<string, Product[]>();
@@ -582,6 +610,47 @@ export function App() {
       setCreditAdjustmentReason("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
+    }
+  }
+
+  async function resolveUnclaimedFunds(
+    item: UnclaimedFundItem,
+    action: "convert_to_credit" | "allocate_invoice",
+  ) {
+    if (!me?.staff) return;
+    setError("");
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      const invoiceId =
+        action === "allocate_invoice"
+          ? fundResolutionInvoiceId || item.suggestedInvoiceId
+          : null;
+      await api(`/api/v1/admin/funds/${item.receiptId}/resolutions`, {
+        method: "POST",
+        body: JSON.stringify({
+          action,
+          amountMinor: fundResolutionMinor,
+          invoiceId,
+          reason: fundResolutionReason,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      });
+      await refreshUnclaimedFunds();
+      if (item.clientAccountId === me.clientAccountId) {
+        await refreshBilling();
+      }
+      setNotice(
+        action === "convert_to_credit"
+          ? "Unclaimed funds converted to Credit with a balanced journal."
+          : "Unclaimed funds allocated to the matching invoice with a balanced journal.",
+      );
+      setFundResolutionMinor("");
+      setFundResolutionReason("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Fund resolution failed");
     }
   }
 
@@ -904,6 +973,88 @@ export function App() {
                 ))}
               </>
             )}
+            <div className="admin-subsection">
+              <div>
+                <p className="eyebrow">Money received but not yet assigned</p>
+                <h3>Unclaimed funds</h3>
+                <p>
+                  Original Provider facts remain immutable. Each resolution requires password
+                  confirmation, a reason, and creates a separate balanced journal.
+                </p>
+              </div>
+              <button onClick={() => void refreshUnclaimedFunds()}>
+                Refresh unclaimed funds
+              </button>
+              <div className="inline-form admin-confirm">
+                <input
+                  aria-label="Fund resolution amount in cents"
+                  inputMode="numeric"
+                  value={fundResolutionMinor}
+                  onChange={(event) => setFundResolutionMinor(event.target.value)}
+                  placeholder="Resolution amount in cents"
+                />
+                <input
+                  aria-label="Fund resolution invoice ID"
+                  value={fundResolutionInvoiceId}
+                  onChange={(event) => setFundResolutionInvoiceId(event.target.value)}
+                  placeholder="Matching invoice ID (allocation only)"
+                />
+                <input
+                  aria-label="Fund resolution reason"
+                  value={fundResolutionReason}
+                  onChange={(event) => setFundResolutionReason(event.target.value)}
+                  placeholder="Resolution reason (10+ characters)"
+                />
+              </div>
+              {unclaimedFunds.length === 0 ? (
+                <p className="muted">No unclaimed funds are waiting.</p>
+              ) : (
+                <div data-testid="unclaimed-funds-list">
+                  {unclaimedFunds.map((item) => (
+                    <article
+                      className="manual-item"
+                      data-testid="unclaimed-fund-item"
+                      key={item.receiptId}
+                    >
+                      <div>
+                        <strong>
+                          {item.clientAccountName} · remaining {usd(item.remainingMinor)}
+                        </strong>
+                        <span>
+                          Received {usd(item.amountMinor)} via {item.providerInstallationId}
+                        </span>
+                        <span className="mono">{item.externalPaymentId}</span>
+                        <span>{item.reason ?? "Awaiting operator classification"}</span>
+                      </div>
+                      <div className="fund-actions">
+                        <button
+                          className="primary"
+                          disabled={
+                            adminPassword.length === 0 ||
+                            !/^[1-9]\d*$/.test(fundResolutionMinor) ||
+                            fundResolutionReason.trim().length < 10
+                          }
+                          onClick={() => resolveUnclaimedFunds(item, "convert_to_credit")}
+                        >
+                          Convert amount to Credit
+                        </button>
+                        <button
+                          disabled={
+                            adminPassword.length === 0 ||
+                            !/^[1-9]\d*$/.test(fundResolutionMinor) ||
+                            fundResolutionReason.trim().length < 10 ||
+                            (!fundResolutionInvoiceId && !item.suggestedInvoiceId)
+                          }
+                          onClick={() => resolveUnclaimedFunds(item, "allocate_invoice")}
+                        >
+                          Allocate amount to invoice
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
           </section>
         )}
 

@@ -2943,6 +2943,212 @@ assert.equal(afterCapRace.rows[0]?.balance_minor, "996000");
 assert.equal(afterCapRace.rows[0]?.unclaimed, "10");
 assert.equal(afterCapRace.rows[0]?.add_funds_credits, "2");
 
+const resolutionReceiptId = String(preservedCallbackBeforeReject.result?.receiptId ?? "");
+assert.match(resolutionReceiptId, /^[0-9a-f-]{36}$/);
+const resolutionOrder = await createOrder(automaticPrice.id, legal);
+const recoveryCookie = cookie;
+cookie = staffCookie;
+
+const unclaimedList = await request<{
+  items: Array<{
+    receiptId: string;
+    clientAccountId: string;
+    remainingMinor: string;
+    currency: string;
+  }>;
+}>("/api/v1/admin/funds/unclaimed");
+const listedReceipt = unclaimedList.items.find((item) => item.receiptId === resolutionReceiptId);
+assert.ok(listedReceipt);
+assert.equal(listedReceipt.clientAccountId, recoveryMe.clientAccountId);
+assert.equal(listedReceipt.currency, "USD");
+const allocationAmount = resolutionOrder.invoice.dueMinor;
+assert.ok(BigInt(allocationAmount) > 0n);
+assert.ok(BigInt(listedReceipt.remainingMinor) > BigInt(allocationAmount));
+const allocationKey = randomUUID();
+const allocationBody = {
+  action: "allocate_invoice",
+  amountMinor: allocationAmount,
+  invoiceId: resolutionOrder.invoice.id,
+  reason: "Synthetic operator allocation to the matching unpaid invoice",
+  idempotencyKey: allocationKey,
+};
+await corePool.query(
+  "UPDATE reauth_grants SET invalidated_at = now() WHERE user_id = $1 AND invalidated_at IS NULL",
+  [staffMe.id],
+);
+await request(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  { method: "POST", body: JSON.stringify(allocationBody) },
+  403,
+);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+await request(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...allocationBody,
+      invoiceId: automaticOrder.invoice.id,
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  409,
+);
+const allocatedUnclaimed = await request<{
+  resolutionId: string;
+  remainingMinor: string;
+  invoiceStatus: string;
+  replayed: boolean;
+}>(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  { method: "POST", body: JSON.stringify(allocationBody) },
+  201,
+);
+assert.equal(allocatedUnclaimed.invoiceStatus, "paid");
+assert.equal(allocatedUnclaimed.replayed, false);
+const allocationReplay = await request<{
+  resolutionId: string;
+  replayed: boolean;
+}>(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  { method: "POST", body: JSON.stringify(allocationBody) },
+  200,
+);
+assert.equal(allocationReplay.resolutionId, allocatedUnclaimed.resolutionId);
+assert.equal(allocationReplay.replayed, true);
+await request(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({ ...allocationBody, amountMinor: "1" }),
+  },
+  409,
+);
+const creditResolutionKey = randomUUID();
+const competingCreditResolutionKey = randomUUID();
+const creditResolutionBody = {
+  action: "convert_to_credit",
+  amountMinor: allocatedUnclaimed.remainingMinor,
+  invoiceId: null,
+  reason: "Synthetic operator conversion of the remaining verified funds",
+};
+const competingCreditResolutions = await Promise.all([
+  rawCoreRequest(`/api/v1/admin/funds/${resolutionReceiptId}/resolutions`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...creditResolutionBody,
+      idempotencyKey: creditResolutionKey,
+    }),
+  }),
+  rawCoreRequest(`/api/v1/admin/funds/${resolutionReceiptId}/resolutions`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...creditResolutionBody,
+      idempotencyKey: competingCreditResolutionKey,
+    }),
+  }),
+]);
+assert.deepEqual(
+  competingCreditResolutions.map((response) => response.status).sort(),
+  [201, 409],
+);
+const successfulCreditResolution = competingCreditResolutions.find(
+  (response) => response.status === 201,
+);
+assert.ok(successfulCreditResolution);
+const successfulCreditResolutionKey =
+  successfulCreditResolution === competingCreditResolutions[0]
+    ? creditResolutionKey
+    : competingCreditResolutionKey;
+const creditResolution = successfulCreditResolution.body as {
+  resolutionId: string;
+  remainingMinor: string;
+  creditBalanceMinor: string;
+  replayed: boolean;
+};
+assert.equal(creditResolution.remainingMinor, "0");
+assert.equal(creditResolution.replayed, false);
+assert.equal(
+  creditResolution.creditBalanceMinor,
+  (996000n + BigInt(allocatedUnclaimed.remainingMinor)).toString(),
+);
+const creditResolutionReplay = await request<{
+  resolutionId: string;
+  replayed: boolean;
+}>(
+  `/api/v1/admin/funds/${resolutionReceiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...creditResolutionBody,
+      idempotencyKey: successfulCreditResolutionKey,
+    }),
+  },
+  200,
+);
+assert.equal(creditResolutionReplay.resolutionId, creditResolution.resolutionId);
+assert.equal(creditResolutionReplay.replayed, true);
+const resolvedReceiptFacts = await corePool.query<{
+  allocated_minor: string;
+  amount_minor: string;
+  disposition: string;
+  resolutions: string;
+  allocations: string;
+  journals: string;
+}>(
+  `SELECT
+     receipt.allocated_minor::text,
+     receipt.amount_minor::text,
+     receipt.disposition,
+     (
+       SELECT count(*)::text
+       FROM fund_receipt_resolutions resolution
+       WHERE resolution.fund_receipt_id = receipt.id
+     ) AS resolutions,
+     (
+       SELECT count(*)::text
+       FROM fund_receipt_allocations allocation
+       WHERE allocation.fund_receipt_id = receipt.id
+     ) AS allocations,
+     (
+       SELECT count(*)::text
+       FROM ledger_journals journal
+       JOIN fund_receipt_resolutions resolution ON resolution.id = journal.source_id
+       WHERE journal.source_type = 'fund_receipt_resolution'
+         AND resolution.fund_receipt_id = receipt.id
+     ) AS journals
+   FROM fund_receipts receipt
+   WHERE receipt.id = $1`,
+  [resolutionReceiptId],
+);
+assert.equal(
+  resolvedReceiptFacts.rows[0]?.allocated_minor,
+  resolvedReceiptFacts.rows[0]?.amount_minor,
+);
+assert.equal(resolvedReceiptFacts.rows[0]?.disposition, "allocated");
+assert.equal(resolvedReceiptFacts.rows[0]?.resolutions, "2");
+assert.equal(resolvedReceiptFacts.rows[0]?.allocations, "1");
+assert.equal(resolvedReceiptFacts.rows[0]?.journals, "2");
+const noLongerUnclaimed = await request<{
+  items: Array<{ receiptId: string }>;
+}>("/api/v1/admin/funds/unclaimed");
+assert.equal(
+  noLongerUnclaimed.items.some((item) => item.receiptId === resolutionReceiptId),
+  false,
+);
+
+cookie = recoveryCookie;
+const activeResolutionOrder = await waitFor(
+  "invoice allocation from unclaimed funds to continue service fulfillment",
+  () => request<OrderDetail>(`/api/v1/orders/${resolutionOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+assert.equal(activeResolutionOrder.invoice.status, "paid");
+assert.equal(activeResolutionOrder.invoice.dueMinor, "0");
 cookie = staffCookie;
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
