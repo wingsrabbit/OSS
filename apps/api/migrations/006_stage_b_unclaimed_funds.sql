@@ -59,6 +59,14 @@ DECLARE
   invoice_row record;
   invoice_allocated bigint;
 BEGIN
+  IF NEW.action = 'allocate_invoice' THEN
+    SELECT client_account_id, currency, total_minor
+    INTO invoice_row
+    FROM invoices
+    WHERE id = NEW.invoice_id
+    FOR UPDATE;
+  END IF;
+
   SELECT client_account_id, currency, amount_minor, allocated_minor
   INTO receipt_row
   FROM fund_receipts
@@ -73,11 +81,6 @@ BEGIN
   END IF;
 
   IF NEW.action = 'allocate_invoice' THEN
-    SELECT client_account_id, currency, total_minor
-    INTO invoice_row
-    FROM invoices
-    WHERE id = NEW.invoice_id
-    FOR UPDATE;
     SELECT allocated_minor
     INTO invoice_allocated
     FROM invoice_allocation_totals

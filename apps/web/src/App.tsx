@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LAB_BANNER } from "@opensales/core";
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Locale = "en" | "zh-CN";
 type Me = {
@@ -223,6 +223,11 @@ export function App() {
   const [fundResolutionMinor, setFundResolutionMinor] = useState("");
   const [fundResolutionInvoiceId, setFundResolutionInvoiceId] = useState("");
   const [fundResolutionReason, setFundResolutionReason] = useState("");
+  const fundResolutionKeys = useRef(new Map<string, string>());
+  const fundResolutionInFlight = useRef(new Set<string>());
+  const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
+    ReadonlySet<string>
+  >(new Set());
   const [bootstrapToken, setBootstrapToken] = useState("");
   const text = words[locale];
 
@@ -618,30 +623,47 @@ export function App() {
     action: "convert_to_credit" | "allocate_invoice",
   ) {
     if (!me?.staff) return;
+    if (fundResolutionInFlight.current.has(item.receiptId)) return;
+    const invoiceId =
+      action === "allocate_invoice"
+        ? fundResolutionInvoiceId || item.suggestedInvoiceId
+        : null;
+    const reason = fundResolutionReason.trim();
+    const requestIdentity = JSON.stringify({
+      receiptId: item.receiptId,
+      action,
+      amountMinor: fundResolutionMinor,
+      invoiceId,
+      reason,
+    });
+    let idempotencyKey = fundResolutionKeys.current.get(requestIdentity);
+    if (!idempotencyKey) {
+      idempotencyKey = crypto.randomUUID();
+      fundResolutionKeys.current.set(requestIdentity, idempotencyKey);
+    }
+    fundResolutionInFlight.current.add(item.receiptId);
+    setFundResolutionPendingReceiptIds((current) => {
+      const next = new Set(current);
+      next.add(item.receiptId);
+      return next;
+    });
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
-      const invoiceId =
-        action === "allocate_invoice"
-          ? fundResolutionInvoiceId || item.suggestedInvoiceId
-          : null;
       await api(`/api/v1/admin/funds/${item.receiptId}/resolutions`, {
         method: "POST",
         body: JSON.stringify({
           action,
           amountMinor: fundResolutionMinor,
           invoiceId,
-          reason: fundResolutionReason,
-          idempotencyKey: crypto.randomUUID(),
+          reason,
+          idempotencyKey,
         }),
       });
-      await refreshUnclaimedFunds();
-      if (item.clientAccountId === me.clientAccountId) {
-        await refreshBilling();
-      }
+      fundResolutionKeys.current.delete(requestIdentity);
       setNotice(
         action === "convert_to_credit"
           ? "Unclaimed funds converted to Credit with a balanced journal."
@@ -649,8 +671,22 @@ export function App() {
       );
       setFundResolutionMinor("");
       setFundResolutionReason("");
+      const refreshResults = await Promise.allSettled([
+        refreshUnclaimedFunds(),
+        ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
+      ]);
+      if (refreshResults.some((result) => result.status === "rejected")) {
+        setError("The resolution was saved, but current balances could not be refreshed.");
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Fund resolution failed");
+    } finally {
+      fundResolutionInFlight.current.delete(item.receiptId);
+      setFundResolutionPendingReceiptIds((current) => {
+        const next = new Set(current);
+        next.delete(item.receiptId);
+        return next;
+      });
     }
   }
 
@@ -1030,6 +1066,7 @@ export function App() {
                         <button
                           className="primary"
                           disabled={
+                            fundResolutionPendingReceiptIds.has(item.receiptId) ||
                             adminPassword.length === 0 ||
                             !/^[1-9]\d*$/.test(fundResolutionMinor) ||
                             fundResolutionReason.trim().length < 10
@@ -1040,6 +1077,7 @@ export function App() {
                         </button>
                         <button
                           disabled={
+                            fundResolutionPendingReceiptIds.has(item.receiptId) ||
                             adminPassword.length === 0 ||
                             !/^[1-9]\d*$/.test(fundResolutionMinor) ||
                             fundResolutionReason.trim().length < 10 ||

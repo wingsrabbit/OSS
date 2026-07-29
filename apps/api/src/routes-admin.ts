@@ -247,6 +247,33 @@ export async function registerAdminRoutes(
         return { ...replay.result, replayed: true };
       }
 
+      let invoice:
+        | {
+            id: string;
+            client_account_id: string;
+            currency: string;
+            total_minor: string;
+          }
+        | undefined;
+      if (body.action === "allocate_invoice") {
+        const invoiceResult = await client.query<{
+          id: string;
+          client_account_id: string;
+          currency: string;
+          total_minor: string;
+        }>(
+          `SELECT id, client_account_id, currency, total_minor::text
+           FROM invoices
+           WHERE id = $1
+           FOR UPDATE`,
+          [body.invoiceId],
+        );
+        invoice = invoiceResult.rows[0];
+        if (!invoice) {
+          throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
+        }
+      }
+
       const receiptResult = await client.query<{
         id: string;
         client_account_id: string;
@@ -383,21 +410,8 @@ export async function registerAdminRoutes(
           [journalId, body.amountMinor],
         );
       } else {
-        const invoiceResult = await client.query<{
-          id: string;
-          client_account_id: string;
-          currency: string;
-          total_minor: string;
-        }>(
-          `SELECT id, client_account_id, currency, total_minor::text
-           FROM invoices
-           WHERE id = $1
-           FOR UPDATE`,
-          [body.invoiceId],
-        );
-        const invoice = invoiceResult.rows[0];
         if (!invoice) {
-          throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
+          throw new Error("Locked invoice is required for a fund allocation");
         }
         if (
           invoice.client_account_id !== receipt.client_account_id ||

@@ -349,6 +349,33 @@ async function dropPaymentStartDelay(): Promise<void> {
   `);
 }
 
+async function installProviderInboxLockOrderDelay(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_provider_inbox_lock_order ON provider_inbox;
+    CREATE OR REPLACE FUNCTION integration_delay_provider_inbox_lock_order()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.external_event_id LIKE 'lock-order:%' THEN
+        PERFORM pg_sleep(1.5);
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER integration_delay_provider_inbox_lock_order
+    BEFORE INSERT ON provider_inbox
+    FOR EACH ROW EXECUTE FUNCTION integration_delay_provider_inbox_lock_order();
+  `);
+}
+
+async function dropProviderInboxLockOrderDelay(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_provider_inbox_lock_order ON provider_inbox;
+    DROP FUNCTION IF EXISTS integration_delay_provider_inbox_lock_order();
+  `);
+}
+
 async function releasePaymentStart(paymentAttemptId: string): Promise<void> {
   await corePool.query(
     `UPDATE durable_jobs
@@ -3150,6 +3177,99 @@ const activeResolutionOrder = await waitFor(
 assert.equal(activeResolutionOrder.invoice.status, "paid");
 assert.equal(activeResolutionOrder.invoice.dueMinor, "0");
 cookie = staffCookie;
+
+const lockOrderReceipt = await corePool.query<{ id: string }>(
+  `SELECT id
+   FROM fund_receipts
+   WHERE provider_installation_id = 'mock-payment-v1'
+     AND external_payment_id = $1`,
+  [mismatchExternalId],
+);
+const lockOrderReceiptId = lockOrderReceipt.rows[0]?.id;
+assert.ok(lockOrderReceiptId);
+const lockOrderEventId = `lock-order:${randomUUID()}`;
+let lockOrderRace:
+  | [
+      { status: number; body: Record<string, unknown> },
+      { status: number; body: Record<string, unknown> },
+    ]
+  | undefined;
+await installProviderInboxLockOrderDelay();
+try {
+  const repeatedProviderFact = submitPaymentFact({
+    eventId: lockOrderEventId,
+    providerOperationId: mismatchRecords.operation_id,
+    paymentAttemptId: mismatchCommand.paymentAttemptId,
+    externalPaymentId: mismatchExternalId,
+    status: "succeeded",
+    amountMinor: mismatchAmountMinor,
+    currency: mismatchRecords.currency,
+    occurredAt: new Date().toISOString(),
+  });
+  await waitFor(
+    "Provider callback to hold the invoice lock before receipt reconciliation",
+    async () => {
+      const result = await corePool.query<{ sleeping: string }>(
+        `SELECT count(*)::text AS sleeping
+         FROM pg_stat_activity
+         WHERE state = 'active'
+           AND wait_event = 'PgSleep'
+           AND query ILIKE '%INSERT INTO provider_inbox%'`,
+      );
+      return result.rows[0]?.sleeping ?? "0";
+    },
+    (sleeping) => BigInt(sleeping) > 0n,
+  );
+  lockOrderRace = await Promise.all([
+    repeatedProviderFact,
+    rawCoreRequest(`/api/v1/admin/funds/${lockOrderReceiptId}/resolutions`, {
+      method: "POST",
+      body: JSON.stringify({
+        action: "allocate_invoice",
+        amountMinor: mismatchOrder.invoice.dueMinor,
+        invoiceId: mismatchOrder.invoice.id,
+        reason: "Synthetic concurrent allocation while a duplicate Provider fact reconciles",
+        idempotencyKey: randomUUID(),
+      }),
+    }),
+  ]);
+} finally {
+  await dropProviderInboxLockOrderDelay();
+}
+assert.ok(lockOrderRace);
+const [repeatedProviderFact, concurrentFundAllocation] = lockOrderRace;
+assert.equal(repeatedProviderFact.status, 200);
+assert.equal(repeatedProviderFact.body.duplicate, true);
+assert.equal(concurrentFundAllocation.status, 201);
+const lockOrderFacts = await corePool.query<{
+  receipt_allocated_minor: string;
+  invoice_allocated_minor: string;
+  resolutions: string;
+  allocations: string;
+}>(
+  `SELECT
+     receipt.allocated_minor::text AS receipt_allocated_minor,
+     totals.allocated_minor::text AS invoice_allocated_minor,
+     (
+       SELECT count(*)::text
+       FROM fund_receipt_resolutions resolution
+       WHERE resolution.fund_receipt_id = receipt.id
+     ) AS resolutions,
+     (
+       SELECT count(*)::text
+       FROM fund_receipt_allocations allocation
+       WHERE allocation.fund_receipt_id = receipt.id
+     ) AS allocations
+   FROM fund_receipts receipt
+   JOIN payment_attempts payment ON payment.id = receipt.reported_payment_attempt_id
+   JOIN invoice_allocation_totals totals ON totals.invoice_id = payment.invoice_id
+   WHERE receipt.id = $1`,
+  [lockOrderReceiptId],
+);
+assert.equal(lockOrderFacts.rows[0]?.receipt_allocated_minor, mismatchOrder.invoice.dueMinor);
+assert.equal(lockOrderFacts.rows[0]?.invoice_allocated_minor, mismatchOrder.invoice.dueMinor);
+assert.equal(lockOrderFacts.rows[0]?.resolutions, "1");
+assert.equal(lockOrderFacts.rows[0]?.allocations, "1");
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count
