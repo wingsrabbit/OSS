@@ -569,7 +569,7 @@ export async function registerProviderEventRoutes(
         );
         await client.query(
           `UPDATE services
-           SET status = 'confirming', updated_at = now(), version = version + 1
+           SET status = 'provision_failed', updated_at = now(), version = version + 1
            WHERE id = $1 AND status IN ('provisioning', 'confirming')`,
           [service.id],
         );

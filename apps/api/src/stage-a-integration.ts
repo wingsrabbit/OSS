@@ -650,7 +650,11 @@ await request(
   { method: "POST", body: JSON.stringify({ token: expiredToken }) },
   410,
 );
-await request("/api/v1/auth/resend-verification", { method: "POST" }, 200);
+await request(
+  "/api/v1/auth/resend-verification",
+  { method: "POST", body: JSON.stringify({}) },
+  200,
+);
 const resentMailbox = await waitFor(
   "replacement verification message",
   () => request<{ messages: Array<{ body: string }> }>("/api/v1/lab/mailbox"),
