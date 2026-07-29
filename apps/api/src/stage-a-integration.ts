@@ -543,6 +543,120 @@ assert.equal(
   "payment signing secret must not authorize provisioning facts",
 );
 
+await corePool.query(`
+  CREATE OR REPLACE FUNCTION integration_delay_provision_start()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF NEW.job_type = 'provision.start' THEN
+      NEW.available_at = now() + interval '1 hour';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  CREATE TRIGGER integration_delay_provision_start
+  BEFORE INSERT ON durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION integration_delay_provision_start();
+`);
+const restrictedBeforeProvision = await createOrder(automaticPrice.id, legal);
+const paidBeforeRestriction = await pay(restrictedBeforeProvision, "success");
+const heldProvisionOperation = await corePool.query<{ id: string }>(
+  `SELECT po.id
+   FROM provider_operations po
+   WHERE po.subject_type = 'service'
+     AND po.subject_id = $1`,
+  [paidBeforeRestriction.service.id],
+);
+assert.ok(heldProvisionOperation.rows[0]?.id);
+await corePool.query("UPDATE users SET restricted_at = now() WHERE email = $1", [email]);
+await corePool.query(`
+  DROP TRIGGER integration_delay_provision_start ON durable_jobs;
+  DROP FUNCTION integration_delay_provision_start();
+`);
+await corePool.query(
+  `UPDATE durable_jobs
+  SET available_at = now()
+  WHERE job_type = 'provision.start'
+    AND payload->>'serviceId' = $1`,
+  [paidBeforeRestriction.service.id],
+);
+const heldForRestriction = await waitFor(
+  "restriction before provisioning to prevent the provider create",
+  () => request<OrderDetail>(`/api/v1/orders/${paidBeforeRestriction.order.id}`),
+  (value) => value.order.status === "on_hold",
+);
+assert.equal(heldForRestriction.service.status, "pending");
+const restrictedCreateCount = await providerPool.query<{ count: string }>(
+  "SELECT count(*)::text AS count FROM mock_resource_operations WHERE operation_id = $1",
+  [heldProvisionOperation.rows[0].id],
+);
+assert.equal(restrictedCreateCount.rows[0]?.count, "0");
+await corePool.query("UPDATE users SET restricted_at = NULL WHERE email = $1", [email]);
+
+await corePool.query(`
+  CREATE OR REPLACE FUNCTION integration_delay_payment_start()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF NEW.job_type = 'payment.start' THEN
+      NEW.available_at = now() + interval '1 hour';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  CREATE TRIGGER integration_delay_payment_start
+  BEFORE INSERT ON durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION integration_delay_payment_start();
+`);
+const staleLeaseOrder = await createOrder(automaticPrice.id, legal);
+const staleLeasePayment = await request<{ paymentAttemptId: string }>(
+  `/api/v1/invoices/${staleLeaseOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({ scenario: "success", idempotencyKey: randomUUID() }),
+  },
+  202,
+);
+const staleLeaseRecord = await corePool.query<{ job_id: string; operation_id: string }>(
+  `SELECT j.id AS job_id, po.id AS operation_id
+   FROM durable_jobs j
+   JOIN provider_operations po
+     ON po.subject_type = 'payment'
+    AND po.subject_id = $1
+   WHERE j.job_type = 'payment.start'
+     AND j.payload->>'paymentAttemptId' = $1`,
+  [staleLeasePayment.paymentAttemptId],
+);
+assert.ok(staleLeaseRecord.rows[0]);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'running',
+       attempts = 1,
+       locked_at = now() - interval '10 minutes',
+       locked_by = 'synthetic-dead-worker',
+       available_at = now()
+   WHERE id = $1`,
+  [staleLeaseRecord.rows[0]?.job_id],
+);
+await corePool.query(`
+  DROP TRIGGER integration_delay_payment_start ON durable_jobs;
+  DROP FUNCTION integration_delay_payment_start();
+`);
+const recoveredLease = await waitFor(
+  "stale queued/zero-attempt provider operation to recover without duplicate create",
+  () => request<OrderDetail>(`/api/v1/orders/${staleLeaseOrder.order.id}`),
+  (value) => value.service.status === "active",
+  35_000,
+);
+assert.equal(recoveredLease.invoice.status, "paid");
+const recoveredCreateCount = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_payment_operations WHERE operation_id = $1",
+  [staleLeaseRecord.rows[0]?.operation_id],
+);
+assert.equal(recoveredCreateCount.rows[0]?.create_calls, 1);
+
 const manualOrder = await createOrder(manualPrice.id, legal);
 const paidManual = await pay(manualOrder, "success");
 assert.equal(paidManual.order.status, "awaiting_manual");

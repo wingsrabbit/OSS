@@ -7,7 +7,7 @@ x-core-env: &core-env
   OSS_PUBLIC_URL: ${OSS_PUBLIC_URL:-http://localhost:8080}
   WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
   DATABASE_URL: postgresql://oss:${CORE_DATABASE_PASSWORD:?required}@core-db:5432/oss
-  MOCK_MAILBOX_URL: http://provider-mailbox:4000
+  MOCK_MAILBOX_URL: http://mailbox-gateway:8082
   LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
   MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
   MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
@@ -19,9 +19,6 @@ x-provider-base: &provider-base
     target: runtime
   command: ["node", "providers/mock-lab/dist/server.js"]
   restart: unless-stopped
-  depends_on:
-    provider-db:
-      condition: service_healthy
   read_only: true
   tmpfs:
     - /tmp:size=32m,mode=1777
@@ -56,18 +53,52 @@ services:
       retries: 20
     security_opt: ["no-new-privileges:true"]
 
-  provider-db:
+  provider-payment-db:
     image: postgres:18-bookworm
     restart: unless-stopped
     environment:
-      POSTGRES_DB: provider
-      POSTGRES_USER: provider
-      POSTGRES_PASSWORD: ${PROVIDER_DATABASE_PASSWORD:?required}
+      POSTGRES_DB: payment_provider
+      POSTGRES_USER: payment_provider
+      POSTGRES_PASSWORD: ${PAYMENT_PROVIDER_DATABASE_PASSWORD:?required}
     volumes:
-      - provider-db-data:/var/lib/postgresql
-    networks: [provider-data]
+      - provider-payment-db-data:/var/lib/postgresql
+    networks: [payment-data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U provider -d provider"]
+      test: ["CMD-SHELL", "pg_isready -U payment_provider -d payment_provider"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+
+  provider-provisioning-db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: provisioning_provider
+      POSTGRES_USER: provisioning_provider
+      POSTGRES_PASSWORD: ${PROVISIONING_PROVIDER_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-provisioning-db-data:/var/lib/postgresql
+    networks: [provisioning-data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U provisioning_provider -d provisioning_provider"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+
+  provider-mail-db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mail_provider
+      POSTGRES_USER: mail_provider
+      POSTGRES_PASSWORD: ${MAIL_PROVIDER_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-mail-db-data:/var/lib/postgresql
+    networks: [mail-data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mail_provider -d mail_provider"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -103,7 +134,7 @@ services:
         condition: service_completed_successfully
       provider-mailbox:
         condition: service_healthy
-    networks: [core-data, core-app, provider-app]
+    networks: [core-data, core-app]
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -145,7 +176,7 @@ services:
         condition: service_healthy
       provider-mail:
         condition: service_healthy
-    networks: [core-data, core-app, provider-app]
+    networks: [core-data, core-app, payment-app, provisioning-app, mail-app]
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -156,7 +187,19 @@ services:
     restart: unless-stopped
     volumes:
       - ./deploy/Caddyfile.callback:/etc/caddy/Caddyfile:ro
-    networks: [core-app, callback-app]
+    networks: [core-app, payment-callback, provisioning-callback]
+    read_only: true
+    tmpfs:
+      - /config:size=8m,mode=0700
+      - /data:size=16m,mode=0700
+    security_opt: ["no-new-privileges:true"]
+
+  mailbox-gateway:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./deploy/Caddyfile.mailbox:/etc/caddy/Caddyfile:ro
+    networks: [core-app, mailbox-app]
     read_only: true
     tmpfs:
       - /config:size=8m,mode=0700
@@ -166,36 +209,48 @@ services:
   provider-payment:
     <<: *provider-base
     environment:
-      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      PROVIDER_DATABASE_URL: postgresql://payment_provider:${PAYMENT_PROVIDER_DATABASE_PASSWORD:?required}@provider-payment-db:5432/payment_provider
       MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
       MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
       CORE_CALLBACK_URL: http://callback-gateway:8081
-    networks: [provider-data, provider-app, callback-app]
+    depends_on:
+      provider-payment-db:
+        condition: service_healthy
+    networks: [payment-data, payment-app, payment-callback]
 
   provider-provisioning:
     <<: *provider-base
     environment:
-      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      PROVIDER_DATABASE_URL: postgresql://provisioning_provider:${PROVISIONING_PROVIDER_DATABASE_PASSWORD:?required}@provider-provisioning-db:5432/provisioning_provider
       MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
       MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
       CORE_CALLBACK_URL: http://callback-gateway:8081
-    networks: [provider-data, provider-app, callback-app]
+    depends_on:
+      provider-provisioning-db:
+        condition: service_healthy
+    networks: [provisioning-data, provisioning-app, provisioning-callback]
 
   provider-mail:
     <<: *provider-base
     environment:
-      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      PROVIDER_DATABASE_URL: postgresql://mail_provider:${MAIL_PROVIDER_DATABASE_PASSWORD:?required}@provider-mail-db:5432/mail_provider
       MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
       CORE_CALLBACK_URL: http://127.0.0.1
-    networks: [provider-data, provider-app]
+    depends_on:
+      provider-mail-db:
+        condition: service_healthy
+    networks: [mail-data, mail-app]
 
   provider-mailbox:
     <<: *provider-base
     environment:
-      PROVIDER_DATABASE_URL: postgresql://provider:${PROVIDER_DATABASE_PASSWORD:?required}@provider-db:5432/provider
+      PROVIDER_DATABASE_URL: postgresql://mail_provider:${MAIL_PROVIDER_DATABASE_PASSWORD:?required}@provider-mail-db:5432/mail_provider
       LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
       CORE_CALLBACK_URL: http://127.0.0.1
-    networks: [provider-data, provider-app]
+    depends_on:
+      provider-mail-db:
+        condition: service_healthy
+    networks: [mail-data, mailbox-app]
 
   web:
     build:
@@ -216,16 +271,30 @@ services:
 
 volumes:
   core-db-data:
-  provider-db-data:
+  provider-payment-db-data:
+  provider-provisioning-db-data:
+  provider-mail-db-data:
 
 networks:
   core-data:
     internal: true
-  provider-data:
+  payment-data:
+    internal: true
+  provisioning-data:
+    internal: true
+  mail-data:
     internal: true
   core-app:
     internal: true
-  provider-app:
+  payment-app:
     internal: true
-  callback-app:
+  provisioning-app:
+    internal: true
+  mail-app:
+    internal: true
+  mailbox-app:
+    internal: true
+  payment-callback:
+    internal: true
+  provisioning-callback:
     internal: true
