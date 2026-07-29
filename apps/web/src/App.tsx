@@ -172,7 +172,8 @@ export function App() {
       body: JSON.stringify({ token }),
     })
       .then(async (result) => {
-        setNotice(`Email verification: ${result.status}`);
+        const visibleStatus = result.status === "already_verified" ? "verified" : result.status;
+        setNotice(`Email verification: ${visibleStatus}`);
         window.history.replaceState({}, "", window.location.pathname);
         await refreshMe();
       })
