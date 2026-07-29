@@ -63,6 +63,21 @@ type ManualItem = {
   orderId: string;
   productName: string;
 };
+type PaymentCommand = {
+  commandId: string;
+  paymentAttemptId: string | null;
+  status: string;
+  replayed: boolean;
+};
+type PaymentRecords = {
+  command_status: string;
+  attempt_status: string;
+  operation_id: string;
+  operation_status: string;
+  job_status: string;
+  amount_minor: string;
+  currency: string;
+};
 
 async function request<T>(
   path: string,
@@ -184,6 +199,69 @@ async function createPaymentQuote(
   );
 }
 
+async function readPaymentRecords(commandId: string): Promise<PaymentRecords> {
+  const result = await corePool.query<PaymentRecords>(
+    `SELECT
+       command.status AS command_status,
+       attempt.status AS attempt_status,
+       operation.id AS operation_id,
+       operation.status AS operation_status,
+       job.status AS job_status,
+       attempt.amount_minor::text,
+       attempt.currency
+     FROM invoice_payment_commands command
+     JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+     JOIN provider_operations operation
+       ON operation.subject_type = 'payment'
+      AND operation.subject_id = attempt.id
+     JOIN durable_jobs job
+       ON job.job_type = 'payment.start'
+      AND job.payload->>'paymentAttemptId' = attempt.id::text
+     WHERE command.id = $1`,
+    [commandId],
+  );
+  const row = result.rows[0];
+  assert.ok(row, `payment command ${commandId} must have complete operation records`);
+  return row;
+}
+
+async function installPaymentStartDelay(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_security_payment_start ON durable_jobs;
+    CREATE OR REPLACE FUNCTION integration_delay_security_payment_start()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.job_type = 'payment.start' THEN
+        NEW.available_at = now() + interval '1 hour';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER integration_delay_security_payment_start
+    BEFORE INSERT ON durable_jobs
+    FOR EACH ROW EXECUTE FUNCTION integration_delay_security_payment_start();
+  `);
+}
+
+async function dropPaymentStartDelay(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_security_payment_start ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_security_payment_start();
+  `);
+}
+
+async function releasePaymentStart(paymentAttemptId: string): Promise<void> {
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET available_at = now(), status = 'pending', locked_at = NULL, locked_by = NULL
+     WHERE job_type = 'payment.start'
+       AND payload->>'paymentAttemptId' = $1`,
+    [paymentAttemptId],
+  );
+}
+
 async function pay(
   order: OrderDetail,
   scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order",
@@ -257,6 +335,11 @@ const meBefore = await request<{ eligible: boolean; verification: { email: strin
 );
 assert.equal(meBefore.eligible, false);
 assert.equal(meBefore.verification.email, "pending");
+const unverifiedBillingSummary = await rawCoreRequest("/api/v1/billing/summary", {
+  method: "GET",
+});
+assert.equal(unverifiedBillingSummary.status, 403);
+assert.equal(unverifiedBillingSummary.body.code, "EMAIL_VERIFICATION_REQUIRED");
 
 await request(
   "/api/v1/orders",
@@ -749,7 +832,7 @@ const activeManual = await request<OrderDetail>(`/api/v1/orders/${paidManual.ord
 assert.equal(activeManual.service.status, "active");
 assert.equal(activeManual.service.activatedAt, activeManual.service.termStart);
 
-const staffMe = await request<{ clientAccountId: string }>("/api/v1/auth/me");
+const staffMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
 const creditAdjustmentKey = randomUUID();
 const creditAdjustmentBody = {
   direction: "increase",
@@ -782,7 +865,7 @@ assert.equal(mixedUsdtPreview.creditToApplyMinor, "200");
 assert.equal(mixedUsdtPreview.feeMinor, "0");
 assert.equal(mixedUsdtPreview.externalDueMinor, "300");
 const mixedFinalQuote = await createPaymentQuote(mixedPaymentOrder.invoice.id, "card", true);
-await request(
+const mixedPaymentCommand = await request<PaymentCommand>(
   `/api/v1/invoices/${mixedPaymentOrder.invoice.id}/payments`,
   {
     method: "POST",
@@ -825,6 +908,39 @@ const mixedCreditFacts = await corePool.query<{
 assert.equal(mixedCreditFacts.rows[0]?.balance_minor, "0");
 assert.equal(mixedCreditFacts.rows[0]?.applications, "1");
 assert.equal(mixedCreditFacts.rows[0]?.fee_charges, "1");
+const creditReplayAfterSpend = await request<{ balanceMinor: string }>(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  { method: "POST", body: JSON.stringify(creditAdjustmentBody) },
+  200,
+);
+assert.equal(
+  creditReplayAfterSpend.balanceMinor,
+  "200",
+  "an idempotent Credit replay must return its stored result, not the current balance",
+);
+const mixedCreditSource = await corePool.query<{
+  transaction_id: string;
+  credit_account_id: string;
+  source_type: string;
+  source_id: string;
+}>(
+  `SELECT
+     ct.id AS transaction_id,
+     ct.credit_account_id,
+     ct.source_type,
+     ct.source_id
+   FROM credit_transactions ct
+   JOIN credit_allocations allocation ON allocation.credit_transaction_id = ct.id
+   WHERE allocation.invoice_id = $1`,
+  [mixedPaymentOrder.invoice.id],
+);
+assert.equal(mixedCreditSource.rows.length, 1);
+assert.equal(mixedCreditSource.rows[0]?.source_type, "invoice_payment_command");
+assert.equal(
+  mixedCreditSource.rows[0]?.source_id,
+  mixedPaymentCommand.commandId,
+  "Credit application must be owned by the payment command, not by itself",
+);
 
 await request(
   `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
@@ -962,6 +1078,534 @@ const competingCreditFacts = await corePool.query<{
 );
 assert.equal(competingCreditFacts.rows[0]?.balance_minor, "0");
 assert.equal(competingCreditFacts.rows[0]?.allocations, "1");
+
+await request(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      direction: "increase",
+      amountMinor: "1",
+      currency: "USD",
+      reason: "Synthetic source-identity uniqueness guard funding",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+let duplicateCreditSourceError: unknown;
+try {
+  await corePool.query(
+    `INSERT INTO credit_transactions(
+       credit_account_id, kind, credit_minor, debit_minor,
+       source_type, source_id, actor_type, reason,
+       idempotency_key, request_fingerprint
+     ) VALUES (
+       $1, 'invoice_application', 0, 1,
+       'invoice_payment_command', $2, 'system',
+       'Synthetic duplicate source must be rejected', $3, $4
+     )`,
+    [
+      mixedCreditSource.rows[0]?.credit_account_id,
+      mixedPaymentCommand.commandId,
+      `duplicate-source:${randomUUID()}`,
+      createHash("sha256").update(randomUUID()).digest("hex"),
+    ],
+  );
+} catch (error) {
+  duplicateCreditSourceError = error;
+}
+assert.equal(
+  (duplicateCreditSourceError as { code?: string } | undefined)?.code,
+  "23505",
+  "database must reject a second Credit transaction for the same payment-command source",
+);
+
+await installPaymentStartDelay();
+
+async function assertMockSignatureCannotCrossProviderBoundary(
+  mode: "non_mock" | "operation_mismatch",
+): Promise<void> {
+  const order = await createOrder(automaticPrice!.id, legal);
+  const quote = await createPaymentQuote(order.invoice.id, "card", false);
+  const command = await request<PaymentCommand>(
+    `/api/v1/invoices/${order.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: quote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(command.paymentAttemptId);
+  const before = await readPaymentRecords(command.commandId);
+  const otherProvider = `synthetic-${mode}-provider`;
+  if (mode === "non_mock") {
+    await corePool.query(
+      `UPDATE payment_attempts
+       SET provider_installation_id = $2, status = 'processing'
+       WHERE id = $1`,
+      [command.paymentAttemptId, otherProvider],
+    );
+  } else {
+    await corePool.query(
+      `UPDATE payment_attempts
+       SET status = 'processing'
+       WHERE id = $1`,
+      [command.paymentAttemptId],
+    );
+  }
+  await corePool.query(
+    `UPDATE provider_operations
+     SET provider_installation_id = $2, status = 'running', attempt_count = 1
+     WHERE id = $1`,
+    [before.operation_id, otherProvider],
+  );
+
+  const externalPaymentId = `mock-cross-provider-${randomUUID()}`;
+  const callback = await submitPaymentFact({
+    eventId: `cross-provider:${mode}:${randomUUID()}`,
+    paymentAttemptId: command.paymentAttemptId,
+    externalPaymentId,
+    status: "succeeded",
+    amountMinor: before.amount_minor,
+    currency: before.currency,
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(callback.status, 202);
+  assert.equal(
+    callback.body.rejected,
+    true,
+    "a valid Mock Payment signature must not authorize a differently owned payment",
+  );
+
+  const facts = await corePool.query<{
+    receipts: string;
+    allocations: string;
+    fee_charges: string;
+    command_status: string;
+    service_status: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+          FROM fund_receipts
+         WHERE reported_payment_attempt_id = $1) AS receipts,
+       (SELECT count(*)::text
+          FROM payment_allocations
+         WHERE payment_attempt_id = $1) AS allocations,
+       (SELECT count(*)::text
+          FROM invoice_fee_charges
+         WHERE payment_attempt_id = $1) AS fee_charges,
+       (SELECT status
+          FROM invoice_payment_commands
+         WHERE id = $2) AS command_status,
+       (SELECT s.status
+          FROM services s
+          JOIN order_items item ON item.id = s.order_item_id
+          JOIN orders customer_order ON customer_order.id = item.order_id
+         WHERE customer_order.id = $3) AS service_status`,
+    [command.paymentAttemptId, command.commandId, order.order.id],
+  );
+  assert.equal(facts.rows[0]?.receipts, "0");
+  assert.equal(facts.rows[0]?.allocations, "0");
+  assert.equal(facts.rows[0]?.fee_charges, "0");
+  assert.equal(facts.rows[0]?.command_status, "processing");
+  assert.equal(facts.rows[0]?.service_status, "pending");
+
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', locked_at = NULL, locked_by = NULL
+     WHERE job_type = 'payment.start' AND payload->>'paymentAttemptId' = $1;
+     UPDATE provider_operations SET status = 'failed' WHERE id = $2;
+     UPDATE payment_attempts SET status = 'failed' WHERE id = $1;
+     UPDATE invoice_payment_commands
+     SET status = 'failed', result = '{"paymentStatus":"failed","testCleanup":true}'::jsonb
+     WHERE id = $3`,
+    [command.paymentAttemptId, before.operation_id, command.commandId],
+  );
+}
+
+await assertMockSignatureCannotCrossProviderBoundary("non_mock");
+await assertMockSignatureCannotCrossProviderBoundary("operation_mismatch");
+
+const reconcileOwnershipOrder = await createOrder(automaticPrice.id, legal);
+const reconcileOwnershipQuote = await createPaymentQuote(
+  reconcileOwnershipOrder.invoice.id,
+  "card",
+  false,
+);
+const reconcileOwnershipCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${reconcileOwnershipOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: reconcileOwnershipQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(reconcileOwnershipCommand.paymentAttemptId);
+const reconcileOwnershipRecords = await readPaymentRecords(reconcileOwnershipCommand.commandId);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL
+   WHERE job_type = 'payment.start'
+     AND payload->>'paymentAttemptId' = $1;
+   UPDATE payment_attempts SET status = 'unknown' WHERE id = $1;
+   UPDATE provider_operations
+   SET provider_installation_id = 'synthetic-reconcile-provider',
+       status = 'unknown',
+       attempt_count = 1
+   WHERE id = $2;
+   INSERT INTO durable_jobs(job_type, unique_key, payload)
+   VALUES ('payment.reconcile', $3, $4)`,
+  [
+    reconcileOwnershipCommand.paymentAttemptId,
+    reconcileOwnershipRecords.operation_id,
+    `provider-ownership:${reconcileOwnershipCommand.paymentAttemptId}`,
+    {
+      paymentAttemptId: reconcileOwnershipCommand.paymentAttemptId,
+      operationId: reconcileOwnershipRecords.operation_id,
+    },
+  ],
+);
+const reconcileOwnershipClosed = await waitFor(
+  "Provider-mismatched reconciliation to enter manual review without an outbound query",
+  async () => {
+    const result = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      order_status: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         customer_order.status AS order_status
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN invoices invoice ON invoice.id = attempt.invoice_id
+       JOIN orders customer_order ON customer_order.id = invoice.order_id
+       JOIN provider_operations operation ON operation.id = $2
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.reconcile'
+        AND job.payload->>'paymentAttemptId' = attempt.id::text
+       WHERE command.id = $1`,
+      [reconcileOwnershipCommand.commandId, reconcileOwnershipRecords.operation_id],
+    );
+    return result.rows[0];
+  },
+  (value) =>
+    value?.command_status === "manual" &&
+    value.attempt_status === "unknown" &&
+    value.operation_status === "unknown" &&
+    value.job_status === "manual" &&
+    value.order_status === "on_hold",
+  8_000,
+);
+assert.equal(reconcileOwnershipClosed?.job_status, "manual");
+
+const callbackRaceOrder = await createOrder(automaticPrice.id, legal);
+const callbackRaceQuote = await createPaymentQuote(callbackRaceOrder.invoice.id, "card", false);
+const callbackRaceCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${callbackRaceOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: callbackRaceQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(callbackRaceCommand.paymentAttemptId);
+const callbackRaceRecords = await readPaymentRecords(callbackRaceCommand.commandId);
+const competingQuote = await createPaymentQuote(callbackRaceOrder.invoice.id, "usdt", false);
+await corePool.query(
+  `UPDATE payment_attempts SET status = 'processing' WHERE id = $1;
+   UPDATE provider_operations
+   SET status = 'running', attempt_count = 1
+   WHERE id = $2`,
+  [callbackRaceCommand.paymentAttemptId, callbackRaceRecords.operation_id],
+);
+const callbackRaceFact = {
+  eventId: `callback-lock-order:${randomUUID()}`,
+  paymentAttemptId: callbackRaceCommand.paymentAttemptId,
+  externalPaymentId: `mock-lock-order-${randomUUID()}`,
+  status: "succeeded",
+  amountMinor: callbackRaceRecords.amount_minor,
+  currency: callbackRaceRecords.currency,
+  occurredAt: new Date().toISOString(),
+};
+const [callbackRaceResult, competingConfirmation] = await Promise.all([
+  submitPaymentFact(callbackRaceFact),
+  rawCoreRequest(`/api/v1/invoices/${callbackRaceOrder.invoice.id}/payments`, {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: competingQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  }),
+]);
+assert.equal(callbackRaceResult.status, 202);
+assert.equal(callbackRaceResult.body.accepted, true);
+assert.equal(
+  competingConfirmation.status,
+  409,
+  "a concurrent second confirmation must conflict rather than deadlock or create another payment",
+);
+const callbackRaceActive = await waitFor(
+  "callback/confirmation lock-order race to activate exactly one service",
+  () => request<OrderDetail>(`/api/v1/orders/${callbackRaceOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+assert.equal(callbackRaceActive.invoice.status, "paid");
+const callbackRaceFacts = await corePool.query<{
+  receipts: string;
+  fee_charges: string;
+  attempts: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+        FROM fund_receipts
+       WHERE reported_payment_attempt_id = $1) AS receipts,
+     (SELECT count(*)::text
+        FROM invoice_fee_charges
+       WHERE payment_attempt_id = $1) AS fee_charges,
+     (SELECT count(*)::text
+        FROM payment_attempts
+       WHERE invoice_id = $2) AS attempts`,
+  [callbackRaceCommand.paymentAttemptId, callbackRaceOrder.invoice.id],
+);
+assert.equal(callbackRaceFacts.rows[0]?.receipts, "1");
+assert.equal(callbackRaceFacts.rows[0]?.fee_charges, "1");
+assert.equal(callbackRaceFacts.rows[0]?.attempts, "1");
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL
+   WHERE job_type = 'payment.start'
+     AND payload->>'paymentAttemptId' = $1`,
+  [callbackRaceCommand.paymentAttemptId],
+);
+
+await request(
+  `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      direction: "increase",
+      amountMinor: "200",
+      currency: "USD",
+      reason: "Synthetic known-unsent Credit restoration funding",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+const restorableCredit = await corePool.query<{ balance_minor: string }>(
+  `SELECT COALESCE(sum(ct.credit_minor - ct.debit_minor), 0)::text AS balance_minor
+   FROM credit_accounts ca
+   LEFT JOIN credit_transactions ct ON ct.credit_account_id = ca.id
+   WHERE ca.client_account_id = $1 AND ca.currency = 'USD'`,
+  [staffMe.clientAccountId],
+);
+const restorableCreditMinor = restorableCredit.rows[0]?.balance_minor;
+assert.ok(restorableCreditMinor && BigInt(restorableCreditMinor) > 0n);
+
+const eligibilityRevocations: Array<{
+  label: string;
+  revoke: () => Promise<unknown>;
+  restore: () => Promise<unknown>;
+}> = [
+  {
+    label: "user restriction",
+    revoke: () => corePool.query("UPDATE users SET restricted_at = now() WHERE id = $1", [staffMe.id]),
+    restore: () => corePool.query("UPDATE users SET restricted_at = NULL WHERE id = $1", [staffMe.id]),
+  },
+  {
+    label: "client-account restriction",
+    revoke: () =>
+      corePool.query("UPDATE client_accounts SET restricted_at = now() WHERE id = $1", [
+        staffMe.clientAccountId,
+      ]),
+    restore: () =>
+      corePool.query("UPDATE client_accounts SET restricted_at = NULL WHERE id = $1", [
+        staffMe.clientAccountId,
+      ]),
+  },
+  {
+    label: "membership removal",
+    revoke: () =>
+      corePool.query(
+        `UPDATE client_memberships
+         SET removed_at = now()
+         WHERE client_account_id = $1 AND user_id = $2`,
+        [staffMe.clientAccountId, staffMe.id],
+      ),
+    restore: () =>
+      corePool.query(
+        `UPDATE client_memberships
+         SET removed_at = NULL
+         WHERE client_account_id = $1 AND user_id = $2`,
+        [staffMe.clientAccountId, staffMe.id],
+      ),
+  },
+];
+
+for (const revocation of eligibilityRevocations) {
+  const order = await createOrder(automaticPrice.id, legal);
+  const exercisesCreditRestoration = revocation.label === "user restriction";
+  const quote = await createPaymentQuote(
+    order.invoice.id,
+    "card",
+    exercisesCreditRestoration,
+  );
+  if (exercisesCreditRestoration) {
+    assert.equal(quote.creditToApplyMinor, restorableCreditMinor);
+  }
+  const command = await request<PaymentCommand>(
+    `/api/v1/invoices/${order.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: quote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(command.paymentAttemptId);
+  const initialRecords = await readPaymentRecords(command.commandId);
+  assert.equal(initialRecords.attempt_status, "created");
+  assert.equal(initialRecords.operation_status, "queued");
+
+  await revocation.revoke();
+  await releasePaymentStart(command.paymentAttemptId);
+  const closed = await waitFor(
+    `known-unsent payment to close after ${revocation.label}`,
+    () => readPaymentRecords(command.commandId),
+    (records) =>
+      records.command_status === "failed" &&
+      records.attempt_status === "cancelled" &&
+      records.operation_status === "failed" &&
+      records.job_status === "completed",
+    8_000,
+  );
+  const providerCalls = await providerPool.query<{ count: string }>(
+    "SELECT count(*)::text AS count FROM mock_payment_operations WHERE operation_id = $1",
+    [closed.operation_id],
+  );
+  assert.equal(providerCalls.rows[0]?.count, "0");
+  if (exercisesCreditRestoration) {
+    const restored = await corePool.query<{
+      balance_minor: string;
+      allocated_minor: string;
+      allocation_rows: string;
+      reversal_rows: string;
+    }>(
+      `SELECT
+         (SELECT COALESCE(sum(ct.credit_minor - ct.debit_minor), 0)::text
+            FROM credit_accounts ca
+            LEFT JOIN credit_transactions ct ON ct.credit_account_id = ca.id
+           WHERE ca.client_account_id = $1 AND ca.currency = 'USD') AS balance_minor,
+         (SELECT COALESCE(sum(amount_minor), 0)::text
+            FROM credit_allocations
+           WHERE invoice_id = $2) AS allocated_minor,
+         (SELECT count(*)::text
+            FROM credit_allocations
+           WHERE invoice_id = $2) AS allocation_rows,
+         (SELECT count(*)::text
+            FROM credit_transactions
+           WHERE kind = 'invoice_application_reversal'
+             AND source_type = 'invoice_payment_command_reversal'
+             AND source_id = $3) AS reversal_rows`,
+      [staffMe.clientAccountId, order.invoice.id, command.commandId],
+    );
+    assert.equal(restored.rows[0]?.balance_minor, restorableCreditMinor);
+    assert.equal(restored.rows[0]?.allocated_minor, "0");
+    assert.equal(restored.rows[0]?.allocation_rows, "2");
+    assert.equal(restored.rows[0]?.reversal_rows, "1");
+  }
+
+  await revocation.restore();
+  const retryQuote = await createPaymentQuote(order.invoice.id, "card", false);
+  const retry = await request<PaymentCommand>(
+    `/api/v1/invoices/${order.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: retryQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(retry.paymentAttemptId);
+  await releasePaymentStart(retry.paymentAttemptId);
+  const retriedOrder = await waitFor(
+    `payment retry after restoring ${revocation.label}`,
+    () => request<OrderDetail>(`/api/v1/orders/${order.order.id}`),
+    (value) => value.service.status === "active",
+  );
+  assert.equal(retriedOrder.invoice.status, "paid");
+}
+
+const definitiveOrder = await createOrder(automaticPrice.id, legal);
+const definitiveQuote = await createPaymentQuote(definitiveOrder.invoice.id, "card", false);
+const definitiveKey = randomUUID();
+const definitiveRequestBody = {
+  quoteId: definitiveQuote.quoteId,
+  scenario: "success",
+  idempotencyKey: definitiveKey,
+};
+const definitiveCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${definitiveOrder.invoice.id}/payments`,
+  { method: "POST", body: JSON.stringify(definitiveRequestBody) },
+  202,
+);
+assert.ok(definitiveCommand.paymentAttemptId);
+await corePool.query(
+  "UPDATE payment_attempts SET scenario = 'synthetic_definitive_400' WHERE id = $1",
+  [definitiveCommand.paymentAttemptId],
+);
+await releasePaymentStart(definitiveCommand.paymentAttemptId);
+const definitivelyRejected = await waitFor(
+  "definitive Provider 400 to close the command",
+  () => readPaymentRecords(definitiveCommand.commandId),
+  (records) =>
+    records.command_status === "failed" &&
+    records.attempt_status === "failed" &&
+    records.operation_status === "failed",
+  8_000,
+);
+const definitiveProviderCalls = await providerPool.query<{ count: string }>(
+  "SELECT count(*)::text AS count FROM mock_payment_operations WHERE operation_id = $1",
+  [definitivelyRejected.operation_id],
+);
+assert.equal(definitiveProviderCalls.rows[0]?.count, "0");
+const definitiveReplay = await request<PaymentCommand>(
+  `/api/v1/invoices/${definitiveOrder.invoice.id}/payments`,
+  { method: "POST", body: JSON.stringify(definitiveRequestBody) },
+  200,
+);
+assert.equal(definitiveReplay.commandId, definitiveCommand.commandId);
+assert.equal(definitiveReplay.paymentAttemptId, definitiveCommand.paymentAttemptId);
+assert.equal(definitiveReplay.status, "failed");
+assert.equal(definitiveReplay.replayed, true);
+
+await dropPaymentStartDelay();
 
 await corePool.query("UPDATE users SET restricted_at = now() WHERE email = $1", [email]);
 await request(

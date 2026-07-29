@@ -168,8 +168,9 @@ export async function registerAdminRoutes(
         const previous = await client.query<{
           id: string;
           request_fingerprint: string;
+          result: { transactionId: string; balanceMinor: string } | null;
         }>(
-          `SELECT id, request_fingerprint
+          `SELECT id, request_fingerprint, result
            FROM credit_transactions
            WHERE credit_account_id = $1 AND idempotency_key = $2
            FOR UPDATE`,
@@ -182,15 +183,10 @@ export async function registerAdminRoutes(
               { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
             );
           }
-          const balance = await client.query<{ balance_minor: string }>(
-            `SELECT COALESCE(sum(credit_minor - debit_minor), 0)::text AS balance_minor
-             FROM credit_transactions
-             WHERE credit_account_id = $1`,
-            [creditAccountId],
-          );
+          const storedResult = previous.rows[0].result;
+          if (!storedResult) throw new Error("Credit adjustment replay is missing its result");
           return {
-            transactionId: previous.rows[0].id,
-            balanceMinor: balance.rows[0]?.balance_minor ?? "0",
+            ...storedResult,
             replayed: true,
           };
         }
@@ -210,14 +206,20 @@ export async function registerAdminRoutes(
           });
         }
         const transactionId = randomUUID();
+        const resultingBalance =
+          body.direction === "increase" ? currentBalance + amount : currentBalance - amount;
+        const commandResult = {
+          transactionId,
+          balanceMinor: resultingBalance.toString(),
+        };
         await client.query(
           `INSERT INTO credit_transactions(
              id, credit_account_id, kind, credit_minor, debit_minor,
              source_type, source_id, actor_type, actor_id, reason,
-             idempotency_key, request_fingerprint
+             idempotency_key, request_fingerprint, result
            ) VALUES (
              $1, $2, 'manual_adjustment', $3, $4,
-             'admin_credit_adjustment', $1, 'staff', $5, $6, $7, $8
+             'admin_credit_adjustment', $1, 'staff', $5, $6, $7, $8, $9
            )`,
           [
             transactionId,
@@ -228,6 +230,7 @@ export async function registerAdminRoutes(
             body.reason,
             body.idempotencyKey,
             fingerprint,
+            commandResult,
           ],
         );
         const journal = await client.query<{ id: string }>(
@@ -272,11 +275,7 @@ export async function registerAdminRoutes(
           ],
         );
         return {
-          transactionId,
-          balanceMinor:
-            body.direction === "increase"
-              ? (currentBalance + amount).toString()
-              : (currentBalance - amount).toString(),
+          ...commandResult,
           replayed: false,
         };
       });

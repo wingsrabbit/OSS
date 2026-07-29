@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
     kind IN (
       'manual_adjustment',
       'invoice_application',
+      'invoice_application_reversal',
       'add_funds',
       'refund',
       'chargeback'
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
   reason text NOT NULL,
   idempotency_key text NOT NULL,
   request_fingerprint text NOT NULL,
+  result jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK ((credit_minor = 0) <> (debit_minor = 0)),
   UNIQUE (credit_account_id, idempotency_key),
@@ -56,7 +58,7 @@ CREATE TABLE IF NOT EXISTS credit_allocations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   credit_transaction_id uuid NOT NULL UNIQUE REFERENCES credit_transactions(id),
   invoice_id uuid NOT NULL REFERENCES invoices(id),
-  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
+  amount_minor bigint NOT NULL CHECK (amount_minor <> 0),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -91,7 +93,9 @@ CREATE TABLE IF NOT EXISTS invoice_payment_commands (
   invoice_id uuid NOT NULL REFERENCES invoices(id),
   quote_id uuid NOT NULL REFERENCES invoice_payment_quotes(id),
   payment_attempt_id uuid REFERENCES payment_attempts(id),
-  status text NOT NULL CHECK (status IN ('created', 'processing', 'succeeded', 'failed')),
+  status text NOT NULL CHECK (
+    status IN ('created', 'processing', 'unknown', 'manual', 'succeeded', 'failed')
+  ),
   idempotency_key text NOT NULL,
   request_fingerprint text NOT NULL,
   result jsonb,
@@ -194,6 +198,9 @@ BEGIN
     ct.kind,
     ct.credit_minor,
     ct.debit_minor,
+    ct.source_type,
+    ct.source_id,
+    ct.credit_account_id,
     ca.client_account_id,
     ca.currency
   INTO transaction_row
@@ -206,11 +213,50 @@ BEGIN
   FROM invoices
   WHERE id = NEW.invoice_id;
 
-  IF transaction_row.kind <> 'invoice_application'
-     OR transaction_row.credit_minor <> 0
-     OR transaction_row.debit_minor <> NEW.amount_minor
-     OR transaction_row.client_account_id <> invoice_row.client_account_id
-     OR transaction_row.currency <> invoice_row.currency THEN
+  IF transaction_row.client_account_id <> invoice_row.client_account_id
+     OR transaction_row.currency <> invoice_row.currency
+     OR (
+       transaction_row.kind = 'invoice_application'
+       AND (
+         NEW.amount_minor <= 0
+         OR transaction_row.source_type <> 'invoice_payment_command'
+         OR transaction_row.credit_minor <> 0
+         OR transaction_row.debit_minor <> NEW.amount_minor
+         OR NOT EXISTS (
+           SELECT 1
+           FROM invoice_payment_commands ipc
+           WHERE ipc.id = transaction_row.source_id
+             AND ipc.invoice_id = NEW.invoice_id
+             AND ipc.client_account_id = transaction_row.client_account_id
+         )
+       )
+     )
+     OR (
+       transaction_row.kind = 'invoice_application_reversal'
+       AND (
+         NEW.amount_minor >= 0
+         OR transaction_row.source_type <> 'invoice_payment_command_reversal'
+         OR transaction_row.debit_minor <> 0
+         OR transaction_row.credit_minor <> -NEW.amount_minor
+         OR NOT EXISTS (
+           SELECT 1
+           FROM credit_transactions original
+           JOIN credit_allocations original_allocation
+             ON original_allocation.credit_transaction_id = original.id
+           WHERE original.kind = 'invoice_application'
+             AND original.source_type = 'invoice_payment_command'
+             AND original.source_id = transaction_row.source_id
+             AND original.credit_account_id = transaction_row.credit_account_id
+             AND original.debit_minor = transaction_row.credit_minor
+             AND original_allocation.invoice_id = NEW.invoice_id
+             AND original_allocation.amount_minor = transaction_row.credit_minor
+         )
+       )
+     )
+     OR transaction_row.kind NOT IN (
+       'invoice_application',
+       'invoice_application_reversal'
+     ) THEN
     RAISE EXCEPTION 'credit allocation does not match its transaction or invoice';
   END IF;
   RETURN NEW;

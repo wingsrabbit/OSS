@@ -15,6 +15,7 @@ export async function registerBillingRoutes(
 ): Promise<void> {
   app.get("/api/v1/billing/summary", async (request) => {
     const user = await requireUser(request, pool, config);
+    assertEligible(user);
     const credit = await pool.query<{ balance_minor: string }>(
       `SELECT COALESCE(sum(ct.credit_minor - ct.debit_minor), 0)::text AS balance_minor
        FROM credit_accounts ca

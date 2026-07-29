@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { addBillingCycle, canTransitionPayment, type BillingCycle, type PaymentStatus } from "@opensales/core";
+import { randomUUID } from "node:crypto";
+import {
+  addBillingCycle,
+  canTransitionPayment,
+  type BillingCycle,
+  type PaymentStatus,
+} from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { Config } from "./config.js";
@@ -27,6 +33,8 @@ const provisioningEventSchema = z.object({
   occurredAt: z.iso.datetime(),
 });
 
+const MOCK_PAYMENT_INSTALLATION_ID = "mock-payment-v1";
+
 async function insertInbox(
   client: DatabaseClient,
   providerInstallationId: string,
@@ -47,6 +55,7 @@ async function insertInbox(
 
 async function auditProvider(
   client: DatabaseClient,
+  providerInstallationId: string,
   action: string,
   targetType: string,
   targetId: string,
@@ -56,8 +65,8 @@ async function auditProvider(
   await client.query(
     `INSERT INTO audit_events(
        actor_type, actor_id, action, target_type, target_id, reason, metadata
-     ) VALUES ('provider', 'mock-laboratory', $1, $2, $3, $4, $5)`,
-    [action, targetType, targetId, reason, metadata],
+     ) VALUES ('provider', $1, $2, $3, $4, $5, $6)`,
+    [providerInstallationId, action, targetType, targetId, reason, metadata],
   );
 }
 
@@ -68,6 +77,7 @@ function isAfter(previous: Date | null, next: Date): boolean {
 async function recordReceipt(
   client: DatabaseClient,
   input: {
+    providerInstallationId: string;
     attemptId: string;
     clientAccountId: string;
     externalPaymentId: string;
@@ -80,10 +90,11 @@ async function recordReceipt(
     `INSERT INTO fund_receipts(
        provider_installation_id, external_payment_id, reported_payment_attempt_id,
        client_account_id, amount_minor, currency, occurred_at, disposition
-     ) VALUES ('mock-payment-v1', $1, $2, $3, $4, $5, $6, 'received')
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'received')
      ON CONFLICT (provider_installation_id, external_payment_id) DO NOTHING
      RETURNING id`,
     [
+      input.providerInstallationId,
       input.externalPaymentId,
       input.attemptId,
       input.clientAccountId,
@@ -104,10 +115,10 @@ async function recordReceipt(
   }>(
     `SELECT id, reported_payment_attempt_id, client_account_id, amount_minor, currency
      FROM fund_receipts
-     WHERE provider_installation_id = 'mock-payment-v1'
-       AND external_payment_id = $1
+     WHERE provider_installation_id = $1
+       AND external_payment_id = $2
      FOR UPDATE`,
-    [input.externalPaymentId],
+    [input.providerInstallationId, input.externalPaymentId],
   );
   const row = existing.rows[0];
   if (!row) throw new Error("Fund receipt conflict could not be resolved");
@@ -156,6 +167,91 @@ async function postReceiptJournal(
   }
 }
 
+async function reverseInvoiceCreditApplication(
+  client: DatabaseClient,
+  paymentAttemptId: string,
+  reason: string,
+): Promise<string> {
+  const commandResult = await client.query<{ id: string; invoice_id: string }>(
+    `SELECT id, invoice_id
+     FROM invoice_payment_commands
+     WHERE payment_attempt_id = $1
+     FOR UPDATE`,
+    [paymentAttemptId],
+  );
+  const command = commandResult.rows[0];
+  if (!command) return "0";
+  const originalResult = await client.query<{
+    credit_account_id: string;
+    debit_minor: string;
+    currency: string;
+  }>(
+    `SELECT ct.credit_account_id, ct.debit_minor::text, ca.currency
+     FROM credit_transactions ct
+     JOIN credit_accounts ca ON ca.id = ct.credit_account_id
+     WHERE ct.kind = 'invoice_application'
+       AND ct.source_type = 'invoice_payment_command'
+       AND ct.source_id = $1`,
+    [command.id],
+  );
+  const original = originalResult.rows[0];
+  if (!original || BigInt(original.debit_minor) === 0n) return "0";
+  const priorReversal = await client.query(
+    `SELECT id
+     FROM credit_transactions
+     WHERE kind = 'invoice_application_reversal'
+       AND source_type = 'invoice_payment_command_reversal'
+       AND source_id = $1`,
+    [command.id],
+  );
+  if (priorReversal.rowCount) return original.debit_minor;
+
+  await client.query("SELECT id FROM credit_accounts WHERE id = $1 FOR UPDATE", [
+    original.credit_account_id,
+  ]);
+  const reversalId = randomUUID();
+  await client.query(
+    `INSERT INTO credit_transactions(
+       id, credit_account_id, kind, credit_minor, debit_minor,
+       source_type, source_id, actor_type, actor_id, reason,
+       idempotency_key, request_fingerprint
+     ) VALUES (
+       $1, $2, 'invoice_application_reversal', $3, 0,
+       'invoice_payment_command_reversal', $4, 'system', NULL, $5, $6, $7
+     )`,
+    [
+      reversalId,
+      original.credit_account_id,
+      original.debit_minor,
+      command.id,
+      reason,
+      `invoice-credit-reversal:${command.id}`,
+      `invoice-credit-reversal:v1:${paymentAttemptId}`,
+    ],
+  );
+  await client.query(
+    `INSERT INTO credit_allocations(credit_transaction_id, invoice_id, amount_minor)
+     VALUES ($1, $2, $3)`,
+    [reversalId, command.invoice_id, `-${original.debit_minor}`],
+  );
+  const journal = await client.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES ('invoice_credit_application_reversal', $1, $2, 'Credit restored after payment failure')
+     RETURNING id`,
+    [reversalId, original.currency],
+  );
+  const journalId = journal.rows[0]?.id;
+  if (!journalId) throw new Error("Unable to create Credit reversal journal");
+  await client.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'accounts_receivable', $2, 0),
+       ($1, 'client_credit_liability', 0, $2)`,
+    [journalId, original.debit_minor],
+  );
+  return original.debit_minor;
+}
+
 export async function registerProviderEventRoutes(
   app: FastifyInstance,
   pool: DatabasePool,
@@ -170,8 +266,30 @@ export async function registerProviderEventRoutes(
         return { duplicate: true };
       }
       const occurredAt = new Date(body.occurredAt);
+      const attemptPointer = await client.query<{ invoice_id: string }>(
+        `SELECT invoice_id
+         FROM payment_attempts
+         WHERE id = $1 AND provider_installation_id = $2`,
+        [body.paymentAttemptId, MOCK_PAYMENT_INSTALLATION_ID],
+      );
+      const invoiceId = attemptPointer.rows[0]?.invoice_id;
+      if (!invoiceId) {
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "payment.event_rejected",
+          "payment",
+          body.paymentAttemptId,
+          "payment attempt is unknown to the authenticated Provider installation",
+          { eventId: body.eventId, externalPaymentId: body.externalPaymentId },
+        );
+        return { rejected: true, reason: "unknown_payment_attempt" };
+      }
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
       const attemptResult = await client.query<{
         id: string;
+        operation_id: string;
+        operation_attempt_count: number;
         client_account_id: string;
         invoice_id: string;
         status: PaymentStatus;
@@ -183,39 +301,60 @@ export async function registerProviderEventRoutes(
         currency: string;
         provider_occurred_at: Date | null;
       }>(
-        `SELECT id, client_account_id, invoice_id, status, amount_minor,
-                principal_minor::text, fee_basis_points, fee_minor::text,
-                payment_method_code, currency,
-                provider_occurred_at
-         FROM payment_attempts
-         WHERE id = $1
-         FOR UPDATE`,
-        [body.paymentAttemptId],
+        `SELECT pa.id, po.id AS operation_id, po.attempt_count AS operation_attempt_count,
+                pa.client_account_id, pa.invoice_id,
+                pa.status, pa.amount_minor, pa.principal_minor::text,
+                pa.fee_basis_points, pa.fee_minor::text,
+                pa.payment_method_code, pa.currency, pa.provider_occurred_at
+         FROM payment_attempts pa
+         JOIN provider_operations po
+           ON po.subject_type = 'payment'
+          AND po.subject_id = pa.id
+          AND po.kind = 'payment_create'
+          AND po.provider_installation_id = $2
+         WHERE pa.id = $1
+           AND pa.provider_installation_id = $2
+         FOR UPDATE OF pa, po`,
+        [body.paymentAttemptId, MOCK_PAYMENT_INSTALLATION_ID],
       );
       const attempt = attemptResult.rows[0];
       if (!attempt) {
         await auditProvider(
           client,
+          MOCK_PAYMENT_INSTALLATION_ID,
           "payment.event_rejected",
           "payment",
           body.paymentAttemptId,
-          "unknown payment attempt",
+          "payment Attempt and Operation are not owned by the authenticated Provider installation",
           { eventId: body.eventId, externalPaymentId: body.externalPaymentId },
         );
-        return { rejected: true, reason: "unknown_payment_attempt" };
+        return { rejected: true, reason: "provider_ownership_mismatch" };
+      }
+      if (attempt.operation_attempt_count === 0) {
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "payment.event_rejected",
+          "payment",
+          attempt.id,
+          "Provider reported a payment fact before Core sent the operation",
+          { eventId: body.eventId, providerOperationId: attempt.operation_id },
+        );
+        return { rejected: true, reason: "provider_operation_not_started" };
       }
 
       const externalOwner = await client.query<{ id: string }>(
         `SELECT id
          FROM payment_attempts
-         WHERE provider_installation_id = 'mock-payment-v1'
-           AND external_payment_id = $1
-           AND id <> $2`,
-        [body.externalPaymentId, attempt.id],
+         WHERE provider_installation_id = $1
+           AND external_payment_id = $2
+           AND id <> $3`,
+        [MOCK_PAYMENT_INSTALLATION_ID, body.externalPaymentId, attempt.id],
       );
       if (externalOwner.rows[0]) {
         await auditProvider(
           client,
+          MOCK_PAYMENT_INSTALLATION_ID,
           "payment.external_id_conflict",
           "payment",
           attempt.id,
@@ -232,6 +371,14 @@ export async function registerProviderEventRoutes(
         if (!canTransitionPayment(attempt.status, body.status)) {
           return { ignored: true, reason: "stale_or_backward_transition" };
         }
+        const creditRestoredMinor =
+          body.status === "processing"
+            ? "0"
+            : await reverseInvoiceCreditApplication(
+                client,
+                attempt.id,
+                `Credit restored because Provider reported payment ${body.status}`,
+              );
         await client.query(
           `UPDATE payment_attempts
            SET status = $2, external_payment_id = COALESCE(external_payment_id, $3),
@@ -243,9 +390,9 @@ export async function registerProviderEventRoutes(
           `UPDATE provider_operations
            SET status = $2, external_reference = COALESCE(external_reference, $3),
                provider_occurred_at = $4, updated_at = now()
-           WHERE subject_type = 'payment' AND subject_id = $1 AND status <> 'succeeded'`,
+           WHERE id = $1 AND status <> 'succeeded'`,
           [
-            attempt.id,
+            attempt.operation_id,
             body.status === "processing" ? "running" : "failed",
             body.externalPaymentId,
             occurredAt,
@@ -258,13 +405,14 @@ export async function registerProviderEventRoutes(
           [
             attempt.id,
             body.status === "processing" ? "processing" : "failed",
-            { paymentStatus: body.status },
+            { paymentStatus: body.status, creditRestoredMinor },
           ],
         );
         return { accepted: true, status: body.status };
       }
 
       const receipt = await recordReceipt(client, {
+        providerInstallationId: MOCK_PAYMENT_INSTALLATION_ID,
         attemptId: attempt.id,
         clientAccountId: attempt.client_account_id,
         externalPaymentId: body.externalPaymentId,
@@ -275,6 +423,7 @@ export async function registerProviderEventRoutes(
       if (receipt.conflict) {
         await auditProvider(
           client,
+          MOCK_PAYMENT_INSTALLATION_ID,
           "payment.receipt_conflict",
           "fund_receipt",
           receipt.id,
@@ -315,11 +464,12 @@ export async function registerProviderEventRoutes(
         await client.query(
           `UPDATE provider_operations
            SET status = 'unknown', last_error = $2, provider_occurred_at = $3, updated_at = now()
-           WHERE subject_type = 'payment' AND subject_id = $1 AND status <> 'succeeded'`,
-          [attempt.id, reason, occurredAt],
+           WHERE id = $1 AND status <> 'succeeded'`,
+          [attempt.operation_id, reason, occurredAt],
         );
         await auditProvider(
           client,
+          MOCK_PAYMENT_INSTALLATION_ID,
           "payment.settlement_unclaimed",
           "fund_receipt",
           receipt.id,
@@ -450,8 +600,8 @@ export async function registerProviderEventRoutes(
         `UPDATE provider_operations
          SET status = 'succeeded', external_reference = $2, provider_occurred_at = $3,
              last_error = NULL, updated_at = now()
-         WHERE subject_type = 'payment' AND subject_id = $1`,
-        [attempt.id, body.externalPaymentId, occurredAt],
+         WHERE id = $1`,
+        [attempt.operation_id, body.externalPaymentId, occurredAt],
       );
 
       const settlement = await advancePaidInvoice(client, attempt.invoice_id);
@@ -578,6 +728,7 @@ export async function registerProviderEventRoutes(
       ) {
         await auditProvider(
           client,
+          "mock-provisioning-v1",
           "provisioning.state_conflict",
           "service",
           service.id,
@@ -602,6 +753,7 @@ export async function registerProviderEventRoutes(
       ) {
         await auditProvider(
           client,
+          "mock-provisioning-v1",
           "provisioning.ready_time_rejected",
           "service",
           service.id,
@@ -634,6 +786,7 @@ export async function registerProviderEventRoutes(
       if (resourceOwner.rows[0]) {
         await auditProvider(
           client,
+          "mock-provisioning-v1",
           "provisioning.resource_id_conflict",
           "service",
           service.id,

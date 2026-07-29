@@ -206,6 +206,19 @@ async function recoverStaleJobs(): Promise<number> {
                AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
             [subjectId],
           );
+          await client.query(
+            `UPDATE invoice_payment_commands
+             SET status = 'unknown', result = $2, updated_at = now()
+             WHERE payment_attempt_id = $1
+               AND status NOT IN ('succeeded', 'failed')`,
+            [
+              subjectId,
+              {
+                paymentStatus: "unknown",
+                reason: "worker lock expired after a possible Provider request",
+              },
+            ],
+          );
         } else {
           await client.query(
             `UPDATE services
@@ -344,6 +357,13 @@ async function markUnknown(
          WHERE id = $1 AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
         [subjectId],
       );
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE payment_attempt_id = $1
+           AND status NOT IN ('succeeded', 'failed')`,
+        [subjectId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
+      );
     } else {
       await client.query(
         `UPDATE services
@@ -371,6 +391,150 @@ type PaymentCall = {
 
 type PreflightResult<T> = { kind: "call"; value: T } | { kind: "halted" };
 
+async function reverseInvoiceCreditApplicationWithClient(
+  client: DatabaseClient,
+  paymentAttemptId: string,
+  reason: string,
+): Promise<string> {
+  const commandResult = await client.query<{ id: string; invoice_id: string }>(
+    `SELECT id, invoice_id
+     FROM invoice_payment_commands
+     WHERE payment_attempt_id = $1
+     FOR UPDATE`,
+    [paymentAttemptId],
+  );
+  const command = commandResult.rows[0];
+  if (!command) return "0";
+  const originalResult = await client.query<{
+    credit_account_id: string;
+    debit_minor: string;
+    currency: string;
+  }>(
+    `SELECT ct.credit_account_id, ct.debit_minor::text, ca.currency
+     FROM credit_transactions ct
+     JOIN credit_accounts ca ON ca.id = ct.credit_account_id
+     WHERE ct.kind = 'invoice_application'
+       AND ct.source_type = 'invoice_payment_command'
+       AND ct.source_id = $1`,
+    [command.id],
+  );
+  const original = originalResult.rows[0];
+  if (!original || BigInt(original.debit_minor) === 0n) return "0";
+  const priorReversal = await client.query(
+    `SELECT id
+     FROM credit_transactions
+     WHERE kind = 'invoice_application_reversal'
+       AND source_type = 'invoice_payment_command_reversal'
+       AND source_id = $1`,
+    [command.id],
+  );
+  if (priorReversal.rowCount) return original.debit_minor;
+
+  await client.query("SELECT id FROM credit_accounts WHERE id = $1 FOR UPDATE", [
+    original.credit_account_id,
+  ]);
+  const reversalId = randomUUID();
+  await client.query(
+    `INSERT INTO credit_transactions(
+       id, credit_account_id, kind, credit_minor, debit_minor,
+       source_type, source_id, actor_type, actor_id, reason,
+       idempotency_key, request_fingerprint
+     ) VALUES (
+       $1, $2, 'invoice_application_reversal', $3, 0,
+       'invoice_payment_command_reversal', $4, 'system', NULL, $5, $6, $7
+     )`,
+    [
+      reversalId,
+      original.credit_account_id,
+      original.debit_minor,
+      command.id,
+      reason,
+      `invoice-credit-reversal:${command.id}`,
+      `invoice-credit-reversal:v1:${paymentAttemptId}`,
+    ],
+  );
+  await client.query(
+    `INSERT INTO credit_allocations(credit_transaction_id, invoice_id, amount_minor)
+     VALUES ($1, $2, $3)`,
+    [reversalId, command.invoice_id, `-${original.debit_minor}`],
+  );
+  const journal = await client.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES ('invoice_credit_application_reversal', $1, $2, 'Credit restored after payment failure')
+     RETURNING id`,
+    [reversalId, original.currency],
+  );
+  const journalId = journal.rows[0]?.id;
+  if (!journalId) throw new Error("Unable to create Credit reversal journal");
+  await client.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'accounts_receivable', $2, 0),
+       ($1, 'client_credit_liability', 0, $2)`,
+    [journalId, original.debit_minor],
+  );
+  return original.debit_minor;
+}
+
+async function cancelKnownUnsentPaymentWithClient(
+  client: DatabaseClient,
+  job: Job,
+  operationId: string,
+  paymentAttemptId: string,
+  orderId: string,
+  reason: string,
+  holdOrder: boolean,
+): Promise<PreflightResult<never>> {
+  const creditRestoredMinor = await reverseInvoiceCreditApplicationWithClient(
+    client,
+    paymentAttemptId,
+    reason,
+  );
+  await client.query(
+    `UPDATE payment_attempts
+     SET status = 'cancelled', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'created'`,
+    [paymentAttemptId],
+  );
+  await client.query(
+    `UPDATE provider_operations
+     SET status = 'failed', last_error = $2, updated_at = now()
+     WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+    [operationId, reason.slice(0, 1_000)],
+  );
+  await client.query(
+    `UPDATE invoice_payment_commands
+     SET status = 'failed', result = $2, updated_at = now()
+     WHERE payment_attempt_id = $1`,
+    [
+      paymentAttemptId,
+      { paymentStatus: "cancelled", reason: reason.slice(0, 1_000), creditRestoredMinor },
+    ],
+  );
+  if (holdOrder) {
+    await client.query(
+      `UPDATE orders
+       SET status = 'on_hold', updated_at = now(), version = version + 1
+       WHERE id = $1
+         AND status IN ('waiting_payment', 'accepted', 'awaiting_manual', 'fulfilling')`,
+      [orderId],
+    );
+  }
+  await client.query(
+    `INSERT INTO audit_events(
+       actor_type, actor_id, action, target_type, target_id, reason, metadata
+     ) VALUES ('system', $1, 'payment.known_unsent_cancelled', 'payment', $2, $3, $4)`,
+    [
+      config.WORKER_ID,
+      paymentAttemptId,
+      reason.slice(0, 1_000),
+      { providerOperationId: operationId, orderId, creditRestoredMinor, holdOrder },
+    ],
+  );
+  await completeJobWithClient(client, job.id);
+  return { kind: "halted" };
+}
+
 async function holdPaymentWithClient(
   client: DatabaseClient,
   job: Job,
@@ -387,9 +551,31 @@ async function holdPaymentWithClient(
   );
   await client.query(
     `UPDATE provider_operations
-     SET last_error = $2, updated_at = now()
+     SET status = 'unknown', last_error = $2, updated_at = now()
      WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
     [operationId, reason.slice(0, 1_000)],
+  );
+  await client.query(
+    `UPDATE payment_attempts
+     SET status = 'unknown', updated_at = now(), version = version + 1
+     WHERE id = (
+       SELECT subject_id
+       FROM provider_operations
+       WHERE id = $1 AND subject_type = 'payment'
+     )
+       AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+    [operationId],
+  );
+  await client.query(
+    `UPDATE invoice_payment_commands
+     SET status = 'manual', result = $2, updated_at = now()
+     WHERE payment_attempt_id = (
+       SELECT subject_id
+       FROM provider_operations
+       WHERE id = $1 AND subject_type = 'payment'
+     )
+       AND status NOT IN ('succeeded', 'failed')`,
+    [operationId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
   );
   await manualJobWithClient(client, job.id, reason);
   return { kind: "halted" };
@@ -402,6 +588,16 @@ async function preflightPayment(
   mode: "start" | "reconcile",
 ): Promise<PreflightResult<PaymentCall>> {
   return transaction(async (client) => {
+    const paymentPointer = await client.query<{ invoice_id: string }>(
+      "SELECT invoice_id FROM payment_attempts WHERE id = $1",
+      [paymentAttemptId],
+    );
+    const invoiceId = paymentPointer.rows[0]?.invoice_id;
+    if (!invoiceId) {
+      await manualJobWithClient(client, job.id, "payment job references a missing Payment Attempt");
+      return { kind: "halted" };
+    }
+    await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
     const result = await client.query<{
       payment_status: string;
       amount_minor: string;
@@ -478,6 +674,18 @@ async function preflightPayment(
       );
       return { kind: "halted" };
     }
+    const consistentOwnership =
+      payment.payment_client_account_id === payment.invoice_client_account_id &&
+      payment.invoice_client_account_id === payment.order_client_account_id;
+    const consistentProvider =
+      payment.payment_provider_installation_id ===
+        payment.operation_provider_installation_id &&
+      payment.payment_provider_installation_id === "mock-payment-v1";
+    const knownUnsent =
+      payment.payment_status === "created" &&
+      payment.operation_status === "queued" &&
+      payment.operation_attempt_count === 0;
+
     if (mode === "reconcile") {
       const potentiallySent =
         payment.operation_attempt_count > 0 ||
@@ -485,13 +693,27 @@ async function preflightPayment(
         payment.operation_status === "unknown" ||
         payment.payment_status === "processing" ||
         payment.payment_status === "unknown";
-      if (!potentiallySent) {
-        await manualJobWithClient(
+      if (!consistentOwnership || !consistentProvider) {
+        return holdPaymentWithClient(
           client,
-          job.id,
-          "payment reconciliation has no evidence that a provider create was sent",
+          job,
+          providerOperationId,
+          payment.order_id,
+          !consistentOwnership
+            ? "payment reconciliation blocked because Core ownership records are inconsistent"
+            : "payment reconciliation blocked because Provider ownership records are inconsistent",
         );
-        return { kind: "halted" };
+      }
+      if (!potentiallySent) {
+        return cancelKnownUnsentPaymentWithClient(
+          client,
+          job,
+          providerOperationId,
+          paymentAttemptId,
+          payment.order_id,
+          "payment reconciliation has no evidence that a provider create was sent",
+          true,
+        );
       }
       return {
         kind: "call",
@@ -511,6 +733,58 @@ async function preflightPayment(
       await completeJobWithClient(client, job.id);
       return { kind: "halted" };
     }
+    if (!knownUnsent) {
+      await client.query(
+        `UPDATE payment_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [paymentAttemptId],
+      );
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown',
+             last_error = 'create operation may already have run; reconciliation required',
+             updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId],
+      );
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE payment_attempt_id = $1
+           AND status NOT IN ('succeeded', 'failed')`,
+        [
+          paymentAttemptId,
+          {
+            paymentStatus: "unknown",
+            reason: "create operation may already have run; reconciliation required",
+          },
+        ],
+      );
+      await enqueueReconcileWithClient(
+        client,
+        "payment.reconcile",
+        job.unique_key,
+        { ...job.payload, operationId: providerOperationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeJobWithClient(client, job.id);
+      return { kind: "halted" };
+    }
+    if (!consistentOwnership || !consistentProvider) {
+      return cancelKnownUnsentPaymentWithClient(
+        client,
+        job,
+        providerOperationId,
+        paymentAttemptId,
+        payment.order_id,
+        !consistentOwnership
+          ? "payment provider call blocked because Core ownership records are inconsistent"
+          : "payment provider call blocked because Provider ownership records are inconsistent",
+        true,
+      );
+    }
 
     const membership = await client.query<{ removed_at: Date | null }>(
       `SELECT removed_at
@@ -526,25 +800,16 @@ async function preflightPayment(
       !payment.account_restricted_at &&
       Boolean(member) &&
       !member?.removed_at;
-    const consistentOwnership =
-      payment.payment_client_account_id === payment.invoice_client_account_id &&
-      payment.invoice_client_account_id === payment.order_client_account_id;
-    const consistentProvider =
-      payment.payment_provider_installation_id ===
-        payment.operation_provider_installation_id &&
-      payment.payment_provider_installation_id === "mock-payment-v1";
 
-    if (!eligible || !consistentOwnership || !consistentProvider) {
-      return holdPaymentWithClient(
+    if (!eligible) {
+      return cancelKnownUnsentPaymentWithClient(
         client,
         job,
         providerOperationId,
+        paymentAttemptId,
         payment.order_id,
-        !eligible
-          ? "payment provider call blocked because the user, account, or membership is not eligible"
-          : !consistentOwnership
-            ? "payment provider call blocked because Core ownership records are inconsistent"
-            : "payment provider call blocked because Provider ownership records are inconsistent",
+        "payment provider call blocked because the user, account, or membership is not eligible",
+        false,
       );
     }
     if (
@@ -552,12 +817,14 @@ async function preflightPayment(
       payment.order_currency !== payment.invoice_currency ||
       payment.invoice_currency !== payment.payment_currency
     ) {
-      return holdPaymentWithClient(
+      return cancelKnownUnsentPaymentWithClient(
         client,
         job,
         providerOperationId,
+        paymentAttemptId,
         payment.order_id,
         "payment provider call blocked because order, currency, or operation state changed",
+        true,
       );
     }
 
@@ -571,29 +838,14 @@ async function preflightPayment(
       BigInt(payment.invoice_total_minor) -
       BigInt(allocationResult.rows[0]?.allocated_minor ?? "0");
     if (dueMinor <= 0n) {
-      if (payment.payment_status === "created" && payment.operation_attempt_count === 0) {
-        await client.query(
-          `UPDATE payment_attempts
-           SET status = 'cancelled', updated_at = now(), version = version + 1
-           WHERE id = $1 AND status = 'created'`,
-          [paymentAttemptId],
-        );
-        await client.query(
-          `UPDATE provider_operations
-           SET status = 'failed', last_error = 'invoice was already settled before provider call',
-               updated_at = now()
-           WHERE id = $1 AND status = 'queued'`,
-          [providerOperationId],
-        );
-        await completeJobWithClient(client, job.id);
-        return { kind: "halted" };
-      }
-      return holdPaymentWithClient(
+      return cancelKnownUnsentPaymentWithClient(
         client,
         job,
         providerOperationId,
+        paymentAttemptId,
         payment.order_id,
-        "payment result may be outstanding but the invoice no longer has an allocatable balance",
+        "invoice no longer has an allocatable balance before the Provider call",
+        false,
       );
     }
     const principalMinor = BigInt(payment.principal_minor ?? payment.amount_minor);
@@ -602,46 +854,18 @@ async function preflightPayment(
       dueMinor !== principalMinor ||
       BigInt(payment.amount_minor) !== principalMinor + feeMinor
     ) {
-      return holdPaymentWithClient(
+      return cancelKnownUnsentPaymentWithClient(
         client,
         job,
         providerOperationId,
+        paymentAttemptId,
         payment.order_id,
         "payment provider call blocked because the invoice balance changed",
+        true,
       );
     }
 
     if (mode === "start") {
-      const createMayHaveRun =
-        payment.payment_status !== "created" ||
-        payment.operation_status !== "queued" ||
-        payment.operation_attempt_count > 0;
-      if (createMayHaveRun) {
-        await client.query(
-          `UPDATE payment_attempts
-           SET status = 'unknown', updated_at = now(), version = version + 1
-           WHERE id = $1
-             AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
-          [paymentAttemptId],
-        );
-        await client.query(
-          `UPDATE provider_operations
-           SET status = 'unknown',
-               last_error = 'create operation may already have run; reconciliation required',
-               updated_at = now()
-           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
-          [providerOperationId],
-        );
-        await enqueueReconcileWithClient(
-          client,
-          "payment.reconcile",
-          job.unique_key,
-          { ...job.payload, operationId: providerOperationId },
-          config.RECONCILE_BASE_DELAY_SECONDS,
-        );
-        await completeJobWithClient(client, job.id);
-        return { kind: "halted" };
-      }
       await client.query(
         `UPDATE payment_attempts
          SET status = 'processing', updated_at = now(), version = version + 1
@@ -931,16 +1155,47 @@ async function rejectPaymentStartManually(
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
-    const result = await client.query<{ order_id: string }>(
-      `SELECT o.id AS order_id
+    const pointer = await client.query<{ invoice_id: string; order_id: string }>(
+      `SELECT i.id AS invoice_id, o.id AS order_id
        FROM payment_attempts pa
        JOIN invoices i ON i.id = pa.invoice_id
        JOIN orders o ON o.id = i.order_id
-       WHERE pa.id = $1
-       FOR UPDATE OF pa, o`,
+       WHERE pa.id = $1`,
       [paymentAttemptId],
     );
-    const orderId = result.rows[0]?.order_id;
+    const invoiceId = pointer.rows[0]?.invoice_id;
+    const orderId = pointer.rows[0]?.order_id;
+    if (invoiceId) {
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
+    }
+    const locked = await client.query<{
+      payment_status: string;
+      operation_status: string;
+    }>(
+      `SELECT pa.status AS payment_status, po.status AS operation_status
+       FROM payment_attempts pa
+       JOIN orders o ON o.id = $2
+       JOIN provider_operations po ON po.id = $3
+       WHERE pa.id = $1
+         AND po.subject_type = 'payment'
+         AND po.subject_id = pa.id
+       FOR UPDATE OF pa, o, po`,
+      [paymentAttemptId, orderId, operationId],
+    );
+    const current = locked.rows[0];
+    if (
+      !current ||
+      current.payment_status === "succeeded" ||
+      current.operation_status === "succeeded"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return;
+    }
+    const creditRestoredMinor = await reverseInvoiceCreditApplicationWithClient(
+      client,
+      paymentAttemptId,
+      reason,
+    );
     await client.query(
       `UPDATE provider_operations
        SET status = 'failed', last_error = $2, updated_at = now()
@@ -952,6 +1207,15 @@ async function rejectPaymentStartManually(
        SET status = 'failed', updated_at = now(), version = version + 1
        WHERE id = $1 AND status IN ('created', 'processing')`,
       [paymentAttemptId],
+    );
+    await client.query(
+      `UPDATE invoice_payment_commands
+       SET status = 'failed', result = $2, updated_at = now()
+       WHERE payment_attempt_id = $1`,
+      [
+        paymentAttemptId,
+        { paymentStatus: "failed", reason: reason.slice(0, 1_000), creditRestoredMinor },
+      ],
     );
     if (orderId) {
       await client.query(
@@ -970,7 +1234,11 @@ async function rejectPaymentStartManually(
         config.WORKER_ID,
         paymentAttemptId,
         reason.slice(0, 1_000),
-        { providerOperationId: operationId, orderId: orderId ?? null },
+        {
+          providerOperationId: operationId,
+          orderId: orderId ?? null,
+          creditRestoredMinor,
+        },
       ],
     );
     await manualJobWithClient(client, job.id, reason);
@@ -1280,6 +1548,19 @@ async function delayReconcile(
         reason.slice(0, 1_000),
       ],
     );
+    if (manual) {
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET status = 'manual', result = $2, updated_at = now()
+         WHERE payment_attempt_id = (
+           SELECT subject_id
+           FROM provider_operations
+           WHERE id = $1 AND subject_type = 'payment'
+         )
+           AND status NOT IN ('succeeded', 'failed')`,
+        [operationId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
+      );
+    }
   });
 }
 

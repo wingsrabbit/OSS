@@ -557,7 +557,6 @@ export async function registerOrderRoutes(
         };
       }
 
-      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       const quoteResult = await client.query<{
         id: string;
         payment_method_code: string;
@@ -621,6 +620,7 @@ export async function registerOrderRoutes(
       );
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
+      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       const allocationResult = await client.query<{
         payment_minor: string;
         credit_minor: string;
@@ -717,13 +717,14 @@ export async function registerOrderRoutes(
              idempotency_key, request_fingerprint
            ) VALUES (
              $1, $2, 'invoice_application', 0, $3,
-             'invoice_payment_command', $1, 'user', $4,
-             'Credit applied to invoice payment', $5, $6
+             'invoice_payment_command', $4, 'user', $5,
+             'Credit applied to invoice payment', $6, $7
            )`,
           [
             creditTransactionId,
             creditAccountId,
             quote.credit_to_apply_minor,
+            commandId,
             user.userId,
             `invoice-credit:${commandId}`,
             fingerprint,
@@ -822,9 +823,17 @@ export async function registerOrderRoutes(
       );
       await client.query(
         `UPDATE invoice_payment_commands
-         SET payment_attempt_id = $2, status = 'processing', updated_at = now()
+         SET payment_attempt_id = $2, status = 'processing', result = $3, updated_at = now()
          WHERE id = $1`,
-        [commandId, paymentAttemptId],
+        [
+          commandId,
+          paymentAttemptId,
+          {
+            creditAppliedMinor: quote.credit_to_apply_minor,
+            externalDueMinor: quote.external_due_minor,
+            feeMinor: quote.fee_minor,
+          },
+        ],
       );
       return {
         commandId,
