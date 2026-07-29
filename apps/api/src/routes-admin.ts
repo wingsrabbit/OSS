@@ -151,7 +151,7 @@ export async function registerAdminRoutes(
          JOIN invoices i ON i.order_id = o.id
          JOIN users customer ON customer.id = o.submitted_by_user_id
          JOIN client_accounts ca ON ca.id = o.client_account_id
-         LEFT JOIN client_memberships cm
+         JOIN client_memberships cm
            ON cm.client_account_id = o.client_account_id
           AND cm.user_id = o.submitted_by_user_id
          WHERE s.id = $1
