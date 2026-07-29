@@ -765,7 +765,7 @@ const forgedProvisionRecord = await corePool.query<{
    FROM durable_jobs job
    JOIN provider_operations operation
      ON operation.subject_type = 'service'
-    AND operation.subject_id = $1
+    AND operation.subject_id::text = $1
    WHERE job.job_type = 'provision.start'
      AND job.payload->>'serviceId' = $1`,
   [paidForgedProvision.service.id],
