@@ -36,6 +36,9 @@ jobs:
           test "$(pnpm --version)" = '11.14.0'
           pnpm install --frozen-lockfile
 
+      - name: Build shared Core declarations
+        run: pnpm --filter @opensales/core build
+
       - name: Strict TypeScript
         run: pnpm -r --if-present typecheck
 
