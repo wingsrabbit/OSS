@@ -67,4 +67,20 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(journey.getByText("active", { exact: true })).toBeVisible({ timeout: 30_000 });
   await expect(journey.getByText(/Ready for service:/)).toBeVisible();
   await expect(journey.getByText(/Service term:/)).toBeVisible();
+
+  const addFunds = page.locator('section[aria-label="Add Funds"]');
+  await expect(addFunds.getByRole("heading", { name: "Add usable Credit after verified settlement" }))
+    .toBeVisible();
+  await addFunds.getByLabel("Add Funds principal in cents").fill("5000");
+  await addFunds.getByLabel("Add Funds payment method").selectOption("card");
+  await expect(addFunds.getByText("Principal added to Credit: $50.00")).toBeVisible();
+  await expect(addFunds.getByText("Payment fee: $1.75", { exact: true })).toBeVisible();
+  await expect(addFunds.getByText("External amount due: $51.75", { exact: true })).toBeVisible();
+  await addFunds.getByRole("button", { name: "Start Mock Add Funds" }).click();
+  const addFundsStatus = addFunds.getByTestId("add-funds-status");
+  await expect(addFundsStatus.getByText("succeeded", { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await expect(addFundsStatus.getByText("credited $50.00", { exact: true })).toBeVisible();
+  await expect(addFunds.getByText(/Current Credit/)).toContainText("$50.00");
 });

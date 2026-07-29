@@ -75,6 +75,31 @@ type PaymentCommand = {
   status: string;
   replayed: boolean;
 };
+type AddFundsQuote = {
+  quoteId: string;
+  principalMinor: string;
+  feeMinor: string;
+  externalDueMinor: string;
+  balanceCapMinor: string;
+};
+type AddFundsCommand = {
+  commandId: string;
+  addFundsAttemptId: string;
+  status: string;
+  replayed?: boolean;
+};
+type AddFundsStatus = {
+  commandId: string;
+  addFundsAttemptId: string;
+  providerOperationId: string;
+  status: string;
+  attemptStatus: string;
+  providerOperationStatus: string;
+  principalMinor: string;
+  feeMinor: string;
+  externalDueMinor: string;
+  result: Record<string, unknown> | null;
+};
 type PaymentRecords = {
   command_status: string;
   attempt_status: string;
@@ -357,6 +382,56 @@ async function pay(
   );
 }
 
+async function createAddFundsQuote(
+  principalMinor: string,
+  paymentMethod = "card",
+): Promise<AddFundsQuote> {
+  return request<AddFundsQuote>(
+    "/api/v1/billing/add-funds/quotes",
+    {
+      method: "POST",
+      body: JSON.stringify({ principalMinor, paymentMethod }),
+    },
+    201,
+  );
+}
+
+async function startAddFunds(
+  quoteId: string,
+  scenario:
+    | "success"
+    | "failed"
+    | "cancelled"
+    | "timeout_success"
+    | "duplicate_out_of_order"
+    | "partial"
+    | "wrong_currency"
+    | "expired_late",
+  idempotencyKey = randomUUID(),
+): Promise<{ command: AddFundsCommand; idempotencyKey: string }> {
+  const command = await request<AddFundsCommand>(
+    "/api/v1/billing/add-funds",
+    {
+      method: "POST",
+      body: JSON.stringify({ quoteId, scenario, idempotencyKey }),
+    },
+    202,
+  );
+  return { command, idempotencyKey };
+}
+
+async function waitForAddFunds(
+  commandId: string,
+  expectedStatus: "succeeded" | "failed" | "cancelled" | "expired" | "manual",
+): Promise<AddFundsStatus> {
+  return waitFor(
+    `Add Funds command ${commandId} to become ${expectedStatus}`,
+    () => request<AddFundsStatus>(`/api/v1/billing/add-funds/${commandId}`),
+    (value) => value.status === expectedStatus,
+    30_000,
+  );
+}
+
 await waitFor(
   "Core readiness",
   async () => {
@@ -412,6 +487,19 @@ const unverifiedBillingSummary = await rawCoreRequest("/api/v1/billing/summary",
 });
 assert.equal(unverifiedBillingSummary.status, 403);
 assert.equal(unverifiedBillingSummary.body.code, "EMAIL_VERIFICATION_REQUIRED");
+const unverifiedAddFunds = await rawCoreRequest("/api/v1/billing/add-funds/quotes", {
+  method: "POST",
+  body: JSON.stringify({ principalMinor: "5000", paymentMethod: "card" }),
+});
+assert.equal(unverifiedAddFunds.status, 403);
+const unverifiedAddFundsFacts = await corePool.query<{ count: string }>(
+  `SELECT (
+     (SELECT count(*) FROM add_funds_quotes) +
+     (SELECT count(*) FROM add_funds_attempts) +
+     (SELECT count(*) FROM add_funds_commands)
+   )::text AS count`,
+);
+assert.equal(unverifiedAddFundsFacts.rows[0]?.count, "0");
 
 await request(
   "/api/v1/orders",
@@ -2225,6 +2313,242 @@ await request(
   { method: "POST", body: JSON.stringify({ token: replacementToken }) },
   200,
 );
+
+for (const invalidPrincipal of ["4999", "500001"]) {
+  const invalidQuote = await rawCoreRequest("/api/v1/billing/add-funds/quotes", {
+    method: "POST",
+    body: JSON.stringify({ principalMinor: invalidPrincipal, paymentMethod: "card" }),
+  });
+  assert.equal(invalidQuote.status, 409);
+  assert.equal(invalidQuote.body.code, "ADD_FUNDS_AMOUNT_OUT_OF_RANGE");
+}
+
+const cardAddFundsQuote = await createAddFundsQuote("5000", "card");
+assert.equal(cardAddFundsQuote.principalMinor, "5000");
+assert.equal(cardAddFundsQuote.feeMinor, "175");
+assert.equal(cardAddFundsQuote.externalDueMinor, "5175");
+assert.equal(cardAddFundsQuote.balanceCapMinor, "1000000");
+const duplicateAddFunds = await startAddFunds(
+  cardAddFundsQuote.quoteId,
+  "duplicate_out_of_order",
+);
+const duplicateAddFundsReplay = await request<AddFundsCommand>(
+  "/api/v1/billing/add-funds",
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: cardAddFundsQuote.quoteId,
+      scenario: "duplicate_out_of_order",
+      idempotencyKey: duplicateAddFunds.idempotencyKey,
+    }),
+  },
+  200,
+);
+assert.equal(duplicateAddFundsReplay.commandId, duplicateAddFunds.command.commandId);
+assert.equal(duplicateAddFundsReplay.replayed, true);
+const settledAddFunds = await waitForAddFunds(
+  duplicateAddFunds.command.commandId,
+  "succeeded",
+);
+assert.equal(settledAddFunds.result?.principalCreditedMinor, "5000");
+assert.equal(settledAddFunds.result?.feeMinor, "175");
+assert.equal(settledAddFunds.result?.externalPaidMinor, "5175");
+
+const initialAddFundsFacts = await corePool.query<{
+  balance_minor: string;
+  credits: string;
+  settlements: string;
+  receipts: string;
+  journals: string;
+  invoice_allocations: string;
+}>(
+  `SELECT
+     (SELECT COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text
+        FROM credit_accounts account
+        LEFT JOIN credit_transactions transaction
+          ON transaction.credit_account_id = account.id
+       WHERE account.client_account_id = $1 AND account.currency = 'USD') AS balance_minor,
+     (SELECT count(*)::text
+        FROM credit_transactions
+       WHERE kind = 'add_funds'
+         AND source_type = 'add_funds_settlement') AS credits,
+     (SELECT count(*)::text FROM add_funds_settlements) AS settlements,
+     (SELECT count(*)::text
+        FROM fund_receipts
+       WHERE reported_add_funds_attempt_id IS NOT NULL
+         AND disposition = 'allocated') AS receipts,
+     (SELECT count(*)::text
+        FROM ledger_journals
+       WHERE source_type = 'add_funds_settlement') AS journals,
+     (SELECT count(*)::text
+        FROM payment_allocations allocation
+        JOIN payment_attempts attempt ON attempt.id = allocation.payment_attempt_id
+       WHERE attempt.client_account_id = $1) AS invoice_allocations`,
+  [
+    (
+      await request<{ clientAccountId: string }>("/api/v1/auth/me")
+    ).clientAccountId,
+  ],
+);
+assert.equal(initialAddFundsFacts.rows[0]?.balance_minor, "5000");
+assert.equal(initialAddFundsFacts.rows[0]?.credits, "1");
+assert.equal(initialAddFundsFacts.rows[0]?.settlements, "1");
+assert.equal(initialAddFundsFacts.rows[0]?.receipts, "1");
+assert.equal(initialAddFundsFacts.rows[0]?.journals, "1");
+assert.equal(initialAddFundsFacts.rows[0]?.invoice_allocations, "0");
+
+const usdtAddFundsQuote = await createAddFundsQuote("5000", "usdt");
+assert.equal(usdtAddFundsQuote.feeMinor, "0");
+assert.equal(usdtAddFundsQuote.externalDueMinor, "5000");
+
+const timeoutAddFundsQuote = await createAddFundsQuote("5000", "card");
+const timeoutAddFunds = await startAddFunds(timeoutAddFundsQuote.quoteId, "timeout_success");
+const settledTimeoutAddFunds = await waitForAddFunds(
+  timeoutAddFunds.command.commandId,
+  "succeeded",
+);
+assert.equal(settledTimeoutAddFunds.result?.principalCreditedMinor, "5000");
+
+for (const scenario of ["partial", "wrong_currency", "expired_late"] as const) {
+  const quote = await createAddFundsQuote("5000", "card");
+  const started = await startAddFunds(quote.quoteId, scenario);
+  const manual = await waitForAddFunds(started.command.commandId, "manual");
+  assert.match(
+    String(manual.result?.reason),
+    scenario === "expired_late"
+      ? /settlement arrived after Add Funds became expired/
+      : /does not match the Add Funds snapshot/,
+  );
+}
+
+const recoveryMe = await request<{ clientAccountId: string }>("/api/v1/auth/me");
+const beforeCapRace = await corePool.query<{ balance_minor: string; unclaimed: string }>(
+  `SELECT
+     (SELECT COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text
+        FROM credit_accounts account
+        LEFT JOIN credit_transactions transaction
+          ON transaction.credit_account_id = account.id
+       WHERE account.client_account_id = $1 AND account.currency = 'USD') AS balance_minor,
+     (SELECT count(*)::text
+        FROM fund_receipts
+       WHERE client_account_id = $1
+         AND reported_add_funds_attempt_id IS NOT NULL
+         AND disposition = 'unclaimed') AS unclaimed`,
+  [recoveryMe.clientAccountId],
+);
+assert.equal(beforeCapRace.rows[0]?.balance_minor, "10000");
+assert.equal(beforeCapRace.rows[0]?.unclaimed, "3");
+
+await corePool.query(`
+  CREATE OR REPLACE FUNCTION integration_delay_add_funds_start()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF NEW.job_type = 'add_funds.start' THEN
+      NEW.available_at = now() + interval '1 hour';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS integration_delay_add_funds_start ON durable_jobs;
+  CREATE TRIGGER integration_delay_add_funds_start
+  BEFORE INSERT ON durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION integration_delay_add_funds_start();
+`);
+const capRaceQuote = await createAddFundsQuote("5000", "card");
+const capRace = await startAddFunds(capRaceQuote.quoteId, "success");
+const adjustmentClient = await corePool.connect();
+try {
+  await adjustmentClient.query("BEGIN");
+  const account = await adjustmentClient.query<{ id: string }>(
+    `SELECT id
+     FROM credit_accounts
+     WHERE client_account_id = $1 AND currency = 'USD'
+     FOR UPDATE`,
+    [recoveryMe.clientAccountId],
+  );
+  const accountId = account.rows[0]?.id;
+  assert.ok(accountId);
+  const adjustmentId = randomUUID();
+  await adjustmentClient.query(
+    `INSERT INTO credit_transactions(
+       id, credit_account_id, kind, credit_minor, debit_minor,
+       source_type, source_id, actor_type, reason,
+       idempotency_key, request_fingerprint
+     ) VALUES (
+       $1, $2, 'manual_adjustment', 986000, 0,
+       'integration_cap_race', $3, 'system',
+       'Synthetic balance movement while Add Funds is in flight', $4, $5
+     )`,
+    [
+      adjustmentId,
+      accountId,
+      randomUUID(),
+      `integration-cap-race:${adjustmentId}`,
+      createHash("sha256").update(adjustmentId).digest("hex"),
+    ],
+  );
+  const journal = await adjustmentClient.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES ('integration_cap_race', $1, 'USD', 'Synthetic in-flight balance movement')
+     RETURNING id`,
+    [adjustmentId],
+  );
+  await adjustmentClient.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'accounts_receivable', 986000, 0),
+       ($1, 'client_credit_liability', 0, 986000)`,
+    [journal.rows[0]?.id],
+  );
+  await adjustmentClient.query("COMMIT");
+} catch (error) {
+  await adjustmentClient.query("ROLLBACK");
+  throw error;
+} finally {
+  adjustmentClient.release();
+}
+await corePool.query(
+  `UPDATE durable_jobs
+   SET available_at = now()
+   WHERE job_type = 'add_funds.start'
+     AND payload->>'addFundsAttemptId' = $1`,
+  [capRace.command.addFundsAttemptId],
+);
+const capRaceManual = await waitForAddFunds(capRace.command.commandId, "manual");
+assert.match(String(capRaceManual.result?.reason), /balance cap would be exceeded/);
+await corePool.query(`
+  DROP TRIGGER IF EXISTS integration_delay_add_funds_start ON durable_jobs;
+  DROP FUNCTION IF EXISTS integration_delay_add_funds_start();
+`);
+const afterCapRace = await corePool.query<{
+  balance_minor: string;
+  unclaimed: string;
+  add_funds_credits: string;
+}>(
+  `SELECT
+     (SELECT COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text
+        FROM credit_accounts account
+        LEFT JOIN credit_transactions transaction
+          ON transaction.credit_account_id = account.id
+       WHERE account.client_account_id = $1 AND account.currency = 'USD') AS balance_minor,
+     (SELECT count(*)::text
+        FROM fund_receipts
+       WHERE client_account_id = $1
+         AND reported_add_funds_attempt_id IS NOT NULL
+         AND disposition = 'unclaimed') AS unclaimed,
+     (SELECT count(*)::text
+        FROM credit_transactions transaction
+        JOIN credit_accounts account ON account.id = transaction.credit_account_id
+       WHERE account.client_account_id = $1 AND transaction.kind = 'add_funds')
+       AS add_funds_credits`,
+  [recoveryMe.clientAccountId],
+);
+assert.equal(afterCapRace.rows[0]?.balance_minor, "996000");
+assert.equal(afterCapRace.rows[0]?.unclaimed, "4");
+assert.equal(afterCapRace.rows[0]?.add_funds_credits, "2");
+
 cookie = staffCookie;
 
 const unbalancedJournals = await corePool.query<{ count: string }>(

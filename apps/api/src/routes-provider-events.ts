@@ -14,6 +14,10 @@ import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertProviderSignature } from "./provider-signature.js";
+import {
+  handleAddFundsPaymentEvent,
+  type AddFundsPaymentEvent,
+} from "./add-funds-settlement.js";
 
 const paymentEventSchema = z.object({
   eventId: z.string().min(1).max(160),
@@ -276,6 +280,19 @@ export async function registerProviderEventRoutes(
       );
       const invoiceId = attemptPointer.rows[0]?.invoice_id;
       if (!invoiceId) {
+        const addFundsPointer = await client.query<{ id: string }>(
+          `SELECT id
+           FROM add_funds_attempts
+           WHERE id = $1 AND provider_installation_id = $2`,
+          [body.paymentAttemptId, MOCK_PAYMENT_INSTALLATION_ID],
+        );
+        if (addFundsPointer.rows[0]) {
+          return handleAddFundsPaymentEvent(
+            client,
+            config,
+            body as AddFundsPaymentEvent,
+          );
+        }
         await auditProvider(
           client,
           MOCK_PAYMENT_INSTALLATION_ID,
@@ -382,10 +399,19 @@ export async function registerProviderEventRoutes(
 
       const externalOwner = await client.query<{ id: string }>(
         `SELECT id
-         FROM payment_attempts
-         WHERE provider_installation_id = $1
-           AND external_payment_id = $2
-           AND id <> $3`,
+         FROM (
+           SELECT id
+           FROM payment_attempts
+           WHERE provider_installation_id = $1
+             AND external_payment_id = $2
+             AND id <> $3
+           UNION ALL
+           SELECT id
+           FROM add_funds_attempts
+           WHERE provider_installation_id = $1
+             AND external_payment_id = $2
+         ) owners
+         LIMIT 1`,
         [MOCK_PAYMENT_INSTALLATION_ID, body.externalPaymentId, attempt.id],
       );
       if (externalOwner.rows[0]) {

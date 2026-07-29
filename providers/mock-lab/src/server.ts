@@ -33,6 +33,9 @@ const paymentCreateSchema = z.object({
     "timeout_success",
     "duplicate_out_of_order",
     "definitive_reject",
+    "partial",
+    "wrong_currency",
+    "expired_late",
   ]),
 });
 
@@ -311,11 +314,32 @@ app.post("/v1/payments", async (request, reply) => {
     callbackCapability: body.callbackCapability,
     externalPaymentId: operation.external_payment_id,
     status: operation.status,
-    amountMinor: body.amountMinor,
-    currency: body.currency,
+    amountMinor:
+      body.scenario === "partial"
+        ? (BigInt(body.amountMinor) / 2n || 1n).toString()
+        : body.amountMinor,
+    currency: body.scenario === "wrong_currency" ? "EUR" : body.currency,
     occurredAt: operation.occurred_at.toISOString(),
   };
-  if (body.scenario === "duplicate_out_of_order") {
+  if (body.scenario === "expired_late") {
+    scheduleCallback(
+      "/api/v1/provider-events/payment",
+      {
+        ...event,
+        eventId: `${event.eventId}:expired`,
+        status: "expired",
+        occurredAt: new Date(operation.occurred_at.getTime() - 1).toISOString(),
+      },
+      20,
+      callbackSecret,
+    );
+    scheduleCallback(
+      "/api/v1/provider-events/payment",
+      { ...event, eventId: `${event.eventId}:late-success` },
+      60,
+      callbackSecret,
+    );
+  } else if (body.scenario === "duplicate_out_of_order") {
     scheduleCallback("/api/v1/provider-events/payment", event, 20, callbackSecret);
     scheduleCallback(
       "/api/v1/provider-events/payment",
@@ -355,9 +379,11 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
     status: "succeeded" | "failed" | "cancelled";
     amount_minor: string;
     currency: string;
+    scenario: string;
     occurred_at: Date;
   }>(
-    `SELECT callback_capability, external_payment_id, status, amount_minor, currency, occurred_at
+    `SELECT callback_capability, external_payment_id, status, amount_minor, currency, scenario,
+            occurred_at
      FROM mock_payment_operations
      WHERE operation_id = $1`,
     [params.operationId],
@@ -368,8 +394,11 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
     callbackCapability: row.callback_capability,
     externalPaymentId: row.external_payment_id,
     status: row.status,
-    amountMinor: row.amount_minor,
-    currency: row.currency,
+    amountMinor:
+      row.scenario === "partial"
+        ? (BigInt(row.amount_minor) / 2n || 1n).toString()
+        : row.amount_minor,
+    currency: row.scenario === "wrong_currency" ? "EUR" : row.currency,
     occurredAt: row.occurred_at.toISOString(),
   };
 });

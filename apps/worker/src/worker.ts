@@ -100,7 +100,7 @@ async function manualJobWithClient(
 
 async function enqueueReconcileWithClient(
   client: DatabaseClient,
-  jobType: "payment.reconcile" | "provision.reconcile",
+  jobType: "payment.reconcile" | "add_funds.reconcile" | "provision.reconcile",
   uniqueKey: string,
   payload: Record<string, string>,
   delaySeconds: number,
@@ -139,9 +139,18 @@ async function recoverStaleJobs(): Promise<number> {
     );
 
     for (const job of result.rows) {
-      if (job.job_type === "payment.start" || job.job_type === "provision.start") {
+      if (
+        job.job_type === "payment.start" ||
+        job.job_type === "add_funds.start" ||
+        job.job_type === "provision.start"
+      ) {
         const payment = job.job_type === "payment.start";
-        const subjectId = payment ? job.payload.paymentAttemptId : job.payload.serviceId;
+        const addFunds = job.job_type === "add_funds.start";
+        const subjectId = payment
+          ? job.payload.paymentAttemptId
+          : addFunds
+            ? job.payload.addFundsAttemptId
+            : job.payload.serviceId;
         const operationId = job.payload.providerOperationId;
         if (!subjectId || !operationId) {
           await manualJobWithClient(
@@ -224,6 +233,27 @@ async function recoverStaleJobs(): Promise<number> {
               },
             ],
           );
+        } else if (addFunds) {
+          await client.query(
+            `UPDATE add_funds_attempts
+             SET status = 'unknown', updated_at = now(), version = version + 1
+             WHERE id = $1
+               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+            [subjectId],
+          );
+          await client.query(
+            `UPDATE add_funds_commands
+             SET status = 'unknown', result = $2, updated_at = now()
+             WHERE add_funds_attempt_id = $1
+               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+            [
+              subjectId,
+              {
+                paymentStatus: "unknown",
+                reason: "worker lock expired after a possible Provider request",
+              },
+            ],
+          );
         } else {
           await client.query(
             `UPDATE services
@@ -234,7 +264,11 @@ async function recoverStaleJobs(): Promise<number> {
         }
         await enqueueReconcileWithClient(
           client,
-          payment ? "payment.reconcile" : "provision.reconcile",
+          payment
+            ? "payment.reconcile"
+            : addFunds
+              ? "add_funds.reconcile"
+              : "provision.reconcile",
           job.unique_key,
           { ...job.payload, operationId },
           config.RECONCILE_BASE_DELAY_SECONDS,
@@ -342,9 +376,9 @@ async function providerRequest(
 async function markUnknown(
   job: Job,
   operationId: string,
-  subjectTable: "payment_attempts" | "services",
+  subjectTable: "payment_attempts" | "add_funds_attempts" | "services",
   subjectId: string,
-  reconcileType: "payment.reconcile" | "provision.reconcile",
+  reconcileType: "payment.reconcile" | "add_funds.reconcile" | "provision.reconcile",
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
@@ -367,6 +401,20 @@ async function markUnknown(
          SET status = 'unknown', result = $2, updated_at = now()
          WHERE payment_attempt_id = $1
            AND status NOT IN ('succeeded', 'failed')`,
+        [subjectId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
+      );
+    } else if (subjectTable === "add_funds_attempts") {
+      await client.query(
+        `UPDATE add_funds_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [subjectId],
+      );
+      await client.query(
+        `UPDATE add_funds_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE add_funds_attempt_id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
         [subjectId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
       );
     } else {
@@ -504,7 +552,7 @@ async function cancelKnownUnsentPaymentWithClient(
   await client.query(
     `UPDATE provider_operations
      SET status = 'failed', last_error = $2, updated_at = now()
-     WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+     WHERE id = $1 AND status <> 'succeeded'`,
     [operationId, reason.slice(0, 1_000)],
   );
   await client.query(
@@ -1150,7 +1198,7 @@ async function preflightProvision(
 async function finishStartWithWatchdog(
   job: Job,
   operationId: string,
-  reconcileType: "payment.reconcile" | "provision.reconcile",
+  reconcileType: "payment.reconcile" | "add_funds.reconcile" | "provision.reconcile",
 ): Promise<void> {
   await transaction(async (client) => {
     const operation = await client.query<{ status: string }>(
@@ -1318,6 +1366,378 @@ async function rejectProvisionStartManually(
     );
     await manualJobWithClient(client, job.id, reason);
   });
+}
+
+async function failKnownUnsentAddFunds(
+  client: DatabaseClient,
+  job: Job,
+  operationId: string,
+  addFundsAttemptId: string,
+  reason: string,
+): Promise<void> {
+  await client.query(
+    `UPDATE provider_operations
+     SET status = 'failed', last_error = $2, updated_at = now()
+     WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+    [operationId, reason.slice(0, 1_000)],
+  );
+  await client.query(
+     `UPDATE add_funds_attempts
+     SET status = 'failed', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status <> 'succeeded'`,
+    [addFundsAttemptId],
+  );
+  await client.query(
+    `UPDATE add_funds_commands
+     SET status = 'failed', result = $2, updated_at = now()
+     WHERE add_funds_attempt_id = $1
+       AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+    [
+      addFundsAttemptId,
+      { paymentStatus: "failed", reason: reason.slice(0, 1_000) },
+    ],
+  );
+  await client.query(
+    `INSERT INTO audit_events(
+       actor_type, actor_id, action, target_type, target_id, reason, metadata
+     ) VALUES ('system', $1, 'add_funds.known_unsent_rejected',
+               'add_funds_attempt', $2, $3, $4)`,
+    [
+      config.WORKER_ID,
+      addFundsAttemptId,
+      reason.slice(0, 1_000),
+      { providerOperationId: operationId },
+    ],
+  );
+  await completeJobWithClient(client, job.id);
+}
+
+async function preflightAddFunds(
+  job: Job,
+  addFundsAttemptId: string,
+  providerOperationId: string,
+  mode: "start" | "reconcile",
+): Promise<PreflightResult<PaymentCall>> {
+  return transaction(async (client) => {
+    const result = await client.query<{
+      status: string;
+      amount_minor: string;
+      principal_minor: string;
+      fee_minor: string;
+      currency: string;
+      scenario: string;
+      provider_installation_id: string;
+      client_account_id: string;
+      submitted_by_user_id: string;
+      quote_client_account_id: string;
+      quote_provider_installation_id: string;
+      quote_currency: string;
+      quote_principal_minor: string;
+      quote_fee_minor: string;
+      quote_external_due_minor: string;
+      quote_fee_basis_points: number;
+      payment_method_code: string;
+      current_provider_installation_id: string;
+      current_fee_basis_points: number;
+      method_enabled: boolean;
+      add_funds_enabled: boolean;
+      policy_enabled: boolean;
+      min_principal_minor: string;
+      max_principal_minor: string;
+      email_verified_at: Date | null;
+      user_restricted_at: Date | null;
+      account_restricted_at: Date | null;
+      removed_at: Date | null;
+      membership_role: string | null;
+      operation_status: string;
+      operation_attempt_count: number;
+      operation_provider_installation_id: string;
+      operation_kind: string;
+      operation_subject_type: string;
+      operation_subject_id: string;
+    }>(
+      `SELECT
+         afa.status, afa.amount_minor::text, afa.principal_minor::text,
+         afa.fee_minor::text, afa.currency, afa.scenario,
+         afa.provider_installation_id, afa.client_account_id,
+         afa.submitted_by_user_id,
+         q.client_account_id AS quote_client_account_id,
+         q.provider_installation_id AS quote_provider_installation_id,
+         q.currency AS quote_currency, q.principal_minor::text AS quote_principal_minor,
+         q.fee_minor::text AS quote_fee_minor,
+         q.external_due_minor::text AS quote_external_due_minor,
+         q.fee_basis_points AS quote_fee_basis_points,
+         afa.payment_method_code,
+         pm.provider_installation_id AS current_provider_installation_id,
+         pm.fee_basis_points AS current_fee_basis_points,
+         pm.enabled AS method_enabled, pm.add_funds_enabled,
+         afp.enabled AS policy_enabled,
+         afp.min_principal_minor::text, afp.max_principal_minor::text,
+         u.email_verified_at, u.restricted_at AS user_restricted_at,
+         ca.restricted_at AS account_restricted_at, cm.removed_at,
+         cm.role AS membership_role,
+         po.status AS operation_status, po.attempt_count AS operation_attempt_count,
+         po.provider_installation_id AS operation_provider_installation_id,
+         po.kind AS operation_kind, po.subject_type AS operation_subject_type,
+         po.subject_id AS operation_subject_id
+       FROM add_funds_attempts afa
+       JOIN add_funds_quotes q ON q.id = afa.quote_id
+       JOIN add_funds_commands afc ON afc.add_funds_attempt_id = afa.id
+       JOIN users u ON u.id = afa.submitted_by_user_id
+       LEFT JOIN client_memberships cm
+         ON cm.user_id = u.id AND cm.client_account_id = afa.client_account_id
+       JOIN client_accounts ca ON ca.id = afa.client_account_id
+       JOIN payment_methods pm ON pm.code = afa.payment_method_code
+       JOIN add_funds_policies afp ON afp.currency = afa.currency
+       JOIN provider_operations po ON po.id = $2
+       WHERE afa.id = $1
+       FOR UPDATE OF afa, afc, u, ca, po`,
+      [addFundsAttemptId, providerOperationId],
+    );
+    const attempt = result.rows[0];
+    if (!attempt) {
+      await manualJobWithClient(
+        client,
+        job.id,
+        "Add Funds job references missing or inconsistent Core records",
+      );
+      return { kind: "halted" };
+    }
+    if (
+      attempt.operation_status === "succeeded" ||
+      attempt.operation_status === "failed" ||
+      attempt.status === "succeeded"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return { kind: "halted" };
+    }
+    const ownershipConsistent =
+      attempt.client_account_id === attempt.quote_client_account_id &&
+      attempt.provider_installation_id === attempt.quote_provider_installation_id &&
+      attempt.provider_installation_id === attempt.operation_provider_installation_id &&
+      attempt.operation_kind === "payment_create" &&
+      attempt.operation_subject_type === "add_funds" &&
+      attempt.operation_subject_id === addFundsAttemptId;
+    const snapshotConsistent =
+      attempt.currency === attempt.quote_currency &&
+      attempt.principal_minor === attempt.quote_principal_minor &&
+      attempt.fee_minor === attempt.quote_fee_minor &&
+      attempt.amount_minor === attempt.quote_external_due_minor &&
+      BigInt(attempt.amount_minor) ===
+        BigInt(attempt.principal_minor) + BigInt(attempt.fee_minor);
+    if (!ownershipConsistent || !snapshotConsistent) {
+      const reason = !ownershipConsistent
+        ? "Add Funds Provider and account ownership records are inconsistent"
+        : "Add Funds immutable amount snapshot is inconsistent";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId, reason],
+      );
+      await client.query(
+        `UPDATE add_funds_commands
+         SET status = 'manual', result = $2, updated_at = now()
+         WHERE add_funds_attempt_id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [addFundsAttemptId, { reason }],
+      );
+      await manualJobWithClient(client, job.id, reason);
+      return { kind: "halted" };
+    }
+
+    const knownUnsent =
+      attempt.status === "created" &&
+      attempt.operation_status === "queued" &&
+      attempt.operation_attempt_count === 0;
+    if (mode === "reconcile") {
+      if (!knownUnsent) {
+        return {
+          kind: "call",
+          value: {
+            amountMinor: attempt.amount_minor,
+            currency: attempt.currency,
+            scenario: attempt.scenario,
+          },
+        };
+      }
+      await failKnownUnsentAddFunds(
+        client,
+        job,
+        providerOperationId,
+        addFundsAttemptId,
+        "Add Funds reconciliation has no evidence that Provider create was sent",
+      );
+      return { kind: "halted" };
+    }
+
+    if (!knownUnsent) {
+      const reason = "Add Funds create may already have run; reconciliation required";
+      await client.query(
+        `UPDATE add_funds_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [addFundsAttemptId],
+      );
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId, reason],
+      );
+      await client.query(
+        `UPDATE add_funds_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE add_funds_attempt_id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [addFundsAttemptId, { paymentStatus: "unknown", reason }],
+      );
+      await enqueueReconcileWithClient(
+        client,
+        "add_funds.reconcile",
+        job.unique_key,
+        { ...job.payload, operationId: providerOperationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeJobWithClient(client, job.id);
+      return { kind: "halted" };
+    }
+
+    const eligible =
+      Boolean(attempt.email_verified_at) &&
+      !attempt.user_restricted_at &&
+      !attempt.account_restricted_at &&
+      attempt.removed_at === null &&
+      (attempt.membership_role === "owner" || attempt.membership_role === "billing");
+    const configurationCurrent =
+      attempt.provider_installation_id === "mock-payment-v1" &&
+      attempt.method_enabled &&
+      attempt.add_funds_enabled &&
+      attempt.policy_enabled &&
+      attempt.current_provider_installation_id === attempt.provider_installation_id &&
+      attempt.current_fee_basis_points === attempt.quote_fee_basis_points &&
+      BigInt(attempt.principal_minor) >= BigInt(attempt.min_principal_minor) &&
+      BigInt(attempt.principal_minor) <= BigInt(attempt.max_principal_minor);
+    if (!eligible || !configurationCurrent) {
+      await failKnownUnsentAddFunds(
+        client,
+        job,
+        providerOperationId,
+        addFundsAttemptId,
+        !eligible
+          ? "Customer eligibility was revoked before Add Funds left Core"
+          : "Add Funds policy or payment method changed before Provider create",
+      );
+      return { kind: "halted" };
+    }
+
+    await client.query(
+      `UPDATE add_funds_attempts
+       SET status = 'processing', updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = 'created'`,
+      [addFundsAttemptId],
+    );
+    await client.query(
+      `UPDATE add_funds_commands
+       SET status = 'processing', updated_at = now()
+       WHERE add_funds_attempt_id = $1 AND status = 'created'`,
+      [addFundsAttemptId],
+    );
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = attempt_count + 1,
+           last_error = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+      [providerOperationId],
+    );
+    return {
+      kind: "call",
+      value: {
+        amountMinor: attempt.amount_minor,
+        currency: attempt.currency,
+        scenario: attempt.scenario,
+      },
+    };
+  });
+}
+
+async function startAddFunds(job: Job): Promise<void> {
+  const addFundsAttemptId = job.payload.addFundsAttemptId;
+  const providerOperationId = job.payload.providerOperationId;
+  if (!addFundsAttemptId || !providerOperationId) {
+    throw new Error("Invalid add_funds.start payload");
+  }
+  const preflight = await preflightAddFunds(
+    job,
+    addFundsAttemptId,
+    providerOperationId,
+    "start",
+  );
+  if (preflight.kind === "halted") return;
+  const callbackCapability = providerOperationCapability(
+    config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+    "mock-payment-v1",
+    providerOperationId,
+  );
+  try {
+    const response = await providerRequest(
+      config.MOCK_PAYMENT_PROVIDER_URL,
+      config.MOCK_PAYMENT_PROVIDER_TOKEN,
+      "/v1/payments",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": providerOperationId },
+        body: JSON.stringify({
+          operationId: providerOperationId,
+          paymentAttemptId: addFundsAttemptId,
+          callbackCapability,
+          amountMinor: preflight.value.amountMinor,
+          currency: preflight.value.currency,
+          scenario: preflight.value.scenario,
+        }),
+      },
+    );
+    if (!response.ok) {
+      if (
+        response.status === 408 ||
+        response.status === 409 ||
+        response.status === 425 ||
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        await markUnknown(
+          job,
+          providerOperationId,
+          "add_funds_attempts",
+          addFundsAttemptId,
+          "add_funds.reconcile",
+          `Add Funds create returned ambiguous HTTP ${response.status}; reconciliation required`,
+        );
+        return;
+      }
+      await transaction(async (client) => {
+        await failKnownUnsentAddFunds(
+          client,
+          job,
+          providerOperationId,
+          addFundsAttemptId,
+          `Payment Provider definitively rejected Add Funds with HTTP ${response.status}`,
+        );
+      });
+      return;
+    }
+    await finishStartWithWatchdog(job, providerOperationId, "add_funds.reconcile");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await markUnknown(
+      job,
+      providerOperationId,
+      "add_funds_attempts",
+      addFundsAttemptId,
+      "add_funds.reconcile",
+      `Add Funds create transport result is unknown (${message}); reconciliation required`,
+    );
+  }
 }
 
 async function startPayment(job: Job): Promise<void> {
@@ -1616,6 +2036,17 @@ async function delayReconcile(
            AND status NOT IN ('succeeded', 'failed')`,
         [operationId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
       );
+      await client.query(
+        `UPDATE add_funds_commands
+         SET status = 'manual', result = $2, updated_at = now()
+         WHERE add_funds_attempt_id = (
+           SELECT subject_id
+           FROM provider_operations
+           WHERE id = $1 AND subject_type = 'add_funds'
+         )
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [operationId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
+      );
     }
   });
 }
@@ -1697,6 +2128,132 @@ async function manualProvisionReconcile(
     );
     await manualJobWithClient(client, job.id, reason);
   });
+}
+
+async function reconcileAddFunds(job: Job): Promise<void> {
+  const operationId = job.payload.operationId ?? job.payload.providerOperationId;
+  const addFundsAttemptId = job.payload.addFundsAttemptId;
+  if (!operationId || !addFundsAttemptId) {
+    throw new Error("Invalid add_funds.reconcile payload");
+  }
+  const preflight = await preflightAddFunds(
+    job,
+    addFundsAttemptId,
+    operationId,
+    "reconcile",
+  );
+  if (preflight.kind === "halted") return;
+
+  let response: Response;
+  try {
+    response = await providerRequest(
+      config.MOCK_PAYMENT_PROVIDER_URL,
+      config.MOCK_PAYMENT_PROVIDER_TOKEN,
+      `/v1/payments/${encodeURIComponent(operationId)}`,
+      { method: "GET" },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await delayReconcile(
+      job,
+      operationId,
+      `Add Funds reconciliation transport failed: ${message}`,
+    );
+    return;
+  }
+  if (response.status === 404 || response.status === 408 || response.status === 425) {
+    await delayReconcile(
+      job,
+      operationId,
+      `Add Funds operation is not terminal at Provider (HTTP ${response.status})`,
+    );
+    return;
+  }
+  if (response.status === 429 || response.status >= 500) {
+    await delayReconcile(
+      job,
+      operationId,
+      `Add Funds reconciliation is temporarily unavailable (HTTP ${response.status})`,
+    );
+    return;
+  }
+  if (!response.ok) {
+    await delayReconcile(
+      job,
+      operationId,
+      `Add Funds reconciliation requires manual intervention (HTTP ${response.status})`,
+      true,
+    );
+    return;
+  }
+  let fact: {
+    callbackCapability: string;
+    externalPaymentId: string;
+    status: "processing" | "succeeded" | "failed" | "cancelled" | "expired";
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+  };
+  try {
+    fact = z
+      .object({
+        callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+        externalPaymentId: z.string().min(1),
+        status: z.enum(["processing", "succeeded", "failed", "cancelled", "expired"]),
+        amountMinor: z.string().regex(/^[1-9]\d*$/),
+        currency: z.string().regex(/^[A-Z]{3}$/),
+        occurredAt: z.string(),
+      })
+      .parse(await response.json());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid Provider response";
+    await delayReconcile(
+      job,
+      operationId,
+      `Add Funds reconciliation response is invalid: ${message}`,
+      true,
+    );
+    return;
+  }
+  if (
+    !providerOperationCapabilityMatches(
+      fact.callbackCapability,
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+      "mock-payment-v1",
+      operationId,
+    )
+  ) {
+    await delayReconcile(
+      job,
+      operationId,
+      "Add Funds reconciliation returned an invalid operation capability",
+      true,
+    );
+    return;
+  }
+  if (fact.status === "processing") {
+    await delayReconcile(
+      job,
+      operationId,
+      "Add Funds operation remains processing at Provider",
+    );
+    return;
+  }
+  const coreOutcome = await submitReconciledEvent(
+    "/api/v1/provider-events/payment",
+    {
+      eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      providerOperationId: operationId,
+      paymentAttemptId: addFundsAttemptId,
+      ...fact,
+    },
+    config.MOCK_PAYMENT_WEBHOOK_SECRET,
+  );
+  if (coreOutcome.kind === "retry") {
+    await delayReconcile(job, operationId, coreOutcome.reason);
+    return;
+  }
+  await completeJob(job.id);
 }
 
 async function reconcilePayment(job: Job): Promise<void> {
@@ -1982,6 +2539,8 @@ async function processJob(job: Job): Promise<void> {
   if (job.job_type === "notification.send") return sendNotification(job);
   if (job.job_type === "payment.start") return startPayment(job);
   if (job.job_type === "payment.reconcile") return reconcilePayment(job);
+  if (job.job_type === "add_funds.start") return startAddFunds(job);
+  if (job.job_type === "add_funds.reconcile") return reconcileAddFunds(job);
   if (job.job_type === "provision.start") return startProvision(job);
   if (job.job_type === "provision.reconcile") return reconcileProvision(job);
   throw new Error(`Unsupported job type: ${job.job_type}`);
