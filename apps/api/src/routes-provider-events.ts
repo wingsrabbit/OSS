@@ -1238,7 +1238,7 @@ export async function registerProviderEventRoutes(
             frozenRefundIds,
           },
         );
-        return { accepted: true, status: "manual", reason: action };
+        return { accepted: true, status: "manual", reason: action, securityHold: true };
       };
       const placeSettledReceiptHold = async (
         reason: string,
