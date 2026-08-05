@@ -91,6 +91,89 @@ type UnclaimedFundItem = {
   reason: string | null;
   suggestedInvoiceId: string | null;
 };
+type RefundCandidate = {
+  receiptId: string;
+  invoiceId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  providerInstallationId: string;
+  externalPaymentId: string;
+  receiptAmountMinor: string;
+  refundableMinor: string;
+  referenceRefundMinor: string | null;
+  referenceOnly: true;
+  currency: string;
+  serviceId: string | null;
+  termStart: string | null;
+  termEnd: string | null;
+  occurredAt: string;
+};
+type RefundRecord = {
+  refundId: string;
+  invoiceId: string;
+  receiptId: string;
+  destination: "original_payment" | "credit" | "none";
+  amountMode: "full" | "partial" | "none";
+  amountMinor: string;
+  currency: string;
+  status: string;
+  version: number;
+  securityHold: boolean;
+  securityHoldReason: string | null;
+  securityHoldCreatedAt: string | null;
+  providerOperationStatus: string | null;
+  externalRefundId: string | null;
+  lastError: string | null;
+  replayed: boolean;
+};
+type RefundSecurityHold = {
+  holdId: string;
+  receiptId: string;
+  receiptAmountMinor: string;
+  confirmedSettlementMinor: string;
+  refundId: string;
+  invoiceId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  refundStatus: string;
+  refundVersion: number;
+  refundAmountMinor: string;
+  refundCurrency: string;
+  reason: string;
+  createdAt: string;
+  providerFact: {
+    factId: string;
+    eventId: string;
+    externalRefundId: string;
+    status: "succeeded" | "failed";
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+  };
+  providerFacts: Array<{
+    factId: string;
+    eventId: string;
+    externalRefundId: string;
+    status: "succeeded" | "failed";
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+  }>;
+  discrepancy: {
+    discrepancyId: string;
+    providerFactId: string;
+    externalRefundId: string;
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+    cashAlreadyPosted: true;
+  } | null;
+  allowedDecisions: Array<"accept_authorized_outflow" | "dismiss_provider_claim">;
+  impact: {
+    acceptAuthorizedOutflow?: string;
+    dismissProviderClaim: string;
+  };
+};
 type BillingSummary = {
   currency: string;
   creditBalanceMinor: string;
@@ -204,6 +287,17 @@ async function fundResolutionIdempotencyKey(requestIdentity: string): Promise<st
   return `fund-resolution:${fingerprint}`;
 }
 
+async function refundIntentStorageKey(requestIdentity: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(requestIdentity),
+  );
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `opensales:refund-intent:${fingerprint}`;
+}
+
 export function App() {
   const [locale, setLocale] = useState<Locale>("en");
   const [products, setProducts] = useState<Product[]>([]);
@@ -227,6 +321,24 @@ export function App() {
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
   const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
+  const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
+  const [refundRecords, setRefundRecords] = useState<Record<string, RefundRecord>>({});
+  const [refundSecurityHolds, setRefundSecurityHolds] = useState<RefundSecurityHold[]>([]);
+  const [refundAmountMode, setRefundAmountMode] = useState<"full" | "partial">("full");
+  const [refundAmountMinor, setRefundAmountMinor] = useState("");
+  const [refundReason, setRefundReason] = useState("");
+  const [refundScenario, setRefundScenario] = useState<
+    "success" | "failed" | "timeout_success" | "duplicate_out_of_order"
+  >("success");
+  const refundIntentKeys = useRef(new Map<string, string>());
+  const refundInFlight = useRef(new Set<string>());
+  const refundAdjudicationInFlight = useRef(new Set<string>());
+  const [refundAdjudicationPendingIds, setRefundAdjudicationPendingIds] = useState<
+    ReadonlySet<string>
+  >(new Set());
+  const [refundPendingReceiptIds, setRefundPendingReceiptIds] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const [adminPassword, setAdminPassword] = useState("");
   const [manualReason, setManualReason] = useState("");
   const [creditAdjustmentMinor, setCreditAdjustmentMinor] = useState("5000");
@@ -423,9 +535,71 @@ export function App() {
     setUnclaimedFunds(result.items);
   }, [me?.staff]);
 
+  const refreshRefundCandidates = useCallback(async () => {
+    if (!me?.staff) {
+      setRefundCandidates([]);
+      return;
+    }
+    const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
+    setRefundCandidates(result.items);
+  }, [me?.staff]);
+
+  const refreshRefundRecords = useCallback(async () => {
+    if (!me?.staff) {
+      setRefundRecords({});
+      return;
+    }
+    const result = await api<{ items: RefundRecord[] }>("/api/v1/admin/refunds");
+    setRefundRecords(
+      Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
+    );
+  }, [me?.staff]);
+
+  const refreshRefundSecurityHolds = useCallback(async () => {
+    if (!me?.staff) {
+      setRefundSecurityHolds([]);
+      return;
+    }
+    const result = await api<{ items: RefundSecurityHold[] }>(
+      "/api/v1/admin/refund-security-holds",
+    );
+    setRefundSecurityHolds(result.items);
+  }, [me?.staff]);
+
   useEffect(() => {
-    void Promise.all([refreshManualItems(), refreshUnclaimedFunds()]).catch(() => undefined);
-  }, [refreshManualItems, refreshUnclaimedFunds]);
+    void Promise.all([
+      refreshManualItems(),
+      refreshUnclaimedFunds(),
+      refreshRefundCandidates(),
+      refreshRefundRecords(),
+      refreshRefundSecurityHolds(),
+    ]).catch(() => undefined);
+  }, [
+    refreshManualItems,
+    refreshRefundCandidates,
+    refreshRefundRecords,
+    refreshRefundSecurityHolds,
+    refreshUnclaimedFunds,
+  ]);
+
+  useEffect(() => {
+    const active = Object.values(refundRecords).filter((refund) =>
+      ["queued", "processing", "unknown"].includes(refund.status),
+    );
+    if (active.length === 0) return;
+    const timer = window.setInterval(() => {
+      void Promise.all(
+        active.map((refund) =>
+          api<RefundRecord>(`/api/v1/admin/refunds/${refund.refundId}`).then((updated) => {
+            setRefundRecords((current) => ({ ...current, [updated.refundId]: updated }));
+          }),
+        ),
+      )
+        .then(() => Promise.all([refreshRefundCandidates(), refreshRefundSecurityHolds()]))
+        .catch(() => undefined);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [refundRecords, refreshRefundCandidates, refreshRefundSecurityHolds]);
 
   const groups = useMemo(() => {
     const result = new Map<string, Product[]>();
@@ -695,6 +869,168 @@ export function App() {
       setFundResolutionPendingReceiptIds((current) => {
         const next = new Set(current);
         next.delete(item.receiptId);
+        return next;
+      });
+    }
+  }
+
+  async function decideRefund(
+    item: RefundCandidate,
+    destination: "original_payment" | "credit" | "none",
+  ) {
+    if (!me?.staff || refundInFlight.current.has(item.receiptId)) return;
+    const amountMode = destination === "none" ? "none" : refundAmountMode;
+    const amountMinor =
+      destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
+    const scenario = destination === "original_payment" ? refundScenario : null;
+    const reason = refundReason.trim();
+    const identity = JSON.stringify({
+      invoiceId: item.invoiceId,
+      receiptId: item.receiptId,
+      destination,
+      amountMode,
+      amountMinor,
+      scenario,
+      reason,
+    });
+    refundInFlight.current.add(item.receiptId);
+    setRefundPendingReceiptIds((current) => new Set(current).add(item.receiptId));
+    setError("");
+    try {
+      const storageKey = await refundIntentStorageKey(identity);
+      let storedKey: string | null = null;
+      try {
+        storedKey = window.localStorage.getItem(storageKey);
+      } catch {
+        storedKey = null;
+      }
+      const idempotencyKey =
+        refundIntentKeys.current.get(identity) ?? storedKey ?? crypto.randomUUID();
+      refundIntentKeys.current.set(identity, idempotencyKey);
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The in-memory key still protects repeated clicks when storage is unavailable.
+      }
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      const refund = await api<RefundRecord>(
+        `/api/v1/admin/invoices/${item.invoiceId}/refunds`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            receiptId: item.receiptId,
+            destination,
+            amountMode,
+            amountMinor,
+            expectedRefundableMinor: destination === "none" ? null : item.refundableMinor,
+            scenario,
+            reason,
+            idempotencyKey,
+          }),
+        },
+      );
+      refundIntentKeys.current.delete(identity);
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A retained key is safe: a later retry will replay instead of moving money twice.
+      }
+      setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
+      setNotice(
+        refund.replayed
+          ? "The same refund intent was replayed; no second Credit or Provider request was created."
+          : destination === "credit"
+            ? "Refund confirmed as Credit with one balanced journal."
+            : destination === "none"
+              ? "The audited no-refund decision was recorded without moving money."
+              : "Original-payment refund requested. Provider confirmation remains separate.",
+      );
+      setRefundReason("");
+      setRefundAmountMinor("");
+      await Promise.all([
+        refreshRefundCandidates(),
+        ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Refund decision failed");
+    } finally {
+      refundInFlight.current.delete(item.receiptId);
+      setRefundPendingReceiptIds((current) => {
+        const next = new Set(current);
+        next.delete(item.receiptId);
+        return next;
+      });
+    }
+  }
+
+  async function adjudicateRefundHold(
+    hold: RefundSecurityHold,
+    decision: "accept_authorized_outflow" | "dismiss_provider_claim",
+  ) {
+    if (!me?.staff || refundAdjudicationInFlight.current.has(hold.holdId)) return;
+    const reason = refundReason.trim();
+    const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
+    refundAdjudicationInFlight.current.add(hold.holdId);
+    setRefundAdjudicationPendingIds((current) => new Set(current).add(hold.holdId));
+    setError("");
+    try {
+      const storageKey = await refundIntentStorageKey(`adjudication:${identity}`);
+      let idempotencyKey: string | null = null;
+      try {
+        idempotencyKey = window.localStorage.getItem(storageKey);
+      } catch {
+        idempotencyKey = null;
+      }
+      idempotencyKey ??= crypto.randomUUID();
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The server-side decision fingerprint still prevents duplicate adjudication.
+      }
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      const result = await api<{ replayed: boolean }>(
+        `/api/v1/admin/refund-security-holds/${hold.holdId}/adjudications`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            decision,
+            reason,
+            idempotencyKey,
+            expectedRefundVersion: hold.refundVersion,
+          }),
+        },
+      );
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A retained key can only replay the same immutable adjudication.
+      }
+      setNotice(
+        result.replayed
+          ? "The same hold adjudication was replayed; no second settlement or journal was created."
+          : decision === "accept_authorized_outflow"
+            ? "Authorized Provider outflow accepted; suspense was reclassified without reducing cash again."
+            : "Provider claim dismissed; immutable evidence remains and any suspense was compensated.",
+      );
+      setRefundReason("");
+      await Promise.all([
+        refreshRefundSecurityHolds(),
+        refreshRefundCandidates(),
+        refreshRefundRecords(),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Refund hold adjudication failed");
+    } finally {
+      refundAdjudicationInFlight.current.delete(hold.holdId);
+      setRefundAdjudicationPendingIds((current) => {
+        const next = new Set(current);
+        next.delete(hold.holdId);
         return next;
       });
     }
@@ -1097,6 +1433,254 @@ export function App() {
                         >
                           Allocate amount to invoice
                         </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="admin-subsection" aria-label="Manual refunds">
+              <div>
+                <p className="eyebrow">Independent money decision</p>
+                <h3>Manual refunds</h3>
+                <p>
+                  The reference amount is advisory. A refund does not silently cancel service,
+                  reopen the paid invoice, or rewrite the original payment. Add Funds and
+                  unclaimed receipts are excluded from this safe scope.
+                </p>
+              </div>
+              <button
+                onClick={() =>
+                  void Promise.all([
+                    refreshRefundCandidates(),
+                    refreshRefundRecords(),
+                    refreshRefundSecurityHolds(),
+                  ])
+                }
+              >
+                Refresh refunds
+              </button>
+              <div className="inline-form admin-confirm refund-controls">
+                <select
+                  aria-label="Refund amount mode"
+                  value={refundAmountMode}
+                  onChange={(event) =>
+                    setRefundAmountMode(event.target.value as "full" | "partial")
+                  }
+                >
+                  <option value="full">Full current refundable amount</option>
+                  <option value="partial">Partial amount</option>
+                </select>
+                <input
+                  aria-label="Refund amount in cents"
+                  inputMode="numeric"
+                  disabled={refundAmountMode === "full"}
+                  value={refundAmountMinor}
+                  onChange={(event) => setRefundAmountMinor(event.target.value)}
+                  placeholder={
+                    refundAmountMode === "full"
+                      ? "Displayed maximum; changes require reconfirmation"
+                      : "Amount in cents"
+                  }
+                />
+                <select
+                  aria-label="Refund Provider scenario"
+                  value={refundScenario}
+                  onChange={(event) =>
+                    setRefundScenario(
+                      event.target.value as
+                        | "success"
+                        | "failed"
+                        | "timeout_success"
+                        | "duplicate_out_of_order",
+                    )
+                  }
+                >
+                  <option value="success">Success</option>
+                  <option value="failed">Failure — no settlement</option>
+                  <option value="timeout_success">Timeout but actually refunded</option>
+                  <option value="duplicate_out_of_order">Duplicate + out of order</option>
+                </select>
+                <input
+                  aria-label="Refund reason"
+                  value={refundReason}
+                  onChange={(event) => setRefundReason(event.target.value)}
+                  placeholder="Decision reason (10+ characters)"
+                />
+              </div>
+              <p className="muted">
+                Third-party destinations are disabled until a logged-in customer ticket and
+                two-person approval are both implemented.
+              </p>
+              {refundCandidates.length === 0 ? (
+                <p className="muted">No fully allocated invoice receipt is currently refundable.</p>
+              ) : (
+                <div data-testid="refund-candidate-list">
+                  {refundCandidates.map((item) => {
+                    const disabled =
+                      refundPendingReceiptIds.has(item.receiptId) ||
+                      adminPassword.length === 0 ||
+                      refundReason.trim().length < 10 ||
+                      (refundAmountMode === "partial" &&
+                        (!/^[1-9]\d*$/.test(refundAmountMinor) ||
+                          BigInt(refundAmountMinor) > BigInt(item.refundableMinor)));
+                    return (
+                      <article
+                        className="manual-item"
+                        data-testid="refund-candidate"
+                        key={item.receiptId}
+                      >
+                        <div>
+                          <strong>
+                            {item.clientAccountName} · refundable {usd(item.refundableMinor)}
+                          </strong>
+                          <span>
+                            Invoice {item.invoiceId} · receipt {usd(item.receiptAmountMinor)}
+                          </span>
+                          <span>
+                            Reference only:{" "}
+                            {item.referenceRefundMinor === null
+                              ? "not available for this service shape"
+                              : usd(item.referenceRefundMinor)}
+                          </span>
+                          <span className="mono">
+                            {item.providerInstallationId} · {item.externalPaymentId}
+                          </span>
+                        </div>
+                        <div className="fund-actions">
+                          <button
+                            className="primary"
+                            disabled={disabled}
+                            onClick={() => decideRefund(item, "original_payment")}
+                          >
+                            Refund original payment
+                          </button>
+                          <button
+                            disabled={disabled}
+                            onClick={() => decideRefund(item, "credit")}
+                          >
+                            Refund to Credit
+                          </button>
+                          <button
+                            disabled={
+                              refundPendingReceiptIds.has(item.receiptId) ||
+                              adminPassword.length === 0 ||
+                              refundReason.trim().length < 10
+                            }
+                            onClick={() => decideRefund(item, "none")}
+                          >
+                            Record no refund
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+              {refundSecurityHolds.length > 0 && (
+                <div data-testid="refund-security-hold-list">
+                  <h4>Provider facts requiring human adjudication</h4>
+                  <p className="muted">
+                    Review the immutable fact and impact. Provider callbacks cannot close these
+                    holds. Your password confirmation and the reason above are required.
+                  </p>
+                  {refundSecurityHolds.map((hold) => {
+                    const pending = refundAdjudicationPendingIds.has(hold.holdId);
+                    const disabled =
+                      pending || adminPassword.length === 0 || refundReason.trim().length < 10;
+                    return (
+                      <article
+                        className="manual-item security-hold-item"
+                        data-testid="refund-security-hold"
+                        key={hold.holdId}
+                      >
+                        <div>
+                          <strong>
+                            {hold.clientAccountName} · refund {usd(hold.refundAmountMinor)} ·{" "}
+                            {hold.refundStatus}
+                          </strong>
+                          <span>{hold.reason}</span>
+                          <span>
+                            Provider reported {hold.providerFact.status}{" "}
+                            {usd(hold.providerFact.amountMinor)} {hold.providerFact.currency}
+                          </span>
+                          <span className="mono">
+                            {hold.providerFact.externalRefundId} · event{" "}
+                            {hold.providerFact.eventId}
+                          </span>
+                          <span>
+                            Receipt {usd(hold.receiptAmountMinor)} · already confirmed{" "}
+                            {usd(hold.confirmedSettlementMinor)} · {hold.providerFacts.length}{" "}
+                            immutable Provider fact{hold.providerFacts.length === 1 ? "" : "s"}
+                          </span>
+                          {hold.providerFacts.map((fact) => (
+                            <span className="mono" key={fact.factId}>
+                              {fact.status} · {fact.amountMinor} {fact.currency} ·{" "}
+                              {fact.externalRefundId}
+                            </span>
+                          ))}
+                          {hold.discrepancy ? (
+                            <span>
+                              Cash outflow is already isolated in discrepancy suspense; accepting
+                              it will only reclassify suspense. External identity: {" "}
+                              <span className="mono">{hold.discrepancy.externalRefundId}</span>
+                            </span>
+                          ) : (
+                            <span>No automatic financial posting was made for this claim.</span>
+                          )}
+                          <span>{hold.impact.dismissProviderClaim}</span>
+                          {hold.impact.acceptAuthorizedOutflow && (
+                            <span>{hold.impact.acceptAuthorizedOutflow}</span>
+                          )}
+                        </div>
+                        <div className="fund-actions">
+                          {hold.allowedDecisions.includes("accept_authorized_outflow") && (
+                            <button
+                              className="primary"
+                              disabled={disabled}
+                              onClick={() =>
+                                adjudicateRefundHold(hold, "accept_authorized_outflow")
+                              }
+                            >
+                              Accept authorized outflow
+                            </button>
+                          )}
+                          <button
+                            disabled={disabled}
+                            onClick={() => adjudicateRefundHold(hold, "dismiss_provider_claim")}
+                          >
+                            Dismiss Provider claim
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+              {Object.values(refundRecords).length > 0 && (
+                <div data-testid="refund-status-list">
+                  {Object.values(refundRecords).map((refund) => (
+                    <article className="manual-item" key={refund.refundId}>
+                      <div>
+                        <strong>
+                          {refund.destination.replaceAll("_", " ")} · {usd(refund.amountMinor)}
+                        </strong>
+                        <span>
+                          Refund {refund.status} · Provider{" "}
+                          {refund.providerOperationStatus ?? "not used"}
+                        </span>
+                        {refund.securityHold && (
+                          <span>
+                            Security hold —{" "}
+                            {refund.securityHoldReason ??
+                              "Provider facts cannot release this decision"}
+                          </span>
+                        )}
+                        <span className="mono">{refund.refundId}</span>
+                        {refund.externalRefundId && (
+                          <span className="mono">{refund.externalRefundId}</span>
+                        )}
+                        {refund.lastError && <span>{refund.lastError}</span>}
                       </div>
                     </article>
                   ))}

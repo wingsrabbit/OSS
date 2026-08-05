@@ -8,6 +8,19 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Administrator manual refunds for fully allocated invoice receipts, including
+  full/partial amounts, original-payment or Credit destinations, an explicit
+  no-refund decision, and a reference-only remaining-service calculation.
+- Refund Provider Operations, timeout reconciliation, duplicate/out-of-order
+  callback handling, append-only settlements/events, and balanced refund
+  journals without changing the original paid invoice or service.
+- A web refund queue showing the maximum refundable amount, advisory reference,
+  password confirmation, reason, Provider fault scenario, and live outcome.
+- An append-only refund security-hold queue with impact preview, independent
+  adjudication permission, fixed-window password confirmation, optimistic
+  concurrency, semantic replay, and compensating or reclassification journals.
+- Add Funds settlement and reconciliation, configured limits, external fees,
+  unclaimed-funds review, and audited allocation or Credit conversion.
 - Append-only per-account Credit movements, invoice Credit allocations, and
   balanced journals for audited administrator adjustments and customer use.
 - Versioned payment-method configuration with immutable invoice payment Quotes.
@@ -17,6 +30,23 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Security
 
+- Refund capacity serializes on the immutable Fund Receipt; queued, processing,
+  unknown, manual, and succeeded refunds reserve capacity, while only a
+  definitive Provider failure releases it.
+- Refund submissions bind the displayed available balance and deduplicate the
+  same decision across idempotency-key aliases.
+- Capability-authorized refund facts are append-only. Contradictory success is
+  booked to discrepancy suspense, places a sticky receipt hold, and freezes
+  competing operations without allowing a Provider callback to clear the hold.
+- Automatic discrepancy posting is limited to one exact authorized outflow per
+  refund. Wrong, extra, duplicate, or reused identities cannot create arbitrary
+  cash entries; only a human adjudication can settle or compensate the hold.
+- Original-payment refunds use the receipt's Provider and external payment
+  identity, call Provider create at most once, and reconcile unknown results by
+  query. Third-party destinations are rejected until authenticated ticket
+  authorization and two-person approval exist.
+- The first refund scope deliberately rejects Add Funds and unclaimed receipts
+  so consumed Credit or unassigned liabilities cannot be erased.
 - Credit writes serialize on the Client Account and Credit Account, reject
   negative balances, and bind every command to a request fingerprint.
 - Payment confirmation rejects expired Quotes and any changed invoice,
@@ -39,8 +69,8 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Still planned
 
-- Remaining Add Funds, renewal, suspension, cancellation, refund, customer
-  operations, plugin, and two-VPS laboratory stages.
+- Chargeback, renewal, suspension/recovery, cancellation/termination, saved
+  payment methods, customer operations, plugin, and two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 

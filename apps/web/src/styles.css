@@ -205,6 +205,14 @@ main {
   justify-content: flex-end;
 }
 
+.refund-controls {
+  flex-wrap: wrap;
+}
+
+.refund-controls > * {
+  flex: 1 1 210px;
+}
+
 .form-columns {
   display: grid;
   grid-template-columns: 1fr 1fr;

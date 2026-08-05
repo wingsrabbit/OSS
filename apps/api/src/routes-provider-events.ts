@@ -12,6 +12,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertProviderSignature } from "./provider-signature.js";
 import {
@@ -41,6 +42,18 @@ const provisioningEventSchema = z.object({
   occurredAt: z.iso.datetime(),
 });
 
+const refundEventSchema = z.object({
+  eventId: z.string().min(1).max(160),
+  providerOperationId: z.uuid(),
+  refundId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  externalRefundId: z.string().min(1).max(160),
+  status: z.enum(["succeeded", "failed"]),
+  amountMinor: z.string().regex(/^[1-9]\d*$/),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  occurredAt: z.iso.datetime(),
+});
+
 const MOCK_PAYMENT_INSTALLATION_ID = "mock-payment-v1";
 const MOCK_PROVISIONING_INSTALLATION_ID = "mock-provisioning-v1";
 
@@ -64,6 +77,292 @@ async function insertInbox(
     [providerInstallationId, eventId, eventType, storedPayload],
   );
   return result.rowCount === 1;
+}
+
+async function insertRefundInbox(
+  client: DatabaseClient,
+  providerInstallationId: string,
+  eventId: string,
+  payload: Record<string, unknown>,
+): Promise<"inserted" | "duplicate" | "conflict"> {
+  const storedPayload = { ...payload, callbackCapability: "[REDACTED]" };
+  const result = await client.query(
+    `INSERT INTO provider_inbox(
+       provider_installation_id, external_event_id, event_type, payload
+     ) VALUES ($1, $2, 'refund.status', $3)
+     ON CONFLICT (provider_installation_id, external_event_id) DO NOTHING
+     RETURNING id`,
+    [providerInstallationId, eventId, storedPayload],
+  );
+  if (result.rowCount === 1) return "inserted";
+  const existing = await client.query<{ exact_match: boolean }>(
+    `SELECT (event_type = 'refund.status' AND payload = $3::jsonb) AS exact_match
+     FROM provider_inbox
+     WHERE provider_installation_id = $1 AND external_event_id = $2
+     FOR UPDATE`,
+    [providerInstallationId, eventId, JSON.stringify(storedPayload)],
+  );
+  return existing.rows[0]?.exact_match ? "duplicate" : "conflict";
+}
+
+async function recordRefundProviderFact(
+  client: DatabaseClient,
+  input: {
+    refundId: string;
+    eventId: string;
+    externalRefundId: string;
+    status: "succeeded" | "failed";
+    amountMinor: string;
+    currency: string;
+    occurredAt: Date;
+  },
+): Promise<string> {
+  const factFingerprint = requestFingerprint("provider.refund-fact:v1", {
+    refundId: input.refundId,
+    externalRefundId: input.externalRefundId,
+    status: input.status,
+    amountMinor: input.amountMinor,
+    currency: input.currency,
+    occurredAt: input.occurredAt.toISOString(),
+  });
+  const inserted = await client.query<{ id: string }>(
+    `INSERT INTO refund_provider_facts(
+       refund_id, provider_installation_id, external_event_id, external_refund_id,
+       status, amount_minor, currency, occurred_at, fact_fingerprint
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (provider_installation_id, fact_fingerprint)
+       DO NOTHING
+     RETURNING id`,
+    [
+      input.refundId,
+      MOCK_PAYMENT_INSTALLATION_ID,
+      input.eventId,
+      input.externalRefundId,
+      input.status,
+      input.amountMinor,
+      input.currency,
+      input.occurredAt,
+      factFingerprint,
+    ],
+  );
+  if (inserted.rows[0]) return inserted.rows[0].id;
+  const existing = await client.query<{ id: string }>(
+    `SELECT id
+     FROM refund_provider_facts
+     WHERE provider_installation_id = $1
+       AND fact_fingerprint = $2`,
+    [MOCK_PAYMENT_INSTALLATION_ID, factFingerprint],
+  );
+  const factId = existing.rows[0]?.id;
+  if (!factId) throw new Error("Refund Provider fact could not be recorded");
+  return factId;
+}
+
+async function postRefundDiscrepancy(
+  client: DatabaseClient,
+  input: {
+    providerFactId: string;
+    refundId: string;
+    externalRefundId: string;
+    amountMinor: string;
+    currency: string;
+    occurredAt: Date;
+    reason: string;
+  },
+): Promise<boolean> {
+  const authorized = await client.query<{
+    amount_minor: string;
+    currency: string;
+  }>(
+    `SELECT amount_minor::text, currency
+     FROM refunds
+     WHERE id = $1`,
+    [input.refundId],
+  );
+  const snapshot = authorized.rows[0];
+  if (
+    !snapshot ||
+    snapshot.amount_minor !== input.amountMinor ||
+    snapshot.currency !== input.currency
+  ) {
+    return false;
+  }
+  const alreadySettled = await client.query(
+    `SELECT id
+     FROM refund_settlements
+     WHERE refund_id = $1
+        OR (
+          provider_installation_id = $2
+          AND external_refund_id = $3
+        )`,
+    [input.refundId, MOCK_PAYMENT_INSTALLATION_ID, input.externalRefundId],
+  );
+  if (alreadySettled.rowCount !== 0) return false;
+
+  const inserted = await client.query<{ id: string }>(
+    `INSERT INTO refund_discrepancy_settlements(
+       refund_provider_fact_id, refund_id, provider_installation_id,
+       external_refund_id, amount_minor, currency, reason, occurred_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT DO NOTHING
+     RETURNING id`,
+    [
+      input.providerFactId,
+      input.refundId,
+      MOCK_PAYMENT_INSTALLATION_ID,
+      input.externalRefundId,
+      input.amountMinor,
+      input.currency,
+      input.reason,
+      input.occurredAt,
+    ],
+  );
+  const discrepancyId = inserted.rows[0]?.id;
+  if (!discrepancyId) return false;
+
+  const journal = await client.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES (
+       'refund_provider_discrepancy',
+       $1,
+       $2,
+       'Provider-reported refund requires manual allocation'
+     )
+     RETURNING id`,
+    [discrepancyId, input.currency],
+  );
+  const journalId = journal.rows[0]?.id;
+  if (!journalId) throw new Error("Unable to create refund discrepancy journal");
+  await client.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'refund_discrepancy_suspense', $2, 0),
+       ($1, 'mock_cash', 0, $2)`,
+    [journalId, input.amountMinor],
+  );
+  return true;
+}
+
+async function freezeCompetingRefunds(
+  client: DatabaseClient,
+  input: {
+    heldRefundId: string;
+    receiptId: string;
+    reason: string;
+  },
+): Promise<string[]> {
+  const candidates = await client.query<{
+    id: string;
+    status: string;
+    operation_id: string | null;
+    attempt_count: number | null;
+  }>(
+    `SELECT
+       competing.id,
+       competing.status,
+       operation.id AS operation_id,
+       operation.attempt_count
+     FROM refunds competing
+     LEFT JOIN provider_operations operation
+       ON operation.subject_type = 'refund'
+      AND operation.subject_id = competing.id
+      AND operation.kind = 'refund_create'
+     WHERE competing.source_fund_receipt_id = $1
+       AND competing.id <> $2
+       AND competing.status IN ('queued', 'processing', 'unknown')
+     ORDER BY competing.id
+     FOR UPDATE OF competing`,
+    [input.receiptId, input.heldRefundId],
+  );
+  const frozenIds: string[] = [];
+  for (const competing of candidates.rows) {
+    const knownUnsent =
+      competing.status === "queued" &&
+      competing.operation_id !== null &&
+      competing.attempt_count === 0;
+    const nextStatus = knownUnsent ? "failed" : "manual";
+    await client.query(
+      `UPDATE refunds
+       SET status = $2,
+           security_hold = $3,
+           last_error = $4,
+           result = result || $5::jsonb,
+           updated_at = now(),
+           version = version + 1
+       WHERE id = $1`,
+      [
+        competing.id,
+        nextStatus,
+        false,
+        input.reason,
+        JSON.stringify({ frozenByRefundId: input.heldRefundId }),
+      ],
+    );
+    if (competing.operation_id) {
+      await client.query(
+        `UPDATE provider_operations
+         SET status = $2, last_error = $3, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [competing.operation_id, knownUnsent ? "failed" : "unknown", input.reason],
+      );
+    }
+    await client.query(
+      `UPDATE durable_jobs
+       SET status = $2,
+           locked_at = NULL,
+           locked_by = NULL,
+           last_error = $3,
+           updated_at = now()
+       WHERE payload->>'refundId' = $1
+         AND job_type IN ('refund.start', 'refund.reconcile')
+         AND status NOT IN ('completed', 'manual')`,
+      [competing.id, knownUnsent ? "completed" : "manual", input.reason],
+    );
+    await client.query(
+      `INSERT INTO refund_events(
+         refund_id, event_type, actor_type, actor_id, reason, metadata
+       ) VALUES ($1, $2, 'system', 'refund-security-freeze', $3, $4)`,
+      [
+        competing.id,
+        knownUnsent ? "failed" : "manual",
+        input.reason,
+        { heldRefundId: input.heldRefundId, knownUnsent },
+      ],
+    );
+    frozenIds.push(competing.id);
+  }
+  return frozenIds;
+}
+
+async function holdRefundReceipt(
+  client: DatabaseClient,
+  input: {
+    receiptId: string;
+    refundId: string;
+    providerFactId: string;
+    reason: string;
+  },
+): Promise<boolean> {
+  const inserted = await client.query(
+    `INSERT INTO refund_receipt_security_holds(
+       source_fund_receipt_id, refund_id, refund_provider_fact_id, reason
+     )
+     SELECT $1, $2, $3, $4
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM refund_receipt_security_holds active_hold
+       WHERE active_hold.refund_id = $2
+         AND NOT EXISTS (
+           SELECT 1
+           FROM refund_security_hold_adjudications adjudication
+           WHERE adjudication.receipt_security_hold_id = active_hold.id
+         )
+     )
+     ON CONFLICT (refund_provider_fact_id) DO NOTHING
+     RETURNING id`,
+    [input.receiptId, input.refundId, input.providerFactId, input.reason],
+  );
+  return inserted.rowCount === 1;
 }
 
 async function auditProvider(
@@ -706,6 +1005,646 @@ export async function registerProviderEventRoutes(
         invoiceStatus: settlement.invoiceStatus,
         orderStatus: settlement.orderStatus,
       };
+    });
+    return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
+  });
+
+  app.post("/api/v1/provider-events/refund", async (request, reply) => {
+    const body = refundEventSchema.parse(request.body);
+    assertProviderSignature(request, config.MOCK_PAYMENT_WEBHOOK_SECRET, body);
+    const outcome = await transaction(pool, async (client) => {
+      for (const lock of [
+        `refund:${body.refundId}`,
+        `refund-external:${body.externalRefundId}`,
+      ].sort()) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [lock]);
+      }
+      const pointer = await client.query<{ source_fund_receipt_id: string }>(
+        `SELECT source_fund_receipt_id
+         FROM refunds
+         WHERE id = $1`,
+        [body.refundId],
+      );
+      const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+      if (!receiptId) {
+        return { rejected: true, reason: "unknown_refund" };
+      }
+      await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+      const refundResult = await client.query<{
+        id: string;
+        source_fund_receipt_id: string;
+        provider_installation_id: string;
+        destination: string;
+        amount_minor: string;
+        currency: string;
+        status: string;
+        security_hold: boolean;
+        provider_occurred_at: Date | null;
+        operation_id: string;
+        operation_status: string;
+        operation_attempt_count: number;
+        operation_created_at: Date;
+        settlement_external_refund_id: string | null;
+        settlement_amount_minor: string | null;
+        settlement_currency: string | null;
+        settlement_occurred_at: Date | null;
+      }>(
+        `SELECT
+           refund.id,
+           refund.source_fund_receipt_id,
+           refund.provider_installation_id,
+           refund.destination,
+           refund.amount_minor::text,
+           refund.currency,
+           refund.status,
+           refund.security_hold,
+           refund.provider_occurred_at,
+           operation.id AS operation_id,
+           operation.status AS operation_status,
+           operation.attempt_count AS operation_attempt_count,
+           operation.created_at AS operation_created_at,
+           settlement.external_refund_id AS settlement_external_refund_id,
+           settlement.amount_minor::text AS settlement_amount_minor,
+           settlement.currency AS settlement_currency,
+           settlement.occurred_at AS settlement_occurred_at
+         FROM refunds refund
+         JOIN provider_operations operation
+           ON operation.subject_type = 'refund'
+          AND operation.subject_id = refund.id
+          AND operation.kind = 'refund_create'
+          AND operation.id = $2
+          AND operation.provider_installation_id = $3
+         LEFT JOIN refund_settlements settlement ON settlement.refund_id = refund.id
+         WHERE refund.id = $1
+           AND refund.provider_installation_id = $3
+           AND refund.destination = 'original_payment'
+         FOR UPDATE OF refund, operation`,
+        [body.refundId, body.providerOperationId, MOCK_PAYMENT_INSTALLATION_ID],
+      );
+      const refund = refundResult.rows[0];
+      if (!refund) {
+        return { rejected: true, reason: "provider_ownership_mismatch" };
+      }
+      if (
+        !providerOperationCapabilityMatches(
+          body.callbackCapability,
+          config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          refund.operation_id,
+        )
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "refund.event_rejected",
+          "refund",
+          refund.id,
+          "refund callback capability is invalid for the Provider operation",
+          { eventId: body.eventId, providerOperationId: refund.operation_id },
+        );
+        return { rejected: true, reason: "invalid_operation_capability" };
+      }
+      if (refund.operation_attempt_count === 0) {
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "refund.event_rejected",
+          "refund",
+          refund.id,
+          "Provider reported a refund fact before Core sent the operation",
+          { eventId: body.eventId, providerOperationId: refund.operation_id },
+        );
+        return { rejected: true, reason: "provider_operation_not_started" };
+      }
+      const inboxOutcome = await insertRefundInbox(
+        client,
+        MOCK_PAYMENT_INSTALLATION_ID,
+        body.eventId,
+        body,
+      );
+      if (inboxOutcome === "duplicate") {
+        return { duplicate: true };
+      }
+      const occurredAt = new Date(body.occurredAt);
+      const providerFactId = await recordRefundProviderFact(client, {
+        refundId: refund.id,
+        eventId: body.eventId,
+        externalRefundId: body.externalRefundId,
+        status: body.status,
+        amountMinor: body.amountMinor,
+        currency: body.currency,
+        occurredAt,
+      });
+      const adjudicatedFact = await client.query(
+        `SELECT adjudication.id
+         FROM refund_receipt_security_holds security_hold
+         JOIN refund_security_hold_adjudications adjudication
+           ON adjudication.receipt_security_hold_id = security_hold.id
+         WHERE security_hold.refund_provider_fact_id = $1
+         LIMIT 1`,
+        [providerFactId],
+      );
+      if (adjudicatedFact.rowCount !== 0) {
+        return { ignored: true, reason: "provider_fact_already_adjudicated" };
+      }
+      const placeSecurityHold = async (
+        reason: string,
+        action: string,
+        metadata: Record<string, unknown>,
+      ): Promise<Record<string, unknown>> => {
+        const discrepancyPosted =
+          body.status === "succeeded"
+            ? await postRefundDiscrepancy(client, {
+                providerFactId,
+                refundId: refund.id,
+                externalRefundId: body.externalRefundId,
+                amountMinor: body.amountMinor,
+                currency: body.currency,
+                occurredAt,
+                reason,
+              })
+            : false;
+        await holdRefundReceipt(client, {
+          receiptId: refund.source_fund_receipt_id,
+          refundId: refund.id,
+          providerFactId,
+          reason,
+        });
+        await client.query(
+          `UPDATE refunds
+           SET status = 'manual',
+               security_hold = true,
+               provider_occurred_at = $2,
+               last_error = $3,
+               result = result || $4::jsonb,
+               updated_at = now(),
+               version = version + 1
+           WHERE id = $1`,
+          [
+            refund.id,
+            occurredAt,
+            reason,
+            JSON.stringify({
+              ...metadata,
+              providerFactId,
+              discrepancyPosted,
+              externalRefundId: body.externalRefundId,
+            }),
+          ],
+        );
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'unknown',
+               external_reference = COALESCE(external_reference, $2),
+               provider_occurred_at = $3,
+               last_error = $4,
+               updated_at = now()
+           WHERE id = $1 AND status <> 'succeeded'`,
+          [refund.operation_id, body.externalRefundId, occurredAt, reason],
+        );
+        const frozenRefundIds = await freezeCompetingRefunds(client, {
+          heldRefundId: refund.id,
+          receiptId: refund.source_fund_receipt_id,
+          reason: `Competing refund frozen because ${reason}`,
+        });
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+           ) VALUES ($1, 'manual', 'provider', $2, $3, $4, now())`,
+          [
+            refund.id,
+            MOCK_PAYMENT_INSTALLATION_ID,
+            reason,
+            {
+              ...metadata,
+              providerFactId,
+              discrepancyPosted,
+              externalRefundId: body.externalRefundId,
+              frozenRefundIds,
+              providerOccurredAt: body.occurredAt,
+            },
+          ],
+        );
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          action,
+          "refund",
+          refund.id,
+          reason,
+          {
+            ...metadata,
+            providerFactId,
+            discrepancyPosted,
+            externalRefundId: body.externalRefundId,
+            frozenRefundIds,
+          },
+        );
+        return { accepted: true, status: "manual", reason: action };
+      };
+      const placeSettledReceiptHold = async (
+        reason: string,
+        action: string,
+        metadata: Record<string, unknown>,
+      ): Promise<Record<string, unknown>> => {
+        const discrepancyPosted =
+          body.status === "succeeded"
+            ? await postRefundDiscrepancy(client, {
+                providerFactId,
+                refundId: refund.id,
+                externalRefundId: body.externalRefundId,
+                amountMinor: body.amountMinor,
+                currency: body.currency,
+                occurredAt,
+                reason,
+              })
+            : false;
+        await holdRefundReceipt(client, {
+          receiptId: refund.source_fund_receipt_id,
+          refundId: refund.id,
+          providerFactId,
+          reason,
+        });
+        const frozenRefundIds = await freezeCompetingRefunds(client, {
+          heldRefundId: refund.id,
+          receiptId: refund.source_fund_receipt_id,
+          reason: `Competing refund frozen because ${reason}`,
+        });
+        const eventMetadata = {
+          ...metadata,
+          providerFactId,
+          discrepancyPosted,
+          externalRefundId: body.externalRefundId,
+          frozenRefundIds,
+          providerOccurredAt: body.occurredAt,
+          receiptSecurityHold: true,
+        };
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+           ) VALUES ($1, 'provider_fact_ignored', 'provider', $2, $3, $4, now())`,
+          [refund.id, MOCK_PAYMENT_INSTALLATION_ID, reason, eventMetadata],
+        );
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          action,
+          "refund",
+          refund.id,
+          reason,
+          eventMetadata,
+        );
+        return {
+          accepted: true,
+          status: "succeeded",
+          reason: action,
+          securityHold: true,
+        };
+      };
+
+      if (inboxOutcome === "conflict") {
+        const reason = "Provider reused a refund event id with conflicting facts";
+        if (refund.status !== "succeeded") {
+          return placeSecurityHold(reason, "refund.event_id_conflict", {
+            conflictingEventId: body.eventId,
+            reportedStatus: body.status,
+          });
+        }
+        return placeSettledReceiptHold(
+          reason,
+          "refund.event_id_conflict",
+          {
+            eventId: body.eventId,
+            reportedStatus: body.status,
+          },
+        );
+      }
+
+      if (refund.status === "succeeded") {
+        const exactCanonicalSuccess =
+          body.status === "succeeded" &&
+          refund.settlement_external_refund_id === body.externalRefundId &&
+          refund.settlement_amount_minor === body.amountMinor &&
+          refund.settlement_currency === body.currency &&
+          refund.settlement_occurred_at?.getTime() === occurredAt.getTime();
+        const definitelyStaleFailure =
+          body.status === "failed" &&
+          refund.settlement_external_refund_id === body.externalRefundId &&
+          refund.settlement_amount_minor === body.amountMinor &&
+          refund.settlement_currency === body.currency &&
+          refund.settlement_occurred_at !== null &&
+          occurredAt.getTime() <= refund.settlement_occurred_at.getTime();
+        if (!exactCanonicalSuccess && !definitelyStaleFailure) {
+          return placeSettledReceiptHold(
+            "Provider fact conflicts with the canonical settled refund",
+            "refund.settled_fact_conflict",
+            {
+              eventId: body.eventId,
+              reportedStatus: body.status,
+              canonicalExternalRefundId: refund.settlement_external_refund_id,
+              canonicalAmountMinor: refund.settlement_amount_minor,
+              canonicalCurrency: refund.settlement_currency,
+              canonicalOccurredAt: refund.settlement_occurred_at?.toISOString() ?? null,
+              reportedAmountMinor: body.amountMinor,
+              reportedCurrency: body.currency,
+            },
+          );
+        }
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+           ) VALUES ($1, 'provider_fact_ignored', 'provider', $2, $3, $4, $5)`,
+          [
+            refund.id,
+            MOCK_PAYMENT_INSTALLATION_ID,
+            "Refund is already settled; terminal fact cannot move it backward",
+            {
+              eventId: body.eventId,
+              status: body.status,
+              providerFactId,
+              canonicalDuplicate: exactCanonicalSuccess,
+              staleFailure: definitelyStaleFailure,
+            },
+            occurredAt,
+          ],
+        );
+        return { ignored: true, reason: "already_succeeded" };
+      }
+      if (refund.security_hold) {
+        const discrepancyPosted =
+          body.status === "succeeded"
+            ? await postRefundDiscrepancy(client, {
+                providerFactId,
+                refundId: refund.id,
+                externalRefundId: body.externalRefundId,
+                amountMinor: body.amountMinor,
+                currency: body.currency,
+                occurredAt,
+                reason: "Provider success arrived while the refund was security-held",
+              })
+            : false;
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+           ) VALUES ($1, 'provider_fact_ignored', 'provider', $2, $3, $4, now())`,
+          [
+            refund.id,
+            MOCK_PAYMENT_INSTALLATION_ID,
+            "Security hold is sticky; Provider facts cannot release it",
+            {
+              eventId: body.eventId,
+              status: body.status,
+              providerFactId,
+              discrepancyPosted,
+              providerOccurredAt: body.occurredAt,
+            },
+          ],
+        );
+        return { accepted: true, status: "manual", reason: "security_hold" };
+      }
+      if (refund.status === "failed" && body.status === "succeeded") {
+        return placeSecurityHold(
+          "Provider reported success after previously confirming that the refund failed",
+          "refund.terminal_fact_conflict",
+          { eventId: body.eventId, reportedStatus: body.status },
+        );
+      }
+      if (!isAfter(refund.provider_occurred_at, occurredAt)) {
+        if (body.status === "succeeded") {
+          return placeSecurityHold(
+            "Provider reported an outflow with stale ordering metadata",
+            "refund.stale_success_conflict",
+            { eventId: body.eventId, reportedStatus: body.status },
+          );
+        }
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+           ) VALUES ($1, 'provider_fact_ignored', 'provider', $2, $3, $4, $5)`,
+          [
+            refund.id,
+            MOCK_PAYMENT_INSTALLATION_ID,
+            "Provider fact is stale",
+            { eventId: body.eventId, status: body.status, providerFactId },
+            occurredAt,
+          ],
+        );
+        return { ignored: true, reason: "stale_provider_fact" };
+      }
+      if (
+        occurredAt.getTime() < refund.operation_created_at.getTime() - 60_000 ||
+        occurredAt.getTime() > Date.now() + 5 * 60_000
+      ) {
+        return placeSecurityHold(
+          "Provider supplied an implausible refund occurrence time",
+          "refund.occurrence_time_rejected",
+          { eventId: body.eventId, reportedOccurredAt: body.occurredAt },
+        );
+      }
+      const snapshotMatches =
+        body.amountMinor === refund.amount_minor && body.currency === refund.currency;
+      if (!snapshotMatches) {
+        return placeSecurityHold(
+          "Provider refund amount or currency conflicts with the immutable Core snapshot",
+          "refund.snapshot_conflict",
+          {
+            eventId: body.eventId,
+            expectedAmountMinor: refund.amount_minor,
+            reportedAmountMinor: body.amountMinor,
+            expectedCurrency: refund.currency,
+            reportedCurrency: body.currency,
+          },
+        );
+      }
+
+      const externalOwner = await client.query<{
+        refund_id: string;
+        source: "settlement" | "discrepancy";
+      }>(
+        `SELECT owner.refund_id, owner.source
+         FROM (
+           SELECT refund_id, 'settlement'::text AS source
+           FROM refund_settlements
+           WHERE provider_installation_id = $1
+             AND external_refund_id = $2
+           UNION ALL
+           SELECT refund_id, 'discrepancy'::text AS source
+           FROM refund_discrepancy_settlements
+           WHERE provider_installation_id = $1
+             AND external_refund_id = $2
+         ) owner
+         WHERE owner.refund_id <> $3
+         LIMIT 1`,
+        [MOCK_PAYMENT_INSTALLATION_ID, body.externalRefundId, refund.id],
+      );
+      if (externalOwner.rows[0]) {
+        return placeSecurityHold(
+          "Provider reused an external refund id already owned by another refund",
+          "refund.external_id_conflict",
+          {
+            eventId: body.eventId,
+            ownerRefundId: externalOwner.rows[0].refund_id,
+            ownerSource: externalOwner.rows[0].source,
+          },
+        );
+      }
+
+      if (body.status === "failed") {
+        await client.query(
+          `UPDATE refunds
+           SET status = 'failed', provider_occurred_at = $2,
+               last_error = 'Provider confirmed that no refund was settled',
+               result = result || $3::jsonb, updated_at = now(), version = version + 1
+           WHERE id = $1`,
+          [
+            refund.id,
+            occurredAt,
+            JSON.stringify({ externalRefundId: body.externalRefundId }),
+          ],
+        );
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed', external_reference = COALESCE(external_reference, $2),
+               provider_occurred_at = $3,
+               last_error = 'Provider confirmed refund failure', updated_at = now()
+           WHERE id = $1 AND status <> 'succeeded'`,
+          [refund.operation_id, body.externalRefundId, occurredAt],
+        );
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+           ) VALUES ($1, 'failed', 'provider', $2, $3, $4, $5)`,
+          [
+            refund.id,
+            MOCK_PAYMENT_INSTALLATION_ID,
+            "Provider confirmed that no refund was settled",
+            { eventId: body.eventId, externalRefundId: body.externalRefundId },
+            occurredAt,
+          ],
+        );
+        return { accepted: true, status: "failed" };
+      }
+
+      const receiptCapacity = await client.query<{
+        receipt_amount_minor: string;
+        settled_minor: string;
+        active_security_hold: boolean;
+      }>(
+        `SELECT
+           receipt.amount_minor::text AS receipt_amount_minor,
+           COALESCE(sum(settlement.amount_minor), 0)::text AS settled_minor,
+           EXISTS (
+             SELECT 1
+             FROM refund_receipt_security_holds security_hold
+             WHERE security_hold.source_fund_receipt_id = receipt.id
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM refund_security_hold_adjudications adjudication
+                 WHERE adjudication.receipt_security_hold_id = security_hold.id
+               )
+           ) AS active_security_hold
+         FROM fund_receipts receipt
+         LEFT JOIN refunds related_refund
+           ON related_refund.source_fund_receipt_id = receipt.id
+         LEFT JOIN refund_settlements settlement
+           ON settlement.refund_id = related_refund.id
+         WHERE receipt.id = $1
+         GROUP BY receipt.id`,
+        [refund.source_fund_receipt_id],
+      );
+      const capacity = receiptCapacity.rows[0];
+      if (
+        !capacity ||
+        capacity.active_security_hold ||
+        BigInt(capacity.settled_minor) + BigInt(body.amountMinor) >
+          BigInt(capacity.receipt_amount_minor)
+      ) {
+        return placeSecurityHold(
+          capacity?.active_security_hold
+            ? "Provider reported success while the source receipt has an unresolved security hold"
+            : "Provider success would exceed the immutable source receipt amount",
+          "refund.receipt_capacity_conflict",
+          {
+            eventId: body.eventId,
+            receiptAmountMinor: capacity?.receipt_amount_minor ?? null,
+            settledMinor: capacity?.settled_minor ?? null,
+            reportedAmountMinor: body.amountMinor,
+            activeReceiptSecurityHold: capacity?.active_security_hold ?? null,
+          },
+        );
+      }
+
+      await client.query(
+        `UPDATE refunds
+         SET status = 'succeeded', provider_occurred_at = $2, last_error = NULL,
+             result = result || $3::jsonb, updated_at = now(), version = version + 1
+         WHERE id = $1`,
+        [
+          refund.id,
+          occurredAt,
+          JSON.stringify({ externalRefundId: body.externalRefundId }),
+        ],
+      );
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'succeeded', external_reference = $2, provider_occurred_at = $3,
+             last_error = NULL, updated_at = now()
+         WHERE id = $1`,
+        [refund.operation_id, body.externalRefundId, occurredAt],
+      );
+      await client.query(
+        `INSERT INTO refund_settlements(
+           refund_id, provider_installation_id, external_refund_id,
+           destination, amount_minor, currency, occurred_at
+         ) VALUES ($1, $2, $3, 'original_payment', $4, $5, $6)`,
+        [
+          refund.id,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          body.externalRefundId,
+          body.amountMinor,
+          body.currency,
+          occurredAt,
+        ],
+      );
+      const journal = await client.query<{ id: string }>(
+        `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+         VALUES ('refund', $1, $2, 'Confirmed manual refund to original payment method')
+         RETURNING id`,
+        [refund.id, body.currency],
+      );
+      const journalId = journal.rows[0]?.id;
+      if (!journalId) throw new Error("Unable to create refund journal");
+      await client.query(
+        `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+         VALUES
+           ($1, 'sales_refunds_and_allowances', $2, 0),
+           ($1, 'mock_cash', 0, $2)`,
+        [journalId, body.amountMinor],
+      );
+      await client.query(
+        `INSERT INTO refund_events(
+           refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
+         ) VALUES ($1, 'succeeded', 'provider', $2, $3, $4, $5)`,
+        [
+          refund.id,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "Provider confirmed the original-payment refund",
+          { eventId: body.eventId, externalRefundId: body.externalRefundId },
+          occurredAt,
+        ],
+      );
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('provider', $1, 'refund.settled', 'refund', $2, $3, $4)`,
+        [
+          MOCK_PAYMENT_INSTALLATION_ID,
+          refund.id,
+          "Provider confirmed the refund",
+          { externalRefundId: body.externalRefundId, amountMinor: body.amountMinor },
+        ],
+      );
+      return { accepted: true, status: "succeeded" };
     });
     return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
   });

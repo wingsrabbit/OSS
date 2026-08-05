@@ -42,6 +42,16 @@ const paymentCreateSchema = z.object({
   ]),
 });
 
+const refundCreateSchema = z.object({
+  operationId: z.uuid(),
+  refundId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  originalExternalPaymentId: z.string().min(1).max(160),
+  amountMinor: z.string().regex(/^[1-9]\d*$/),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  scenario: z.enum(["success", "failed", "timeout_success", "duplicate_out_of_order"]),
+});
+
 const resourceCreateSchema = z.object({
   operationId: z.uuid(),
   serviceId: z.uuid(),
@@ -91,6 +101,23 @@ await pool.query(`
     callback_capability text NOT NULL,
     occurred_at timestamptz NOT NULL DEFAULT now(),
     create_calls integer NOT NULL DEFAULT 1,
+    request_fingerprint text NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS mock_refund_operations (
+    operation_id uuid PRIMARY KEY,
+    refund_id uuid NOT NULL UNIQUE,
+    original_external_payment_id text NOT NULL
+      REFERENCES mock_payment_operations(external_payment_id),
+    external_refund_id text NOT NULL UNIQUE,
+    amount_minor bigint NOT NULL CHECK (amount_minor > 0),
+    currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    scenario text NOT NULL CHECK (
+      scenario IN ('success', 'failed', 'timeout_success', 'duplicate_out_of_order')
+    ),
+    status text NOT NULL CHECK (status IN ('succeeded', 'failed', 'unknown')),
+    callback_capability text NOT NULL,
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    create_calls integer NOT NULL DEFAULT 1 CHECK (create_calls > 0),
     request_fingerprint text NOT NULL
   );
   CREATE TABLE IF NOT EXISTS mock_resource_operations (
@@ -153,6 +180,36 @@ await pool.query(`
   WHERE request_fingerprint IS NULL;
   ALTER TABLE mock_mail_messages
     ALTER COLUMN request_fingerprint SET NOT NULL;
+  CREATE INDEX IF NOT EXISTS mock_refund_operations_original_status_idx
+    ON mock_refund_operations (original_external_payment_id, status);
+  CREATE OR REPLACE FUNCTION opensales_guard_mock_refund_operation_mutation()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF TG_OP = 'DELETE'
+       OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+       OR NEW.refund_id IS DISTINCT FROM OLD.refund_id
+       OR NEW.original_external_payment_id IS DISTINCT FROM OLD.original_external_payment_id
+       OR NEW.external_refund_id IS DISTINCT FROM OLD.external_refund_id
+       OR NEW.amount_minor IS DISTINCT FROM OLD.amount_minor
+       OR NEW.currency IS DISTINCT FROM OLD.currency
+       OR NEW.scenario IS DISTINCT FROM OLD.scenario
+       OR NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.callback_capability IS DISTINCT FROM OLD.callback_capability
+       OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+       OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
+       OR NEW.create_calls <> OLD.create_calls + 1 THEN
+      RAISE EXCEPTION
+        'Mock refund operations are append-only except for idempotent create call counting';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS mock_refund_operations_append_only ON mock_refund_operations;
+  CREATE TRIGGER mock_refund_operations_append_only
+  BEFORE UPDATE OR DELETE ON mock_refund_operations
+  FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_refund_operation_mutation();
 `);
 
 const app = Fastify({
@@ -169,7 +226,7 @@ const app = Fastify({
 app.addHook("onRequest", async (request, reply) => {
   if (!request.url.startsWith("/v1/")) return;
   const expectedToken =
-    request.url.startsWith("/v1/payments")
+    request.url.startsWith("/v1/payments") || request.url.startsWith("/v1/refunds")
       ? config.MOCK_PAYMENT_PROVIDER_TOKEN
       : request.url.startsWith("/v1/resources")
         ? config.MOCK_PROVISIONING_PROVIDER_TOKEN
@@ -421,6 +478,221 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
       row.scenario === "late_success"
         ? new Date(row.occurred_at.getTime() + 31 * 60 * 1_000).toISOString()
         : row.occurred_at.toISOString(),
+  };
+});
+
+app.post("/v1/refunds", async (request, reply) => {
+  const body = refundCreateSchema.parse(request.body);
+  const callbackSecret = config.MOCK_PAYMENT_WEBHOOK_SECRET;
+  if (!callbackSecret) return reply.code(503).send({ error: "refund callback is not configured" });
+  if (request.headers["idempotency-key"] !== body.operationId) {
+    return reply.code(400).send({ error: "stable idempotency key is required" });
+  }
+
+  const externalRefundId = `mock-refund-${body.operationId}`;
+  const fingerprint = requestFingerprint("refund.create:v1", body);
+  const status = body.scenario === "failed" ? "failed" : "succeeded";
+  type RefundOperation = {
+    operation_id: string;
+    refund_id: string;
+    external_refund_id: string;
+    status: "succeeded" | "failed";
+    amount_minor: string;
+    currency: string;
+    scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order";
+    callback_capability: string;
+    occurred_at: Date;
+  };
+  let operation: RefundOperation | undefined;
+  let replayed = false;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const originalResult = await client.query<{
+      amount_minor: string;
+      currency: string;
+      status: string;
+    }>(
+      `SELECT amount_minor::text, currency, status
+       FROM mock_payment_operations
+       WHERE external_payment_id = $1
+       FOR UPDATE`,
+      [body.originalExternalPaymentId],
+    );
+    const original = originalResult.rows[0];
+    if (!original) {
+      await client.query("ROLLBACK");
+      return reply.code(404).send({ error: "original payment operation not found" });
+    }
+    if (original.status !== "succeeded") {
+      await client.query("ROLLBACK");
+      return reply.code(409).send({ error: "original payment is not refundable" });
+    }
+    if (original.currency !== body.currency) {
+      await client.query("ROLLBACK");
+      return reply.code(409).send({ error: "refund currency does not match original payment" });
+    }
+    if (BigInt(body.amountMinor) > BigInt(original.amount_minor)) {
+      await client.query("ROLLBACK");
+      return reply.code(409).send({ error: "refund exceeds original payment amount" });
+    }
+
+    const existingResult = await client.query<RefundOperation & { request_fingerprint: string }>(
+      `SELECT operation_id, refund_id, external_refund_id, status, amount_minor::text,
+              currency, scenario, callback_capability, occurred_at, request_fingerprint
+       FROM mock_refund_operations
+       WHERE operation_id = $1
+       FOR UPDATE`,
+      [body.operationId],
+    );
+    const existing = existingResult.rows[0];
+    if (existing) {
+      if (existing.request_fingerprint !== fingerprint) {
+        await client.query("ROLLBACK");
+        return reply
+          .code(409)
+          .send({ error: "idempotency key was reused with a different refund" });
+      }
+      const replayResult = await client.query<RefundOperation>(
+        `UPDATE mock_refund_operations
+         SET create_calls = create_calls + 1
+         WHERE operation_id = $1
+         RETURNING operation_id, refund_id, external_refund_id, status, amount_minor::text,
+                   currency, scenario, callback_capability, occurred_at`,
+        [body.operationId],
+      );
+      operation = replayResult.rows[0];
+      replayed = true;
+    } else {
+      const refundOwner = await client.query<{ operation_id: string }>(
+        `SELECT operation_id
+         FROM mock_refund_operations
+         WHERE refund_id = $1
+         FOR UPDATE`,
+        [body.refundId],
+      );
+      if (refundOwner.rows[0]) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({ error: "refund is already bound to another operation" });
+      }
+      if (status !== "failed") {
+        const reservedResult = await client.query<{ reserved_minor: string }>(
+          `SELECT COALESCE(sum(amount_minor), 0)::text AS reserved_minor
+           FROM mock_refund_operations
+           WHERE original_external_payment_id = $1
+             AND status IN ('succeeded', 'unknown')`,
+          [body.originalExternalPaymentId],
+        );
+        const reservedMinor = BigInt(reservedResult.rows[0]?.reserved_minor ?? "0");
+        if (reservedMinor + BigInt(body.amountMinor) > BigInt(original.amount_minor)) {
+          await client.query("ROLLBACK");
+          return reply.code(409).send({ error: "cumulative refunds exceed original payment amount" });
+        }
+      }
+      const inserted = await client.query<RefundOperation>(
+        `INSERT INTO mock_refund_operations(
+           operation_id, refund_id, original_external_payment_id, external_refund_id,
+           amount_minor, currency, scenario, status, callback_capability, request_fingerprint
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING operation_id, refund_id, external_refund_id, status, amount_minor::text,
+                   currency, scenario, callback_capability, occurred_at`,
+        [
+          body.operationId,
+          body.refundId,
+          body.originalExternalPaymentId,
+          externalRefundId,
+          body.amountMinor,
+          body.currency,
+          body.scenario,
+          status,
+          body.callbackCapability,
+          fingerprint,
+        ],
+      );
+      operation = inserted.rows[0];
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+  if (!operation) throw new Error("Unable to create Mock refund operation");
+
+  const event = {
+    eventId: `refund:${operation.operation_id}:${operation.status}`,
+    providerOperationId: operation.operation_id,
+    refundId: operation.refund_id,
+    callbackCapability: operation.callback_capability,
+    externalRefundId: operation.external_refund_id,
+    status: operation.status,
+    amountMinor: operation.amount_minor,
+    currency: operation.currency,
+    occurredAt: operation.occurred_at.toISOString(),
+  };
+  if (operation.scenario === "duplicate_out_of_order") {
+    scheduleCallback("/api/v1/provider-events/refund", event, 20, callbackSecret);
+    scheduleCallback(
+      "/api/v1/provider-events/refund",
+      {
+        ...event,
+        eventId: `${event.eventId}:late-failed`,
+        status: "failed",
+        occurredAt: new Date(operation.occurred_at.getTime() - 1).toISOString(),
+      },
+      40,
+      callbackSecret,
+    );
+    scheduleCallback(
+      "/api/v1/provider-events/refund",
+      { ...event, eventId: `${event.eventId}:duplicate` },
+      60,
+      callbackSecret,
+    );
+  } else {
+    scheduleCallback(
+      "/api/v1/provider-events/refund",
+      event,
+      operation.scenario === "timeout_success" ? 3_500 : 20,
+      callbackSecret,
+    );
+  }
+  if (operation.scenario === "timeout_success") {
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+  return reply.code(202).send({
+    operationId: operation.operation_id,
+    status: operation.status,
+    replayed,
+  });
+});
+
+app.get("/v1/refunds/:operationId", async (request, reply) => {
+  const params = z.object({ operationId: z.uuid() }).parse(request.params);
+  const result = await pool.query<{
+    callback_capability: string;
+    external_refund_id: string;
+    status: "succeeded" | "failed";
+    amount_minor: string;
+    currency: string;
+    occurred_at: Date;
+  }>(
+    `SELECT callback_capability, external_refund_id, status, amount_minor::text,
+            currency, occurred_at
+     FROM mock_refund_operations
+     WHERE operation_id = $1`,
+    [params.operationId],
+  );
+  const row = result.rows[0];
+  if (!row) return reply.code(404).send({ error: "operation not found" });
+  return {
+    callbackCapability: row.callback_capability,
+    externalRefundId: row.external_refund_id,
+    status: row.status,
+    amountMinor: row.amount_minor,
+    currency: row.currency,
+    occurredAt: row.occurred_at.toISOString(),
   };
 });
 

@@ -49,7 +49,7 @@ const fundResolutionSchema = z
     }
   });
 
-async function requireStaffPermission(
+export async function requireStaffPermission(
   pool: DatabasePool,
   user: AuthenticatedUser,
   permission: string,
@@ -72,7 +72,7 @@ async function requireStaffPermission(
   }
 }
 
-async function requireStaffActionLocked(
+export async function requireStaffActionLocked(
   client: DatabaseClient,
   user: AuthenticatedUser,
   permission: string,
@@ -116,7 +116,10 @@ async function requireStaffActionLocked(
   }
 }
 
-async function requireRecentReauth(pool: DatabasePool, user: AuthenticatedUser): Promise<void> {
+export async function requireRecentReauth(
+  pool: DatabasePool,
+  user: AuthenticatedUser,
+): Promise<void> {
   const result = await pool.query(
     `SELECT rg.id
      FROM reauth_grants rg

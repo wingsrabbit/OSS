@@ -85,3 +85,80 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(addFundsStatus.getByText("credited $50.00", { exact: true })).toBeVisible();
   await expect(addFunds.getByText(/Current Credit/)).toContainText("$50.00");
 });
+
+test("staff records a manual refund decision and reloads its history", async ({ page }) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  const decisionIdentity = crypto.randomUUID();
+
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  await expect(
+    admin.getByText("Administrator · audited billing and fulfillment", { exact: true }),
+  ).toBeVisible();
+  await admin
+    .getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill(staffPassword);
+  await admin.getByLabel("Refund reason").fill(
+    `Synthetic browser operator selected no refund for decision ${decisionIdentity}`,
+  );
+
+  const candidate = admin.getByTestId("refund-candidate").first();
+  await expect(candidate).toBeVisible();
+  await candidate.getByRole("button", { name: "Record no refund" }).click();
+  await expect(
+    page.getByText("The audited no-refund decision was recorded without moving money."),
+  ).toBeVisible();
+
+  const latestBeforeReload = admin.getByTestId("refund-status-list").locator("article").first();
+  await expect(latestBeforeReload).toContainText("none · $0.00");
+  await expect(latestBeforeReload).toContainText("Refund declined");
+
+  await page.reload();
+  const latestAfterReload = page
+    .locator("section.admin-panel")
+    .getByTestId("refund-status-list")
+    .locator("article")
+    .first();
+  await expect(latestAfterReload).toContainText("none · $0.00");
+  await expect(latestAfterReload).toContainText("Refund declined");
+});
+
+test("staff sees and adjudicates a persisted Provider refund conflict", async ({ page }) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const holdList = admin.getByTestId("refund-security-hold-list");
+  await expect(holdList).toBeVisible();
+  await expect(holdList.getByRole("heading", { name: "Provider facts requiring human adjudication" }))
+    .toBeVisible();
+  const hold = admin.getByTestId("refund-security-hold").first();
+  await expect(hold).toContainText("Cash outflow is already isolated in discrepancy suspense");
+  await expect(hold.getByRole("button", { name: "Accept authorized outflow" })).toBeVisible();
+  await admin
+    .getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill(staffPassword);
+  await admin
+    .getByLabel("Refund reason")
+    .fill("Synthetic browser operator accepted the exact authorized Provider outflow");
+  await hold.getByRole("button", { name: "Accept authorized outflow" }).click();
+  await expect(
+    page.getByText(/Authorized Provider outflow accepted; suspense was reclassified/),
+  ).toBeVisible();
+  await expect(admin.getByTestId("refund-security-hold")).toHaveCount(0);
+
+  await page.reload();
+  await expect(
+    page.locator("section.admin-panel").getByTestId("refund-security-hold"),
+  ).toHaveCount(0);
+});
