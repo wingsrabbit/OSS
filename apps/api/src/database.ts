@@ -9,7 +9,7 @@ import type { Config } from "./config.js";
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = "007_stage_b_manual_refunds";
+export const REQUIRED_SCHEMA_VERSION = "008_stage_b_refund_reconciliation";
 
 export function createPool(config: Config): DatabasePool {
   return new Pool({
@@ -57,14 +57,14 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       const migration = await readFile(resolve(migrationsDirectory, migrationFile), "utf8");
       await client.query("BEGIN");
       try {
-      const existing = await client.query<{ version: string }>(
-        "SELECT version FROM schema_migrations WHERE version = $1",
-        [version],
-      );
-      if (existing.rowCount === 0) {
-        await client.query(migration);
-        await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [version]);
-      }
+        const existing = await client.query<{ version: string }>(
+          "SELECT version FROM schema_migrations WHERE version = $1",
+          [version],
+        );
+        if (existing.rowCount === 0) {
+          await client.query(migration);
+          await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [version]);
+        }
         await client.query("COMMIT");
       } catch (error) {
         await client.query("ROLLBACK");

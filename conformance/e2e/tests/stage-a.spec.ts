@@ -128,6 +128,69 @@ test("staff records a manual refund decision and reloads its history", async ({ 
   await expect(latestAfterReload).toContainText("Refund declined");
 });
 
+test("staff completes partial failure, full original, and Credit refund page journeys", async ({
+  page,
+}) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const passwordInput = admin.getByPlaceholder("Re-enter password (15-minute fixed window)");
+  const reasonInput = admin.getByLabel("Refund reason");
+  await admin.getByLabel("Refund amount mode").selectOption("partial");
+  await admin.getByLabel("Refund amount in cents").fill("11");
+  await admin.getByLabel("Refund Provider scenario").selectOption("failed");
+  await passwordInput.fill(staffPassword);
+  await reasonInput.fill("Synthetic browser verifies a partial original-payment refund failure");
+  await admin
+    .getByTestId("refund-candidate")
+    .first()
+    .getByRole("button", { name: "Refund original payment" })
+    .click();
+  await expect(passwordInput).toHaveValue("");
+  const failedRefund = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: "original payment · $0.11" })
+    .first();
+  await expect(failedRefund).toContainText("Refund failed", { timeout: 35_000 });
+
+  await admin.getByLabel("Refund amount mode").selectOption("full");
+  await admin.getByLabel("Refund Provider scenario").selectOption("success");
+  await passwordInput.fill(staffPassword);
+  await reasonInput.fill("Synthetic browser verifies a full original-payment refund success");
+  const fullCandidate = admin.getByTestId("refund-candidate").first();
+  const fullRefundableText = await fullCandidate.locator("strong").textContent();
+  const fullAmount = fullRefundableText?.match(/refundable (\$[0-9.]+)/)?.[1];
+  expect(fullAmount).toBeTruthy();
+  const fullStatuses = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: `original payment · ${fullAmount}` });
+  const fullStatusCount = await fullStatuses.count();
+  await fullCandidate.getByRole("button", { name: "Refund original payment" }).click();
+  await expect(passwordInput).toHaveValue("");
+  await expect.poll(() => fullStatuses.count(), { timeout: 35_000 }).toBe(fullStatusCount + 1);
+  await expect(fullStatuses.first()).toContainText("Refund succeeded", { timeout: 35_000 });
+
+  await passwordInput.fill(staffPassword);
+  await reasonInput.fill("Synthetic browser verifies a full refund into customer Credit");
+  const creditCandidate = admin.getByTestId("refund-candidate").first();
+  const creditRefundableText = await creditCandidate.locator("strong").textContent();
+  const creditAmount = creditRefundableText?.match(/refundable (\$[0-9.]+)/)?.[1];
+  expect(creditAmount).toBeTruthy();
+  const creditStatuses = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: `credit · ${creditAmount}` });
+  const creditStatusCount = await creditStatuses.count();
+  await creditCandidate.getByRole("button", { name: "Refund to Credit" }).click();
+  await expect(passwordInput).toHaveValue("");
+  await expect.poll(() => creditStatuses.count()).toBe(creditStatusCount + 1);
+  await expect(creditStatuses.first()).toContainText("Refund succeeded");
+});
+
 test("staff sees and adjudicates a persisted Provider refund conflict", async ({ page }) => {
   const staffEmail = "stage-a-browser-admin@example.invalid";
   const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
@@ -145,6 +208,8 @@ test("staff sees and adjudicates a persisted Provider refund conflict", async ({
   const hold = admin.getByTestId("refund-security-hold").first();
   await expect(hold).toContainText("Cash outflow is already isolated in discrepancy suspense");
   await expect(hold.getByRole("button", { name: "Accept authorized outflow" })).toBeVisible();
+  const acceptedExternalId = (await hold.locator("span.mono").first().textContent())?.split(" · ")[0];
+  expect(acceptedExternalId).toBeTruthy();
   await admin
     .getByPlaceholder("Re-enter password (15-minute fixed window)")
     .fill(staffPassword);
@@ -155,12 +220,84 @@ test("staff sees and adjudicates a persisted Provider refund conflict", async ({
   await expect(
     page.getByText(/Authorized Provider outflow accepted; suspense was reclassified/),
   ).toBeVisible();
-  await expect(admin.getByTestId("refund-security-hold")).toHaveCount(0);
+  await expect(
+    admin.getByTestId("refund-security-hold").filter({ hasText: acceptedExternalId! }),
+  ).toHaveCount(0);
 
   await page.reload();
   await expect(
-    page.locator("section.admin-panel").getByTestId("refund-security-hold"),
+    page
+      .locator("section.admin-panel")
+      .getByTestId("refund-security-hold")
+      .filter({ hasText: acceptedExternalId! }),
   ).toHaveCount(0);
+});
+
+test("staff dismisses then corrects a later-confirmed Provider outflow", async ({ page }) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const passwordInput = admin.getByPlaceholder("Re-enter password (15-minute fixed window)");
+  const reasonInput = admin.getByLabel("Refund reason");
+  const exactHold = admin
+    .getByTestId("refund-security-hold")
+    .filter({ has: page.getByRole("button", { name: "Accept authorized outflow" }) })
+    .first();
+  await expect(exactHold).toBeVisible();
+  await passwordInput.fill(staffPassword);
+  await reasonInput.fill("Synthetic browser dismisses the Provider claim pending later evidence");
+  await exactHold.getByRole("button", { name: "Dismiss Provider claim" }).click();
+  await expect(page.getByText(/Provider claim dismissed; immutable evidence remains/)).toBeVisible();
+  await expect(passwordInput).toHaveValue("");
+
+  const correction = admin.getByTestId("refund-dismissal-correction").first();
+  await expect(correction).toBeVisible();
+  await passwordInput.fill(staffPassword);
+  await reasonInput.fill("Synthetic browser later confirms the dismissed Provider cash outflow");
+  await correction
+    .getByRole("button", { name: "Confirm later evidence of outflow" })
+    .click();
+  await expect(
+    page.getByText(/later-confirmed Provider outflow was restored to discrepancy suspense/),
+  ).toBeVisible();
+  await expect(passwordInput).toHaveValue("");
+  await expect(admin.getByTestId("refund-dismissal-correction")).toHaveCount(0);
+});
+
+test("staff records a verified unexpected Provider outflow without settling the refund", async ({
+  page,
+}) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const unexpectedHold = admin
+    .getByTestId("refund-security-hold")
+    .filter({ hasText: "No automatic financial posting was made for this claim." })
+    .filter({ has: page.getByRole("button", { name: "Record verified unexpected outflow" }) })
+    .first();
+  await expect(unexpectedHold).toContainText("EUR");
+  await admin
+    .getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill(staffPassword);
+  await admin
+    .getByLabel("Refund reason")
+    .fill("Synthetic browser verifies the unexpected wrong-currency Provider outflow");
+  await unexpectedHold
+    .getByRole("button", { name: "Record verified unexpected outflow" })
+    .click();
+  await expect(
+    page.getByText(/Verified unexpected Provider outflow recorded in suspense/),
+  ).toBeVisible();
 });
 
 test("staff retries an exhausted refund with a Provider query only", async ({ page }) => {
@@ -189,4 +326,31 @@ test("staff retries an exhausted refund with a Provider query only", async ({ pa
   await expect(
     page.getByText(/Query-only Provider reconciliation scheduled/),
   ).toBeVisible();
+});
+
+test("staff confirms no outflow for an exhausted manual refund", async ({ page }) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const passwordInput = admin.getByPlaceholder("Re-enter password (15-minute fixed window)");
+  await passwordInput.fill(staffPassword);
+  await admin
+    .getByLabel("Refund reason")
+    .fill("Synthetic browser confirms the exhausted request never caused Provider outflow");
+  const manualRefund = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: "Refund manual" })
+    .filter({ has: page.getByRole("button", { name: "Confirm no Provider outflow" }) })
+    .first();
+  await expect(manualRefund).toBeVisible();
+  await manualRefund.getByRole("button", { name: "Confirm no Provider outflow" }).click();
+  await expect(
+    page.getByText(/No Provider outflow was confirmed with an audited reason/),
+  ).toBeVisible();
+  await expect(passwordInput).toHaveValue("");
 });

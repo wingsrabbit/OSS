@@ -179,6 +179,29 @@ type RefundSecurityHold = {
     dismissProviderClaim: string;
   };
 };
+type RefundDismissalCorrection = {
+  adjudicationId: string;
+  holdId: string;
+  refundId: string;
+  refundVersion: number;
+  invoiceId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  receiptId: string;
+  providerInstallationId: string;
+  providerFact: {
+    factId: string;
+    eventId: string;
+    externalRefundId: string;
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+  };
+  discrepancyId: string | null;
+  dismissalReason: string;
+  dismissedAt: string;
+  impact: string;
+};
 type BillingSummary = {
   currency: string;
   creditBalanceMinor: string;
@@ -329,6 +352,9 @@ export function App() {
   const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
   const [refundRecords, setRefundRecords] = useState<Record<string, RefundRecord>>({});
   const [refundSecurityHolds, setRefundSecurityHolds] = useState<RefundSecurityHold[]>([]);
+  const [refundDismissalCorrections, setRefundDismissalCorrections] = useState<
+    RefundDismissalCorrection[]
+  >([]);
   const [refundAmountMode, setRefundAmountMode] = useState<"full" | "partial">("full");
   const [refundAmountMinor, setRefundAmountMinor] = useState("");
   const [refundReason, setRefundReason] = useState("");
@@ -339,10 +365,14 @@ export function App() {
   const refundInFlight = useRef(new Set<string>());
   const refundAdjudicationInFlight = useRef(new Set<string>());
   const refundManualActionInFlight = useRef(new Set<string>());
+  const refundCorrectionInFlight = useRef(new Set<string>());
   const [refundAdjudicationPendingIds, setRefundAdjudicationPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
   const [refundManualActionPendingIds, setRefundManualActionPendingIds] = useState<
+    ReadonlySet<string>
+  >(new Set());
+  const [refundCorrectionPendingIds, setRefundCorrectionPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
   const [refundPendingReceiptIds, setRefundPendingReceiptIds] = useState<ReadonlySet<string>>(
@@ -575,6 +605,17 @@ export function App() {
     setRefundSecurityHolds(result.items);
   }, [me?.staff]);
 
+  const refreshRefundDismissalCorrections = useCallback(async () => {
+    if (!me?.staff) {
+      setRefundDismissalCorrections([]);
+      return;
+    }
+    const result = await api<{ items: RefundDismissalCorrection[] }>(
+      "/api/v1/admin/refund-dismissal-corrections",
+    );
+    setRefundDismissalCorrections(result.items);
+  }, [me?.staff]);
+
   useEffect(() => {
     void Promise.all([
       refreshManualItems(),
@@ -582,12 +623,14 @@ export function App() {
       refreshRefundCandidates(),
       refreshRefundRecords(),
       refreshRefundSecurityHolds(),
+      refreshRefundDismissalCorrections(),
     ]).catch(() => undefined);
   }, [
     refreshManualItems,
     refreshRefundCandidates,
     refreshRefundRecords,
     refreshRefundSecurityHolds,
+    refreshRefundDismissalCorrections,
     refreshUnclaimedFunds,
   ]);
 
@@ -772,6 +815,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      setAdminPassword("");
       await api(`/api/v1/admin/services/${serviceId}/complete-manual`, {
         method: "POST",
         body: JSON.stringify({ reason: manualReason }),
@@ -793,6 +837,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      setAdminPassword("");
       await api(`/api/v1/admin/client-accounts/${me.clientAccountId}/credit-adjustments`, {
         method: "POST",
         body: JSON.stringify({
@@ -842,6 +887,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      setAdminPassword("");
       const resolution = await api<{ replayed: boolean }>(
         `/api/v1/admin/funds/${item.receiptId}/resolutions`,
         {
@@ -925,6 +971,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      setAdminPassword("");
       const refund = await api<RefundRecord>(
         `/api/v1/admin/invoices/${item.invoiceId}/refunds`,
         {
@@ -1006,6 +1053,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-security-holds/${hold.holdId}/adjudications`,
         {
@@ -1035,6 +1083,7 @@ export function App() {
       setRefundReason("");
       await Promise.all([
         refreshRefundSecurityHolds(),
+        refreshRefundDismissalCorrections(),
         refreshRefundCandidates(),
         refreshRefundRecords(),
       ]);
@@ -1083,6 +1132,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refunds/${refund.refundId}/manual-actions`,
         {
@@ -1120,6 +1170,76 @@ export function App() {
       setRefundManualActionPendingIds((current) => {
         const next = new Set(current);
         next.delete(refund.refundId);
+        return next;
+      });
+    }
+  }
+
+  async function correctDismissedRefundOutflow(item: RefundDismissalCorrection) {
+    if (!me?.staff || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
+    const reason = refundReason.trim();
+    const identity = JSON.stringify({
+      adjudicationId: item.adjudicationId,
+      reason,
+      expectedRefundVersion: item.refundVersion,
+    });
+    refundCorrectionInFlight.current.add(item.adjudicationId);
+    setRefundCorrectionPendingIds((current) => new Set(current).add(item.adjudicationId));
+    setError("");
+    try {
+      const storageKey = await refundIntentStorageKey(`dismissal-correction:${identity}`);
+      let idempotencyKey: string | null = null;
+      try {
+        idempotencyKey = window.localStorage.getItem(storageKey);
+      } catch {
+        idempotencyKey = null;
+      }
+      idempotencyKey ??= crypto.randomUUID();
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The stable server fingerprint still protects this correction.
+      }
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const result = await api<{ replayed: boolean }>(
+        `/api/v1/admin/refund-adjudications/${item.adjudicationId}/corrections`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            reason,
+            idempotencyKey,
+            expectedRefundVersion: item.refundVersion,
+          }),
+        },
+      );
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A retained key can only replay the same immutable correction.
+      }
+      setNotice(
+        result.replayed
+          ? "The same dismissal correction was replayed; cash and capacity were not reduced twice."
+          : "The later-confirmed Provider outflow was restored to discrepancy suspense and same-currency refund capacity.",
+      );
+      setRefundReason("");
+      await Promise.all([
+        refreshRefundDismissalCorrections(),
+        refreshRefundSecurityHolds(),
+        refreshRefundCandidates(),
+        refreshRefundRecords(),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Refund dismissal correction failed");
+    } finally {
+      refundCorrectionInFlight.current.delete(item.adjudicationId);
+      setRefundCorrectionPendingIds((current) => {
+        const next = new Set(current);
+        next.delete(item.adjudicationId);
         return next;
       });
     }
@@ -1544,6 +1664,7 @@ export function App() {
                     refreshRefundCandidates(),
                     refreshRefundRecords(),
                     refreshRefundSecurityHolds(),
+                    refreshRefundDismissalCorrections(),
                   ])
                 }
               >
@@ -1752,6 +1873,51 @@ export function App() {
                             onClick={() => adjudicateRefundHold(hold, "dismiss_provider_claim")}
                           >
                             Dismiss Provider claim
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+              {refundDismissalCorrections.length > 0 && (
+                <div data-testid="refund-dismissal-correction-list">
+                  <h4>Dismissed Provider facts that can be corrected</h4>
+                  <p className="muted">
+                    Use this only after later authoritative evidence confirms the dismissed cash
+                    outflow. The prior decision stays immutable; this adds a compensating journal
+                    and reserves same-currency receipt capacity.
+                  </p>
+                  {refundDismissalCorrections.map((item) => {
+                    const pending = refundCorrectionPendingIds.has(item.adjudicationId);
+                    return (
+                      <article
+                        className="manual-item security-hold-item"
+                        data-testid="refund-dismissal-correction"
+                        key={item.adjudicationId}
+                      >
+                        <div>
+                          <strong>
+                            {item.clientAccountName} · dismissed {usd(item.providerFact.amountMinor)}{" "}
+                            {item.providerFact.currency}
+                          </strong>
+                          <span>Prior reason: {item.dismissalReason}</span>
+                          <span>{item.impact}</span>
+                          <span className="mono">
+                            {item.providerFact.externalRefundId} · event {item.providerFact.eventId}
+                          </span>
+                        </div>
+                        <div className="fund-actions">
+                          <button
+                            className="primary"
+                            disabled={
+                              pending ||
+                              adminPassword.length === 0 ||
+                              refundReason.trim().length < 10
+                            }
+                            onClick={() => correctDismissedRefundOutflow(item)}
+                          >
+                            Confirm later evidence of outflow
                           </button>
                         </div>
                       </article>

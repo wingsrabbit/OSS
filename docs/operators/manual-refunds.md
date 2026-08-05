@@ -7,6 +7,8 @@
 Open the administrator panel and use **Manual refunds**. Every decision requires
 the `billing.refund_manage` permission, an active Session, a password
 confirmation no older than 15 minutes, and a reason of at least 10 characters.
+The browser erases the entered password as soon as reauthentication succeeds;
+it cannot silently reuse a stored password to roll the 15-minute deadline.
 
 The displayed reference amount is advisory. It uses the recurring invoice lines
 and the remaining time of exactly one active service term. The server separately
@@ -80,6 +82,21 @@ Dr mock_cash
 Cr refund_discrepancy_suspense
 ```
 
+If later authoritative evidence proves that a dismissed success really did move
+cash, use **Dismissed Provider facts that can be corrected**. The correction is
+not an edit or deletion of the original adjudication. It is a one-time,
+fact-bound, reauthenticated and version-checked append-only decision:
+
+```text
+Dr refund_discrepancy_suspense
+Cr mock_cash
+```
+
+This restores the real cash reduction exactly once and reserves only a source
+receipt with the same currency. A EUR discrepancy, for example, remains in its
+EUR suspense ledger and is not subtracted from a USD refundable balance without
+an explicit future FX/allocation fact.
+
 Wrong-amount, wrong-currency, or second outflow claims cannot be accepted as the
 authorized refund. After checking independent Provider evidence, the operator
 may instead record a verified unexpected outflow. That action leaves the refund
@@ -102,6 +119,11 @@ or record—with password confirmation and a reason—that external evidence sho
 no outflow occurred. The latter releases capacity by moving the refund to
 `failed`; any later success fact still creates a new sticky receipt hold. Neither
 manual action ever sends another Provider create request.
+
+Database upgrades are forward-only. Migration `007_stage_b_manual_refunds` is
+immutable; the reconciliation and correction changes are applied by
+`008_stage_b_refund_reconciliation`. API and Worker refuse to start until the
+dedicated migration command has installed the exact required version.
 
 A Credit refund is confirmed in one local transaction:
 

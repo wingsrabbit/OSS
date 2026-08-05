@@ -21,6 +21,11 @@ All notable project changes will be documented here. Project release numbering a
   concurrency, semantic replay, and compensating or reclassification journals.
 - Query-only retry and audited no-outflow decisions for refunds whose bounded
   reconciliation exhausted, without replaying the Provider create request.
+- Append-only correction of a dismissed Provider success when later evidence
+  confirms the cash outflow, restoring discrepancy suspense and same-currency
+  receipt capacity without erasing the original decision or posting twice.
+- Forward migration `008_stage_b_refund_reconciliation`, including serialized
+  migration execution and API/Worker fail-closed schema compatibility checks.
 - Add Funds settlement and reconciliation, configured limits, external fees,
   unclaimed-funds review, and audited allocation or Credit conversion.
 - Append-only per-account Credit movements, invoice Credit allocations, and
@@ -46,6 +51,12 @@ All notable project changes will be documented here. Project release numbering a
   cash entries or reuse a dismissed discrepancy. A separately authorized human
   can record a verified unexpected outflow into suspense without creating a
   normal refund settlement.
+- Provider external refund identities are serialized and mutually owned across
+  settlements and discrepancies. A dismissed fact can be corrected once with
+  reauthentication, version conflict protection, a reason, and an append-only
+  compensating journal; wrong-currency suspense is never summed as USD capacity.
+- The web client erases a successfully used password immediately, so repeated
+  high-risk actions cannot silently renew the fixed 15-minute reauth window.
 - Original-payment refunds use the receipt's Provider and external payment
   identity, call Provider create at most once, and reconcile unknown results by
   query. Third-party destinations are rejected until authenticated ticket

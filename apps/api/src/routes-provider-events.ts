@@ -1557,6 +1557,15 @@ export async function registerProviderEventRoutes(
                 AND adjudication.decision = 'record_unexpected_outflow'
                WHERE unexpected_refund.source_fund_receipt_id = receipt.id
                  AND discrepancy.currency = receipt.currency
+               UNION ALL
+               SELECT corrected_discrepancy.amount_minor
+               FROM refunds corrected_refund
+               JOIN refund_discrepancy_settlements corrected_discrepancy
+                 ON corrected_discrepancy.refund_id = corrected_refund.id
+               JOIN refund_adjudication_corrections correction
+                 ON correction.discrepancy_settlement_id = corrected_discrepancy.id
+               WHERE corrected_refund.source_fund_receipt_id = receipt.id
+                 AND corrected_discrepancy.currency = receipt.currency
              ) recorded_outflow
            ), 0)::text AS settled_minor,
            EXISTS (
