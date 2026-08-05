@@ -162,3 +162,31 @@ test("staff sees and adjudicates a persisted Provider refund conflict", async ({
     page.locator("section.admin-panel").getByTestId("refund-security-hold"),
   ).toHaveCount(0);
 });
+
+test("staff retries an exhausted refund with a Provider query only", async ({ page }) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  await admin
+    .getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill(staffPassword);
+  await admin
+    .getByLabel("Refund reason")
+    .fill("Synthetic browser operator retried the exhausted Provider query only");
+  const manualRefund = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: "Refund manual" })
+    .filter({ has: page.getByRole("button", { name: "Retry Provider query only" }) })
+    .first();
+  await expect(manualRefund).toBeVisible();
+  await manualRefund.getByRole("button", { name: "Retry Provider query only" }).click();
+  await expect(
+    page.getByText(/Query-only Provider reconciliation scheduled/),
+  ).toBeVisible();
+});

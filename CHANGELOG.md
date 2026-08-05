@@ -19,6 +19,8 @@ All notable project changes will be documented here. Project release numbering a
 - An append-only refund security-hold queue with impact preview, independent
   adjudication permission, fixed-window password confirmation, optimistic
   concurrency, semantic replay, and compensating or reclassification journals.
+- Query-only retry and audited no-outflow decisions for refunds whose bounded
+  reconciliation exhausted, without replaying the Provider create request.
 - Add Funds settlement and reconciliation, configured limits, external fees,
   unclaimed-funds review, and audited allocation or Credit conversion.
 - Append-only per-account Credit movements, invoice Credit allocations, and
@@ -39,8 +41,11 @@ All notable project changes will be documented here. Project release numbering a
   booked to discrepancy suspense, places a sticky receipt hold, and freezes
   competing operations without allowing a Provider callback to clear the hold.
 - Automatic discrepancy posting is limited to one exact authorized outflow per
-  refund. Wrong, extra, duplicate, or reused identities cannot create arbitrary
-  cash entries; only a human adjudication can settle or compensate the hold.
+  refund. Each distinct additional success claim receives its own fact-bound
+  hold; wrong, extra, duplicate, or reused identities cannot create arbitrary
+  cash entries or reuse a dismissed discrepancy. A separately authorized human
+  can record a verified unexpected outflow into suspense without creating a
+  normal refund settlement.
 - Original-payment refunds use the receipt's Provider and external payment
   identity, call Provider create at most once, and reconcile unknown results by
   query. Third-party destinations are rejected until authenticated ticket

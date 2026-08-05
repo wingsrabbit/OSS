@@ -81,13 +81,27 @@ Cr refund_discrepancy_suspense
 ```
 
 Wrong-amount, wrong-currency, or second outflow claims cannot be accepted as the
-authorized refund. Holds and adjudications are both append-only. The active hold
-is derived from a hold that has no adjudication, so page reloads and retries do
-not recreate settlements or journals. Core shows every retained Provider fact,
-allows at most one unresolved hold per refund, and enforces a cumulative
-settlement cap equal to the immutable source receipt. Once every hold on that
-receipt is resolved, possibly sent competing operations resume with a Provider
-query, never a second create call.
+authorized refund. After checking independent Provider evidence, the operator
+may instead record a verified unexpected outflow. That action leaves the refund
+unsettled and records the cash reduction against discrepancy suspense; if that
+cash journal already exists, it is retained rather than posted twice. A later
+financial investigation must clear the suspense with a separate compensating
+decision. Holds and adjudications are both append-only. The active hold is
+derived from a hold that has no adjudication, so page reloads and retries do not
+recreate settlements or journals. Core shows every retained Provider fact,
+creates a separate unresolved hold for every distinct success claim, and binds
+any discrepancy to the exact fact that created that hold. It also enforces a
+cumulative settlement cap equal to the immutable source receipt. Once every hold
+on that receipt is resolved, possibly sent competing operations resume with a
+Provider query, never a second create call.
+
+If bounded Provider queries exhaust without a terminal fact, the refund remains
+`manual` and continues reserving its amount. An administrator with the separate
+adjudication permission can either schedule another query-only reconciliation,
+or record—with password confirmation and a reason—that external evidence shows
+no outflow occurred. The latter releases capacity by moving the refund to
+`failed`; any later success fact still creates a new sticky receipt hold. Neither
+manual action ever sends another Provider create request.
 
 A Credit refund is confirmed in one local transaction:
 

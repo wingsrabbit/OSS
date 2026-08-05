@@ -168,9 +168,14 @@ type RefundSecurityHold = {
     occurredAt: string;
     cashAlreadyPosted: true;
   } | null;
-  allowedDecisions: Array<"accept_authorized_outflow" | "dismiss_provider_claim">;
+  allowedDecisions: Array<
+    | "accept_authorized_outflow"
+    | "record_unexpected_outflow"
+    | "dismiss_provider_claim"
+  >;
   impact: {
     acceptAuthorizedOutflow?: string;
+    recordUnexpectedOutflow?: string;
     dismissProviderClaim: string;
   };
 };
@@ -333,7 +338,11 @@ export function App() {
   const refundIntentKeys = useRef(new Map<string, string>());
   const refundInFlight = useRef(new Set<string>());
   const refundAdjudicationInFlight = useRef(new Set<string>());
+  const refundManualActionInFlight = useRef(new Set<string>());
   const [refundAdjudicationPendingIds, setRefundAdjudicationPendingIds] = useState<
+    ReadonlySet<string>
+  >(new Set());
+  const [refundManualActionPendingIds, setRefundManualActionPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
   const [refundPendingReceiptIds, setRefundPendingReceiptIds] = useState<ReadonlySet<string>>(
@@ -968,7 +977,10 @@ export function App() {
 
   async function adjudicateRefundHold(
     hold: RefundSecurityHold,
-    decision: "accept_authorized_outflow" | "dismiss_provider_claim",
+    decision:
+      | "accept_authorized_outflow"
+      | "record_unexpected_outflow"
+      | "dismiss_provider_claim",
   ) {
     if (!me?.staff || refundAdjudicationInFlight.current.has(hold.holdId)) return;
     const reason = refundReason.trim();
@@ -1016,7 +1028,9 @@ export function App() {
           ? "The same hold adjudication was replayed; no second settlement or journal was created."
           : decision === "accept_authorized_outflow"
             ? "Authorized Provider outflow accepted; suspense was reclassified without reducing cash again."
-            : "Provider claim dismissed; immutable evidence remains and any suspense was compensated.",
+            : decision === "record_unexpected_outflow"
+              ? "Verified unexpected Provider outflow recorded in suspense without creating a refund settlement."
+              : "Provider claim dismissed; immutable evidence remains and any suspense was compensated.",
       );
       setRefundReason("");
       await Promise.all([
@@ -1031,6 +1045,81 @@ export function App() {
       setRefundAdjudicationPendingIds((current) => {
         const next = new Set(current);
         next.delete(hold.holdId);
+        return next;
+      });
+    }
+  }
+
+  async function recoverManualRefund(
+    refund: RefundRecord,
+    action: "retry_query" | "confirm_no_outflow",
+  ) {
+    if (!me?.staff || refundManualActionInFlight.current.has(refund.refundId)) return;
+    const reason = refundReason.trim();
+    const identity = JSON.stringify({
+      refundId: refund.refundId,
+      action,
+      reason,
+      expectedRefundVersion: refund.version,
+    });
+    refundManualActionInFlight.current.add(refund.refundId);
+    setRefundManualActionPendingIds((current) => new Set(current).add(refund.refundId));
+    setError("");
+    try {
+      const storageKey = await refundIntentStorageKey(`manual-action:${identity}`);
+      let idempotencyKey: string | null = null;
+      try {
+        idempotencyKey = window.localStorage.getItem(storageKey);
+      } catch {
+        idempotencyKey = null;
+      }
+      idempotencyKey ??= crypto.randomUUID();
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The stable in-flight identity and server key still protect the current action.
+      }
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      const result = await api<{ replayed: boolean }>(
+        `/api/v1/admin/refunds/${refund.refundId}/manual-actions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            reason,
+            idempotencyKey,
+            expectedRefundVersion: refund.version,
+          }),
+        },
+      );
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A retained key can only replay this same manual action.
+      }
+      setNotice(
+        result.replayed
+          ? "The same manual refund action was replayed; no duplicate query or decision occurred."
+          : action === "retry_query"
+            ? "Query-only Provider reconciliation scheduled; the refund create request will not be sent again."
+            : "No Provider outflow was confirmed with an audited reason; a late success will still enter security hold.",
+      );
+      setRefundReason("");
+      await Promise.all([
+        refreshRefundRecords(),
+        refreshRefundCandidates(),
+        refreshRefundSecurityHolds(),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Manual refund action failed");
+    } finally {
+      refundManualActionInFlight.current.delete(refund.refundId);
+      setRefundManualActionPendingIds((current) => {
+        const next = new Set(current);
+        next.delete(refund.refundId);
         return next;
       });
     }
@@ -1632,6 +1721,9 @@ export function App() {
                           {hold.impact.acceptAuthorizedOutflow && (
                             <span>{hold.impact.acceptAuthorizedOutflow}</span>
                           )}
+                          {hold.impact.recordUnexpectedOutflow && (
+                            <span>{hold.impact.recordUnexpectedOutflow}</span>
+                          )}
                         </div>
                         <div className="fund-actions">
                           {hold.allowedDecisions.includes("accept_authorized_outflow") && (
@@ -1643,6 +1735,16 @@ export function App() {
                               }
                             >
                               Accept authorized outflow
+                            </button>
+                          )}
+                          {hold.allowedDecisions.includes("record_unexpected_outflow") && (
+                            <button
+                              disabled={disabled}
+                              onClick={() =>
+                                adjudicateRefundHold(hold, "record_unexpected_outflow")
+                              }
+                            >
+                              Record verified unexpected outflow
                             </button>
                           )}
                           <button
@@ -1660,7 +1762,11 @@ export function App() {
               {Object.values(refundRecords).length > 0 && (
                 <div data-testid="refund-status-list">
                   {Object.values(refundRecords).map((refund) => (
-                    <article className="manual-item" key={refund.refundId}>
+                    <article
+                      className="manual-item"
+                      data-testid="refund-status"
+                      key={refund.refundId}
+                    >
                       <div>
                         <strong>
                           {refund.destination.replaceAll("_", " ")} · {usd(refund.amountMinor)}
@@ -1682,6 +1788,33 @@ export function App() {
                         )}
                         {refund.lastError && <span>{refund.lastError}</span>}
                       </div>
+                      {refund.status === "manual" &&
+                        !refund.securityHold &&
+                        refund.destination === "original_payment" && (
+                          <div className="fund-actions">
+                            <button
+                              className="primary"
+                              disabled={
+                                refundManualActionPendingIds.has(refund.refundId) ||
+                                adminPassword.length === 0 ||
+                                refundReason.trim().length < 10
+                              }
+                              onClick={() => recoverManualRefund(refund, "retry_query")}
+                            >
+                              Retry Provider query only
+                            </button>
+                            <button
+                              disabled={
+                                refundManualActionPendingIds.has(refund.refundId) ||
+                                adminPassword.length === 0 ||
+                                refundReason.trim().length < 10
+                              }
+                              onClick={() => recoverManualRefund(refund, "confirm_no_outflow")}
+                            >
+                              Confirm no Provider outflow
+                            </button>
+                          </div>
+                        )}
                     </article>
                   ))}
                 </div>

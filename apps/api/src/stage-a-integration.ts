@@ -158,7 +158,11 @@ type RefundSecurityHold = {
     currency: string;
   }>;
   discrepancy: { discrepancyId: string; amountMinor: string; currency: string } | null;
-  allowedDecisions: Array<"accept_authorized_outflow" | "dismiss_provider_claim">;
+  allowedDecisions: Array<
+    | "accept_authorized_outflow"
+    | "record_unexpected_outflow"
+    | "dismiss_provider_claim"
+  >;
 };
 
 async function request<T>(
@@ -329,7 +333,10 @@ async function submitRefundFact(
 
 async function adjudicateRefundHold(
   hold: RefundSecurityHold,
-  decision: "accept_authorized_outflow" | "dismiss_provider_claim",
+  decision:
+    | "accept_authorized_outflow"
+    | "record_unexpected_outflow"
+    | "dismiss_provider_claim",
   reason: string,
   idempotencyKey = randomUUID(),
   expectedStatus = 201,
@@ -3721,7 +3728,12 @@ await request(
 const refundOrder = await createOrder(automaticPrice.id, legal);
 const paidRefundOrder = await pay(refundOrder, "success");
 assert.equal(paidRefundOrder.invoice.status, "paid");
-assert.equal(paidRefundOrder.service.status, "active");
+const activeRefundOrder = await waitFor(
+  "refund source service activation",
+  () => request<OrderDetail>(`/api/v1/orders/${refundOrder.order.id}`),
+  (current) => current.service.status === "active",
+);
+assert.equal(activeRefundOrder.service.status, "active");
 const refundCandidates = await request<{ items: RefundCandidate[] }>(
   "/api/v1/admin/refund-candidates",
 );
@@ -4504,7 +4516,7 @@ try {
   assert.equal(securityAccounting.rows[0]?.provider_facts, "6");
   assert.equal(securityAccounting.rows[0]?.conflicting_event_facts, "2");
   assert.equal(securityAccounting.rows[0]?.discrepancy_settlements, "1");
-  assert.equal(securityAccounting.rows[0]?.receipt_security_holds, "2");
+  assert.equal(securityAccounting.rows[0]?.receipt_security_holds, "5");
   assert.equal(securityAccounting.rows[0]?.suspense_debit_minor, "90");
   assert.equal(securityAccounting.rows[0]?.cash_credit_minor, "90");
   const competingProviderCalls = await providerPool.query<{ count: string }>(
@@ -4536,7 +4548,7 @@ try {
   const refundSecurityHolds = activeSecurityHolds.items.filter(
     (hold) => hold.refundId === failedThenSucceeded.refundId,
   );
-  assert.equal(refundSecurityHolds.length, 1);
+  assert.equal(refundSecurityHolds.length, 4);
   const acceptableHold = refundSecurityHolds.find((hold) =>
     hold.allowedDecisions.includes("accept_authorized_outflow"),
   );
@@ -4588,15 +4600,39 @@ try {
   const holdsAfterAccept = await request<{ items: RefundSecurityHold[] }>(
     "/api/v1/admin/refund-security-holds",
   );
+  const remainingProviderClaims = holdsAfterAccept.items.filter(
+    (hold) => hold.refundId === failedThenSucceeded.refundId,
+  );
+  assert.equal(remainingProviderClaims.length, 3);
+  for (const remainingProviderClaim of remainingProviderClaims) {
+    assert.equal(remainingProviderClaim.discrepancy, null);
+    assert.deepEqual(remainingProviderClaim.allowedDecisions, [
+      "record_unexpected_outflow",
+      "dismiss_provider_claim",
+    ]);
+    await adjudicateRefundHold(
+      remainingProviderClaim,
+      "dismiss_provider_claim",
+      "Synthetic human dismissed one additional unverified Provider success claim",
+    );
+  }
+  const holdsAfterProviderClaimDismissals = await request<{
+    items: RefundSecurityHold[];
+  }>("/api/v1/admin/refund-security-holds");
   assert.equal(
-    holdsAfterAccept.items.some((hold) => hold.refundId === failedThenSucceeded.refundId),
+    holdsAfterProviderClaimDismissals.items.some(
+      (hold) => hold.refundId === failedThenSucceeded.refundId,
+    ),
     false,
   );
-  const overCapacityHold = holdsAfterAccept.items.find(
+  const overCapacityHold = holdsAfterProviderClaimDismissals.items.find(
     (hold) => hold.refundId === competingPossiblySent.refundId,
   );
   assert.ok(overCapacityHold);
-  assert.deepEqual(overCapacityHold.allowedDecisions, ["dismiss_provider_claim"]);
+  assert.deepEqual(overCapacityHold.allowedDecisions, [
+    "record_unexpected_outflow",
+    "dismiss_provider_claim",
+  ]);
   assert.equal(overCapacityHold.confirmedSettlementMinor, "90");
   await adjudicateRefundHold(
     overCapacityHold,
@@ -4648,15 +4684,18 @@ try {
         start_status: string;
         reconcile_status: string;
         reconcile_attempts: number;
+        still_frozen: boolean;
       }>(
         `SELECT
            start_job.status AS start_status,
            reconcile_job.status AS reconcile_status,
-           reconcile_job.attempts AS reconcile_attempts
+           reconcile_job.attempts AS reconcile_attempts,
+           refund.result ? 'frozenByRefundId' AS still_frozen
          FROM durable_jobs start_job
          JOIN durable_jobs reconcile_job
            ON reconcile_job.job_type = 'refund.reconcile'
           AND reconcile_job.unique_key = start_job.unique_key
+         JOIN refunds refund ON refund.id = $1
          WHERE start_job.job_type = 'refund.start'
            AND start_job.payload->>'refundId' = $1`,
         [competingResumable.refundId],
@@ -4669,23 +4708,40 @@ try {
     15_000,
   );
   assert.ok(resumedQueryOnly);
+  assert.equal(resumedQueryOnly.still_frozen, false);
   const resumedProviderCreates = await providerPool.query<{ count: string }>(
     `SELECT count(*)::text AS count FROM mock_refund_operations WHERE refund_id = $1`,
     [competingResumable.refundId],
   );
   assert.equal(resumedProviderCreates.rows[0]?.count, "0");
-  const resumedFailure = await submitRefundFact({
-    eventId: `refund-resumed-query-failed:${randomUUID()}`,
-    providerOperationId: competingResumable.providerOperationId,
-    refundId: competingResumable.refundId,
-    externalRefundId: `mock-refund-resumed-failed:${competingResumable.refundId}`,
-    status: "failed",
-    amountMinor: "20",
-    currency: "USD",
-    occurredAt: new Date().toISOString(),
-  });
-  assert.equal(resumedFailure.status, 202);
-  assert.equal(resumedFailure.body.status, "failed");
+  const resumableManual = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}`,
+  );
+  assert.equal(resumableManual.status, "manual");
+  assert.equal(resumableManual.securityHold, false);
+  const confirmedNoOutflow = await request<{
+    action: string;
+    status: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}/manual-actions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "confirm_no_outflow",
+        reason: "Synthetic administrator confirmed the query-only operation never left cash",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: resumableManual.version,
+      }),
+    },
+    201,
+  );
+  assert.equal(confirmedNoOutflow.action, "confirm_no_outflow");
+  assert.equal(confirmedNoOutflow.status, "confirmed_no_outflow");
+  const confirmedNoOutflowRefund = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}`,
+  );
+  assert.equal(confirmedNoOutflowRefund.status, "failed");
   const afterAdjudication = await request<RefundRecord>(
     `/api/v1/admin/refunds/${failedThenSucceeded.refundId}`,
   );
@@ -4761,7 +4817,7 @@ try {
     [failedThenSucceeded.refundId],
   );
   assert.equal(adjudicationAccounting.rows[0]?.settlements, "1");
-  assert.equal(adjudicationAccounting.rows[0]?.adjudications, "1");
+  assert.equal(adjudicationAccounting.rows[0]?.adjudications, "4");
   assert.equal(adjudicationAccounting.rows[0]?.discrepancy_cash_credit, "90");
   assert.equal(adjudicationAccounting.rows[0]?.suspense_debit, "90");
   assert.equal(adjudicationAccounting.rows[0]?.suspense_credit, "90");
@@ -4879,6 +4935,61 @@ try {
   assert.equal(externalReuseResolved.status, "failed");
   assert.equal(externalReuseResolved.securityHold, false);
 
+  const settledExternalIdReuse = await submitRefundFact({
+    eventId: `refund-success-settled-external-reuse:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: originalSuccessRefund.externalRefundId,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 500).toISOString(),
+  });
+  assert.equal(settledExternalIdReuse.status, 202);
+  assert.equal(settledExternalIdReuse.body.status, "manual");
+  assert.equal(settledExternalIdReuse.body.reason, "refund.external_id_conflict");
+  const settledExternalIdReuseHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const settledExternalIdReuseHold = settledExternalIdReuseHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(settledExternalIdReuseHold);
+  const rejectedSettledExternalIdRecord = await rawCoreRequest(
+    `/api/v1/admin/refund-security-holds/${settledExternalIdReuseHold.holdId}/adjudications`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision: "record_unexpected_outflow",
+        reason: "Synthetic reused Provider identity must never reduce mock cash twice",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: settledExternalIdReuseHold.refundVersion,
+      }),
+    },
+  );
+  assert.equal(rejectedSettledExternalIdRecord.status, 422);
+  assert.equal(rejectedSettledExternalIdRecord.body.code, "REFUND_EXTERNAL_ID_ALREADY_OWNED");
+  const settledExternalOwner = await corePool.query<{
+    settlements: string;
+    discrepancies: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_settlements
+        WHERE provider_installation_id = 'mock-payment-v1'
+          AND external_refund_id = $1) AS settlements,
+       (SELECT count(*)::text FROM refund_discrepancy_settlements
+        WHERE provider_installation_id = 'mock-payment-v1'
+          AND external_refund_id = $1) AS discrepancies`,
+    [originalSuccessRefund.externalRefundId],
+  );
+  assert.equal(settledExternalOwner.rows[0]?.settlements, "1");
+  assert.equal(settledExternalOwner.rows[0]?.discrepancies, "0");
+  await adjudicateRefundHold(
+    settledExternalIdReuseHold,
+    "dismiss_provider_claim",
+    "Synthetic human dismissed a success claim that reused a settled Provider identity",
+  );
+
   const dismissedSuccessOccurredAt = new Date().toISOString();
   const dismissedSuccessExternalId = `mock-refund-dismissed-success:${externalReuseRefund.refundId}`;
   const successAfterDismissal = await submitRefundFact({
@@ -4932,6 +5043,143 @@ try {
     false,
   );
 
+  const secondDistinctSuccess = await submitRefundFact({
+    eventId: `refund-distinct-success-after-dismissal:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: `mock-refund-distinct-after-dismissal:${externalReuseRefund.refundId}`,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 1_000).toISOString(),
+  });
+  assert.equal(secondDistinctSuccess.status, 202);
+  assert.equal(secondDistinctSuccess.body.status, "manual");
+  const distinctSuccessHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const distinctSuccessHold = distinctSuccessHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(distinctSuccessHold);
+  assert.equal(distinctSuccessHold.discrepancy, null);
+  assert.deepEqual(distinctSuccessHold.allowedDecisions, [
+    "record_unexpected_outflow",
+    "dismiss_provider_claim",
+  ]);
+  const rejectedOldDiscrepancyReuse = await rawCoreRequest(
+    `/api/v1/admin/refund-security-holds/${distinctSuccessHold.holdId}/adjudications`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision: "accept_authorized_outflow",
+        reason: "Synthetic old discrepancy must not be accepted for a distinct Provider fact",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: distinctSuccessHold.refundVersion,
+      }),
+    },
+  );
+  assert.equal(rejectedOldDiscrepancyReuse.status, 422);
+  assert.equal(rejectedOldDiscrepancyReuse.body.code, "REFUND_OUTFLOW_NOT_ACCEPTABLE");
+  await adjudicateRefundHold(
+    distinctSuccessHold,
+    "record_unexpected_outflow",
+    "Synthetic human verified the separate unexpected Provider cash outflow",
+  );
+  const recordedUnexpectedOutflow = await corePool.query<{
+    settlements: string;
+    suspense_debit: string;
+    cash_credit: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+       COALESCE((
+         SELECT sum(line.debit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN refund_discrepancy_settlements discrepancy
+           ON discrepancy.id = adjudication.discrepancy_settlement_id
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'refund_discrepancy_suspense'
+         WHERE adjudication.refund_id = $1
+           AND adjudication.decision = 'record_unexpected_outflow'
+       ), '0') AS suspense_debit,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN refund_discrepancy_settlements discrepancy
+           ON discrepancy.id = adjudication.discrepancy_settlement_id
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'mock_cash'
+         WHERE adjudication.refund_id = $1
+           AND adjudication.decision = 'record_unexpected_outflow'
+       ), '0') AS cash_credit`,
+    [externalReuseRefund.refundId],
+  );
+  assert.equal(recordedUnexpectedOutflow.rows[0]?.settlements, "0");
+  assert.equal(recordedUnexpectedOutflow.rows[0]?.suspense_debit, "25");
+  assert.equal(recordedUnexpectedOutflow.rows[0]?.cash_credit, "25");
+
+  const wrongCurrencySuccess = await submitRefundFact({
+    eventId: `refund-wrong-currency-unexpected-outflow:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: `mock-refund-wrong-currency:${externalReuseRefund.refundId}`,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "EUR",
+    occurredAt: new Date(Date.now() + 2_000).toISOString(),
+  });
+  assert.equal(wrongCurrencySuccess.status, 202);
+  assert.equal(wrongCurrencySuccess.body.status, "manual");
+  const wrongCurrencyHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const wrongCurrencyHold = wrongCurrencyHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(wrongCurrencyHold);
+  assert.equal(wrongCurrencyHold.providerFact.currency, "EUR");
+  assert.equal(wrongCurrencyHold.discrepancy, null);
+  await adjudicateRefundHold(
+    wrongCurrencyHold,
+    "record_unexpected_outflow",
+    "Synthetic human verified a wrong-currency Provider outflow without an FX allocation",
+  );
+  const wrongCurrencyLedger = await corePool.query<{
+    suspense_debit: string;
+    cash_credit: string;
+  }>(
+    `SELECT
+       COALESCE(sum(line.debit_minor) FILTER (
+         WHERE line.account_code = 'refund_discrepancy_suspense'
+       ), 0)::text AS suspense_debit,
+       COALESCE(sum(line.credit_minor) FILTER (
+         WHERE line.account_code = 'mock_cash'
+       ), 0)::text AS cash_credit
+     FROM refund_security_hold_adjudications adjudication
+     JOIN refund_discrepancy_settlements discrepancy
+       ON discrepancy.id = adjudication.discrepancy_settlement_id
+      AND discrepancy.currency = 'EUR'
+     JOIN ledger_journals journal
+       ON journal.source_type = 'refund_provider_discrepancy'
+      AND journal.source_id = discrepancy.id
+      AND journal.currency = discrepancy.currency
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE adjudication.refund_id = $1
+       AND adjudication.decision = 'record_unexpected_outflow'`,
+    [externalReuseRefund.refundId],
+  );
+  assert.equal(wrongCurrencyLedger.rows[0]?.suspense_debit, "25");
+  assert.equal(wrongCurrencyLedger.rows[0]?.cash_credit, "25");
+
   const staleStartCandidates = await request<{ items: RefundCandidate[] }>(
     "/api/v1/admin/refund-candidates",
   );
@@ -4939,6 +5187,10 @@ try {
     (candidate) => candidate.receiptId === externalReuseCandidate.receiptId,
   );
   assert.ok(staleStartCandidate);
+  assert.equal(
+    BigInt(staleStartCandidate.refundableMinor),
+    BigInt(externalReuseCandidate.refundableMinor) - 25n,
+  );
   const staleKnownUnsent = await request<RefundRecord>(
     `/api/v1/admin/invoices/${externalReuseOrder.invoice.id}/refunds`,
     {
@@ -5114,6 +5366,38 @@ try {
   assert.equal(recoveredReconcile.operation_status, "unknown");
   assert.equal(recoveredReconcile.events, "1");
   assert.equal(recoveredReconcile.audits, "1");
+  const staleManualRefund = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${staleReconcileRefund.refundId}`,
+  );
+  const retryQueryKey = randomUUID();
+  const retryQueryBody = {
+    action: "retry_query",
+    reason: "Synthetic administrator retried the exhausted refund using Provider query only",
+    idempotencyKey: retryQueryKey,
+    expectedRefundVersion: staleManualRefund.version,
+  };
+  const retryQuery = await request<{ actionId: string; status: string; replayed: boolean }>(
+    `/api/v1/admin/refunds/${staleReconcileRefund.refundId}/manual-actions`,
+    { method: "POST", body: JSON.stringify(retryQueryBody) },
+    201,
+  );
+  assert.equal(retryQuery.status, "query_scheduled");
+  const retryQueryReplay = await request<{
+    actionId: string;
+    status: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refunds/${staleReconcileRefund.refundId}/manual-actions`,
+    { method: "POST", body: JSON.stringify(retryQueryBody) },
+    200,
+  );
+  assert.equal(retryQueryReplay.actionId, retryQuery.actionId);
+  assert.equal(retryQueryReplay.replayed, true);
+  const staleRetryProviderCreates = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM mock_refund_operations WHERE refund_id = $1`,
+    [staleReconcileRefund.refundId],
+  );
+  assert.equal(staleRetryProviderCreates.rows[0]?.count, "0");
 } finally {
   await dropRefundStartDelay();
 }
@@ -5241,6 +5525,7 @@ assert.ok(browserAdjudicationHold, "the browser journey must receive a persisted
 assert.ok(browserAdjudicationHold.discrepancy);
 assert.deepEqual(browserAdjudicationHold.allowedDecisions, [
   "accept_authorized_outflow",
+  "record_unexpected_outflow",
   "dismiss_provider_claim",
 ]);
 

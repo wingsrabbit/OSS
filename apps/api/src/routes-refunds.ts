@@ -94,7 +94,20 @@ const refundRequestSchema = z
 
 const refundHoldAdjudicationSchema = z
   .object({
-    decision: z.enum(["accept_authorized_outflow", "dismiss_provider_claim"]),
+    decision: z.enum([
+      "accept_authorized_outflow",
+      "record_unexpected_outflow",
+      "dismiss_provider_claim",
+    ]),
+    reason: z.string().trim().min(10).max(1_000),
+    idempotencyKey: z.string().min(8).max(128),
+    expectedRefundVersion: z.number().int().positive(),
+  })
+  .strict();
+
+const refundManualActionSchema = z
+  .object({
+    action: z.enum(["retry_query", "confirm_no_outflow"]),
     reason: z.string().trim().min(10).max(1_000),
     idempotencyKey: z.string().min(8).max(128),
     expectedRefundVersion: z.number().int().positive(),
@@ -149,9 +162,22 @@ type RefundHoldAdjudicationRow = {
   id: string;
   receipt_security_hold_id: string;
   refund_id: string;
-  decision: "accept_authorized_outflow" | "dismiss_provider_claim";
+  decision:
+    | "accept_authorized_outflow"
+    | "record_unexpected_outflow"
+    | "dismiss_provider_claim";
   discrepancy_settlement_id: string | null;
   reason: string;
+  request_fingerprint: string;
+  created_at: Date;
+};
+
+type RefundManualActionRow = {
+  id: string;
+  refund_id: string;
+  action: "retry_query" | "confirm_no_outflow";
+  reason: string;
+  idempotency_key: string;
   request_fingerprint: string;
   created_at: Date;
 };
@@ -270,16 +296,25 @@ function refundSecurityHoldResponse(row: RefundSecurityHoldRow): Record<string, 
       ...(exactAuthorizedDiscrepancy && row.refund_status === "manual"
         ? ["accept_authorized_outflow"]
         : []),
+      ...(row.provider_fact_status === "succeeded" ? ["record_unexpected_outflow"] : []),
       "dismiss_provider_claim",
     ],
     impact: exactAuthorizedDiscrepancy
       ? {
           acceptAuthorizedOutflow:
             "Reclassifies discrepancy suspense to sales refunds; mock cash is not reduced again.",
+          recordUnexpectedOutflow:
+            "Keeps the verified cash outflow in discrepancy suspense without settling the refund.",
           dismissProviderClaim:
             "Posts a compensating cash/suspense journal and does not settle the refund.",
         }
       : {
+          ...(row.provider_fact_status === "succeeded"
+            ? {
+                recordUnexpectedOutflow:
+                  "Records the verified cash reduction in discrepancy suspense without settling the refund.",
+              }
+            : {}),
           dismissProviderClaim:
             "Closes this claim without a financial journal; immutable Provider facts remain visible.",
         },
@@ -401,9 +436,22 @@ async function readActiveRefundSecurityHold(
        receipt.amount_minor::text AS receipt_amount_minor,
        COALESCE((
          SELECT sum(confirmed.amount_minor)
-         FROM refunds related_refund
-         JOIN refund_settlements confirmed ON confirmed.refund_id = related_refund.id
-         WHERE related_refund.source_fund_receipt_id = receipt.id
+         FROM (
+           SELECT settlement.amount_minor
+           FROM refunds related_refund
+           JOIN refund_settlements settlement ON settlement.refund_id = related_refund.id
+           WHERE related_refund.source_fund_receipt_id = receipt.id
+           UNION ALL
+           SELECT discrepancy.amount_minor
+           FROM refunds related_refund
+           JOIN refund_discrepancy_settlements discrepancy
+             ON discrepancy.refund_id = related_refund.id
+           JOIN refund_security_hold_adjudications adjudication
+             ON adjudication.discrepancy_settlement_id = discrepancy.id
+            AND adjudication.decision = 'record_unexpected_outflow'
+           WHERE related_refund.source_fund_receipt_id = receipt.id
+             AND discrepancy.currency = receipt.currency
+         ) confirmed
        ), 0)::text AS confirmed_settlement_minor,
        security_hold.refund_id,
        refund.invoice_id,
@@ -459,7 +507,7 @@ async function readActiveRefundSecurityHold(
       AND operation.subject_id = refund.id
       AND operation.kind = 'refund_create'
      LEFT JOIN refund_discrepancy_settlements discrepancy
-       ON discrepancy.refund_id = refund.id
+       ON discrepancy.refund_provider_fact_id = security_hold.refund_provider_fact_id
      LEFT JOIN refund_settlements settlement ON settlement.refund_id = refund.id
      WHERE security_hold.id = $1
        AND NOT EXISTS (
@@ -508,9 +556,22 @@ export async function registerRefundRoutes(
          receipt.amount_minor::text AS receipt_amount_minor,
          COALESCE((
            SELECT sum(confirmed.amount_minor)
-           FROM refunds related_refund
-           JOIN refund_settlements confirmed ON confirmed.refund_id = related_refund.id
-           WHERE related_refund.source_fund_receipt_id = receipt.id
+           FROM (
+             SELECT settlement.amount_minor
+             FROM refunds related_refund
+             JOIN refund_settlements settlement ON settlement.refund_id = related_refund.id
+             WHERE related_refund.source_fund_receipt_id = receipt.id
+             UNION ALL
+             SELECT discrepancy.amount_minor
+             FROM refunds related_refund
+             JOIN refund_discrepancy_settlements discrepancy
+               ON discrepancy.refund_id = related_refund.id
+             JOIN refund_security_hold_adjudications adjudication
+               ON adjudication.discrepancy_settlement_id = discrepancy.id
+              AND adjudication.decision = 'record_unexpected_outflow'
+             WHERE related_refund.source_fund_receipt_id = receipt.id
+               AND discrepancy.currency = receipt.currency
+           ) confirmed
          ), 0)::text AS confirmed_settlement_minor,
          security_hold.refund_id,
          refund.invoice_id,
@@ -566,7 +627,7 @@ export async function registerRefundRoutes(
         AND operation.subject_id = refund.id
         AND operation.kind = 'refund_create'
        LEFT JOIN refund_discrepancy_settlements discrepancy
-         ON discrepancy.refund_id = refund.id
+         ON discrepancy.refund_provider_fact_id = security_hold.refund_provider_fact_id
        LEFT JOIN refund_settlements settlement ON settlement.refund_id = refund.id
        WHERE NOT EXISTS (
          SELECT 1
@@ -641,19 +702,30 @@ export async function registerRefundRoutes(
         const pointer = await client.query<{
           refund_id: string;
           source_fund_receipt_id: string;
+          external_refund_id: string;
+          provider_installation_id: string;
         }>(
-          `SELECT refund_id, source_fund_receipt_id
-           FROM refund_receipt_security_holds
-           WHERE id = $1`,
+          `SELECT security_hold.refund_id, security_hold.source_fund_receipt_id,
+                  fact.external_refund_id, fact.provider_installation_id
+           FROM refund_receipt_security_holds security_hold
+           JOIN refund_provider_facts fact
+             ON fact.id = security_hold.refund_provider_fact_id
+            AND fact.refund_id = security_hold.refund_id
+           WHERE security_hold.id = $1`,
           [params.holdId],
         );
         const target = pointer.rows[0];
         if (!target) {
           throw Object.assign(new Error("Refund security hold not found"), { statusCode: 404 });
         }
-        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        for (const lock of [
           `refund:${target.refund_id}`,
-        ]);
+          `refund-external:${target.external_refund_id}`,
+        ].sort()) {
+          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+            lock,
+          ]);
+        }
         await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
           target.source_fund_receipt_id,
         ]);
@@ -691,6 +763,71 @@ export async function registerRefundRoutes(
             { statusCode: 422, code: "REFUND_OUTFLOW_NOT_ACCEPTABLE" },
           );
         }
+        if (
+          body.decision === "record_unexpected_outflow" &&
+          hold.provider_fact_status !== "succeeded"
+        ) {
+          throw Object.assign(
+            new Error("Only a held Provider success fact can be recorded as an unexpected outflow"),
+            { statusCode: 422, code: "REFUND_UNEXPECTED_OUTFLOW_NOT_RECORDABLE" },
+          );
+        }
+
+        await client.query("SET LOCAL opensales.refund_human_adjudication = 'on'");
+        let adjudicationDiscrepancyId = hold.discrepancy_id;
+        if (body.decision === "record_unexpected_outflow" && !adjudicationDiscrepancyId) {
+          const existingExternalOwner = await client.query(
+            `SELECT 1
+             FROM (
+               SELECT settlement.provider_installation_id, settlement.external_refund_id
+               FROM refund_settlements settlement
+               WHERE settlement.provider_installation_id = $2
+                 AND settlement.external_refund_id = $1
+               UNION ALL
+               SELECT discrepancy.provider_installation_id, discrepancy.external_refund_id
+               FROM refund_discrepancy_settlements discrepancy
+               WHERE discrepancy.provider_installation_id = $2
+                 AND discrepancy.external_refund_id = $1
+             ) owner
+             LIMIT 1`,
+            [hold.external_refund_id, target.provider_installation_id],
+          );
+          if (existingExternalOwner.rowCount !== 0) {
+            throw Object.assign(
+              new Error(
+                "The Provider external refund identity is already owned and cannot reduce cash again",
+              ),
+              { statusCode: 422, code: "REFUND_EXTERNAL_ID_ALREADY_OWNED" },
+            );
+          }
+          const unexpectedDiscrepancy = await client.query<{ id: string }>(
+            `INSERT INTO refund_discrepancy_settlements(
+               refund_provider_fact_id, refund_id, provider_installation_id,
+               external_refund_id, amount_minor, currency, reason, occurred_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT DO NOTHING
+             RETURNING id`,
+            [
+              hold.provider_fact_id,
+              hold.refund_id,
+              target.provider_installation_id,
+              hold.external_refund_id,
+              hold.provider_amount_minor,
+              hold.provider_currency,
+              body.reason,
+              hold.provider_occurred_at,
+            ],
+          );
+          adjudicationDiscrepancyId = unexpectedDiscrepancy.rows[0]?.id ?? null;
+          if (!adjudicationDiscrepancyId) {
+            throw Object.assign(
+              new Error(
+                "The Provider external refund identity is already owned and cannot reduce cash again",
+              ),
+              { statusCode: 422, code: "REFUND_EXTERNAL_ID_ALREADY_OWNED" },
+            );
+          }
+        }
 
         const adjudicationResult = await client.query<RefundHoldAdjudicationRow>(
           `INSERT INTO refund_security_hold_adjudications(
@@ -704,7 +841,7 @@ export async function registerRefundRoutes(
             hold.hold_id,
             hold.refund_id,
             body.decision,
-            hold.discrepancy_id,
+            adjudicationDiscrepancyId,
             user.userId,
             user.sessionId,
             body.reason,
@@ -721,8 +858,6 @@ export async function registerRefundRoutes(
            ) VALUES ($1, $2, $3)`,
           [body.idempotencyKey, adjudication.id, fingerprint],
         );
-        await client.query("SET LOCAL opensales.refund_human_adjudication = 'on'");
-
         let journalId: string | null = null;
         if (body.decision === "accept_authorized_outflow") {
           const changed = await client.query(
@@ -800,7 +935,7 @@ export async function registerRefundRoutes(
             [hold.refund_id],
           );
         } else {
-          if (hold.discrepancy_id) {
+          if (body.decision === "dismiss_provider_claim" && hold.discrepancy_id) {
             const journal = await client.query<{ id: string }>(
               `INSERT INTO ledger_journals(source_type, source_id, currency, description)
                VALUES (
@@ -818,6 +953,26 @@ export async function registerRefundRoutes(
                  ($1, 'mock_cash', $2, 0),
                  ($1, 'refund_discrepancy_suspense', 0, $2)`,
               [journalId, hold.discrepancy_amount_minor],
+            );
+          }
+          if (body.decision === "record_unexpected_outflow" && !hold.discrepancy_id) {
+            const journal = await client.query<{ id: string }>(
+              `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+               VALUES (
+                 'refund_provider_discrepancy', $1, $2,
+                 'Verified unexpected Provider outflow retained in discrepancy suspense'
+               )
+               RETURNING id`,
+              [adjudicationDiscrepancyId, hold.provider_currency],
+            );
+            journalId = journal.rows[0]?.id ?? null;
+            if (!journalId) throw new Error("Unable to create unexpected-outflow journal");
+            await client.query(
+              `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+               VALUES
+                 ($1, 'refund_discrepancy_suspense', $2, 0),
+                 ($1, 'mock_cash', 0, $2)`,
+              [journalId, hold.provider_amount_minor],
             );
           }
           const remainingRefundHolds = await client.query(
@@ -838,21 +993,32 @@ export async function registerRefundRoutes(
             await client.query(
               `UPDATE refunds
                SET status = 'failed', security_hold = false,
-                   last_error = 'Provider claim dismissed after human reconciliation',
-                   result = result || $2::jsonb,
+                   last_error = $2,
+                   result = (result - 'frozenByRefundId') || $3::jsonb,
                    updated_at = now(), version = version + 1
-               WHERE id = $1 AND version = $3`,
+               WHERE id = $1 AND version = $4`,
               [
                 hold.refund_id,
-                JSON.stringify({ adjudicationId: adjudication.id, providerClaimDismissed: true }),
+                body.decision === "record_unexpected_outflow"
+                  ? "Unexpected Provider outflow recorded for manual financial reconciliation"
+                  : "Provider claim dismissed after human reconciliation",
+                JSON.stringify({
+                  adjudicationId: adjudication.id,
+                  providerClaimDismissed: body.decision === "dismiss_provider_claim",
+                  unexpectedOutflowRecorded: body.decision === "record_unexpected_outflow",
+                }),
                 body.expectedRefundVersion,
               ],
             );
             await client.query(
               `UPDATE provider_operations
-               SET status = 'failed', last_error = $2, updated_at = now()
+               SET status = $2, last_error = $3, updated_at = now()
                WHERE id = $1 AND status <> 'succeeded'`,
-              [hold.provider_operation_id, body.reason],
+              [
+                hold.provider_operation_id,
+                body.decision === "record_unexpected_outflow" ? "unknown" : "failed",
+                body.reason,
+              ],
             );
             await client.query(
               `UPDATE durable_jobs
@@ -880,7 +1046,7 @@ export async function registerRefundRoutes(
               decision: body.decision,
               providerFactId: hold.provider_fact_id,
               discrepancyProviderFactId: hold.discrepancy_provider_fact_id,
-              discrepancySettlementId: hold.discrepancy_id,
+              discrepancySettlementId: adjudicationDiscrepancyId,
               journalId,
             },
           ],
@@ -917,7 +1083,7 @@ export async function registerRefundRoutes(
             await client.query(
               `UPDATE refunds
                SET last_error = 'Receipt hold resolved; safe Provider reconciliation resumed',
-                   result = result || $2::jsonb,
+                   result = (result - 'frozenByRefundId') || $2::jsonb,
                    updated_at = now(), version = version + 1
                WHERE id = $1`,
               [competing.id, JSON.stringify({ resumedByAdjudicationId: adjudication.id })],
@@ -971,7 +1137,7 @@ export async function registerRefundRoutes(
               decision: body.decision,
               providerFactId: hold.provider_fact_id,
               discrepancyProviderFactId: hold.discrepancy_provider_fact_id,
-              discrepancySettlementId: hold.discrepancy_id,
+              discrepancySettlementId: adjudicationDiscrepancyId,
               journalId,
               remainingReceiptHolds: remainingReceiptHolds.rowCount ?? 0,
               resumedRefundIds,
@@ -1065,10 +1231,23 @@ export async function registerRefundRoutes(
                AND manual_refund.status = 'manual'
            ) THEN receipt.amount_minor
            ELSE (
-             SELECT COALESCE(sum(reserved_refund.amount_minor), 0)::bigint
-             FROM refunds reserved_refund
-             WHERE reserved_refund.source_fund_receipt_id = receipt.id
-               AND reserved_refund.status IN ('queued', 'processing', 'unknown', 'succeeded')
+             SELECT COALESCE(sum(reserved_outflow.amount_minor), 0)::bigint
+             FROM (
+               SELECT reserved_refund.amount_minor
+               FROM refunds reserved_refund
+               WHERE reserved_refund.source_fund_receipt_id = receipt.id
+                 AND reserved_refund.status IN ('queued', 'processing', 'unknown', 'succeeded')
+               UNION ALL
+               SELECT discrepancy.amount_minor
+               FROM refunds unexpected_refund
+               JOIN refund_discrepancy_settlements discrepancy
+                 ON discrepancy.refund_id = unexpected_refund.id
+               JOIN refund_security_hold_adjudications adjudication
+                 ON adjudication.discrepancy_settlement_id = discrepancy.id
+                AND adjudication.decision = 'record_unexpected_outflow'
+               WHERE unexpected_refund.source_fund_receipt_id = receipt.id
+                 AND discrepancy.currency = receipt.currency
+             ) reserved_outflow
            )
          END AS amount_minor
        ) reserved ON true
@@ -1233,6 +1412,228 @@ export async function registerRefundRoutes(
     return refundResponse(row, false);
   });
 
+  app.post("/api/v1/admin/refunds/:refundId/manual-actions", async (request, reply) => {
+    const user = await requireUser(request, pool, config);
+    await requireStaffPermission(pool, user, "billing.refund_adjudicate");
+    await requireRecentReauth(pool, user);
+    const params = z.object({ refundId: canonicalUuid }).parse(request.params);
+    const body = refundManualActionSchema.parse(request.body);
+    const fingerprint = requestFingerprint("admin.refund-manual-action:v1", {
+      refundId: params.refundId,
+      action: body.action,
+      reason: body.reason,
+    });
+
+    const outcome = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `refund-manual-action:${body.idempotencyKey}`,
+      ]);
+      const existing = await client.query<RefundManualActionRow>(
+        `SELECT id, refund_id, action, reason, idempotency_key, request_fingerprint, created_at
+         FROM refund_manual_actions
+         WHERE idempotency_key = $1`,
+        [body.idempotencyKey],
+      );
+      const replay = existing.rows[0];
+      if (replay) {
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
+        if (replay.refund_id !== params.refundId || replay.request_fingerprint !== fingerprint) {
+          throw Object.assign(new Error("The idempotency key was used for another manual action"), {
+            statusCode: 409,
+            code: "IDEMPOTENCY_CONFLICT",
+          });
+        }
+        return { row: replay, replayed: true };
+      }
+
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `refund:${params.refundId}`,
+      ]);
+      const pointer = await client.query<{ source_fund_receipt_id: string }>(
+        "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
+        [params.refundId],
+      );
+      const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+      if (!receiptId) {
+        throw Object.assign(new Error("Refund not found"), { statusCode: 404 });
+      }
+      await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+      const stateResult = await client.query<{
+        refund_status: string;
+        refund_version: number;
+        refund_security_hold: boolean;
+        destination: string;
+        operation_id: string;
+        operation_status: string;
+        operation_attempt_count: number;
+        active_receipt_hold: boolean;
+      }>(
+        `SELECT
+           refund.status AS refund_status,
+           refund.version AS refund_version,
+           refund.security_hold AS refund_security_hold,
+           refund.destination,
+           operation.id AS operation_id,
+           operation.status AS operation_status,
+           operation.attempt_count AS operation_attempt_count,
+           EXISTS (
+             SELECT 1
+             FROM refund_receipt_security_holds security_hold
+             WHERE security_hold.source_fund_receipt_id = refund.source_fund_receipt_id
+               AND NOT EXISTS (
+                 SELECT 1 FROM refund_security_hold_adjudications adjudication
+                 WHERE adjudication.receipt_security_hold_id = security_hold.id
+               )
+           ) AS active_receipt_hold
+         FROM refunds refund
+         JOIN provider_operations operation
+           ON operation.subject_type = 'refund'
+          AND operation.subject_id = refund.id
+          AND operation.kind = 'refund_create'
+         WHERE refund.id = $1
+         FOR UPDATE OF refund, operation`,
+        [params.refundId],
+      );
+      const state = stateResult.rows[0];
+      if (!state) {
+        throw Object.assign(new Error("Refund Provider operation not found"), { statusCode: 409 });
+      }
+      await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
+      if (state.refund_version !== body.expectedRefundVersion) {
+        throw Object.assign(new Error("The refund changed; refresh before deciding"), {
+          statusCode: 409,
+          code: "REFUND_VERSION_CONFLICT",
+        });
+      }
+      if (
+        state.refund_status !== "manual" ||
+        state.refund_security_hold ||
+        state.active_receipt_hold ||
+        state.destination !== "original_payment" ||
+        state.operation_attempt_count === 0 ||
+        ["succeeded", "failed"].includes(state.operation_status)
+      ) {
+        throw Object.assign(
+          new Error("Only an attempted, unsettled manual refund without a receipt hold can use this action"),
+          { statusCode: 422, code: "REFUND_MANUAL_ACTION_NOT_ALLOWED" },
+        );
+      }
+
+      const inserted = await client.query<RefundManualActionRow>(
+        `INSERT INTO refund_manual_actions(
+           refund_id, action, staff_user_id, staff_session_id, reason,
+           idempotency_key, request_fingerprint, expected_refund_version
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, refund_id, action, reason, idempotency_key,
+                   request_fingerprint, created_at`,
+        [
+          params.refundId,
+          body.action,
+          user.userId,
+          user.sessionId,
+          body.reason,
+          body.idempotencyKey,
+          fingerprint,
+          body.expectedRefundVersion,
+        ],
+      );
+      const action = inserted.rows[0];
+      if (!action) throw new Error("Unable to record manual refund action");
+
+      if (body.action === "retry_query") {
+        await client.query(
+          `UPDATE refunds
+           SET last_error = 'Administrator scheduled a query-only Provider reconciliation',
+               result = result || $2::jsonb, updated_at = now(), version = version + 1
+           WHERE id = $1`,
+          [params.refundId, { manualActionId: action.id, manualQueryScheduled: true }],
+        );
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'unknown', last_error = NULL, updated_at = now()
+           WHERE id = $1`,
+          [state.operation_id],
+        );
+        await client.query(
+          `UPDATE durable_jobs
+           SET status = 'completed', locked_at = NULL, locked_by = NULL, updated_at = now()
+           WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+          [params.refundId],
+        );
+        await client.query(
+          `INSERT INTO durable_jobs(job_type, unique_key, payload, status)
+           VALUES ('refund.reconcile', $1, $2, 'pending')
+           ON CONFLICT (job_type, unique_key) DO UPDATE
+           SET payload = EXCLUDED.payload, status = 'pending', available_at = now(), attempts = 0,
+               locked_at = NULL, locked_by = NULL, last_error = NULL, updated_at = now()`,
+          [
+            `refund:${params.refundId}`,
+            { refundId: params.refundId, operationId: state.operation_id },
+          ],
+        );
+      } else {
+        await client.query(
+          `UPDATE refunds
+           SET status = 'failed', last_error = 'Administrator confirmed no Provider outflow',
+               result = result || $2::jsonb, updated_at = now(), version = version + 1
+           WHERE id = $1`,
+          [params.refundId, { manualActionId: action.id, confirmedNoOutflow: true }],
+        );
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed', last_error = $2, updated_at = now()
+           WHERE id = $1`,
+          [state.operation_id, body.reason],
+        );
+        await client.query(
+          `UPDATE durable_jobs
+           SET status = 'completed', locked_at = NULL, locked_by = NULL,
+               last_error = $2, updated_at = now()
+           WHERE payload->>'refundId' = $1
+             AND job_type IN ('refund.start', 'refund.reconcile')`,
+          [params.refundId, body.reason],
+        );
+      }
+
+      await client.query(
+        `INSERT INTO refund_events(
+           refund_id, event_type, actor_type, actor_id, reason, metadata
+         ) VALUES ($1, $2, 'staff', $3, $4, $5)`,
+        [
+          params.refundId,
+          body.action === "retry_query" ? "manual" : "failed",
+          user.userId,
+          body.reason,
+          { manualActionId: action.id, action: body.action, queryOnly: body.action === "retry_query" },
+        ],
+      );
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('staff', $1, $2, 'refund', $3, $4, $5)`,
+        [
+          user.userId,
+          `refund.manual_${body.action}`,
+          params.refundId,
+          body.reason,
+          { manualActionId: action.id, providerOperationId: state.operation_id },
+        ],
+      );
+      return { row: action, replayed: false };
+    });
+
+    return reply.code(outcome.replayed ? 200 : 201).send({
+      warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+      actionId: outcome.row.id,
+      refundId: outcome.row.refund_id,
+      action: outcome.row.action,
+      status:
+        outcome.row.action === "retry_query" ? "query_scheduled" : "confirmed_no_outflow",
+      replayed: outcome.replayed,
+      createdAt: outcome.row.created_at.toISOString(),
+    });
+  });
+
   app.post("/api/v1/admin/invoices/:invoiceId/refunds", async (request, reply) => {
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_manage");
@@ -1356,11 +1757,24 @@ export async function registerRefundRoutes(
                WHERE manual_refund.source_fund_receipt_id = receipt.id
                  AND manual_refund.status = 'manual'
              ) THEN receipt.amount_minor
-             ELSE (
-               SELECT COALESCE(sum(reserved_refund.amount_minor), 0)::bigint
-               FROM refunds reserved_refund
-               WHERE reserved_refund.source_fund_receipt_id = receipt.id
-                 AND reserved_refund.status IN ('queued', 'processing', 'unknown', 'succeeded')
+           ELSE (
+               SELECT COALESCE(sum(reserved_outflow.amount_minor), 0)::bigint
+               FROM (
+                 SELECT reserved_refund.amount_minor
+                 FROM refunds reserved_refund
+                 WHERE reserved_refund.source_fund_receipt_id = receipt.id
+                   AND reserved_refund.status IN ('queued', 'processing', 'unknown', 'succeeded')
+                 UNION ALL
+                 SELECT discrepancy.amount_minor
+                 FROM refunds unexpected_refund
+                 JOIN refund_discrepancy_settlements discrepancy
+                   ON discrepancy.refund_id = unexpected_refund.id
+                 JOIN refund_security_hold_adjudications adjudication
+                   ON adjudication.discrepancy_settlement_id = discrepancy.id
+                  AND adjudication.decision = 'record_unexpected_outflow'
+                 WHERE unexpected_refund.source_fund_receipt_id = receipt.id
+                   AND discrepancy.currency = receipt.currency
+               ) reserved_outflow
              )
            END AS amount_minor
          ) reserved ON true

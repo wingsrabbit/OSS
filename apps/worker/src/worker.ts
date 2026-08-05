@@ -41,6 +41,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
+const REQUIRED_SCHEMA_VERSION = "007_stage_b_manual_refunds";
 
 type Job = {
   id: string;
@@ -3751,6 +3752,15 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   stopping = true;
 });
+
+const schema = await pool.query<{ version: string | null }>(
+  "SELECT max(version) AS version FROM schema_migrations",
+);
+if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
+  throw new Error(
+    `OpenSales schema ${schema.rows[0]?.version ?? "missing"} is incompatible with worker requirement ${REQUIRED_SCHEMA_VERSION}`,
+  );
+}
 
 console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`);
 let nextRecoveryAt = 0;

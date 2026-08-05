@@ -194,6 +194,14 @@ async function postRefundDiscrepancy(
         OR (
           provider_installation_id = $2
           AND external_refund_id = $3
+        )
+     UNION ALL
+     SELECT id
+     FROM refund_discrepancy_settlements
+     WHERE refund_id = $1
+        OR (
+          provider_installation_id = $2
+          AND external_refund_id = $3
         )`,
     [input.refundId, MOCK_PAYMENT_INSTALLATION_ID, input.externalRefundId],
   );
@@ -346,18 +354,7 @@ async function holdRefundReceipt(
   const inserted = await client.query(
     `INSERT INTO refund_receipt_security_holds(
        source_fund_receipt_id, refund_id, refund_provider_fact_id, reason
-     )
-     SELECT $1, $2, $3, $4
-     WHERE NOT EXISTS (
-       SELECT 1
-       FROM refund_receipt_security_holds active_hold
-       WHERE active_hold.refund_id = $2
-         AND NOT EXISTS (
-           SELECT 1
-           FROM refund_security_hold_adjudications adjudication
-           WHERE adjudication.receipt_security_hold_id = active_hold.id
-         )
-     )
+     ) VALUES ($1, $2, $3, $4)
      ON CONFLICT (refund_provider_fact_id) DO NOTHING
      RETURNING id`,
     [input.receiptId, input.refundId, input.providerFactId, input.reason],
@@ -1383,6 +1380,15 @@ export async function registerProviderEventRoutes(
                 reason: "Provider success arrived while the refund was security-held",
               })
             : false;
+        const additionalHoldCreated =
+          body.status === "succeeded"
+            ? await holdRefundReceipt(client, {
+                receiptId: refund.source_fund_receipt_id,
+                refundId: refund.id,
+                providerFactId,
+                reason: "Additional Provider success arrived while the refund was security-held",
+              })
+            : false;
         await client.query(
           `INSERT INTO refund_events(
              refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
@@ -1396,6 +1402,7 @@ export async function registerProviderEventRoutes(
               status: body.status,
               providerFactId,
               discrepancyPosted,
+              additionalHoldCreated,
               providerOccurredAt: body.occurredAt,
             },
           ],
@@ -1532,7 +1539,26 @@ export async function registerProviderEventRoutes(
       }>(
         `SELECT
            receipt.amount_minor::text AS receipt_amount_minor,
-           COALESCE(sum(settlement.amount_minor), 0)::text AS settled_minor,
+           COALESCE((
+             SELECT sum(recorded_outflow.amount_minor)
+             FROM (
+               SELECT settlement.amount_minor
+               FROM refunds settled_refund
+               JOIN refund_settlements settlement
+                 ON settlement.refund_id = settled_refund.id
+               WHERE settled_refund.source_fund_receipt_id = receipt.id
+               UNION ALL
+               SELECT discrepancy.amount_minor
+               FROM refunds unexpected_refund
+               JOIN refund_discrepancy_settlements discrepancy
+                 ON discrepancy.refund_id = unexpected_refund.id
+               JOIN refund_security_hold_adjudications adjudication
+                 ON adjudication.discrepancy_settlement_id = discrepancy.id
+                AND adjudication.decision = 'record_unexpected_outflow'
+               WHERE unexpected_refund.source_fund_receipt_id = receipt.id
+                 AND discrepancy.currency = receipt.currency
+             ) recorded_outflow
+           ), 0)::text AS settled_minor,
            EXISTS (
              SELECT 1
              FROM refund_receipt_security_holds security_hold
@@ -1544,12 +1570,8 @@ export async function registerProviderEventRoutes(
                )
            ) AS active_security_hold
          FROM fund_receipts receipt
-         LEFT JOIN refunds related_refund
-           ON related_refund.source_fund_receipt_id = receipt.id
-         LEFT JOIN refund_settlements settlement
-           ON settlement.refund_id = related_refund.id
          WHERE receipt.id = $1
-         GROUP BY receipt.id`,
+         FOR UPDATE`,
         [refund.source_fund_receipt_id],
       );
       const capacity = receiptCapacity.rows[0];

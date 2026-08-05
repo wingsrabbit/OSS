@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS refund_provider_facts (
 CREATE TABLE IF NOT EXISTS refund_discrepancy_settlements (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   refund_provider_fact_id uuid NOT NULL UNIQUE REFERENCES refund_provider_facts(id),
-  refund_id uuid NOT NULL UNIQUE REFERENCES refunds(id),
+  refund_id uuid NOT NULL REFERENCES refunds(id),
   provider_installation_id text NOT NULL,
   external_refund_id text NOT NULL,
   amount_minor bigint NOT NULL CHECK (amount_minor > 0),
@@ -179,9 +179,13 @@ CREATE TABLE IF NOT EXISTS refund_security_hold_adjudications (
   receipt_security_hold_id uuid NOT NULL UNIQUE REFERENCES refund_receipt_security_holds(id),
   refund_id uuid NOT NULL REFERENCES refunds(id),
   decision text NOT NULL CHECK (
-    decision IN ('accept_authorized_outflow', 'dismiss_provider_claim')
+    decision IN (
+      'accept_authorized_outflow',
+      'record_unexpected_outflow',
+      'dismiss_provider_claim'
+    )
   ),
-  discrepancy_settlement_id uuid REFERENCES refund_discrepancy_settlements(id),
+  discrepancy_settlement_id uuid UNIQUE REFERENCES refund_discrepancy_settlements(id),
   staff_user_id uuid NOT NULL REFERENCES users(id),
   staff_session_id uuid NOT NULL REFERENCES sessions(id),
   reason text NOT NULL CHECK (length(reason) BETWEEN 10 AND 1000),
@@ -195,6 +199,19 @@ CREATE TABLE IF NOT EXISTS refund_security_adjudication_aliases (
   idempotency_key text PRIMARY KEY CHECK (length(idempotency_key) BETWEEN 8 AND 128),
   adjudication_id uuid NOT NULL REFERENCES refund_security_hold_adjudications(id),
   request_fingerprint text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS refund_manual_actions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  refund_id uuid NOT NULL REFERENCES refunds(id),
+  action text NOT NULL CHECK (action IN ('retry_query', 'confirm_no_outflow')),
+  staff_user_id uuid NOT NULL REFERENCES users(id),
+  staff_session_id uuid NOT NULL REFERENCES sessions(id),
+  reason text NOT NULL CHECK (length(reason) BETWEEN 10 AND 1000),
+  idempotency_key text NOT NULL UNIQUE CHECK (length(idempotency_key) BETWEEN 8 AND 128),
+  request_fingerprint text NOT NULL,
+  expected_refund_version integer NOT NULL CHECK (expected_refund_version > 0),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -214,6 +231,8 @@ CREATE INDEX IF NOT EXISTS refund_receipt_security_holds_receipt_created_idx
   ON refund_receipt_security_holds (source_fund_receipt_id, created_at, id);
 CREATE INDEX IF NOT EXISTS refund_security_hold_adjudications_refund_created_idx
   ON refund_security_hold_adjudications (refund_id, created_at, id);
+CREATE INDEX IF NOT EXISTS refund_manual_actions_refund_created_idx
+  ON refund_manual_actions (refund_id, created_at, id);
 
 CREATE OR REPLACE FUNCTION opensales_validate_refund_insert()
 RETURNS trigger
@@ -295,11 +314,24 @@ BEGIN
   ) THEN
     reserved_minor := receipt_row.amount_minor;
   ELSE
-    SELECT COALESCE(sum(amount_minor), 0)
+    SELECT COALESCE(sum(reserved_outflow.amount_minor), 0)
     INTO reserved_minor
-    FROM refunds
-    WHERE source_fund_receipt_id = NEW.source_fund_receipt_id
-      AND status IN ('queued', 'processing', 'unknown', 'succeeded');
+    FROM (
+      SELECT reserved_refund.amount_minor
+      FROM refunds reserved_refund
+      WHERE reserved_refund.source_fund_receipt_id = NEW.source_fund_receipt_id
+        AND reserved_refund.status IN ('queued', 'processing', 'unknown', 'succeeded')
+      UNION ALL
+      SELECT discrepancy.amount_minor
+      FROM refunds unexpected_refund
+      JOIN refund_discrepancy_settlements discrepancy
+        ON discrepancy.refund_id = unexpected_refund.id
+      JOIN refund_security_hold_adjudications adjudication
+        ON adjudication.discrepancy_settlement_id = discrepancy.id
+       AND adjudication.decision = 'record_unexpected_outflow'
+      WHERE unexpected_refund.source_fund_receipt_id = NEW.source_fund_receipt_id
+        AND discrepancy.currency = receipt_row.currency
+    ) reserved_outflow;
   END IF;
 
   IF NEW.amount_minor > receipt_row.amount_minor - reserved_minor THEN
@@ -454,6 +486,18 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('refund-external:' || NEW.external_refund_id, 0)
+  );
+  IF EXISTS (
+    SELECT 1
+    FROM refund_settlements settlement
+    WHERE settlement.provider_installation_id = NEW.provider_installation_id
+      AND settlement.external_refund_id = NEW.external_refund_id
+  ) THEN
+    RAISE EXCEPTION 'Provider external refund identity already belongs to a refund settlement';
+  END IF;
+
   IF NOT EXISTS (
     SELECT 1
     FROM refund_provider_facts fact
@@ -466,19 +510,27 @@ BEGIN
       AND fact.amount_minor = NEW.amount_minor
       AND fact.currency = NEW.currency
       AND fact.occurred_at = NEW.occurred_at
-      AND refund.amount_minor = NEW.amount_minor
-      AND refund.currency = NEW.currency
-      AND NOT EXISTS (
-        SELECT 1
-        FROM refund_settlements settlement
-        WHERE settlement.refund_id = refund.id
-           OR (
-             settlement.provider_installation_id = NEW.provider_installation_id
-             AND settlement.external_refund_id = NEW.external_refund_id
-           )
-      )
   ) THEN
     RAISE EXCEPTION 'refund discrepancy does not match an immutable success fact';
+  END IF;
+
+  IF current_setting('opensales.refund_human_adjudication', true) IS DISTINCT FROM 'on'
+     AND NOT EXISTS (
+       SELECT 1
+       FROM refunds refund
+       WHERE refund.id = NEW.refund_id
+         AND refund.amount_minor = NEW.amount_minor
+         AND refund.currency = NEW.currency
+         AND NOT EXISTS (
+           SELECT 1 FROM refund_settlements settlement
+           WHERE settlement.refund_id = refund.id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM refund_discrepancy_settlements discrepancy
+           WHERE discrepancy.refund_id = refund.id
+         )
+     ) THEN
+    RAISE EXCEPTION 'automatic refund discrepancy must be the first exact authorized outflow';
   END IF;
   RETURN NEW;
 END;
@@ -506,18 +558,6 @@ BEGIN
     RAISE EXCEPTION 'refund receipt security hold does not match its fact and receipt';
   END IF;
 
-  IF EXISTS (
-    SELECT 1
-    FROM refund_receipt_security_holds active_hold
-    WHERE active_hold.refund_id = NEW.refund_id
-      AND NOT EXISTS (
-        SELECT 1
-        FROM refund_security_hold_adjudications adjudication
-        WHERE adjudication.receipt_security_hold_id = active_hold.id
-      )
-  ) THEN
-    RAISE EXCEPTION 'refund already has an active security hold';
-  END IF;
   RETURN NEW;
 END;
 $$;
@@ -553,6 +593,7 @@ BEGIN
        JOIN refund_discrepancy_settlements discrepancy
          ON discrepancy.id = NEW.discrepancy_settlement_id
         AND discrepancy.refund_id = security_hold.refund_id
+        AND discrepancy.refund_provider_fact_id = security_hold.refund_provider_fact_id
        WHERE security_hold.id = NEW.receipt_security_hold_id
      ) THEN
     RAISE EXCEPTION 'refund hold adjudication discrepancy does not match its immutable fact';
@@ -575,6 +616,20 @@ BEGIN
          )
      ) THEN
     RAISE EXCEPTION 'accepted refund outflow must be exact, authorized, held, and unsettled';
+  END IF;
+
+  IF NEW.decision = 'record_unexpected_outflow'
+     AND NOT EXISTS (
+       SELECT 1
+       FROM refund_receipt_security_holds security_hold
+       JOIN refund_provider_facts fact
+         ON fact.id = security_hold.refund_provider_fact_id
+        AND fact.refund_id = security_hold.refund_id
+       WHERE security_hold.id = NEW.receipt_security_hold_id
+         AND security_hold.refund_id = NEW.refund_id
+         AND fact.status = 'succeeded'
+     ) THEN
+    RAISE EXCEPTION 'unexpected refund outflow requires a held Provider success fact';
   END IF;
 
   RETURN NEW;
@@ -644,6 +699,39 @@ CREATE TRIGGER refund_security_adjudication_alias_insert_guard
 BEFORE INSERT ON refund_security_adjudication_aliases
 FOR EACH ROW EXECUTE FUNCTION opensales_validate_refund_adjudication_alias();
 
+CREATE OR REPLACE FUNCTION opensales_validate_refund_manual_action()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM refunds refund
+    JOIN sessions session_record
+      ON session_record.id = NEW.staff_session_id
+     AND session_record.user_id = NEW.staff_user_id
+    WHERE refund.id = NEW.refund_id
+      AND refund.destination = 'original_payment'
+      AND refund.status = 'manual'
+      AND NOT refund.security_hold
+      AND refund.version = NEW.expected_refund_version
+  ) THEN
+    RAISE EXCEPTION 'manual refund action requires an unsettled manual refund and current staff session';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS refund_manual_action_insert_guard ON refund_manual_actions;
+CREATE TRIGGER refund_manual_action_insert_guard
+BEFORE INSERT ON refund_manual_actions
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_refund_manual_action();
+
+DROP TRIGGER IF EXISTS refund_manual_actions_append_only ON refund_manual_actions;
+CREATE TRIGGER refund_manual_actions_append_only
+BEFORE UPDATE OR DELETE ON refund_manual_actions
+FOR EACH ROW EXECUTE FUNCTION opensales_reject_refund_delete();
+
 CREATE OR REPLACE FUNCTION opensales_validate_refund_settlement()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -653,6 +741,30 @@ DECLARE
   receipt_amount_minor bigint;
   prior_settled_minor bigint;
 BEGIN
+  IF NEW.destination = 'original_payment' THEN
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended('refund-external:' || NEW.external_refund_id, 0)
+    );
+    IF EXISTS (
+      SELECT 1
+      FROM refund_discrepancy_settlements discrepancy
+      WHERE discrepancy.provider_installation_id = NEW.provider_installation_id
+        AND discrepancy.external_refund_id = NEW.external_refund_id
+        AND NOT (
+          discrepancy.refund_id = NEW.refund_id
+          AND EXISTS (
+            SELECT 1
+            FROM refund_security_hold_adjudications adjudication
+            WHERE adjudication.discrepancy_settlement_id = discrepancy.id
+              AND adjudication.refund_id = NEW.refund_id
+              AND adjudication.decision = 'accept_authorized_outflow'
+          )
+        )
+    ) THEN
+      RAISE EXCEPTION 'Provider external refund identity already belongs to a discrepancy';
+    END IF;
+  END IF;
+
   SELECT
     status,
     destination,
@@ -680,11 +792,24 @@ BEGIN
   WHERE id = refund_row.source_fund_receipt_id
   FOR UPDATE;
 
-  SELECT COALESCE(sum(settlement.amount_minor), 0)
+  SELECT COALESCE(sum(recorded_outflow.amount_minor), 0)
   INTO prior_settled_minor
-  FROM refund_settlements settlement
-  JOIN refunds settled_refund ON settled_refund.id = settlement.refund_id
-  WHERE settled_refund.source_fund_receipt_id = refund_row.source_fund_receipt_id;
+  FROM (
+    SELECT settlement.amount_minor
+    FROM refund_settlements settlement
+    JOIN refunds settled_refund ON settled_refund.id = settlement.refund_id
+    WHERE settled_refund.source_fund_receipt_id = refund_row.source_fund_receipt_id
+    UNION ALL
+    SELECT discrepancy.amount_minor
+    FROM refunds unexpected_refund
+    JOIN refund_discrepancy_settlements discrepancy
+      ON discrepancy.refund_id = unexpected_refund.id
+    JOIN refund_security_hold_adjudications adjudication
+      ON adjudication.discrepancy_settlement_id = discrepancy.id
+     AND adjudication.decision = 'record_unexpected_outflow'
+    WHERE unexpected_refund.source_fund_receipt_id = refund_row.source_fund_receipt_id
+      AND discrepancy.currency = refund_row.currency
+  ) recorded_outflow;
 
   IF receipt_amount_minor IS NULL
      OR prior_settled_minor + NEW.amount_minor > receipt_amount_minor THEN
