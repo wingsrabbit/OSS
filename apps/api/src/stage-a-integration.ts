@@ -4795,9 +4795,9 @@ try {
          JOIN durable_jobs reconcile_job
            ON reconcile_job.job_type = 'refund.reconcile'
           AND reconcile_job.unique_key = start_job.unique_key
-         JOIN refunds refund ON refund.id = $1
+         JOIN refunds refund ON refund.id = $1::uuid
          WHERE start_job.job_type = 'refund.start'
-           AND start_job.payload->>'refundId' = $1`,
+           AND start_job.payload->>'refundId' = $1::text`,
         [competingResumable.refundId],
       );
       return result.rows[0];
