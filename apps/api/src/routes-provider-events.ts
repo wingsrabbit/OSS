@@ -1148,9 +1148,10 @@ export async function registerProviderEventRoutes(
         reason: string,
         action: string,
         metadata: Record<string, unknown>,
+        preserveReportedOutflow = true,
       ): Promise<Record<string, unknown>> => {
         const discrepancyPosted =
-          body.status === "succeeded"
+          body.status === "succeeded" && preserveReportedOutflow
             ? await postRefundDiscrepancy(client, {
                 providerFactId,
                 refundId: refund.id,
@@ -1243,9 +1244,10 @@ export async function registerProviderEventRoutes(
         reason: string,
         action: string,
         metadata: Record<string, unknown>,
+        preserveReportedOutflow = true,
       ): Promise<Record<string, unknown>> => {
         const discrepancyPosted =
-          body.status === "succeeded"
+          body.status === "succeeded" && preserveReportedOutflow
             ? await postRefundDiscrepancy(client, {
                 providerFactId,
                 refundId: refund.id,
@@ -1298,6 +1300,43 @@ export async function registerProviderEventRoutes(
           securityHold: true,
         };
       };
+
+      const externalOwner = await client.query<{
+        refund_id: string;
+        source: "settlement" | "discrepancy";
+      }>(
+        `SELECT owner.refund_id, owner.source
+         FROM (
+           SELECT refund_id, 'settlement'::text AS source
+           FROM refund_settlements
+           WHERE provider_installation_id = $1
+             AND external_refund_id = $2
+           UNION ALL
+           SELECT refund_id, 'discrepancy'::text AS source
+           FROM refund_discrepancy_settlements
+           WHERE provider_installation_id = $1
+             AND external_refund_id = $2
+         ) owner
+         WHERE owner.refund_id <> $3
+         LIMIT 1`,
+        [MOCK_PAYMENT_INSTALLATION_ID, body.externalRefundId, refund.id],
+      );
+      if (externalOwner.rows[0]) {
+        const reason = "Provider reused an external refund id already owned by another refund";
+        const metadata = {
+          eventId: body.eventId,
+          ownerRefundId: externalOwner.rows[0].refund_id,
+          ownerSource: externalOwner.rows[0].source,
+        };
+        return refund.status === "succeeded"
+          ? placeSettledReceiptHold(
+              reason,
+              "refund.external_id_conflict",
+              metadata,
+              false,
+            )
+          : placeSecurityHold(reason, "refund.external_id_conflict", metadata, false);
+      }
 
       if (inboxOutcome === "conflict") {
         const reason = "Provider reused a refund event id with conflicting facts";
@@ -1460,38 +1499,6 @@ export async function registerProviderEventRoutes(
             reportedAmountMinor: body.amountMinor,
             expectedCurrency: refund.currency,
             reportedCurrency: body.currency,
-          },
-        );
-      }
-
-      const externalOwner = await client.query<{
-        refund_id: string;
-        source: "settlement" | "discrepancy";
-      }>(
-        `SELECT owner.refund_id, owner.source
-         FROM (
-           SELECT refund_id, 'settlement'::text AS source
-           FROM refund_settlements
-           WHERE provider_installation_id = $1
-             AND external_refund_id = $2
-           UNION ALL
-           SELECT refund_id, 'discrepancy'::text AS source
-           FROM refund_discrepancy_settlements
-           WHERE provider_installation_id = $1
-             AND external_refund_id = $2
-         ) owner
-         WHERE owner.refund_id <> $3
-         LIMIT 1`,
-        [MOCK_PAYMENT_INSTALLATION_ID, body.externalRefundId, refund.id],
-      );
-      if (externalOwner.rows[0]) {
-        return placeSecurityHold(
-          "Provider reused an external refund id already owned by another refund",
-          "refund.external_id_conflict",
-          {
-            eventId: body.eventId,
-            ownerRefundId: externalOwner.rows[0].refund_id,
-            ownerSource: externalOwner.rows[0].source,
           },
         );
       }
