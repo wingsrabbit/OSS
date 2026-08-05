@@ -5404,7 +5404,7 @@ try {
            (SELECT count(*)::text FROM refund_events event
             WHERE event.refund_id = refund.id AND event.event_type = 'failed') AS events,
            (SELECT count(*)::text FROM audit_events audit
-            WHERE audit.target_type = 'refund' AND audit.target_id = refund.id
+            WHERE audit.target_type = 'refund' AND audit.target_id = refund.id::text
               AND audit.action = 'refund.known_unsent_rejected') AS audits
          FROM refunds refund
          JOIN provider_operations operation
@@ -5513,7 +5513,7 @@ try {
            (SELECT count(*)::text FROM refund_events event
             WHERE event.refund_id = refund.id AND event.event_type = 'manual') AS events,
            (SELECT count(*)::text FROM audit_events audit
-            WHERE audit.target_type = 'refund' AND audit.target_id = refund.id
+            WHERE audit.target_type = 'refund' AND audit.target_id = refund.id::text
               AND audit.action = 'refund.reconciliation_exhausted') AS audits
          FROM refunds refund
          JOIN provider_operations operation ON operation.id = $2
