@@ -575,8 +575,10 @@ async function readRefundHoldAdjudication(
   value: string,
 ): Promise<RefundHoldAdjudicationRow | null> {
   const result = await client.query<RefundHoldAdjudicationRow>(
-    `SELECT id, receipt_security_hold_id, refund_id, decision,
-            discrepancy_settlement_id, reason, request_fingerprint, created_at
+    `SELECT adjudication.id, adjudication.receipt_security_hold_id,
+            adjudication.refund_id, adjudication.decision,
+            adjudication.discrepancy_settlement_id, adjudication.reason,
+            adjudication.request_fingerprint, adjudication.created_at
      FROM refund_security_hold_adjudications adjudication
      ${
        clause === "idempotency_key"
