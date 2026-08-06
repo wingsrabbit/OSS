@@ -284,6 +284,53 @@ test("staff dismisses then corrects a later-confirmed Provider outflow", async (
   );
 });
 
+test("staff owns a callback-first receipt overage without hiding recovery", async ({
+  page,
+}) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const incident = admin
+    .getByTestId("refund-receipt-capacity-incident")
+    .filter({ hasText: "receipt overage $0.25" });
+  await expect(incident).toBeVisible();
+  await expect(incident).toContainText("receipt overage $0.25");
+  await expect(incident).toContainText("confirmed compensation");
+  await expect(incident).toContainText(
+    "Acknowledgement preserves every compensation and journal",
+  );
+  await admin
+    .getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill(staffPassword);
+  await admin
+    .getByLabel("Refund reason")
+    .fill("Synthetic browser operator accepts manual recovery of the real receipt overage");
+  await incident
+    .getByRole("button", { name: "Acknowledge and take manual recovery" })
+    .click();
+  await expect(
+    page.getByText(/Receipt overage acknowledged; manual financial recovery remains outstanding/),
+  ).toBeVisible();
+  await expect(incident).toContainText("acknowledged recovery outstanding");
+  await expect(incident).toContainText("Manual recovery remains outstanding");
+  await expect(
+    incident.getByRole("button", { name: "Acknowledge and take manual recovery" }),
+  ).toHaveCount(0);
+
+  await page.reload();
+  const persistedIncident = page
+    .locator("section.admin-panel")
+    .getByTestId("refund-receipt-capacity-incident")
+    .filter({ hasText: "receipt overage $0.25" });
+  await expect(persistedIncident).toContainText("acknowledged recovery outstanding");
+  await expect(persistedIncident).toContainText("Manual recovery remains outstanding");
+});
+
 test("staff records a verified unexpected Provider outflow without settling the refund", async ({
   page,
 }) => {

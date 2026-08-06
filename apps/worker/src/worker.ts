@@ -41,7 +41,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "008_stage_b_refund_reconciliation";
+const REQUIRED_SCHEMA_VERSION = "009_stage_b_refund_capacity_incidents";
 
 type Job = {
   id: string;

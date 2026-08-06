@@ -26,8 +26,14 @@ All notable project changes will be documented here. Project release numbering a
   receipt capacity without erasing the original decision or posting twice; the
   correction freezes competing requests and records the Provider Operation as
   succeeded without mislabeling the intended Refund as successful.
-- Forward migration `008_stage_b_refund_reconciliation`, including serialized
-  migration execution and API/Worker fail-closed schema compatibility checks.
+- Forward migrations `008_stage_b_refund_reconciliation` and
+  `009_stage_b_refund_capacity_incidents`, including serialized migration
+  execution and API/Worker fail-closed schema compatibility checks.
+- Callback-first receipt-capacity incidents retain every established cash or
+  Credit compensation and expose the immutable receipt/confirmed/overage amounts in the administrator
+  page, and require a reauthenticated, reasoned, idempotent acknowledgement for
+  manual financial recovery without changing any financial fact or hiding the
+  still-outstanding recovery.
 - Add Funds settlement and reconciliation, configured limits, external fees,
   unclaimed-funds review, and audited allocation or Credit conversion.
 - Append-only per-account Credit movements, invoice Credit allocations, and
@@ -62,6 +68,11 @@ All notable project changes will be documented here. Project release numbering a
   settlements and discrepancies. A dismissed fact can be corrected once with
   reauthentication, version conflict protection, a reason, and an append-only
   compensating journal; wrong-currency suspense is never summed as USD capacity.
+- A correction that discovers a competing settlement already consumed the
+  receipt creates an append-only overage incident. Its acknowledgement is also
+  append-only, remains operationally visible, and cannot erase cash, Credit,
+  settlements, discrepancies, or journals. A later unexpected outflow creates a
+  new incident rather than mutating the prior snapshot.
 - The web client erases a successfully used password immediately, so repeated
   high-risk actions cannot silently renew the fixed 15-minute reauth window.
 - Original-payment refunds use the receipt's Provider and external payment

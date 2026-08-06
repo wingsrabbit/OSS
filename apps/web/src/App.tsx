@@ -202,6 +202,33 @@ type RefundDismissalCorrection = {
   dismissedAt: string;
   impact: string;
 };
+type RefundReceiptCapacityIncident = {
+  incidentId: string;
+  receiptId: string;
+  source:
+    | { type: "dismissal_correction"; correctionId: string }
+    | { type: "unexpected_outflow_adjudication"; adjudicationId: string };
+  refundId: string;
+  invoiceId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  confirmedCompensationMinor: string;
+  receiptAmountMinor: string;
+  overageMinor: string;
+  currency: string;
+  reason: string;
+  createdAt: string;
+  status: "awaiting_acknowledgement" | "acknowledged_recovery_outstanding";
+  acknowledgement: {
+    acknowledgementId: string;
+    reason: string;
+    createdAt: string;
+    recoveryOutstanding: true;
+  } | null;
+  requiresReauthentication: boolean;
+  allowedAction: "acknowledge_manual_recovery" | null;
+  impact: string;
+};
 type BillingSummary = {
   currency: string;
   creditBalanceMinor: string;
@@ -355,6 +382,9 @@ export function App() {
   const [refundDismissalCorrections, setRefundDismissalCorrections] = useState<
     RefundDismissalCorrection[]
   >([]);
+  const [refundReceiptCapacityIncidents, setRefundReceiptCapacityIncidents] = useState<
+    RefundReceiptCapacityIncident[]
+  >([]);
   const [refundAmountMode, setRefundAmountMode] = useState<"full" | "partial">("full");
   const [refundAmountMinor, setRefundAmountMinor] = useState("");
   const [refundReason, setRefundReason] = useState("");
@@ -366,6 +396,7 @@ export function App() {
   const refundAdjudicationInFlight = useRef(new Set<string>());
   const refundManualActionInFlight = useRef(new Set<string>());
   const refundCorrectionInFlight = useRef(new Set<string>());
+  const refundCapacityAcknowledgementInFlight = useRef(new Set<string>());
   const [refundAdjudicationPendingIds, setRefundAdjudicationPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
@@ -375,6 +406,8 @@ export function App() {
   const [refundCorrectionPendingIds, setRefundCorrectionPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
+  const [refundCapacityAcknowledgementPendingIds, setRefundCapacityAcknowledgementPendingIds] =
+    useState<ReadonlySet<string>>(new Set());
   const [refundPendingReceiptIds, setRefundPendingReceiptIds] = useState<ReadonlySet<string>>(
     new Set(),
   );
@@ -616,6 +649,17 @@ export function App() {
     setRefundDismissalCorrections(result.items);
   }, [me?.staff]);
 
+  const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
+    if (!me?.staff) {
+      setRefundReceiptCapacityIncidents([]);
+      return;
+    }
+    const result = await api<{ items: RefundReceiptCapacityIncident[] }>(
+      "/api/v1/admin/refund-receipt-capacity-incidents",
+    );
+    setRefundReceiptCapacityIncidents(result.items);
+  }, [me?.staff]);
+
   useEffect(() => {
     void Promise.all([
       refreshManualItems(),
@@ -624,6 +668,7 @@ export function App() {
       refreshRefundRecords(),
       refreshRefundSecurityHolds(),
       refreshRefundDismissalCorrections(),
+      refreshRefundReceiptCapacityIncidents(),
     ]).catch(() => undefined);
   }, [
     refreshManualItems,
@@ -631,6 +676,7 @@ export function App() {
     refreshRefundRecords,
     refreshRefundSecurityHolds,
     refreshRefundDismissalCorrections,
+    refreshRefundReceiptCapacityIncidents,
     refreshUnclaimedFunds,
   ]);
 
@@ -1084,6 +1130,7 @@ export function App() {
       await Promise.all([
         refreshRefundSecurityHolds(),
         refreshRefundDismissalCorrections(),
+        refreshRefundReceiptCapacityIncidents(),
         refreshRefundCandidates(),
         refreshRefundRecords(),
       ]);
@@ -1229,6 +1276,7 @@ export function App() {
       setRefundReason("");
       await Promise.all([
         refreshRefundDismissalCorrections(),
+        refreshRefundReceiptCapacityIncidents(),
         refreshRefundSecurityHolds(),
         refreshRefundCandidates(),
         refreshRefundRecords(),
@@ -1240,6 +1288,90 @@ export function App() {
       setRefundCorrectionPendingIds((current) => {
         const next = new Set(current);
         next.delete(item.adjudicationId);
+        return next;
+      });
+    }
+  }
+
+  async function acknowledgeRefundReceiptCapacityIncident(
+    incident: RefundReceiptCapacityIncident,
+  ) {
+    if (
+      !me?.staff ||
+      refundCapacityAcknowledgementInFlight.current.has(incident.incidentId)
+    ) {
+      return;
+    }
+    const reason = refundReason.trim();
+    const identity = JSON.stringify({
+      incidentId: incident.incidentId,
+      reason,
+      expectedConfirmedCompensationMinor: incident.confirmedCompensationMinor,
+      expectedOverageMinor: incident.overageMinor,
+    });
+    refundCapacityAcknowledgementInFlight.current.add(incident.incidentId);
+    setRefundCapacityAcknowledgementPendingIds((current) =>
+      new Set(current).add(incident.incidentId),
+    );
+    setError("");
+    try {
+      const storageKey = await refundIntentStorageKey(`capacity-acknowledgement:${identity}`);
+      let idempotencyKey: string | null = null;
+      try {
+        idempotencyKey = window.localStorage.getItem(storageKey);
+      } catch {
+        idempotencyKey = null;
+      }
+      idempotencyKey ??= crypto.randomUUID();
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The stable server fingerprint still protects this acknowledgement.
+      }
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const result = await api<{ replayed: boolean }>(
+        `/api/v1/admin/refund-receipt-capacity-incidents/${incident.incidentId}/acknowledgements`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            reason,
+            idempotencyKey,
+            expectedConfirmedCompensationMinor: incident.confirmedCompensationMinor,
+            expectedOverageMinor: incident.overageMinor,
+          }),
+        },
+      );
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A retained key can only replay the same acknowledgement.
+      }
+      setNotice(
+        result.replayed
+          ? "The same receipt overage acknowledgement was replayed; no financial fact changed."
+          : "Receipt overage acknowledged; manual financial recovery remains outstanding and visible.",
+      );
+      setRefundReason("");
+      await Promise.all([
+        refreshRefundReceiptCapacityIncidents(),
+        refreshRefundCandidates(),
+        refreshRefundRecords(),
+      ]);
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Refund receipt capacity acknowledgement failed",
+      );
+    } finally {
+      refundCapacityAcknowledgementInFlight.current.delete(incident.incidentId);
+      setRefundCapacityAcknowledgementPendingIds((current) => {
+        const next = new Set(current);
+        next.delete(incident.incidentId);
         return next;
       });
     }
@@ -1782,6 +1914,71 @@ export function App() {
                             Record no refund
                           </button>
                         </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+              {refundReceiptCapacityIncidents.length > 0 && (
+                <div data-testid="refund-receipt-capacity-incident-list">
+                  <h4>Receipt compensation overages requiring manual recovery</h4>
+                  <p className="muted">
+                    Every refund or Credit compensation remains an established fact.
+                    Acknowledgement records ownership but the item stays visible until a future
+                    recovery workflow resolves it.
+                  </p>
+                  {refundReceiptCapacityIncidents.map((incident) => {
+                    const pending = refundCapacityAcknowledgementPendingIds.has(
+                      incident.incidentId,
+                    );
+                    const disabled =
+                      pending || adminPassword.length === 0 || refundReason.trim().length < 10;
+                    return (
+                      <article
+                        className="manual-item security-hold-item"
+                        data-testid="refund-receipt-capacity-incident"
+                        key={incident.incidentId}
+                      >
+                        <div>
+                          <strong>
+                            {incident.clientAccountName} · receipt overage {usd(incident.overageMinor)}
+                          </strong>
+                          <span>{incident.reason}</span>
+                          <span>
+                            Immutable receipt {usd(incident.receiptAmountMinor)} · confirmed
+                            compensation {usd(incident.confirmedCompensationMinor)} · overage {" "}
+                            {usd(incident.overageMinor)} {incident.currency}
+                          </span>
+                          <span>{incident.impact}</span>
+                          <span>
+                            Status: {incident.status.replaceAll("_", " ")}
+                          </span>
+                          {incident.acknowledgement && (
+                            <span>
+                              Ownership acknowledged: {incident.acknowledgement.reason}. Manual
+                              recovery remains outstanding.
+                            </span>
+                          )}
+                          <span className="mono">
+                            receipt {incident.receiptId} · {incident.source.type ===
+                            "dismissal_correction"
+                              ? `correction ${incident.source.correctionId}`
+                              : `adjudication ${incident.source.adjudicationId}`}
+                          </span>
+                        </div>
+                        {incident.allowedAction === "acknowledge_manual_recovery" && (
+                          <div className="fund-actions">
+                            <button
+                              className="primary"
+                              disabled={disabled}
+                              onClick={() =>
+                                acknowledgeRefundReceiptCapacityIncident(incident)
+                              }
+                            >
+                              Acknowledge and take manual recovery
+                            </button>
+                          </div>
+                        )}
                       </article>
                     );
                   })}

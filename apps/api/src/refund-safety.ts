@@ -46,7 +46,6 @@ export async function freezeCompetingRefunds(
       competing.operation_status === "queued" &&
       competing.attempt_count === 0;
     const nextStatus = knownUnsent ? "failed" : "manual";
-    const ownsSecurityHold = cause === "dismissal_correction" && !knownUnsent;
     const resultMetadata =
       cause === "dismissal_correction"
         ? {
@@ -66,7 +65,7 @@ export async function freezeCompetingRefunds(
       [
         competing.id,
         nextStatus,
-        ownsSecurityHold,
+        false,
         input.reason,
         JSON.stringify(resultMetadata),
       ],

@@ -123,6 +123,15 @@ const refundAdjudicationCorrectionSchema = z
   })
   .strict();
 
+const refundCapacityAcknowledgementSchema = z
+  .object({
+    reason: z.string().trim().min(10).max(1_000),
+    idempotencyKey: z.string().min(8).max(128),
+    expectedConfirmedCompensationMinor: positiveMinor,
+    expectedOverageMinor: positiveMinor,
+  })
+  .strict();
+
 type RefundSecurityHoldRow = {
   hold_id: string;
   receipt_id: string;
@@ -196,6 +205,34 @@ type RefundAdjudicationCorrectionRow = {
   adjudication_id: string;
   refund_id: string;
   discrepancy_settlement_id: string;
+  reason: string;
+  request_fingerprint: string;
+  created_at: Date;
+};
+
+type RefundReceiptCapacityIncidentRow = {
+  incident_id: string;
+  receipt_id: string;
+  correction_id: string | null;
+  adjudication_id: string | null;
+  refund_id: string;
+  invoice_id: string;
+  client_account_id: string;
+  client_account_name: string;
+  confirmed_compensation_minor: string;
+  receipt_amount_minor: string;
+  overage_minor: string;
+  currency: string;
+  reason: string;
+  created_at: Date;
+  acknowledgement_id: string | null;
+  acknowledgement_reason: string | null;
+  acknowledgement_created_at: Date | null;
+};
+
+type RefundReceiptCapacityAcknowledgementRow = {
+  id: string;
+  incident_id: string;
   reason: string;
   request_fingerprint: string;
   created_at: Date;
@@ -378,6 +415,136 @@ function refundAdjudicationResponse(
   };
 }
 
+function refundCapacityIncidentResponse(
+  row: RefundReceiptCapacityIncidentRow,
+): Record<string, unknown> {
+  return {
+    warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+    incidentId: row.incident_id,
+    receiptId: row.receipt_id,
+    source: row.correction_id
+      ? { type: "dismissal_correction", correctionId: row.correction_id }
+      : { type: "unexpected_outflow_adjudication", adjudicationId: row.adjudication_id },
+    refundId: row.refund_id,
+    invoiceId: row.invoice_id,
+    clientAccountId: row.client_account_id,
+    clientAccountName: row.client_account_name,
+    confirmedCompensationMinor: row.confirmed_compensation_minor,
+    receiptAmountMinor: row.receipt_amount_minor,
+    overageMinor: row.overage_minor,
+    currency: row.currency,
+    reason: row.reason,
+    createdAt: row.created_at.toISOString(),
+    status: row.acknowledgement_id
+      ? "acknowledged_recovery_outstanding"
+      : "awaiting_acknowledgement",
+    acknowledgement: row.acknowledgement_id
+      ? {
+          acknowledgementId: row.acknowledgement_id,
+          reason: row.acknowledgement_reason,
+          createdAt: row.acknowledgement_created_at?.toISOString() ?? null,
+          recoveryOutstanding: true,
+        }
+      : null,
+    requiresReauthentication: row.acknowledgement_id === null,
+    allowedAction:
+      row.acknowledgement_id === null ? "acknowledge_manual_recovery" : null,
+    impact:
+      "Acknowledgement preserves every compensation and journal, records operator ownership, and leaves this incident visible until a future recovery workflow resolves it.",
+  };
+}
+
+function refundCapacityAcknowledgementResponse(
+  row: RefundReceiptCapacityAcknowledgementRow,
+  replayed: boolean,
+): Record<string, unknown> {
+  return {
+    warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+    acknowledgementId: row.id,
+    incidentId: row.incident_id,
+    reason: row.reason,
+    createdAt: row.created_at.toISOString(),
+    replayed,
+  };
+}
+
+async function readConfirmedReceiptCompensation(
+  client: DatabaseClient,
+  receiptId: string,
+  currency: string,
+): Promise<bigint> {
+  const result = await client.query<{ amount_minor: string }>(
+    `SELECT COALESCE(sum(confirmed.amount_minor), 0)::text AS amount_minor
+     FROM (
+       SELECT settlement.amount_minor
+       FROM refunds related_refund
+       JOIN refund_settlements settlement ON settlement.refund_id = related_refund.id
+       WHERE related_refund.source_fund_receipt_id = $1
+         AND settlement.currency = $2
+       UNION ALL
+       SELECT discrepancy.amount_minor
+       FROM refunds related_refund
+       JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = related_refund.id
+       JOIN refund_security_hold_adjudications adjudication
+         ON adjudication.discrepancy_settlement_id = discrepancy.id
+        AND adjudication.decision = 'record_unexpected_outflow'
+       WHERE related_refund.source_fund_receipt_id = $1
+         AND discrepancy.currency = $2
+       UNION ALL
+       SELECT discrepancy.amount_minor
+       FROM refunds related_refund
+       JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = related_refund.id
+       JOIN refund_adjudication_corrections correction
+         ON correction.discrepancy_settlement_id = discrepancy.id
+       WHERE related_refund.source_fund_receipt_id = $1
+         AND discrepancy.currency = $2
+     ) confirmed`,
+    [receiptId, currency],
+  );
+  return BigInt(result.rows[0]?.amount_minor ?? "0");
+}
+
+async function createRefundCapacityIncident(
+  client: DatabaseClient,
+  input: {
+    receiptId: string;
+    receiptAmountMinor: string;
+    currency: string;
+    correctionId?: string;
+    adjudicationId?: string;
+    reason: string;
+  },
+): Promise<{ id: string; confirmedCompensationMinor: string } | null> {
+  const confirmedCompensationMinor = await readConfirmedReceiptCompensation(
+    client,
+    input.receiptId,
+    input.currency,
+  );
+  const receiptAmountMinor = BigInt(input.receiptAmountMinor);
+  if (confirmedCompensationMinor <= receiptAmountMinor) return null;
+  const incident = await client.query<{ id: string }>(
+    `INSERT INTO refund_receipt_capacity_incidents(
+       source_fund_receipt_id, triggering_correction_id, triggering_adjudication_id,
+       confirmed_compensation_minor, receipt_amount_minor, overage_minor,
+       currency, reason
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id`,
+    [
+      input.receiptId,
+      input.correctionId ?? null,
+      input.adjudicationId ?? null,
+      confirmedCompensationMinor.toString(),
+      receiptAmountMinor.toString(),
+      (confirmedCompensationMinor - receiptAmountMinor).toString(),
+      input.currency,
+      input.reason,
+    ],
+  );
+  const id = incident.rows[0]?.id;
+  if (!id) throw new Error("Unable to preserve the refund receipt capacity incident");
+  return { id, confirmedCompensationMinor: confirmedCompensationMinor.toString() };
+}
+
 async function lockInvoice(client: DatabaseClient, invoiceId: string): Promise<void> {
   const result = await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
   if (result.rowCount !== 1) {
@@ -391,7 +558,8 @@ async function readRefund(client: DatabaseClient, refundId: string): Promise<Ref
        refund.*,
        operation.id AS provider_operation_id,
        operation.status AS provider_operation_status,
-       settlement.external_refund_id,
+       COALESCE(settlement.external_refund_id, operation.external_reference)
+         AS external_refund_id,
        EXISTS (
          SELECT 1
          FROM refund_receipt_security_holds security_hold
@@ -597,6 +765,272 @@ export async function registerRefundRoutes(
   pool: DatabasePool,
   config: Config,
 ): Promise<void> {
+  app.get("/api/v1/admin/refund-receipt-capacity-incidents", async (request) => {
+    const user = await requireUser(request, pool, config);
+    await requireStaffPermission(pool, user, "billing.refund_adjudicate");
+    const result = await pool.query<RefundReceiptCapacityIncidentRow>(
+      `SELECT
+         incident.id AS incident_id,
+         incident.source_fund_receipt_id AS receipt_id,
+         incident.triggering_correction_id AS correction_id,
+         incident.triggering_adjudication_id AS adjudication_id,
+         COALESCE(correction.refund_id, source_adjudication.refund_id) AS refund_id,
+         refund.invoice_id,
+         refund.client_account_id,
+         account.name AS client_account_name,
+         incident.confirmed_compensation_minor::text AS confirmed_compensation_minor,
+         incident.receipt_amount_minor::text AS receipt_amount_minor,
+         incident.overage_minor::text AS overage_minor,
+         incident.currency,
+         incident.reason,
+         incident.created_at,
+         acknowledgement.id AS acknowledgement_id,
+         acknowledgement.reason AS acknowledgement_reason,
+         acknowledgement.created_at AS acknowledgement_created_at
+       FROM refund_receipt_capacity_incidents incident
+       LEFT JOIN refund_adjudication_corrections correction
+         ON correction.id = incident.triggering_correction_id
+       LEFT JOIN refund_security_hold_adjudications source_adjudication
+         ON source_adjudication.id = incident.triggering_adjudication_id
+       JOIN refunds refund
+         ON refund.id = COALESCE(correction.refund_id, source_adjudication.refund_id)
+       JOIN client_accounts account ON account.id = refund.client_account_id
+       LEFT JOIN refund_receipt_capacity_acknowledgements acknowledgement
+         ON acknowledgement.incident_id = incident.id
+       ORDER BY incident.created_at, incident.id`,
+    );
+    return {
+      warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+      requiresReauthentication: true,
+      items: result.rows.map(refundCapacityIncidentResponse),
+    };
+  });
+
+  app.post(
+    "/api/v1/admin/refund-receipt-capacity-incidents/:incidentId/acknowledgements",
+    async (request, reply) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "billing.refund_adjudicate");
+      await requireRecentReauth(pool, user);
+      const params = z.object({ incidentId: canonicalUuid }).parse(request.params);
+      const body = refundCapacityAcknowledgementSchema.parse(request.body);
+      const fingerprint = requestFingerprint("admin.refund-capacity-acknowledgement:v1", {
+        incidentId: params.incidentId,
+        reason: body.reason,
+        expectedConfirmedCompensationMinor: body.expectedConfirmedCompensationMinor,
+        expectedOverageMinor: body.expectedOverageMinor,
+      });
+
+      const outcome = await transaction(pool, async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `refund-capacity-ack:idempotency:${body.idempotencyKey}`,
+        ]);
+        const keyReplay = await client.query<RefundReceiptCapacityAcknowledgementRow>(
+          `SELECT acknowledgement.id, acknowledgement.incident_id,
+                  acknowledgement.reason, acknowledgement.request_fingerprint,
+                  acknowledgement.created_at
+           FROM refund_receipt_capacity_acknowledgement_aliases alias
+           JOIN refund_receipt_capacity_acknowledgements acknowledgement
+             ON acknowledgement.id = alias.acknowledgement_id
+           WHERE alias.idempotency_key = $1`,
+          [body.idempotencyKey],
+        );
+        const replay = keyReplay.rows[0];
+        if (replay) {
+          if (
+            replay.incident_id !== params.incidentId ||
+            replay.request_fingerprint !== fingerprint
+          ) {
+            throw Object.assign(
+              new Error("The idempotency key was used for another capacity acknowledgement"),
+              { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
+            );
+          }
+          await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
+          return { acknowledgement: replay, replayed: true };
+        }
+
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `refund-capacity-ack:fingerprint:${fingerprint}`,
+        ]);
+        const semanticReplay = await client.query<RefundReceiptCapacityAcknowledgementRow>(
+          `SELECT id, incident_id, reason, request_fingerprint, created_at
+           FROM refund_receipt_capacity_acknowledgements
+           WHERE request_fingerprint = $1`,
+          [fingerprint],
+        );
+        const semantic = semanticReplay.rows[0];
+        if (semantic) {
+          await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
+          await client.query(
+            `INSERT INTO refund_receipt_capacity_acknowledgement_aliases(
+               idempotency_key, acknowledgement_id, request_fingerprint
+             ) VALUES ($1, $2, $3)`,
+            [body.idempotencyKey, semantic.id, fingerprint],
+          );
+          return { acknowledgement: semantic, replayed: true };
+        }
+
+        const pointer = await client.query<{
+          receipt_id: string;
+          refund_id: string;
+        }>(
+          `SELECT incident.source_fund_receipt_id AS receipt_id,
+                  COALESCE(correction.refund_id, source_adjudication.refund_id) AS refund_id
+           FROM refund_receipt_capacity_incidents incident
+           LEFT JOIN refund_adjudication_corrections correction
+             ON correction.id = incident.triggering_correction_id
+           LEFT JOIN refund_security_hold_adjudications source_adjudication
+             ON source_adjudication.id = incident.triggering_adjudication_id
+           WHERE incident.id = $1`,
+          [params.incidentId],
+        );
+        const target = pointer.rows[0];
+        if (!target) {
+          throw Object.assign(new Error("Refund receipt capacity incident not found"), {
+            statusCode: 404,
+          });
+        }
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `refund:${target.refund_id}`,
+        ]);
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
+        await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
+          target.receipt_id,
+        ]);
+        const incidentResult = await client.query<RefundReceiptCapacityIncidentRow>(
+          `SELECT
+             incident.id AS incident_id,
+             incident.source_fund_receipt_id AS receipt_id,
+             incident.triggering_correction_id AS correction_id,
+             incident.triggering_adjudication_id AS adjudication_id,
+             COALESCE(correction.refund_id, source_adjudication.refund_id) AS refund_id,
+             refund.invoice_id,
+             refund.client_account_id,
+             account.name AS client_account_name,
+             incident.confirmed_compensation_minor::text AS confirmed_compensation_minor,
+             incident.receipt_amount_minor::text AS receipt_amount_minor,
+             incident.overage_minor::text AS overage_minor,
+             incident.currency,
+             incident.reason,
+             incident.created_at,
+             NULL::uuid AS acknowledgement_id,
+             NULL::text AS acknowledgement_reason,
+             NULL::timestamptz AS acknowledgement_created_at
+           FROM refund_receipt_capacity_incidents incident
+           LEFT JOIN refund_adjudication_corrections correction
+             ON correction.id = incident.triggering_correction_id
+           LEFT JOIN refund_security_hold_adjudications source_adjudication
+             ON source_adjudication.id = incident.triggering_adjudication_id
+           JOIN refunds refund
+             ON refund.id = COALESCE(correction.refund_id, source_adjudication.refund_id)
+           JOIN client_accounts account ON account.id = refund.client_account_id
+           WHERE incident.id = $1
+             AND NOT EXISTS (
+               SELECT 1
+               FROM refund_receipt_capacity_acknowledgements acknowledgement
+               WHERE acknowledgement.incident_id = incident.id
+             )
+           FOR UPDATE OF incident`,
+          [params.incidentId],
+        );
+        const incident = incidentResult.rows[0];
+        if (!incident) {
+          throw Object.assign(new Error("Capacity incident was already acknowledged"), {
+            statusCode: 409,
+            code: "REFUND_CAPACITY_INCIDENT_ALREADY_ACKNOWLEDGED",
+          });
+        }
+        if (
+          incident.confirmed_compensation_minor !==
+            body.expectedConfirmedCompensationMinor ||
+          incident.overage_minor !== body.expectedOverageMinor
+        ) {
+          throw Object.assign(
+            new Error("The receipt overage changed after its impact was displayed; refresh first"),
+            { statusCode: 409, code: "REFUND_CAPACITY_INCIDENT_SNAPSHOT_CONFLICT" },
+          );
+        }
+        const acknowledgementResult =
+          await client.query<RefundReceiptCapacityAcknowledgementRow>(
+            `INSERT INTO refund_receipt_capacity_acknowledgements(
+               incident_id, staff_user_id, staff_session_id, reason, idempotency_key,
+               request_fingerprint, expected_confirmed_compensation_minor,
+               expected_overage_minor
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING id, incident_id, reason, request_fingerprint, created_at`,
+            [
+              incident.incident_id,
+              user.userId,
+              user.sessionId,
+              body.reason,
+              body.idempotencyKey,
+              fingerprint,
+              body.expectedConfirmedCompensationMinor,
+              body.expectedOverageMinor,
+            ],
+          );
+        const acknowledgement = acknowledgementResult.rows[0];
+        if (!acknowledgement) {
+          throw new Error("Unable to record refund receipt capacity acknowledgement");
+        }
+        await client.query(
+          `INSERT INTO refund_receipt_capacity_acknowledgement_aliases(
+             idempotency_key, acknowledgement_id, request_fingerprint
+           ) VALUES ($1, $2, $3)`,
+          [body.idempotencyKey, acknowledgement.id, fingerprint],
+        );
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata
+           ) VALUES ($1, 'adjudicated', 'staff', $2, $3, $4)`,
+          [
+            incident.refund_id,
+            user.userId,
+            body.reason,
+            {
+              capacityIncidentId: incident.incident_id,
+              acknowledgementId: acknowledgement.id,
+              confirmedCompensationMinor: incident.confirmed_compensation_minor,
+              receiptAmountMinor: incident.receipt_amount_minor,
+              overageMinor: incident.overage_minor,
+              financialFactsChanged: false,
+            },
+          ],
+        );
+        await client.query(
+          `INSERT INTO audit_events(
+             actor_type, actor_id, action, target_type, target_id, reason, metadata
+           ) VALUES ('staff', $1, 'refund.receipt_capacity_acknowledged', 'fund_receipt', $2, $3, $4)`,
+          [
+            user.userId,
+            incident.receipt_id,
+            body.reason,
+            {
+              refundId: incident.refund_id,
+              capacityIncidentId: incident.incident_id,
+              acknowledgementId: acknowledgement.id,
+              confirmedCompensationMinor: incident.confirmed_compensation_minor,
+              receiptAmountMinor: incident.receipt_amount_minor,
+              overageMinor: incident.overage_minor,
+              financialFactsChanged: false,
+            },
+          ],
+        );
+        return { acknowledgement, replayed: false };
+      });
+
+      return reply
+        .code(outcome.replayed ? 200 : 201)
+        .send(
+          refundCapacityAcknowledgementResponse(
+            outcome.acknowledgement,
+            outcome.replayed,
+          ),
+        );
+    },
+  );
+
   app.get("/api/v1/admin/refund-security-holds", async (request) => {
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_adjudicate");
@@ -992,6 +1426,7 @@ export async function registerRefundRoutes(
           [body.idempotencyKey, adjudication.id, fingerprint],
         );
         let journalId: string | null = null;
+        let capacityIncidentId: string | null = null;
         if (body.decision === "accept_authorized_outflow") {
           const changed = await client.query(
             `UPDATE refunds
@@ -1108,6 +1543,20 @@ export async function registerRefundRoutes(
               [journalId, hold.provider_amount_minor],
             );
           }
+          if (
+            body.decision === "record_unexpected_outflow" &&
+            hold.provider_currency === hold.refund_currency
+          ) {
+            const capacityIncident = await createRefundCapacityIncident(client, {
+              receiptId: hold.receipt_id,
+              receiptAmountMinor: hold.receipt_amount_minor,
+              currency: hold.refund_currency,
+              adjudicationId: adjudication.id,
+              reason:
+                "Confirmed refund compensation exceeds the immutable source receipt after an unexpected Provider outflow was recorded; manual recovery remains outstanding",
+            });
+            capacityIncidentId = capacityIncident?.id ?? null;
+          }
           const remainingRefundHolds = await client.query(
             `SELECT security_hold.id
              FROM refund_receipt_security_holds security_hold
@@ -1181,6 +1630,7 @@ export async function registerRefundRoutes(
               discrepancyProviderFactId: hold.discrepancy_provider_fact_id,
               discrepancySettlementId: adjudicationDiscrepancyId,
               journalId,
+              capacityIncidentId,
             },
           ],
         );
@@ -1272,6 +1722,7 @@ export async function registerRefundRoutes(
               discrepancyProviderFactId: hold.discrepancy_provider_fact_id,
               discrepancySettlementId: adjudicationDiscrepancyId,
               journalId,
+              capacityIncidentId,
               remainingReceiptHolds: remainingReceiptHolds.rowCount ?? 0,
               resumedRefundIds,
             },
@@ -1382,9 +1833,20 @@ export async function registerRefundRoutes(
           ]);
         }
         await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
-        await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
-          target.receipt_id,
-        ]);
+        const receiptResult = await client.query<{
+          amount_minor: string;
+          currency: string;
+        }>(
+          `SELECT amount_minor::text AS amount_minor, currency
+           FROM fund_receipts
+           WHERE id = $1
+           FOR UPDATE`,
+          [target.receipt_id],
+        );
+        const receipt = receiptResult.rows[0];
+        if (!receipt) {
+          throw Object.assign(new Error("Refund source receipt not found"), { statusCode: 404 });
+        }
 
         const stateResult = await client.query<{
           adjudication_id: string;
@@ -1563,14 +2025,35 @@ export async function registerRefundRoutes(
             state.provider_occurred_at,
           ],
         );
-        const frozenRefundIds = await freezeCompetingRefunds(client, {
-          heldRefundId: state.refund_id,
+        const frozenRefundIds =
+          state.provider_currency === receipt.currency
+            ? await freezeCompetingRefunds(client, {
+                heldRefundId: state.refund_id,
+                receiptId: target.receipt_id,
+                reason:
+                  "Refund stopped because a previously dismissed Provider outflow was later confirmed and consumed source receipt capacity",
+                cause: "dismissal_correction",
+                correctionId: correction.id,
+              })
+            : [];
+        const capacityIncident = await createRefundCapacityIncident(client, {
           receiptId: target.receipt_id,
-          reason:
-            "Refund stopped because a previously dismissed Provider outflow was later confirmed and consumed source receipt capacity",
-          cause: "dismissal_correction",
+          receiptAmountMinor: receipt.amount_minor,
+          currency: receipt.currency,
           correctionId: correction.id,
+          reason:
+            "Confirmed refund compensation exceeds the immutable source receipt after a dismissed Provider outflow correction; manual financial recovery remains outstanding",
         });
+        const capacityIncidentId = capacityIncident?.id ?? null;
+        const confirmedCompensationMinor =
+          capacityIncident?.confirmedCompensationMinor ??
+          (
+            await readConfirmedReceiptCompensation(
+              client,
+              target.receipt_id,
+              receipt.currency,
+            )
+          ).toString();
         const changedRefund = await client.query(
           `UPDATE refunds
            SET last_error = 'A dismissed Provider outflow was later confirmed',
@@ -1583,6 +2066,9 @@ export async function registerRefundRoutes(
               correctionId: correction.id,
               discrepancySettlementId: discrepancyId,
               frozenRefundIds,
+              capacityIncidentId,
+              confirmedReceiptCompensationMinor: confirmedCompensationMinor,
+              receiptAmountMinor: receipt.amount_minor,
               providerOperationStatus: "succeeded",
             }),
             body.expectedRefundVersion,
@@ -1611,6 +2097,9 @@ export async function registerRefundRoutes(
               previousProviderOperationStatus: state.provider_operation_status,
               providerOperationStatus: "succeeded",
               frozenRefundIds,
+              capacityIncidentId,
+              confirmedReceiptCompensationMinor: confirmedCompensationMinor,
+              receiptAmountMinor: receipt.amount_minor,
             },
           ],
         );
@@ -1632,6 +2121,9 @@ export async function registerRefundRoutes(
               previousProviderOperationStatus: state.provider_operation_status,
               providerOperationStatus: "succeeded",
               frozenRefundIds,
+              capacityIncidentId,
+              confirmedReceiptCompensationMinor: confirmedCompensationMinor,
+              receiptAmountMinor: receipt.amount_minor,
             },
           ],
         );
@@ -1815,7 +2307,8 @@ export async function registerRefundRoutes(
          refund.*,
          operation.id AS provider_operation_id,
          operation.status AS provider_operation_status,
-         settlement.external_refund_id,
+         COALESCE(settlement.external_refund_id, operation.external_reference)
+           AS external_refund_id,
          EXISTS (
            SELECT 1
            FROM refund_receipt_security_holds security_hold
@@ -1874,7 +2367,8 @@ export async function registerRefundRoutes(
          refund.*,
          operation.id AS provider_operation_id,
          operation.status AS provider_operation_status,
-         settlement.external_refund_id,
+         COALESCE(settlement.external_refund_id, operation.external_reference)
+           AS external_refund_id,
          EXISTS (
            SELECT 1
            FROM refund_receipt_security_holds security_hold

@@ -99,9 +99,26 @@ an explicit future FX/allocation fact. Core marks the Provider Operation as a
 confirmed success while leaving the intended Refund failed, so the page states
 both facts instead of claiming that the Provider failed. Under the same receipt
 lock, Core cancels queued known-unsent competitors and moves any possibly-sent
-competitor into a sticky manual hold. The Worker independently recalculates the
+competitor into a recoverable `manual` state without a synthetic security hold.
+The operator must query the original Provider operation and may only confirm no
+outflow after independent evidence; Core never sends a second create request.
+The Worker independently recalculates the
 aggregate receipt reservation immediately before every Provider create; a stale
 queued request that no longer fits is failed without making an external call.
+
+If a competing refund's real success callback arrives before the correction,
+Core preserves that settlement and also posts the later-confirmed corrected
+outflow. It then opens **Receipt compensation overages requiring manual recovery**
+with the immutable receipt amount, total confirmed cash/Credit compensation, and
+overage. This is
+not a disputable Provider claim: the only page action acknowledges operational
+ownership of manual financial recovery. It requires `billing.refund_adjudicate`,
+recent password confirmation, a reason, a displayed amount snapshot, and an
+idempotency key. Acknowledgement records ownership but the incident remains
+visible as **recovery outstanding**; it does not reverse either compensation,
+change a refund settlement, or add a journal. A later same-currency unexpected
+outflow creates another append-only incident instead of changing or hiding the
+earlier snapshot.
 
 Provider timestamps are high-water marks. An older fact, or a timestamp outside
 the accepted operation window, is retained as immutable evidence and audited,
@@ -133,7 +150,8 @@ manual action ever sends another Provider create request.
 
 Database upgrades are forward-only. Migration `007_stage_b_manual_refunds` is
 immutable; the reconciliation and correction changes are applied by
-`008_stage_b_refund_reconciliation`. API and Worker refuse to start until the
+`008_stage_b_refund_reconciliation`, and callback-first capacity incidents by
+`009_stage_b_refund_capacity_incidents`. API and Worker refuse to start until the
 dedicated migration command has installed the exact required version.
 
 A Credit refund is confirmed in one local transaction:

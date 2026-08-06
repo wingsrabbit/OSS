@@ -44,6 +44,9 @@ The first runnable vertical slice is implemented:
 - staff can see the Provider evidence and financial impact, then use a separate
   permission, recent password confirmation, reason, and append-only adjudication
   to accept one exact authorized outflow or dismiss and compensate the claim;
+- if a competing refund settles before a dismissed real outflow is corrected,
+  staff see the resulting receipt overage and can accept responsibility for
+  manual recovery without deleting or reversing either established outflow;
 - automatic products create one stable Provider operation; a timeout becomes
   `unknown`/`confirming` and is reconciled instead of creating a second resource;
 - a service becomes Active only after a Ready for Service fact, and its term
