@@ -9,6 +9,7 @@ import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { recordInitialServicePeriod } from "./renewal-lifecycle.js";
 
 const manualCompletionSchema = z.object({
   reason: z.string().trim().min(10).max(1_000),
@@ -579,7 +580,10 @@ export async function registerAdminRoutes(
         [receipt.id, body.amountMinor],
       );
       if (body.action === "allocate_invoice" && body.invoiceId) {
-        await advancePaidInvoice(client, body.invoiceId);
+        await advancePaidInvoice(client, body.invoiceId, {
+          kind: "staff_manual",
+          staffUserId: user.userId,
+        });
       }
       await client.query(
         `INSERT INTO audit_events(
@@ -998,6 +1002,13 @@ export async function registerAdminRoutes(
           code: "STATE_CONFLICT",
         });
       }
+      await recordInitialServicePeriod(client, {
+        serviceId: service.service_id,
+        invoiceId: service.invoice_id,
+        periodStart: readyAt,
+        periodEnd: termEnd,
+        grantedAt: readyAt,
+      });
       await client.query(
         `INSERT INTO audit_events(
            actor_type, actor_id, action, target_type, target_id, reason, metadata

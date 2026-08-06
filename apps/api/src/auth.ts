@@ -113,6 +113,16 @@ export function assertEligible(user: AuthenticatedUser): void {
   }
 }
 
+export function assertBillingWriteEligible(user: AuthenticatedUser): void {
+  assertEligible(user);
+  if (user.membershipRole !== "owner" && user.membershipRole !== "billing") {
+    throw Object.assign(new Error("Owner or Billing permission is required"), {
+      statusCode: 403,
+      code: "BILLING_PERMISSION_REQUIRED",
+    });
+  }
+}
+
 export function assertFinancialReadEligible(user: AuthenticatedUser): void {
   if (!user.emailVerifiedAt) {
     throw Object.assign(new Error("Email verification is required"), {

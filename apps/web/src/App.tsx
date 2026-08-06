@@ -263,6 +263,49 @@ type BillingSummary = {
     balanceCapMinor: string;
   };
 };
+type RenewalReminder = {
+  kind: "renewal_created" | "pre_due" | "overdue_first";
+  offsetDays: number;
+  status:
+    | "queued"
+    | "delivered"
+    | "bounced"
+    | "failed"
+    | "suppressed"
+    | "retrying"
+    | "manual";
+  createdAt: string;
+  deliveredAt: string | null;
+  outcomeAt: string | null;
+};
+type RenewalItem = {
+  renewalId: string;
+  serviceId: string;
+  productName: string;
+  serviceStatus: string;
+  billingCycle: string;
+  termStart: string;
+  termEnd: string;
+  invoiceId: string;
+  currency: string;
+  totalMinor: string;
+  allocatedMinor: string;
+  dueMinor: string;
+  status: "open" | "partially_paid" | "paid";
+  fundingStatus: "open" | "partially_paid" | "paid";
+  renewalStatus: "invoiced" | "paid" | "manual_hold";
+  fundedAt: string | null;
+  dueAt: string;
+  periodStart: string;
+  periodEnd: string;
+  settledAt: string | null;
+  version: number;
+  reminders: RenewalReminder[];
+};
+type AdminRenewalItem = RenewalItem & {
+  clientAccountId: string;
+  clientAccountName: string;
+};
 type PaymentQuote = {
   quoteId: string;
   method: string;
@@ -400,6 +443,12 @@ function usd(minor: string): string {
   }).format(Number(minor) / 100);
 }
 
+function reminderLabel(reminder: RenewalReminder): string {
+  if (reminder.kind === "pre_due") return `pre-due ${reminder.offsetDays}d`;
+  if (reminder.kind === "overdue_first") return `overdue ${reminder.offsetDays}d`;
+  return "invoice created";
+}
+
 async function fundResolutionIdempotencyKey(requestIdentity: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -435,6 +484,13 @@ export function App() {
   const [paymentMethod, setPaymentMethod] = useState("card");
   const [applyCredit, setApplyCredit] = useState(true);
   const [billing, setBilling] = useState<BillingSummary | null>(null);
+  const [renewals, setRenewals] = useState<RenewalItem[]>([]);
+  const [adminRenewals, setAdminRenewals] = useState<AdminRenewalItem[]>([]);
+  const [renewalPaymentPendingId, setRenewalPaymentPendingId] = useState<string | null>(null);
+  const [automationEffectiveAt, setAutomationEffectiveAt] = useState("");
+  const [automationReason, setAutomationReason] = useState("");
+  const [renewalHoldReason, setRenewalHoldReason] = useState("");
+  const [renewalHoldPendingId, setRenewalHoldPendingId] = useState<string | null>(null);
   const [paymentQuote, setPaymentQuote] = useState<PaymentQuote | null>(null);
   const [addFundsPrincipalMinor, setAddFundsPrincipalMinor] = useState("5000");
   const [addFundsMethod, setAddFundsMethod] = useState("card");
@@ -524,6 +580,28 @@ export function App() {
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
   }, [me]);
 
+  const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
+    if (!me?.eligible) {
+      setRenewals([]);
+      return [];
+    }
+    const result = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
+    setRenewals(result.items);
+    return result.items;
+  }, [me?.eligible]);
+
+  const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
+    if (!me?.staff) {
+      setAdminRenewals([]);
+      return [];
+    }
+    const result = await api<{ items: AdminRenewalItem[] }>(
+      "/api/v1/admin/billing/renewals",
+    );
+    setAdminRenewals(result.items);
+    return result.items;
+  }, [me?.staff]);
+
   const refreshChargebackStatus = useCallback(async () => {
     if (!me) {
       setChargebackStatus(null);
@@ -549,6 +627,14 @@ export function App() {
   useEffect(() => {
     void refreshBilling().catch(() => undefined);
   }, [refreshBilling]);
+
+  useEffect(() => {
+    void refreshRenewals().catch(() => undefined);
+  }, [refreshRenewals]);
+
+  useEffect(() => {
+    void refreshAdminRenewals().catch(() => undefined);
+  }, [refreshAdminRenewals]);
 
   useEffect(() => {
     void refreshChargebackStatus().catch(() => undefined);
@@ -917,6 +1003,122 @@ export function App() {
       await refreshBilling();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Payment could not start");
+    }
+  }
+
+  async function startRenewalPayment(renewal: RenewalItem) {
+    if (renewal.status === "paid" || renewalPaymentPendingId) return;
+    setError("");
+    setRenewalPaymentPendingId(renewal.renewalId);
+    let paymentStarted = false;
+    try {
+      const quote = await api<PaymentQuote>(
+        `/api/v1/invoices/${renewal.invoiceId}/payment-quotes`,
+        {
+          method: "POST",
+          body: JSON.stringify({ paymentMethod, applyCredit }),
+        },
+      );
+      await api(`/api/v1/invoices/${renewal.invoiceId}/payments`, {
+        method: "POST",
+        body: JSON.stringify({
+          quoteId: quote.quoteId,
+          scenario: paymentScenario,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      });
+      paymentStarted = true;
+      setNotice(
+        "Mock renewal payment started. The service term changes only after real allocations fully settle the invoice.",
+      );
+      for (let poll = 0; poll < 12; poll += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const current = await refreshRenewals();
+        if (current.find((item) => item.renewalId === renewal.renewalId)?.status === "paid") {
+          break;
+        }
+      }
+      await Promise.all([refreshBilling(), refreshAdminRenewals()]);
+    } catch (caught) {
+      setError(
+        paymentStarted
+          ? "The payment was accepted, but its current status could not be refreshed. Check the renewal again before retrying."
+          : caught instanceof Error
+            ? caught.message
+            : "Renewal payment could not start",
+      );
+    } finally {
+      setRenewalPaymentPendingId(null);
+    }
+  }
+
+  async function runBillingAutomation() {
+    if (!me?.staff || automationReason.trim().length < 10) return;
+    setError("");
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const result = await api<{
+        businessDate: string;
+        invoicesCreated: number;
+        remindersCreated: number;
+        replayed: boolean;
+      }>("/api/v1/admin/billing/automation/run", {
+        method: "POST",
+        body: JSON.stringify({
+          reason: automationReason.trim(),
+          idempotencyKey: crypto.randomUUID(),
+          ...(automationEffectiveAt
+            ? { effectiveAt: new Date(automationEffectiveAt).toISOString() }
+            : {}),
+        }),
+      });
+      setAutomationReason("");
+      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      setNotice(
+        `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s).`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Billing automation failed");
+    }
+  }
+
+  async function resolveRenewalHold(renewal: AdminRenewalItem) {
+    if (
+      !me?.staff ||
+      renewal.renewalStatus !== "manual_hold" ||
+      renewalHoldReason.trim().length < 10 ||
+      renewalHoldPendingId
+    ) {
+      return;
+    }
+    setError("");
+    setRenewalHoldPendingId(renewal.renewalId);
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      await api(`/api/v1/admin/billing/renewals/${renewal.renewalId}/resolve-hold`, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "grant_period",
+          reason: renewalHoldReason.trim(),
+          expectedVersion: renewal.version,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      });
+      setRenewalHoldReason("");
+      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      setNotice("The funded renewal Hold was reviewed and the exact service period was granted.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
+    } finally {
+      setRenewalHoldPendingId(null);
     }
   }
 
@@ -1766,6 +1968,115 @@ export function App() {
             </section>
           )}
 
+        {me?.eligible && renewals.length > 0 && (
+          <section className="order-panel" aria-label="Service renewals">
+            <div>
+              <p className="eyebrow">Customer billing · renewals</p>
+              <h2>Renewal invoices and paid-through dates</h2>
+              <p>
+                Renewal periods start at the current paid-through time. Paying early, late or after
+                a reminder does not shorten or silently extend that fixed period.
+              </p>
+              <button onClick={() => void openLabMailbox()}>Open my Mock Provider mailbox</button>
+            </div>
+            <div data-testid="renewal-list">
+              {renewals.map((renewal) => (
+                <article className="manual-item" data-testid="renewal-item" key={renewal.renewalId}>
+                  <div>
+                    <strong>
+                      {renewal.productName} · funding {renewal.fundingStatus} · term grant {" "}
+                      {renewal.renewalStatus}
+                    </strong>
+                    <span>
+                      Invoice {renewal.invoiceId} · due {new Date(renewal.dueAt).toLocaleString()}
+                    </span>
+                    <span>
+                      Period {new Date(renewal.periodStart).toLocaleString()} → {" "}
+                      {new Date(renewal.periodEnd).toLocaleString()}
+                    </span>
+                    <span>
+                      Total {usd(renewal.totalMinor)} · allocated {usd(renewal.allocatedMinor)} · {" "}
+                      due <strong>{usd(renewal.dueMinor)}</strong>
+                    </span>
+                    <span>
+                      Service {renewal.serviceStatus} · current paid-through {" "}
+                      {new Date(renewal.termEnd).toLocaleString()}
+                    </span>
+                    {renewal.renewalStatus === "manual_hold" && (
+                      <span className="notice error">
+                        Funds are recorded, but this renewal needs staff review and the service term
+                        was not extended.
+                      </span>
+                    )}
+                    <span>
+                      Reminders: {" "}
+                      {renewal.reminders.length === 0
+                        ? "none yet"
+                        : renewal.reminders
+                            .map((reminder) => `${reminderLabel(reminder)} (${reminder.status})`)
+                            .join(", ")}
+                    </span>
+                  </div>
+                  {renewal.status !== "paid" && (
+                    <div className="fund-actions">
+                      <select
+                        aria-label={`Renewal payment method ${renewal.invoiceId}`}
+                        value={paymentMethod}
+                        onChange={(event) => setPaymentMethod(event.target.value)}
+                      >
+                        {(billing?.paymentMethods ?? []).map((method) => (
+                          <option key={method.code} value={method.code}>
+                            {method.name} · {(method.feeBasisPoints / 100).toFixed(2)}%
+                          </option>
+                        ))}
+                      </select>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={applyCredit}
+                          onChange={(event) => setApplyCredit(event.target.checked)}
+                        />
+                        Apply Credit
+                      </label>
+                      <select
+                        aria-label={`Renewal Provider scenario ${renewal.invoiceId}`}
+                        value={paymentScenario}
+                        onChange={(event) => setPaymentScenario(event.target.value)}
+                      >
+                        <option value="success">Success</option>
+                        <option value="failed">Failure</option>
+                        <option value="cancelled">Cancelled</option>
+                        <option value="timeout_success">Timeout but actually settled</option>
+                        <option value="duplicate_out_of_order">Duplicate + out of order</option>
+                      </select>
+                      <button
+                        className="primary"
+                        disabled={renewalPaymentPendingId !== null}
+                        onClick={() => void startRenewalPayment(renewal)}
+                      >
+                        {renewalPaymentPendingId === renewal.renewalId
+                          ? "Confirming payment…"
+                          : "Pay renewal with Mock Provider"}
+                      </button>
+                    </div>
+                  )}
+                </article>
+              ))}
+              {mail
+                .filter((message) => message.subject.toLowerCase().includes("renewal") || message.subject.includes("续费"))
+                .map((message) => (
+                  <article className="mock-message" key={message.id}>
+                    <strong>{message.subject}</strong>
+                    <span>
+                      {message.status} · {new Date(message.deliveredAt).toLocaleString()}
+                    </span>
+                    <span>{message.body}</span>
+                  </article>
+                ))}
+            </div>
+          </section>
+        )}
+
         {me?.eligible && billing?.addFunds.enabled && (
           <section className="order-panel" aria-label="Add Funds">
             <div>
@@ -1959,6 +2270,104 @@ export function App() {
             <p>
               Current customer Credit: <strong>{usd(billing?.creditBalanceMinor ?? "0")}</strong>
             </p>
+            <div className="admin-subsection" aria-label="Renewal billing automation">
+              <div>
+                <p className="eyebrow">Manual laboratory billing run · Asia/Shanghai</p>
+                <h3>Renewal generation and reminders</h3>
+                <p>
+                  This run creates the next non-overlapping invoice 14 days before paid-through and
+                  queues the configured pre-due and first overdue reminders. The laboratory time
+                  override is synthetic acceptance control, not a production clock setting. The
+                  unattended 09:00 scheduler is not enabled in this laboratory slice yet.
+                </p>
+              </div>
+              <div className="inline-form admin-confirm">
+                <input
+                  type="datetime-local"
+                  aria-label="Laboratory billing effective time"
+                  value={automationEffectiveAt}
+                  onChange={(event) => setAutomationEffectiveAt(event.target.value)}
+                />
+                <input
+                  value={automationReason}
+                  onChange={(event) => setAutomationReason(event.target.value)}
+                  placeholder="Automation run reason (10+ characters)"
+                />
+                <button
+                  className="primary"
+                  disabled={adminPassword.length === 0 || automationReason.trim().length < 10}
+                  onClick={() => void runBillingAutomation()}
+                >
+                  Run billing day
+                </button>
+                <button onClick={() => void refreshAdminRenewals()}>Refresh renewals</button>
+              </div>
+              <div className="inline-form admin-confirm">
+                <input
+                  aria-label="Renewal Hold resolution reason"
+                  value={renewalHoldReason}
+                  onChange={(event) => setRenewalHoldReason(event.target.value)}
+                  placeholder="Funded Hold review reason (10+ characters)"
+                />
+              </div>
+              {adminRenewals.length === 0 ? (
+                <p className="muted">No generated renewal invoice is currently visible.</p>
+              ) : (
+                <div data-testid="admin-renewal-list">
+                  {adminRenewals.map((renewal) => (
+                    <article
+                      className="manual-item"
+                      data-testid="admin-renewal-item"
+                      key={renewal.renewalId}
+                    >
+                      <div>
+                        <strong>
+                          {renewal.clientAccountName} · {renewal.productName} · {renewal.status}
+                        </strong>
+                        <span>
+                          Invoice {renewal.invoiceId} · {usd(renewal.dueMinor)} due {" "}
+                          {new Date(renewal.dueAt).toLocaleString()}
+                        </span>
+                        <span>
+                          Service {renewal.serviceStatus} · next period {" "}
+                          {new Date(renewal.periodStart).toLocaleString()} → {" "}
+                          {new Date(renewal.periodEnd).toLocaleString()}
+                        </span>
+                        <span>
+                          Funding {renewal.fundingStatus} · term grant {renewal.renewalStatus}
+                          {renewal.renewalStatus === "manual_hold"
+                            ? " — funds recorded; staff disposition required"
+                            : ""}
+                        </span>
+                        <span>
+                          Notification delivery: {" "}
+                          {renewal.reminders.length === 0
+                            ? "none"
+                            : renewal.reminders
+                                .map((reminder) => `${reminderLabel(reminder)}=${reminder.status}`)
+                                .join(", ")}
+                        </span>
+                      </div>
+                      {renewal.renewalStatus === "manual_hold" && (
+                        <button
+                          className="primary"
+                          disabled={
+                            renewalHoldPendingId !== null ||
+                            adminPassword.length === 0 ||
+                            renewalHoldReason.trim().length < 10
+                          }
+                          onClick={() => void resolveRenewalHold(renewal)}
+                        >
+                          {renewalHoldPendingId === renewal.renewalId
+                            ? "Resolving funded Hold…"
+                            : "Review and grant exact period"}
+                        </button>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="admin-subsection" aria-label="Add Funds Chargebacks">
               <div>
                 <p className="eyebrow">Immutable external loss and customer debt</p>

@@ -130,7 +130,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
            AS account_restrictions
        FROM schema_migrations`,
     );
-    assert.equal(upgraded.rows[0]?.version, "011_stage_b_add_funds_chargebacks");
+    assert.equal(upgraded.rows[0]?.version, "012_stage_b_renewal_lifecycle");
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(

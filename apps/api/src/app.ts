@@ -17,6 +17,7 @@ import { registerChargebackRoutes } from "./routes-chargebacks.js";
 import { registerOrderRoutes } from "./routes-orders.js";
 import { registerProviderEventRoutes } from "./routes-provider-events.js";
 import { registerRefundRoutes } from "./routes-refunds.js";
+import { registerRenewalRoutes } from "./routes-renewals.js";
 
 export async function buildApp(
   config: Config,
@@ -128,6 +129,7 @@ export async function buildApp(
   await registerCatalogRoutes(app, pool);
   await registerOrderRoutes(app, pool, config);
   await registerRefundRoutes(app, pool, config);
+  await registerRenewalRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
   app.addHook("onClose", async () => {

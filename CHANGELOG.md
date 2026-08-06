@@ -8,6 +8,19 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Customer and staff renewal pages now show funding separately from service-term
+  grant, paid-through dates, immutable next-period facts, current amount due,
+  reminder delivery, and fully funded manual Holds. Authorized staff can resolve
+  a Hold only after fixed-window password confirmation, impact review, a reason,
+  optimistic version confirmation, and an idempotent decision.
+- A manual laboratory billing-day run applies the configured Asia/Shanghai
+  calendar policy, creates one non-overlapping renewal invoice 14 days before
+  the service paid-through date, auto-applies eligible Credit, and queues the
+  invoice-created, seven-day pre-due, and first overdue Mock Mail notifications.
+- Renewal payments use the existing immutable Quote, fee, Credit, Provider,
+  receipt, and allocation facts. A fully funded renewal advances the exact
+  service period once without provisioning a second resource; service time
+  remains anchored to the previous Ready-derived term.
 - Settled Mock Add Funds Chargebacks now arrive as immutable Provider facts.
   Core recovers the remaining Credit, records already consumed principal as
   explicit Client Account debt, reverses the original fee revenue, books one
@@ -72,6 +85,20 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Security
 
+- Owner or Billing authority is enforced when creating payment Quotes and
+  payments, inside the payment transaction, again before the Worker calls the
+  Provider, and again when a renewal is settled. A late payment after role or
+  account eligibility changes is recorded but cannot grant a service period.
+- PostgreSQL binds every renewal to its Client Account, invoice, historical
+  currency and recurring amount, billing-cycle period, and creation transaction.
+  It rejects cross-account, overlapping, forged, late, Provider-authored, or
+  over-allocated automatic Credit and makes service periods and creation facts
+  immutable.
+- Billing-day concurrency is serialized by policy date; duplicate runs,
+  callbacks, settlement, and Hold decisions cannot create another invoice,
+  journal, Credit allocation, period, reminder, or resource. Reminder dispatch
+  holds the invoice lock through the finite Mock Mail call so payment cannot
+  commit between the final amount check and the delivery fact.
 - Add Funds Chargeback callbacks require the Provider HMAC, the exact started
   Provider Operation and its operation-scoped capability. Core derives the
   Client Account from the immutable operation chain; callback account and

@@ -9,6 +9,10 @@ export default defineConfig({
   fullyParallel: false,
   forbidOnly: true,
   retries: 1,
+  // The laboratory stories deliberately share one synthetic ledger and staff
+  // account. Running money-mutating files concurrently would make one story's
+  // Credit consumption alter another story's Chargeback expectations.
+  workers: 1,
   reporter: [["line"], ["html", { open: "never" }]],
   use: {
     baseURL: process.env.OSS_E2E_URL ?? "http://127.0.0.1:5173",

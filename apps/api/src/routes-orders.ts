@@ -10,7 +10,7 @@ import {
 } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertEligible, requireUser } from "./auth.js";
+import { assertBillingWriteEligible, assertEligible, requireUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -157,6 +157,7 @@ async function assertEligibilityLocked(
   client: DatabaseClient,
   userId: string,
   clientAccountId: string,
+  requireBillingRole = false,
 ): Promise<void> {
   // Keep the shared identity lock order explicit. PostgreSQL does not promise
   // the row-lock order of a multi-relation FOR UPDATE join, and payment
@@ -177,12 +178,14 @@ async function assertEligibilityLocked(
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
     removed_at: Date | null;
+    membership_role: "owner" | "billing" | "technical" | "viewer";
   }>(
     `SELECT
        u.email_verified_at,
        u.restricted_at AS user_restricted_at,
        ca.restricted_at AS account_restricted_at,
-       cm.removed_at
+       cm.removed_at,
+       cm.role AS membership_role
      FROM users u
      JOIN client_memberships cm ON cm.user_id = u.id AND cm.client_account_id = $2
      JOIN client_accounts ca ON ca.id = cm.client_account_id
@@ -194,7 +197,10 @@ async function assertEligibilityLocked(
     !state?.email_verified_at ||
     state.user_restricted_at ||
     state.account_restricted_at ||
-    state.removed_at
+    state.removed_at ||
+    (requireBillingRole &&
+      state.membership_role !== "owner" &&
+      state.membership_role !== "billing")
   ) {
     throw Object.assign(new Error("Account is not eligible for this operation"), {
       statusCode: 403,
@@ -533,7 +539,7 @@ export async function registerOrderRoutes(
 
   app.post("/api/v1/invoices/:invoiceId/payments", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    assertBillingWriteEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = paymentSchema.parse(request.body);
     const fingerprint = requestFingerprint("payments.create:v2", {
@@ -643,7 +649,7 @@ export async function registerOrderRoutes(
       );
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
-      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
+      await assertEligibilityLocked(client, user.userId, user.clientAccountId, true);
       const allocationResult = await client.query<{
         payment_minor: string;
         credit_minor: string;
@@ -717,8 +723,8 @@ export async function registerOrderRoutes(
       await client.query(
         `INSERT INTO invoice_payment_commands(
            id, client_account_id, invoice_id, quote_id, status,
-           idempotency_key, request_fingerprint
-         ) VALUES ($1, $2, $3, $4, 'created', $5, $6)`,
+           idempotency_key, request_fingerprint, initiator_type, initiated_by_user_id
+         ) VALUES ($1, $2, $3, $4, 'created', $5, $6, 'user', $7)`,
         [
           commandId,
           user.clientAccountId,
@@ -726,6 +732,7 @@ export async function registerOrderRoutes(
           quote.id,
           body.idempotencyKey,
           fingerprint,
+          user.userId,
         ],
       );
 
@@ -776,10 +783,15 @@ export async function registerOrderRoutes(
       }
 
       if (BigInt(quote.external_due_minor) === 0n) {
-        const settlement = await advancePaidInvoice(client, params.invoiceId);
+        const settlement = await advancePaidInvoice(client, params.invoiceId, {
+          kind: "user_command",
+          userId: user.userId,
+        });
         const commandResult = {
           invoiceStatus: settlement.invoiceStatus,
           orderStatus: settlement.orderStatus ?? null,
+          renewalStatus: settlement.renewalStatus ?? null,
+          serviceStatus: settlement.serviceStatus ?? null,
           creditAppliedMinor: quote.credit_to_apply_minor,
           externalDueMinor: "0",
         };
