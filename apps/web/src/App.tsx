@@ -205,6 +205,7 @@ type RefundDismissalCorrection = {
 type RefundReceiptCapacityIncident = {
   incidentId: string;
   receiptId: string;
+  receiptSequence: string;
   source:
     | { type: "dismissal_correction"; correctionId: string }
     | { type: "unexpected_outflow_adjudication"; adjudicationId: string };
@@ -218,12 +219,16 @@ type RefundReceiptCapacityIncident = {
   currency: string;
   reason: string;
   createdAt: string;
-  status: "awaiting_acknowledgement" | "acknowledged_recovery_outstanding";
+  isCurrentSnapshot: boolean;
+  status:
+    | "awaiting_acknowledgement"
+    | "acknowledged_recovery_outstanding"
+    | "superseded_history";
   acknowledgement: {
     acknowledgementId: string;
     reason: string;
     createdAt: string;
-    recoveryOutstanding: true;
+    recoveryOutstanding: boolean;
   } | null;
   requiresReauthentication: boolean;
   allowedAction: "acknowledge_manual_recovery" | null;
@@ -1923,9 +1928,9 @@ export function App() {
                 <div data-testid="refund-receipt-capacity-incident-list">
                   <h4>Receipt compensation overages requiring manual recovery</h4>
                   <p className="muted">
-                    Every refund or Credit compensation remains an established fact.
-                    Acknowledgement records ownership but the item stays visible until a future
-                    recovery workflow resolves it.
+                    Every refund or Credit compensation remains an established fact. For each
+                    receipt, only the latest cumulative snapshot is the current recovery amount;
+                    older snapshots remain visible as history and must not be added together.
                   </p>
                   {refundReceiptCapacityIncidents.map((incident) => {
                     const pending = refundCapacityAcknowledgementPendingIds.has(
@@ -1955,12 +1960,14 @@ export function App() {
                           </span>
                           {incident.acknowledgement && (
                             <span>
-                              Ownership acknowledged: {incident.acknowledgement.reason}. Manual
-                              recovery remains outstanding.
+                              Ownership acknowledged: {incident.acknowledgement.reason}.{" "}
+                              {incident.acknowledgement.recoveryOutstanding
+                                ? "Manual recovery remains outstanding."
+                                : "This historical acknowledgement was superseded by a later cumulative snapshot."}
                             </span>
                           )}
                           <span className="mono">
-                            receipt {incident.receiptId} · {incident.source.type ===
+                            receipt {incident.receiptId} · cumulative snapshot {incident.receiptSequence} · {incident.source.type ===
                             "dismissal_correction"
                               ? `correction ${incident.source.correctionId}`
                               : `adjudication ${incident.source.adjudicationId}`}

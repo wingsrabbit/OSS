@@ -117,8 +117,16 @@ recent password confirmation, a reason, a displayed amount snapshot, and an
 idempotency key. Acknowledgement records ownership but the incident remains
 visible as **recovery outstanding**; it does not reverse either compensation,
 change a refund settlement, or add a journal. A later same-currency unexpected
-outflow creates another append-only incident instead of changing or hiding the
-earlier snapshot.
+outflow creates another append-only cumulative incident instead of changing or
+hiding the earlier snapshot. Only the latest snapshot for a receipt is the
+current recovery amount. Earlier amounts are marked **superseded history**, are
+not actionable, and must never be added to the latest cumulative overage.
+Current ordering uses a monotonic per-receipt sequence allocated while the
+receipt is locked; transaction timestamps are display evidence only and cannot
+select an older snapshot as current.
+Wrong-currency compensation remains in its own suspense currency and cannot
+create or advance a receipt-currency capacity incident without an explicit
+future FX/allocation fact.
 
 Provider timestamps are high-water marks. An older fact, or a timestamp outside
 the accepted operation window, is retained as immutable evidence and audited,

@@ -300,6 +300,7 @@ type RefundDismissalCorrection = {
 type RefundReceiptCapacityIncident = {
   incidentId: string;
   receiptId: string;
+  receiptSequence: string;
   source:
     | { type: "dismissal_correction"; correctionId: string }
     | { type: "unexpected_outflow_adjudication"; adjudicationId: string };
@@ -308,8 +309,16 @@ type RefundReceiptCapacityIncident = {
   receiptAmountMinor: string;
   overageMinor: string;
   currency: string;
-  status: "awaiting_acknowledgement" | "acknowledged_recovery_outstanding";
-  acknowledgement: { acknowledgementId: string; recoveryOutstanding: true } | null;
+  isCurrentSnapshot: boolean;
+  status:
+    | "awaiting_acknowledgement"
+    | "acknowledged_recovery_outstanding"
+    | "superseded_history";
+  acknowledgement: {
+    acknowledgementId: string;
+    recoveryOutstanding: boolean;
+  } | null;
+  allowedAction: "acknowledge_manual_recovery" | null;
 };
 
 async function request<T>(
@@ -6083,6 +6092,7 @@ try {
   assert.ok(callbackFirstIncident);
   assert.equal(callbackFirstIncident.refundId, callbackFirstDismissedRefund.refundId);
   assert.equal(callbackFirstIncident.receiptId, callbackFirstCandidate.receiptId);
+  assert.equal(callbackFirstIncident.receiptSequence, "1");
   assert.equal(callbackFirstIncident.receiptAmountMinor, callbackFirstFullCandidate.refundableMinor);
   assert.equal(callbackFirstIncident.overageMinor, "25");
   assert.equal(
@@ -6119,55 +6129,9 @@ try {
   assert.equal(callbackFirstLedger.rows[0]?.corrections, "1");
   assert.equal(callbackFirstLedger.rows[0]?.incidents, "1");
   assert.equal(callbackFirstLedger.rows[0]?.acknowledgements, "0");
-  const laterUnexpectedExternalId =
-    `mock-refund-callback-first-later-unexpected:${callbackFirstWinningRefund.refundId}`;
-  const laterUnexpectedSuccess = await submitRefundFact({
-    eventId: `refund-callback-first-later-unexpected:${randomUUID()}`,
-    providerOperationId: callbackFirstWinningRefund.providerOperationId,
-    refundId: callbackFirstWinningRefund.refundId,
-    externalRefundId: laterUnexpectedExternalId,
-    status: "succeeded",
-    amountMinor: "7",
-    currency: "USD",
-    occurredAt: new Date(callbackFirstBaseTime + 3_000).toISOString(),
-  });
-  assert.equal(laterUnexpectedSuccess.status, 202);
-  assert.equal(laterUnexpectedSuccess.body.status, "succeeded");
-  assert.equal(laterUnexpectedSuccess.body.securityHold, true);
-  const laterUnexpectedHolds = await request<{ items: RefundSecurityHold[] }>(
-    "/api/v1/admin/refund-security-holds",
-  );
-  const laterUnexpectedHold = laterUnexpectedHolds.items.find(
-    (hold) =>
-      hold.refundId === callbackFirstWinningRefund.refundId &&
-      hold.providerFact.externalRefundId === laterUnexpectedExternalId,
-  );
-  assert.ok(laterUnexpectedHold);
-  const laterUnexpectedAdjudication = await adjudicateRefundHold(
-    laterUnexpectedHold,
-    "record_unexpected_outflow",
-    "Synthetic administrator records a later real outflow after the first capacity incident",
-  );
-  const incidentsAfterLaterOutflow = await request<{
-    items: RefundReceiptCapacityIncident[];
-  }>("/api/v1/admin/refund-receipt-capacity-incidents");
-  const laterUnexpectedIncident = incidentsAfterLaterOutflow.items.find(
-    (incident) =>
-      incident.source.type === "unexpected_outflow_adjudication" &&
-      incident.source.adjudicationId === laterUnexpectedAdjudication.adjudicationId,
-  );
-  assert.ok(laterUnexpectedIncident);
-  assert.equal(laterUnexpectedIncident.overageMinor, "32");
-  assert.equal(
-    laterUnexpectedIncident.confirmedCompensationMinor,
-    (BigInt(callbackFirstFullCandidate.refundableMinor) + 32n).toString(),
-  );
-  assert.equal(
-    incidentsAfterLaterOutflow.items.filter(
-      (incident) => incident.receiptId === callbackFirstCandidate.receiptId,
-    ).length,
-    2,
-  );
+  assert.equal(callbackFirstIncident.isCurrentSnapshot, true);
+  assert.equal(callbackFirstIncident.status, "awaiting_acknowledgement");
+  assert.equal(callbackFirstIncident.allowedAction, "acknowledge_manual_recovery");
   const capacityFinancialSnapshot = async () => {
     const snapshot = await corePool.query<{
       settlements: string;
@@ -6244,17 +6208,17 @@ try {
   const capacityAcknowledgementKey = randomUUID();
   const capacityAcknowledgementBody = {
     reason:
-      "Synthetic administrator owns the later receipt overage while recovery remains outstanding",
+      "Synthetic administrator owns the current receipt overage while recovery remains outstanding",
     idempotencyKey: capacityAcknowledgementKey,
     expectedConfirmedCompensationMinor:
-      laterUnexpectedIncident.confirmedCompensationMinor,
-    expectedOverageMinor: laterUnexpectedIncident.overageMinor,
+      callbackFirstIncident.confirmedCompensationMinor,
+    expectedOverageMinor: callbackFirstIncident.overageMinor,
   };
   const capacityAcknowledgement = await request<{
     acknowledgementId: string;
     replayed: boolean;
   }>(
-    `/api/v1/admin/refund-receipt-capacity-incidents/${laterUnexpectedIncident.incidentId}/acknowledgements`,
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
     { method: "POST", body: JSON.stringify(capacityAcknowledgementBody) },
     201,
   );
@@ -6263,7 +6227,7 @@ try {
     acknowledgementId: string;
     replayed: boolean;
   }>(
-    `/api/v1/admin/refund-receipt-capacity-incidents/${laterUnexpectedIncident.incidentId}/acknowledgements`,
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
     { method: "POST", body: JSON.stringify(capacityAcknowledgementBody) },
     200,
   );
@@ -6276,7 +6240,7 @@ try {
     acknowledgementId: string;
     replayed: boolean;
   }>(
-    `/api/v1/admin/refund-receipt-capacity-incidents/${laterUnexpectedIncident.incidentId}/acknowledgements`,
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -6292,7 +6256,7 @@ try {
   );
   assert.equal(semanticCapacityReplay.replayed, true);
   await request(
-    `/api/v1/admin/refund-receipt-capacity-incidents/${laterUnexpectedIncident.incidentId}/acknowledgements`,
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -6307,12 +6271,236 @@ try {
   const incidentsAfterAcknowledgement = await request<{
     items: RefundReceiptCapacityIncident[];
   }>("/api/v1/admin/refund-receipt-capacity-incidents");
-  const acknowledgedLaterIncident = incidentsAfterAcknowledgement.items.find(
-    (incident) => incident.incidentId === laterUnexpectedIncident.incidentId,
+  const acknowledgedFirstIncident = incidentsAfterAcknowledgement.items.find(
+    (incident) => incident.incidentId === callbackFirstIncident.incidentId,
   );
-  assert.ok(acknowledgedLaterIncident);
-  assert.equal(acknowledgedLaterIncident.status, "acknowledged_recovery_outstanding");
-  assert.equal(acknowledgedLaterIncident.acknowledgement?.recoveryOutstanding, true);
+  assert.ok(acknowledgedFirstIncident);
+  assert.equal(acknowledgedFirstIncident.isCurrentSnapshot, true);
+  assert.equal(acknowledgedFirstIncident.status, "acknowledged_recovery_outstanding");
+  assert.equal(acknowledgedFirstIncident.acknowledgement?.recoveryOutstanding, true);
+  const laterUnexpectedExternalId =
+    `mock-refund-callback-first-later-unexpected:${callbackFirstWinningRefund.refundId}`;
+  const laterUnexpectedSuccess = await submitRefundFact({
+    eventId: `refund-callback-first-later-unexpected:${randomUUID()}`,
+    providerOperationId: callbackFirstWinningRefund.providerOperationId,
+    refundId: callbackFirstWinningRefund.refundId,
+    externalRefundId: laterUnexpectedExternalId,
+    status: "succeeded",
+    amountMinor: "7",
+    currency: "USD",
+    occurredAt: new Date(callbackFirstBaseTime + 3_000).toISOString(),
+  });
+  assert.equal(laterUnexpectedSuccess.status, 202);
+  assert.equal(laterUnexpectedSuccess.body.status, "succeeded");
+  assert.equal(laterUnexpectedSuccess.body.securityHold, true);
+  const laterUnexpectedHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const laterUnexpectedHold = laterUnexpectedHolds.items.find(
+    (hold) =>
+      hold.refundId === callbackFirstWinningRefund.refundId &&
+      hold.providerFact.externalRefundId === laterUnexpectedExternalId,
+  );
+  assert.ok(laterUnexpectedHold);
+  const laterUnexpectedAdjudication = await adjudicateRefundHold(
+    laterUnexpectedHold,
+    "record_unexpected_outflow",
+    "Synthetic administrator records a later real outflow after the first capacity incident",
+  );
+  const incidentsAfterLaterOutflow = await request<{
+    items: RefundReceiptCapacityIncident[];
+  }>("/api/v1/admin/refund-receipt-capacity-incidents");
+  const laterUnexpectedIncident = incidentsAfterLaterOutflow.items.find(
+    (incident) =>
+      incident.source.type === "unexpected_outflow_adjudication" &&
+      incident.source.adjudicationId === laterUnexpectedAdjudication.adjudicationId,
+  );
+  assert.ok(laterUnexpectedIncident);
+  assert.equal(laterUnexpectedIncident.overageMinor, "32");
+  assert.equal(laterUnexpectedIncident.receiptSequence, "2");
+  assert.equal(
+    laterUnexpectedIncident.confirmedCompensationMinor,
+    (BigInt(callbackFirstFullCandidate.refundableMinor) + 32n).toString(),
+  );
+  assert.equal(
+    incidentsAfterLaterOutflow.items.filter(
+      (incident) => incident.receiptId === callbackFirstCandidate.receiptId,
+    ).length,
+    2,
+  );
+  const supersededFirstIncident = incidentsAfterLaterOutflow.items.find(
+    (incident) => incident.incidentId === callbackFirstIncident.incidentId,
+  );
+  assert.ok(supersededFirstIncident);
+  assert.equal(supersededFirstIncident.isCurrentSnapshot, false);
+  assert.equal(supersededFirstIncident.status, "superseded_history");
+  assert.equal(supersededFirstIncident.allowedAction, null);
+  assert.equal(supersededFirstIncident.acknowledgement?.recoveryOutstanding, false);
+  assert.equal(laterUnexpectedIncident.isCurrentSnapshot, true);
+  assert.equal(laterUnexpectedIncident.status, "awaiting_acknowledgement");
+  assert.equal(laterUnexpectedIncident.allowedAction, "acknowledge_manual_recovery");
+  await request(
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason: "Synthetic administrator must not acknowledge a superseded cumulative snapshot",
+        idempotencyKey: randomUUID(),
+        expectedConfirmedCompensationMinor:
+          callbackFirstIncident.confirmedCompensationMinor,
+        expectedOverageMinor: callbackFirstIncident.overageMinor,
+      }),
+    },
+    409,
+  );
+  await assert.rejects(
+    corePool.query(
+      `INSERT INTO refund_receipt_capacity_acknowledgements(
+         incident_id, staff_user_id, staff_session_id, reason, idempotency_key,
+         request_fingerprint, expected_confirmed_compensation_minor,
+         expected_overage_minor
+       )
+       SELECT incident_id, staff_user_id, staff_session_id,
+              'Synthetic direct acknowledgement must reject a superseded snapshot',
+              $2, $3, expected_confirmed_compensation_minor, expected_overage_minor
+       FROM refund_receipt_capacity_acknowledgements
+       WHERE id = $1`,
+      [capacityAcknowledgement.acknowledgementId, randomUUID(), randomUUID()],
+    ),
+    /current incident snapshot/i,
+  );
+  await assert.rejects(
+    corePool.query(
+      `INSERT INTO refund_receipt_capacity_incidents(
+         source_fund_receipt_id, receipt_sequence, triggering_correction_id,
+         confirmed_compensation_minor, receipt_amount_minor, overage_minor,
+         currency, reason
+       ) VALUES ($1, 4, $2, $3, $4, $5, 'USD',
+         'Synthetic non-monotonic receipt sequence must be rejected')`,
+      [
+        callbackFirstCandidate.receiptId,
+        callbackFirstCorrectionResult.correctionId,
+        laterUnexpectedIncident.confirmedCompensationMinor,
+        laterUnexpectedIncident.receiptAmountMinor,
+        laterUnexpectedIncident.overageMinor,
+      ],
+    ),
+    /current confirmed overage/i,
+  );
+  const wrongCurrencyExternalId =
+    `mock-refund-callback-first-wrong-currency:${callbackFirstWinningRefund.refundId}`;
+  const callbackFirstWrongCurrencySuccess = await submitRefundFact({
+    eventId: `refund-callback-first-wrong-currency:${randomUUID()}`,
+    providerOperationId: callbackFirstWinningRefund.providerOperationId,
+    refundId: callbackFirstWinningRefund.refundId,
+    externalRefundId: wrongCurrencyExternalId,
+    status: "succeeded",
+    amountMinor: "9",
+    currency: "EUR",
+    occurredAt: new Date(callbackFirstBaseTime + 4_000).toISOString(),
+  });
+  assert.equal(callbackFirstWrongCurrencySuccess.status, 202);
+  assert.equal(callbackFirstWrongCurrencySuccess.body.securityHold, true);
+  const callbackFirstWrongCurrencyHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const callbackFirstWrongCurrencyHold = callbackFirstWrongCurrencyHolds.items.find(
+    (hold) =>
+      hold.refundId === callbackFirstWinningRefund.refundId &&
+      hold.providerFact.externalRefundId === wrongCurrencyExternalId,
+  );
+  assert.ok(callbackFirstWrongCurrencyHold);
+  const callbackFirstWrongCurrencyDismissal = await adjudicateRefundHold(
+    callbackFirstWrongCurrencyHold,
+    "dismiss_provider_claim",
+    "Synthetic administrator initially dismisses the wrong-currency Provider outflow",
+  );
+  const callbackFirstWrongCurrencyCorrectable = await request<{
+    items: RefundDismissalCorrection[];
+  }>("/api/v1/admin/refund-dismissal-corrections");
+  const callbackFirstWrongCurrencyCorrection =
+    callbackFirstWrongCurrencyCorrectable.items.find(
+      (item) => item.adjudicationId === callbackFirstWrongCurrencyDismissal.adjudicationId,
+    );
+  assert.ok(callbackFirstWrongCurrencyCorrection);
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  const callbackFirstWrongCurrencyCorrectionResult = await request<{
+    correctionId: string;
+    status: string;
+  }>(
+    `/api/v1/admin/refund-adjudications/${callbackFirstWrongCurrencyCorrection.adjudicationId}/corrections`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason:
+          "Synthetic later evidence confirms EUR cash without consuming the USD receipt capacity",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: callbackFirstWrongCurrencyCorrection.refundVersion,
+      }),
+    },
+    201,
+  );
+  assert.equal(
+    callbackFirstWrongCurrencyCorrectionResult.status,
+    "dismissed_outflow_confirmed",
+  );
+  const incidentsAfterWrongCurrencyCorrection = await request<{
+    items: RefundReceiptCapacityIncident[];
+  }>("/api/v1/admin/refund-receipt-capacity-incidents");
+  const callbackReceiptIncidentsAfterWrongCurrency =
+    incidentsAfterWrongCurrencyCorrection.items.filter(
+      (incident) => incident.receiptId === callbackFirstCandidate.receiptId,
+    );
+  assert.equal(callbackReceiptIncidentsAfterWrongCurrency.length, 2);
+  assert.equal(
+    callbackReceiptIncidentsAfterWrongCurrency.find(
+      (incident) => incident.isCurrentSnapshot,
+    )?.incidentId,
+    laterUnexpectedIncident.incidentId,
+  );
+  const wrongCurrencyCorrectionAccounting = await corePool.query<{
+    discrepancy_currency: string;
+    cash_credit: string;
+  }>(
+    `SELECT discrepancy.currency AS discrepancy_currency,
+            sum(line.credit_minor) FILTER (
+              WHERE line.account_code = 'mock_cash'
+            )::text AS cash_credit
+     FROM refund_adjudication_corrections correction
+     JOIN refund_discrepancy_settlements discrepancy
+       ON discrepancy.id = correction.discrepancy_settlement_id
+     JOIN ledger_journals journal
+       ON journal.source_type = 'refund_adjudication_correction'
+      AND journal.source_id = correction.id
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE correction.id = $1
+     GROUP BY discrepancy.currency`,
+    [callbackFirstWrongCurrencyCorrectionResult.correctionId],
+  );
+  assert.equal(wrongCurrencyCorrectionAccounting.rows[0]?.discrepancy_currency, "EUR");
+  assert.equal(wrongCurrencyCorrectionAccounting.rows[0]?.cash_credit, "9");
+  await assert.rejects(
+    corePool.query(
+      `INSERT INTO refund_receipt_capacity_incidents(
+         source_fund_receipt_id, receipt_sequence, triggering_correction_id,
+         confirmed_compensation_minor, receipt_amount_minor, overage_minor,
+         currency, reason
+       ) VALUES ($1, 3, $2, $3, $4, $5, 'USD',
+         'Synthetic EUR correction must not forge a USD receipt overage')`,
+      [
+        callbackFirstCandidate.receiptId,
+        callbackFirstWrongCurrencyCorrectionResult.correctionId,
+        laterUnexpectedIncident.confirmedCompensationMinor,
+        laterUnexpectedIncident.receiptAmountMinor,
+        laterUnexpectedIncident.overageMinor,
+      ],
+    ),
+    /must match its correction and receipt/i,
+  );
 } finally {
   await dropRefundStartDelay();
 }

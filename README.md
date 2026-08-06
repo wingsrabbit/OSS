@@ -47,6 +47,8 @@ The first runnable vertical slice is implemented:
 - if a competing refund settles before a dismissed real outflow is corrected,
   staff see the resulting receipt overage and can accept responsibility for
   manual recovery without deleting or reversing either established outflow;
+  only the latest cumulative snapshot for a receipt is actionable, while older
+  snapshots stay visible as non-additive history;
 - automatic products create one stable Provider operation; a timeout becomes
   `unknown`/`confirming` and is reconciled instead of creating a second resource;
 - a service becomes Active only after a Ready for Service fact, and its term

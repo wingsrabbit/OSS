@@ -33,7 +33,9 @@ All notable project changes will be documented here. Project release numbering a
   Credit compensation and expose the immutable receipt/confirmed/overage amounts in the administrator
   page, and require a reauthenticated, reasoned, idempotent acknowledgement for
   manual financial recovery without changing any financial fact or hiding the
-  still-outstanding recovery.
+  still-outstanding recovery. Only the latest cumulative snapshot for each
+  receipt is actionable, selected by a locked monotonic receipt sequence rather
+  than transaction time; older snapshots remain labelled as non-additive history.
 - Add Funds settlement and reconciliation, configured limits, external fees,
   unclaimed-funds review, and audited allocation or Credit conversion.
 - Append-only per-account Credit movements, invoice Credit allocations, and
@@ -72,7 +74,8 @@ All notable project changes will be documented here. Project release numbering a
   receipt creates an append-only overage incident. Its acknowledgement is also
   append-only, remains operationally visible, and cannot erase cash, Credit,
   settlements, discrepancies, or journals. A later unexpected outflow creates a
-  new incident rather than mutating the prior snapshot.
+  new current incident rather than mutating the prior snapshot; the prior
+  cumulative amount becomes superseded history and cannot be acknowledged again.
 - The web client erases a successfully used password immediately, so repeated
   high-risk actions cannot silently renew the fixed 15-minute reauth window.
 - Original-payment refunds use the receipt's Provider and external payment

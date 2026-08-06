@@ -295,14 +295,27 @@ test("staff owns a callback-first receipt overage without hiding recovery", asyn
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
   const admin = page.locator("section.admin-panel");
-  const incident = admin
+  const historicalIncident = admin
     .getByTestId("refund-receipt-capacity-incident")
     .filter({ hasText: "receipt overage $0.25" });
+  await expect(historicalIncident).toBeVisible();
+  await expect(historicalIncident).toContainText("superseded history");
+  await expect(historicalIncident).toContainText(
+    "Do not add this amount to the current receipt overage",
+  );
+  await expect(
+    historicalIncident.getByRole("button", {
+      name: "Acknowledge and take manual recovery",
+    }),
+  ).toHaveCount(0);
+  const incident = admin
+    .getByTestId("refund-receipt-capacity-incident")
+    .filter({ hasText: "receipt overage $0.32" });
   await expect(incident).toBeVisible();
-  await expect(incident).toContainText("receipt overage $0.25");
+  await expect(incident).toContainText("receipt overage $0.32");
   await expect(incident).toContainText("confirmed compensation");
   await expect(incident).toContainText(
-    "Acknowledgement preserves every compensation and journal",
+    "current cumulative receipt overage",
   );
   await admin
     .getByPlaceholder("Re-enter password (15-minute fixed window)")
@@ -326,7 +339,7 @@ test("staff owns a callback-first receipt overage without hiding recovery", asyn
   const persistedIncident = page
     .locator("section.admin-panel")
     .getByTestId("refund-receipt-capacity-incident")
-    .filter({ hasText: "receipt overage $0.25" });
+    .filter({ hasText: "receipt overage $0.32" });
   await expect(persistedIncident).toContainText("acknowledged recovery outstanding");
   await expect(persistedIncident).toContainText("Manual recovery remains outstanding");
 });

@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS refund_receipt_capacity_incidents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   source_fund_receipt_id uuid NOT NULL REFERENCES fund_receipts(id),
+  receipt_sequence bigint NOT NULL CHECK (receipt_sequence > 0),
   triggering_correction_id uuid UNIQUE REFERENCES refund_adjudication_corrections(id),
   triggering_adjudication_id uuid UNIQUE REFERENCES refund_security_hold_adjudications(id),
   confirmed_compensation_minor bigint NOT NULL CHECK (confirmed_compensation_minor > 0),
@@ -9,6 +10,7 @@ CREATE TABLE IF NOT EXISTS refund_receipt_capacity_incidents (
   currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
   reason text NOT NULL CHECK (length(reason) BETWEEN 10 AND 1000),
   created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (source_fund_receipt_id, receipt_sequence),
   CHECK (num_nonnulls(triggering_correction_id, triggering_adjudication_id) = 1),
   CHECK (confirmed_compensation_minor = receipt_amount_minor + overage_minor)
 );
@@ -34,9 +36,6 @@ CREATE TABLE IF NOT EXISTS refund_receipt_capacity_acknowledgement_aliases (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS refund_receipt_capacity_incidents_receipt_created_idx
-  ON refund_receipt_capacity_incidents (source_fund_receipt_id, created_at, id);
-
 CREATE OR REPLACE FUNCTION opensales_validate_refund_receipt_capacity_incident()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -44,6 +43,7 @@ AS $$
 DECLARE
   receipt_row record;
   confirmed_minor bigint;
+  expected_sequence bigint;
 BEGIN
   SELECT receipt.amount_minor, receipt.currency
   INTO receipt_row
@@ -57,8 +57,12 @@ BEGIN
         AND EXISTS (
           SELECT 1
           FROM refund_adjudication_corrections correction
+          JOIN refund_discrepancy_settlements discrepancy
+            ON discrepancy.id = correction.discrepancy_settlement_id
+           AND discrepancy.refund_id = correction.refund_id
           WHERE correction.id = NEW.triggering_correction_id
             AND correction.refund_id = refund.id
+            AND discrepancy.currency = receipt.currency
         )
       )
       OR
@@ -77,11 +81,17 @@ BEGIN
             AND discrepancy.currency = receipt.currency
         )
       )
-    );
+    )
+  FOR UPDATE OF receipt;
 
   IF receipt_row IS NULL THEN
     RAISE EXCEPTION 'refund receipt capacity incident must match its correction and receipt';
   END IF;
+
+  SELECT COALESCE(max(incident.receipt_sequence), 0) + 1
+  INTO expected_sequence
+  FROM refund_receipt_capacity_incidents incident
+  WHERE incident.source_fund_receipt_id = NEW.source_fund_receipt_id;
 
   SELECT COALESCE(sum(confirmed.amount_minor), 0)
   INTO confirmed_minor
@@ -111,6 +121,7 @@ BEGIN
   ) confirmed;
 
   IF NEW.currency <> receipt_row.currency
+     OR NEW.receipt_sequence <> expected_sequence
      OR NEW.receipt_amount_minor <> receipt_row.amount_minor
      OR NEW.confirmed_compensation_minor <> confirmed_minor
      OR NEW.overage_minor <> confirmed_minor - receipt_row.amount_minor
@@ -142,8 +153,14 @@ BEGIN
     WHERE incident.id = NEW.incident_id
       AND incident.confirmed_compensation_minor = NEW.expected_confirmed_compensation_minor
       AND incident.overage_minor = NEW.expected_overage_minor
+      AND NOT EXISTS (
+        SELECT 1
+        FROM refund_receipt_capacity_incidents later_incident
+        WHERE later_incident.source_fund_receipt_id = incident.source_fund_receipt_id
+          AND later_incident.receipt_sequence > incident.receipt_sequence
+      )
   ) THEN
-    RAISE EXCEPTION 'capacity acknowledgement must match the incident snapshot and staff session';
+    RAISE EXCEPTION 'capacity acknowledgement must match the current incident snapshot and staff session';
   END IF;
   RETURN NEW;
 END;
