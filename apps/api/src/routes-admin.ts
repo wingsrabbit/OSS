@@ -158,6 +158,10 @@ export async function registerAdminRoutes(
       amount_minor: string;
       allocated_minor: string;
       remaining_minor: string;
+      reserved_refund_minor: string;
+      confirmed_outflow_minor: string;
+      available_minor: string;
+      capacity_frozen: boolean;
       currency: string;
       occurred_at: Date;
       disposition: string;
@@ -173,7 +177,16 @@ export async function registerAdminRoutes(
          receipt.external_payment_id,
          receipt.amount_minor::text,
          receipt.allocated_minor::text,
-         (receipt.amount_minor - receipt.allocated_minor)::text AS remaining_minor,
+         GREATEST(
+           0,
+           receipt.amount_minor
+           - receipt.allocated_minor
+           - capacity.confirmed_outflow_minor
+         )::text AS remaining_minor,
+         capacity.reserved_refund_minor::text,
+         capacity.confirmed_outflow_minor::text,
+         capacity.available_minor::text,
+         capacity.capacity_frozen,
          receipt.currency,
          receipt.occurred_at,
          receipt.disposition,
@@ -182,9 +195,13 @@ export async function registerAdminRoutes(
          receipt.created_at
        FROM fund_receipts receipt
        JOIN client_accounts account ON account.id = receipt.client_account_id
+       JOIN unclaimed_fund_refund_capacity capacity
+         ON capacity.fund_receipt_id = receipt.id
        LEFT JOIN payment_attempts payment
          ON payment.id = receipt.reported_payment_attempt_id
-       WHERE receipt.amount_minor > receipt.allocated_minor
+       WHERE capacity.available_minor > 0
+          OR capacity.reserved_refund_minor > 0
+          OR capacity.capacity_frozen
        ORDER BY receipt.created_at DESC, receipt.id`,
     );
     return {
@@ -198,6 +215,10 @@ export async function registerAdminRoutes(
         amountMinor: row.amount_minor,
         allocatedMinor: row.allocated_minor,
         remainingMinor: row.remaining_minor,
+        reservedRefundMinor: row.reserved_refund_minor,
+        confirmedOutflowMinor: row.confirmed_outflow_minor,
+        availableMinor: row.available_minor,
+        capacityFrozen: row.capacity_frozen,
         currency: row.currency,
         occurredAt: row.occurred_at.toISOString(),
         disposition: row.disposition,
@@ -329,8 +350,25 @@ export async function registerAdminRoutes(
       if (!receipt) {
         throw Object.assign(new Error("Fund receipt not found"), { statusCode: 404 });
       }
+      const capacityResult = await client.query<{
+        available_minor: string;
+        capacity_frozen: boolean;
+      }>(
+        `SELECT available_minor::text, capacity_frozen
+         FROM unclaimed_fund_refund_capacity
+         WHERE fund_receipt_id = $1`,
+        [params.receiptId],
+      );
+      const capacity = capacityResult.rows[0];
+      if (!capacity) throw new Error("Fund receipt capacity is unavailable");
       const amount = BigInt(body.amountMinor);
-      const remaining = BigInt(receipt.amount_minor) - BigInt(receipt.allocated_minor);
+      if (capacity.capacity_frozen) {
+        throw Object.assign(
+          new Error("The receipt has an unknown or security-held outflow; reconcile it first"),
+          { statusCode: 409, code: "UNCLAIMED_FUNDS_CAPACITY_FROZEN" },
+        );
+      }
+      const remaining = BigInt(capacity.available_minor);
       if (amount > remaining) {
         throw Object.assign(new Error("Resolution exceeds the remaining unclaimed funds"), {
           statusCode: 409,

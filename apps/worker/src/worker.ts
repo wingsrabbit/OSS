@@ -41,7 +41,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "009_stage_b_refund_capacity_incidents";
+const REQUIRED_SCHEMA_VERSION = "010_stage_b_unclaimed_refunds";
 
 type Job = {
   id: string;
@@ -2661,12 +2661,14 @@ async function preflightRefund(
     await assertJobLeaseWithClient(client, job);
     const pointer = await client.query<{
       source_fund_receipt_id: string;
+      source_context: "allocated_invoice" | "unclaimed_funds";
       requested_by_user_id: string;
       requested_session_id: string;
       requested_client_account_id: string;
     }>(
       `SELECT
          source_fund_receipt_id,
+         source_context,
          requested_by_user_id,
          requested_session_id,
          requested_client_account_id
@@ -2705,6 +2707,11 @@ async function preflightRefund(
            AND account.restricted_at IS NULL
            AND staff.active
            AND (staff.permissions ? '*' OR staff.permissions ? 'billing.refund_manage')
+           AND (
+             $4 <> 'unclaimed_funds'
+             OR staff.permissions ? '*'
+             OR staff.permissions ? 'billing.unclaimed_manage'
+           )
            AND session_record.revoked_at IS NULL
            AND session_record.expires_at > now()
          LIMIT 1
@@ -2713,6 +2720,7 @@ async function preflightRefund(
           initial.requested_by_user_id,
           initial.requested_session_id,
           initial.requested_client_account_id,
+          initial.source_context,
         ],
       );
       authorizationValid = authorization.rowCount === 1;
@@ -2723,6 +2731,7 @@ async function preflightRefund(
       id: string;
       status: string;
       source_fund_receipt_id: string;
+      source_context: "allocated_invoice" | "unclaimed_funds";
       provider_installation_id: string;
       original_external_payment_id: string;
       amount_minor: string;
@@ -2733,6 +2742,7 @@ async function preflightRefund(
       receipt_provider_installation_id: string;
       receipt_external_payment_id: string;
       receipt_amount_minor: string;
+      receipt_allocated_minor: string;
       receipt_currency: string;
       operation_status: string;
       operation_attempt_count: number;
@@ -2744,6 +2754,7 @@ async function preflightRefund(
          refund.id,
          refund.status,
          refund.source_fund_receipt_id,
+         refund.source_context,
          refund.provider_installation_id,
          refund.original_external_payment_id,
          refund.amount_minor::text,
@@ -2754,6 +2765,7 @@ async function preflightRefund(
          receipt.provider_installation_id AS receipt_provider_installation_id,
          receipt.external_payment_id AS receipt_external_payment_id,
          receipt.amount_minor::text AS receipt_amount_minor,
+         receipt.allocated_minor::text AS receipt_allocated_minor,
          receipt.currency AS receipt_currency,
          operation.status AS operation_status,
          operation.attempt_count AS operation_attempt_count,
@@ -2778,7 +2790,10 @@ async function preflightRefund(
       refund.receipt_external_payment_id !== refund.original_external_payment_id ||
       refund.receipt_currency !== refund.currency ||
       BigInt(refund.amount_minor) <= 0n ||
-      BigInt(refund.amount_minor) > BigInt(refund.receipt_amount_minor)
+      BigInt(refund.amount_minor) > BigInt(refund.receipt_amount_minor) ||
+      (refund.source_context === "unclaimed_funds" &&
+        BigInt(refund.amount_minor) >
+          BigInt(refund.receipt_amount_minor) - BigInt(refund.receipt_allocated_minor))
     ) {
       if (mode === "start" && refund?.operation_status === "queued") {
         await failKnownUnsentRefund(
@@ -2839,8 +2854,33 @@ async function preflightRefund(
       );
       return { kind: "halted" };
     }
-    const capacity = await client.query<{ reserved_other_minor: string }>(
+    const capacity = await client.query<{
+      receipt_allocated_minor: string;
+      reserved_other_minor: string;
+      capacity_frozen: boolean;
+    }>(
       `SELECT
+         receipt.allocated_minor::text AS receipt_allocated_minor,
+         (
+           EXISTS (
+             SELECT 1
+             FROM refunds competing_unknown
+             WHERE competing_unknown.source_fund_receipt_id = receipt.id
+               AND competing_unknown.id <> $2
+               AND competing_unknown.source_context = 'unclaimed_funds'
+               AND competing_unknown.status IN ('unknown', 'manual')
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM refund_receipt_security_holds security_hold
+             WHERE security_hold.source_fund_receipt_id = receipt.id
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM refund_security_hold_adjudications adjudication
+                 WHERE adjudication.receipt_security_hold_id = security_hold.id
+               )
+           )
+         ) AS capacity_frozen,
          CASE
            WHEN EXISTS (
              SELECT 1
@@ -2895,9 +2935,14 @@ async function preflightRefund(
       [receiptId, refundId],
     );
     const reservedOtherMinor = capacity.rows[0]?.reserved_other_minor;
+    const receiptAllocatedMinor = capacity.rows[0]?.receipt_allocated_minor;
     if (
       reservedOtherMinor === undefined ||
-      BigInt(reservedOtherMinor) + BigInt(refund.amount_minor) >
+      receiptAllocatedMinor === undefined ||
+      (refund.source_context === "unclaimed_funds" && capacity.rows[0]?.capacity_frozen) ||
+      BigInt(reservedOtherMinor) +
+        BigInt(refund.amount_minor) +
+        (refund.source_context === "unclaimed_funds" ? BigInt(receiptAllocatedMinor) : 0n) >
         BigInt(refund.receipt_amount_minor)
     ) {
       await failKnownUnsentRefund(

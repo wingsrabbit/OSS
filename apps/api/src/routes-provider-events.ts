@@ -1060,6 +1060,7 @@ export async function registerProviderEventRoutes(
       const refundResult = await client.query<{
         id: string;
         source_fund_receipt_id: string;
+        source_context: "allocated_invoice" | "unclaimed_funds";
         provider_installation_id: string;
         destination: string;
         amount_minor: string;
@@ -1079,6 +1080,7 @@ export async function registerProviderEventRoutes(
         `SELECT
            refund.id,
            refund.source_fund_receipt_id,
+           refund.source_context,
            refund.provider_installation_id,
            refund.destination,
            refund.amount_minor::text,
@@ -1586,11 +1588,13 @@ export async function registerProviderEventRoutes(
 
       const receiptCapacity = await client.query<{
         receipt_amount_minor: string;
+        receipt_allocated_minor: string;
         settled_minor: string;
         active_security_hold: boolean;
       }>(
         `SELECT
            receipt.amount_minor::text AS receipt_amount_minor,
+           receipt.allocated_minor::text AS receipt_allocated_minor,
            COALESCE((
              SELECT sum(recorded_outflow.amount_minor)
              FROM (
@@ -1639,7 +1643,11 @@ export async function registerProviderEventRoutes(
       if (
         !capacity ||
         capacity.active_security_hold ||
-        BigInt(capacity.settled_minor) + BigInt(body.amountMinor) >
+        BigInt(capacity.settled_minor) +
+          BigInt(body.amountMinor) +
+          (refund.source_context === "unclaimed_funds"
+            ? BigInt(capacity.receipt_allocated_minor)
+            : 0n) >
           BigInt(capacity.receipt_amount_minor)
       ) {
         return placeSecurityHold(
@@ -1691,18 +1699,30 @@ export async function registerProviderEventRoutes(
       );
       const journal = await client.query<{ id: string }>(
         `INSERT INTO ledger_journals(source_type, source_id, currency, description)
-         VALUES ('refund', $1, $2, 'Confirmed manual refund to original payment method')
+         VALUES ('refund', $1, $2, $3)
          RETURNING id`,
-        [refund.id, body.currency],
+        [
+          refund.id,
+          body.currency,
+          refund.source_context === "unclaimed_funds"
+            ? "Confirmed return of unclaimed funds to original payment method"
+            : "Confirmed manual refund to original payment method",
+        ],
       );
       const journalId = journal.rows[0]?.id;
       if (!journalId) throw new Error("Unable to create refund journal");
       await client.query(
         `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
          VALUES
-           ($1, 'sales_refunds_and_allowances', $2, 0),
+           ($1, $3, $2, 0),
            ($1, 'mock_cash', 0, $2)`,
-        [journalId, body.amountMinor],
+        [
+          journalId,
+          body.amountMinor,
+          refund.source_context === "unclaimed_funds"
+            ? "unclaimed_funds_liability"
+            : "sales_refunds_and_allowances",
+        ],
       );
       await client.query(
         `INSERT INTO refund_events(
@@ -1724,7 +1744,11 @@ export async function registerProviderEventRoutes(
           MOCK_PAYMENT_INSTALLATION_ID,
           refund.id,
           "Provider confirmed the refund",
-          { externalRefundId: body.externalRefundId, amountMinor: body.amountMinor },
+          {
+            externalRefundId: body.externalRefundId,
+            amountMinor: body.amountMinor,
+            sourceContext: refund.source_context,
+          },
         ],
       );
       return { accepted: true, status: "succeeded" };

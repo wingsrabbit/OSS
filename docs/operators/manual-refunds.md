@@ -39,12 +39,28 @@ fingerprint identifies the human decision. Reusing either identity returns the
 original result. A genuinely new partial refund has a new displayed balance and
 decision fingerprint.
 
-Only a confirmed success creates a settlement and balanced journal:
+Only a confirmed success creates a settlement and balanced journal. For a
+refund sourced from one fully allocated invoice receipt (`allocated_invoice`):
 
 ```text
 Dr sales_refunds_and_allowances
 Cr mock_cash
 ```
+
+For a return of still-unclaimed receipt funds (`unclaimed_funds`), Core does not
+invent an invoice or sales refund. It releases the existing liability:
+
+```text
+Dr unclaimed_funds_liability
+Cr mock_cash
+```
+
+The unclaimed-funds action requires both `billing.unclaimed_manage` and
+`billing.refund_manage`, recent password confirmation, an operator reason, and
+the displayed available-capacity snapshot. It can only return funds to the
+immutable original Mock Payment destination. A failed return releases the
+reservation; an unknown result freezes the whole receipt until query-only
+reconciliation or a human decision resolves it.
 
 Every capability-authorized callback is retained as an immutable Provider fact.
 A contradictory success, wrong amount or currency, reused event ID, or late
@@ -67,10 +83,12 @@ then re-enters their password and supplies a reason. This action requires the
 separate `billing.refund_adjudicate` permission.
 
 Accepting an exact authorized outflow creates the normal settlement and only
-reclassifies the already-recorded suspense:
+reclassifies the already-recorded suspense. The debit is
+`sales_refunds_and_allowances` for `allocated_invoice`, or
+`unclaimed_funds_liability` for `unclaimed_funds`:
 
 ```text
-Dr sales_refunds_and_allowances
+Dr source-context liability or refund expense
 Cr refund_discrepancy_suspense
 ```
 
@@ -124,6 +142,11 @@ not actionable, and must never be added to the latest cumulative overage.
 Current ordering uses a monotonic per-receipt sequence allocated while the
 receipt is locked; transaction timestamps are display evidence only and cannot
 select an older snapshot as current.
+For an `unclaimed_funds` incident, the displayed confirmed total disposition is
+the receipt's immutable allocated amount (including Credit conversion) plus all
+confirmed Provider outflows. For an `allocated_invoice` incident it remains the
+confirmed refund compensation only. This prevents a dismissed return from being
+allocated and later confirmed as cash out without opening a recovery item.
 Wrong-currency compensation remains in its own suspense currency and cannot
 create or advance a receipt-currency capacity incident without an explicit
 future FX/allocation fact.
@@ -159,8 +182,11 @@ manual action ever sends another Provider create request.
 Database upgrades are forward-only. Migration `007_stage_b_manual_refunds` is
 immutable; the reconciliation and correction changes are applied by
 `008_stage_b_refund_reconciliation`, and callback-first capacity incidents by
-`009_stage_b_refund_capacity_incidents`. API and Worker refuse to start until the
-dedicated migration command has installed the exact required version.
+`009_stage_b_refund_capacity_incidents`. Migration
+`010_stage_b_unclaimed_refunds` adds the unclaimed-funds source context, its
+shared receipt-capacity guard, and source-aware incident accounting. API and
+Worker refuse to start until the dedicated migration command has installed the
+exact required version.
 
 A Credit refund is confirmed in one local transaction:
 
@@ -169,7 +195,10 @@ Dr sales_refunds_and_allowances
 Cr client_credit_liability
 ```
 
-This initial safe scope accepts only a Fund Receipt fully allocated to one
-invoice. It rejects Add Funds and unclaimed receipts. Third-party destinations
-are also rejected because authenticated ticket authorization and two-person
-review are not implemented yet.
+Invoice refunds accept only a Fund Receipt fully allocated to one invoice.
+Separately, a still-unclaimed Payment or Add Funds receipt can be returned to
+its immutable original Mock Payment destination without fabricating an invoice.
+It cannot be converted into an invoice refund, sent to a different destination,
+or returned beyond the amount left after allocations and confirmed/unknown
+outflows. Third-party destinations remain rejected because authenticated ticket
+authorization and two-person review are not implemented yet.

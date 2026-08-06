@@ -89,6 +89,8 @@ async function verifyPublished007Upgrade(): Promise<void> {
       capacity_incidents: string | null;
       capacity_acknowledgements: string | null;
       capacity_acknowledgement_aliases: string | null;
+      unclaimed_refund_capacity: string | null;
+      refund_source_context: string | null;
       old_discrepancy_unique: string | null;
     }>(
       `SELECT
@@ -101,6 +103,15 @@ async function verifyPublished007Upgrade(): Promise<void> {
            AS capacity_acknowledgements,
          to_regclass('public.refund_receipt_capacity_acknowledgement_aliases')::text
            AS capacity_acknowledgement_aliases,
+         to_regclass('public.unclaimed_fund_refund_capacity')::text
+           AS unclaimed_refund_capacity,
+         (
+           SELECT column_name
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'refunds'
+             AND column_name = 'source_context'
+         ) AS refund_source_context,
          (
            SELECT constraint_name
            FROM information_schema.table_constraints
@@ -110,7 +121,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
          ) AS old_discrepancy_unique
        FROM schema_migrations`,
     );
-    assert.equal(upgraded.rows[0]?.version, "009_stage_b_refund_capacity_incidents");
+    assert.equal(upgraded.rows[0]?.version, "010_stage_b_unclaimed_refunds");
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
@@ -125,6 +136,8 @@ async function verifyPublished007Upgrade(): Promise<void> {
       upgraded.rows[0]?.capacity_acknowledgement_aliases,
       "refund_receipt_capacity_acknowledgement_aliases",
     );
+    assert.equal(upgraded.rows[0]?.unclaimed_refund_capacity, "unclaimed_fund_refund_capacity");
+    assert.equal(upgraded.rows[0]?.refund_source_context, "source_context");
     assert.equal(upgraded.rows[0]?.old_discrepancy_unique, null);
   } finally {
     await upgradePool?.end().catch(() => undefined);
@@ -244,7 +257,8 @@ type RefundCandidate = {
 };
 type RefundRecord = {
   refundId: string;
-  invoiceId: string;
+  invoiceId: string | null;
+  sourceContext: "allocated_invoice" | "unclaimed_funds";
   receiptId: string;
   destination: "original_payment" | "credit" | "none";
   amountMinor: string;
@@ -312,6 +326,11 @@ type RefundReceiptCapacityIncident = {
     | { type: "dismissal_correction"; correctionId: string }
     | { type: "unexpected_outflow_adjudication"; adjudicationId: string };
   refundId: string;
+  sourceContext: "allocated_invoice" | "unclaimed_funds";
+  receiptAllocatedMinor: string;
+  allocatedContributionMinor: string;
+  confirmedProviderOutflowMinor: string;
+  confirmedDispositionMinor: string;
   confirmedCompensationMinor: string;
   receiptAmountMinor: string;
   overageMinor: string;
@@ -8472,6 +8491,1002 @@ try {
 } finally {
   await dropRefundStartDelay();
 }
+
+type UnclaimedRefundWorkItem = {
+  receiptId: string;
+  clientAccountId: string;
+  externalPaymentId: string;
+  amountMinor: string;
+  allocatedMinor: string;
+  reservedRefundMinor: string;
+  confirmedOutflowMinor: string;
+  availableMinor: string;
+  capacityFrozen: boolean;
+};
+
+async function readUnclaimedRefundWork(): Promise<UnclaimedRefundWorkItem[]> {
+  return (
+    await request<{ items: UnclaimedRefundWorkItem[] }>("/api/v1/admin/funds/unclaimed")
+  ).items;
+}
+
+async function requestUnclaimedRefund(
+  item: UnclaimedRefundWorkItem,
+  input: {
+    amountMode: "full" | "partial";
+    amountMinor: string | null;
+    scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order";
+    reason: string;
+    idempotencyKey?: string;
+  },
+  expectedStatus = 202,
+): Promise<RefundRecord> {
+  return request<RefundRecord>(
+    `/api/v1/admin/funds/${item.receiptId}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...input,
+        expectedAvailableMinor: item.availableMinor,
+        idempotencyKey: input.idempotencyKey ?? randomUUID(),
+      }),
+    },
+    expectedStatus,
+  );
+}
+
+async function waitForRefundStatus(
+  refundId: string,
+  label: string,
+  predicate: (refund: RefundRecord) => boolean,
+): Promise<RefundRecord> {
+  return waitFor(
+    label,
+    () => request<RefundRecord>(`/api/v1/admin/refunds/${refundId}`),
+    predicate,
+    40_000,
+  );
+}
+
+await corePool.query(
+  "UPDATE reauth_grants SET invalidated_at = now() WHERE invalidated_at IS NULL",
+);
+const preReauthWork = await readUnclaimedRefundWork();
+const providerBackedExternalIds = await providerPool.query<{
+  external_payment_id: string;
+  remaining_minor: string;
+}>(
+  `SELECT
+     payment.external_payment_id,
+     (
+       payment.amount_minor
+       - COALESCE((
+           SELECT sum(refund.amount_minor)
+           FROM mock_refund_operations refund
+           WHERE refund.original_external_payment_id = payment.external_payment_id
+             AND refund.status IN ('succeeded', 'unknown')
+         ), 0)
+     )::text AS remaining_minor
+   FROM mock_payment_operations payment
+   WHERE payment.external_payment_id = ANY($1::text[])
+     AND payment.status = 'succeeded'`,
+  [preReauthWork.map((item) => item.externalPaymentId)],
+);
+const providerRemaining = new Map(
+  providerBackedExternalIds.rows.map((row) => [row.external_payment_id, BigInt(row.remaining_minor)]),
+);
+const primaryUnclaimed = preReauthWork.find(
+  (item) =>
+    item.clientAccountId === recoveryMe.clientAccountId &&
+    !item.capacityFrozen &&
+    BigInt(item.availableMinor) >= 40n &&
+    (providerRemaining.get(item.externalPaymentId) ?? 0n) >= BigInt(item.availableMinor),
+);
+assert.ok(primaryUnclaimed, "integration needs one Provider-backed unclaimed receipt");
+
+const missingReauth = await rawCoreRequest(
+  `/api/v1/admin/funds/${primaryUnclaimed.receiptId}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      amountMode: "partial",
+      amountMinor: "1",
+      expectedAvailableMinor: primaryUnclaimed.availableMinor,
+      scenario: "success",
+      reason: "Synthetic funds return without a current password confirmation",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(missingReauth.status, 403);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+
+const permissionProbeBody = {
+  amountMode: "partial",
+  amountMinor: "1",
+  expectedAvailableMinor: primaryUnclaimed.availableMinor,
+  scenario: "success",
+  reason: "Synthetic split-permission probe must not create a Provider refund",
+};
+const refundsBeforePermissionProbes = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM refunds
+   WHERE source_context = 'unclaimed_funds'
+     AND source_fund_receipt_id = $1`,
+  [primaryUnclaimed.receiptId],
+);
+await corePool.query(
+  `UPDATE staff_members
+   SET permissions = $2::jsonb, updated_at = now()
+   WHERE user_id = $1`,
+  [staffMe.id, JSON.stringify(["billing.unclaimed_manage"])],
+);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const missingRefundManage = await rawCoreRequest(
+  `/api/v1/admin/funds/${primaryUnclaimed.receiptId}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({ ...permissionProbeBody, idempotencyKey: randomUUID() }),
+  },
+);
+assert.equal(missingRefundManage.status, 403);
+await corePool.query(
+  `UPDATE staff_members
+   SET permissions = $2::jsonb, updated_at = now()
+   WHERE user_id = $1`,
+  [staffMe.id, JSON.stringify(["billing.refund_manage"])],
+);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const missingUnclaimedManage = await rawCoreRequest(
+  `/api/v1/admin/funds/${primaryUnclaimed.receiptId}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({ ...permissionProbeBody, idempotencyKey: randomUUID() }),
+  },
+);
+assert.equal(missingUnclaimedManage.status, 403);
+const refundsAfterPermissionProbes = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM refunds
+   WHERE source_context = 'unclaimed_funds'
+     AND source_fund_receipt_id = $1`,
+  [primaryUnclaimed.receiptId],
+);
+assert.equal(
+  refundsAfterPermissionProbes.rows[0]?.count,
+  refundsBeforePermissionProbes.rows[0]?.count,
+);
+await corePool.query(
+  `UPDATE staff_members
+   SET permissions = '["*"]'::jsonb, updated_at = now()
+   WHERE user_id = $1`,
+  [staffMe.id],
+);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+
+const workerPermissionWork = preReauthWork.find(
+  (item) =>
+    item.receiptId !== primaryUnclaimed.receiptId &&
+    item.clientAccountId === recoveryMe.clientAccountId &&
+    !item.capacityFrozen &&
+    BigInt(item.availableMinor) > 1n &&
+    (providerRemaining.get(item.externalPaymentId) ?? 0n) >= BigInt(item.availableMinor),
+);
+assert.ok(
+  workerPermissionWork,
+  "integration needs an independent unclaimed receipt for Worker permission revocation",
+);
+await installRefundStartDelay();
+let revokedWorkerRefund: RefundRecord | undefined;
+try {
+  revokedWorkerRefund = await requestUnclaimedRefund(workerPermissionWork, {
+    amountMode: "partial",
+    amountMinor: "1",
+    scenario: "success",
+    reason: "Synthetic queued return loses unclaimed permission before Provider create",
+  });
+  assert.ok(revokedWorkerRefund.providerOperationId);
+  const queuedBeforePermissionRevocation = await corePool.query<{
+    refund_status: string;
+    operation_status: string;
+    attempt_count: number;
+    job_status: string;
+  }>(
+    `SELECT refund.status AS refund_status,
+            operation.status AS operation_status,
+            operation.attempt_count,
+            job.status AS job_status
+     FROM refunds refund
+     JOIN provider_operations operation
+       ON operation.subject_type = 'refund'
+      AND operation.subject_id = refund.id
+      AND operation.kind = 'refund_create'
+     JOIN durable_jobs job
+       ON job.job_type = 'refund.start'
+      AND job.payload->>'refundId' = refund.id::text
+     WHERE refund.id = $1`,
+    [revokedWorkerRefund.refundId],
+  );
+  assert.deepEqual(queuedBeforePermissionRevocation.rows[0], {
+    refund_status: "queued",
+    operation_status: "queued",
+    attempt_count: 0,
+    job_status: "pending",
+  });
+  await corePool.query(
+    `UPDATE staff_members
+     SET permissions = $2::jsonb, updated_at = now()
+     WHERE user_id = $1`,
+    [staffMe.id, JSON.stringify(["billing.refund_manage"])],
+  );
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET available_at = now(), updated_at = now()
+     WHERE job_type = 'refund.start'
+       AND payload->>'refundId' = $1
+       AND status = 'pending'`,
+    [revokedWorkerRefund.refundId],
+  );
+  const revokedBeforeCreate = await waitFor(
+    "queued unclaimed return to fail after unclaimed permission revocation",
+    async () => {
+      const state = await corePool.query<{
+        refund_status: string;
+        operation_status: string;
+        attempt_count: number;
+        job_status: string;
+        known_unsent_audits: string;
+      }>(
+        `SELECT refund.status AS refund_status,
+                operation.status AS operation_status,
+                operation.attempt_count,
+                job.status AS job_status,
+                (SELECT count(*)::text
+                   FROM audit_events audit
+                  WHERE audit.action = 'refund.known_unsent_rejected'
+                    AND audit.target_type = 'refund'
+                    AND audit.target_id = refund.id::text) AS known_unsent_audits
+         FROM refunds refund
+         JOIN provider_operations operation
+           ON operation.subject_type = 'refund'
+          AND operation.subject_id = refund.id
+          AND operation.kind = 'refund_create'
+         JOIN durable_jobs job
+           ON job.job_type = 'refund.start'
+          AND job.payload->>'refundId' = refund.id::text
+         WHERE refund.id = $1`,
+        [revokedWorkerRefund!.refundId],
+      );
+      return state.rows[0];
+    },
+    (state) =>
+      state?.refund_status === "failed" &&
+      state.operation_status === "failed" &&
+      state.job_status === "completed",
+    15_000,
+  );
+  assert.ok(revokedBeforeCreate);
+  assert.equal(revokedBeforeCreate.attempt_count, 0);
+  assert.equal(revokedBeforeCreate.known_unsent_audits, "1");
+  const revokedProviderCreates = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+     FROM mock_refund_operations
+     WHERE refund_id = $1`,
+    [revokedWorkerRefund.refundId],
+  );
+  assert.equal(revokedProviderCreates.rows[0]?.count, "0");
+} finally {
+  await corePool.query(
+    `UPDATE staff_members
+     SET permissions = '["*"]'::jsonb, updated_at = now()
+     WHERE user_id = $1`,
+    [staffMe.id],
+  );
+  await dropRefundStartDelay();
+}
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const afterWorkerPermissionRevocation = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === workerPermissionWork.receiptId,
+);
+assert.ok(afterWorkerPermissionRevocation);
+assert.equal(afterWorkerPermissionRevocation.availableMinor, workerPermissionWork.availableMinor);
+assert.equal(afterWorkerPermissionRevocation.reservedRefundMinor, "0");
+assert.equal(afterWorkerPermissionRevocation.capacityFrozen, false);
+
+const failedUnclaimedRefund = await requestUnclaimedRefund(primaryUnclaimed, {
+  amountMode: "partial",
+  amountMinor: "2",
+  scenario: "failed",
+  reason: "Synthetic Provider definitively rejects this unclaimed funds return",
+});
+assert.equal(failedUnclaimedRefund.sourceContext, "unclaimed_funds");
+assert.equal(failedUnclaimedRefund.invoiceId, null);
+await waitForRefundStatus(
+  failedUnclaimedRefund.refundId,
+  "unclaimed funds Provider failure",
+  (refund) => refund.status === "failed",
+);
+const afterFailedReturn = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === primaryUnclaimed.receiptId,
+);
+assert.ok(afterFailedReturn);
+assert.equal(afterFailedReturn.availableMinor, primaryUnclaimed.availableMinor);
+assert.equal(afterFailedReturn.reservedRefundMinor, "0");
+assert.equal(afterFailedReturn.capacityFrozen, false);
+
+const allocatedLateSuccessWork = preReauthWork.find(
+  (item) =>
+    item.receiptId !== primaryUnclaimed.receiptId &&
+    item.clientAccountId === recoveryMe.clientAccountId &&
+    item.allocatedMinor === "0" &&
+    item.confirmedOutflowMinor === "0" &&
+    item.availableMinor === item.amountMinor &&
+    !item.capacityFrozen &&
+    (providerRemaining.get(item.externalPaymentId) ?? 0n) >= BigInt(item.availableMinor),
+);
+assert.ok(
+  allocatedLateSuccessWork,
+  "integration needs an independent Provider-backed unclaimed receipt for late-success capacity",
+);
+const allocatedLateFailedRefund = await requestUnclaimedRefund(allocatedLateSuccessWork, {
+  amountMode: "full",
+  amountMinor: null,
+  scenario: "failed",
+  reason: "Synthetic full return fails before the same liability is allocated elsewhere",
+});
+const allocatedLateFailedTerminal = await waitForRefundStatus(
+  allocatedLateFailedRefund.refundId,
+  "full unclaimed return to fail before allocation",
+  (refund) => refund.status === "failed",
+);
+assert.ok(allocatedLateFailedTerminal.providerOperationId);
+const allocatedLateExternalRefundId =
+  allocatedLateFailedTerminal.externalRefundId ??
+  `mock-refund-${allocatedLateFailedTerminal.providerOperationId}`;
+
+cookie = recoveryCookie;
+const allocatedLateInvoice = await createOrder(manualPrice.id, legal);
+assert.ok(
+  BigInt(allocatedLateInvoice.invoice.dueMinor) >= BigInt(allocatedLateSuccessWork.availableMinor),
+  "manual-product invoice must be large enough to consume the independent receipt",
+);
+cookie = staffCookie;
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const allocatedLateBeforeResolution = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === allocatedLateSuccessWork.receiptId,
+);
+assert.ok(allocatedLateBeforeResolution);
+assert.equal(allocatedLateBeforeResolution.availableMinor, allocatedLateSuccessWork.amountMinor);
+const allocatedLateResolution = await request<{
+  resolutionId: string;
+  remainingMinor: string;
+  invoiceStatus: string;
+}>(
+  `/api/v1/admin/funds/${allocatedLateSuccessWork.receiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      action: "allocate_invoice",
+      amountMinor: allocatedLateBeforeResolution.availableMinor,
+      invoiceId: allocatedLateInvoice.invoice.id,
+      reason: "Synthetic operator allocates every remaining cent after the Provider failure",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+assert.equal(allocatedLateResolution.remainingMinor, "0");
+const fullyAllocatedLateReceipt = await corePool.query<{
+  amount_minor: string;
+  allocated_minor: string;
+  resolutions: string;
+}>(
+  `SELECT receipt.amount_minor::text, receipt.allocated_minor::text,
+          (SELECT count(*)::text
+             FROM fund_receipt_resolutions resolution
+            WHERE resolution.fund_receipt_id = receipt.id) AS resolutions
+   FROM fund_receipts receipt
+   WHERE receipt.id = $1`,
+  [allocatedLateSuccessWork.receiptId],
+);
+assert.equal(
+  fullyAllocatedLateReceipt.rows[0]?.allocated_minor,
+  fullyAllocatedLateReceipt.rows[0]?.amount_minor,
+);
+assert.equal(fullyAllocatedLateReceipt.rows[0]?.resolutions, "1");
+
+const allocatedLateBaseTime = Date.now() + 2_000;
+const allocatedLateSuccess = await submitRefundFact({
+  eventId: `unclaimed-allocated-late-success:${randomUUID()}`,
+  providerOperationId: allocatedLateFailedTerminal.providerOperationId,
+  refundId: allocatedLateFailedTerminal.refundId,
+  externalRefundId: allocatedLateExternalRefundId,
+  status: "succeeded",
+  amountMinor: allocatedLateSuccessWork.amountMinor,
+  currency: "USD",
+  occurredAt: new Date(allocatedLateBaseTime).toISOString(),
+});
+assert.equal(allocatedLateSuccess.status, 202);
+assert.equal(allocatedLateSuccess.body.status, "manual");
+const allocatedLateHolds = await request<{ items: RefundSecurityHold[] }>(
+  "/api/v1/admin/refund-security-holds",
+);
+const allocatedLateHold = allocatedLateHolds.items.find(
+  (hold) =>
+    hold.refundId === allocatedLateFailedTerminal.refundId &&
+    hold.providerFact.externalRefundId === allocatedLateExternalRefundId,
+);
+assert.ok(allocatedLateHold);
+assert.equal(allocatedLateHold.refundAmountMinor, allocatedLateSuccessWork.amountMinor);
+assert.deepEqual(allocatedLateHold.allowedDecisions, [
+  "record_unexpected_outflow",
+  "dismiss_provider_claim",
+]);
+const allocatedLateAdjudication = await adjudicateRefundHold(
+  allocatedLateHold,
+  "record_unexpected_outflow",
+  "Synthetic administrator confirms the exact late Provider outflow after full allocation",
+);
+const allocatedLateIncidents = await request<{
+  items: RefundReceiptCapacityIncident[];
+}>("/api/v1/admin/refund-receipt-capacity-incidents");
+const allocatedLateIncident = allocatedLateIncidents.items.find(
+  (incident) =>
+    incident.source.type === "unexpected_outflow_adjudication" &&
+    incident.source.adjudicationId === allocatedLateAdjudication.adjudicationId,
+);
+assert.ok(allocatedLateIncident);
+assert.equal(allocatedLateIncident.receiptId, allocatedLateSuccessWork.receiptId);
+assert.equal(allocatedLateIncident.refundId, allocatedLateFailedTerminal.refundId);
+assert.equal(allocatedLateIncident.sourceContext, "unclaimed_funds");
+assert.equal(allocatedLateIncident.receiptSequence, "1");
+assert.equal(allocatedLateIncident.receiptAllocatedMinor, allocatedLateSuccessWork.amountMinor);
+assert.equal(
+  allocatedLateIncident.allocatedContributionMinor,
+  allocatedLateSuccessWork.amountMinor,
+);
+assert.equal(
+  allocatedLateIncident.confirmedProviderOutflowMinor,
+  allocatedLateSuccessWork.amountMinor,
+);
+assert.equal(
+  allocatedLateIncident.confirmedDispositionMinor,
+  (BigInt(allocatedLateSuccessWork.amountMinor) * 2n).toString(),
+);
+assert.equal(allocatedLateIncident.receiptAmountMinor, allocatedLateSuccessWork.amountMinor);
+assert.equal(allocatedLateIncident.overageMinor, allocatedLateSuccessWork.amountMinor);
+assert.equal(allocatedLateIncident.isCurrentSnapshot, true);
+assert.equal(allocatedLateIncident.status, "awaiting_acknowledgement");
+const allocatedLateIncidentAccounting = await corePool.query<{
+  settlements: string;
+  allocation_liability_debit: string;
+  allocation_ar_credit: string;
+  discrepancy_suspense_debit: string;
+  discrepancy_cash_credit: string;
+  incidents: string;
+  unbalanced: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+     COALESCE((
+       SELECT sum(line.debit_minor)::text
+       FROM fund_receipt_resolutions resolution
+       JOIN ledger_journals journal
+         ON journal.source_type = 'fund_receipt_resolution'
+        AND journal.source_id = resolution.id
+       JOIN ledger_lines line
+         ON line.journal_id = journal.id
+        AND line.account_code = 'unclaimed_funds_liability'
+       WHERE resolution.fund_receipt_id = $2
+     ), '0') AS allocation_liability_debit,
+     COALESCE((
+       SELECT sum(line.credit_minor)::text
+       FROM fund_receipt_resolutions resolution
+       JOIN ledger_journals journal
+         ON journal.source_type = 'fund_receipt_resolution'
+        AND journal.source_id = resolution.id
+       JOIN ledger_lines line
+         ON line.journal_id = journal.id
+        AND line.account_code = 'accounts_receivable'
+       WHERE resolution.fund_receipt_id = $2
+     ), '0') AS allocation_ar_credit,
+     COALESCE((
+       SELECT sum(line.debit_minor)::text
+       FROM refund_discrepancy_settlements discrepancy
+       JOIN ledger_journals journal
+         ON journal.source_type = 'refund_provider_discrepancy'
+        AND journal.source_id = discrepancy.id
+       JOIN ledger_lines line
+         ON line.journal_id = journal.id
+        AND line.account_code = 'refund_discrepancy_suspense'
+       WHERE discrepancy.refund_id = $1
+     ), '0') AS discrepancy_suspense_debit,
+     COALESCE((
+       SELECT sum(line.credit_minor)::text
+       FROM refund_discrepancy_settlements discrepancy
+       JOIN ledger_journals journal
+         ON journal.source_type = 'refund_provider_discrepancy'
+        AND journal.source_id = discrepancy.id
+       JOIN ledger_lines line
+         ON line.journal_id = journal.id
+        AND line.account_code = 'mock_cash'
+       WHERE discrepancy.refund_id = $1
+     ), '0') AS discrepancy_cash_credit,
+     (SELECT count(*)::text
+        FROM refund_receipt_capacity_incidents
+       WHERE source_fund_receipt_id = $2) AS incidents,
+     (SELECT count(*)::text
+        FROM (
+          SELECT line.journal_id
+          FROM ledger_lines line
+          JOIN ledger_journals journal ON journal.id = line.journal_id
+          WHERE (
+            journal.source_type = 'fund_receipt_resolution'
+            AND EXISTS (
+              SELECT 1 FROM fund_receipt_resolutions resolution
+              WHERE resolution.id = journal.source_id
+                AND resolution.fund_receipt_id = $2
+            )
+          ) OR (
+            journal.source_type = 'refund_provider_discrepancy'
+            AND EXISTS (
+              SELECT 1 FROM refund_discrepancy_settlements discrepancy
+              WHERE discrepancy.id = journal.source_id AND discrepancy.refund_id = $1
+            )
+          )
+          GROUP BY line.journal_id
+          HAVING sum(line.debit_minor) <> sum(line.credit_minor)
+        ) imbalance) AS unbalanced`,
+  [allocatedLateFailedTerminal.refundId, allocatedLateSuccessWork.receiptId],
+);
+assert.deepEqual(allocatedLateIncidentAccounting.rows[0], {
+  settlements: "0",
+  allocation_liability_debit: allocatedLateSuccessWork.amountMinor,
+  allocation_ar_credit: allocatedLateSuccessWork.amountMinor,
+  discrepancy_suspense_debit: allocatedLateSuccessWork.amountMinor,
+  discrepancy_cash_credit: allocatedLateSuccessWork.amountMinor,
+  incidents: "1",
+  unbalanced: "0",
+});
+const allocatedLateVisibleAgain = await request<{
+  items: RefundReceiptCapacityIncident[];
+}>("/api/v1/admin/refund-receipt-capacity-incidents");
+assert.ok(
+  allocatedLateVisibleAgain.items.some(
+    (incident) =>
+      incident.incidentId === allocatedLateIncident.incidentId && incident.isCurrentSnapshot,
+  ),
+);
+
+const correctionExternalRefundId =
+  `mock-refund-unclaimed-dismiss-correction:${allocatedLateFailedTerminal.refundId}`;
+const correctionLateSuccess = await submitRefundFact({
+  eventId: `unclaimed-allocated-dismissed-success:${randomUUID()}`,
+  providerOperationId: allocatedLateFailedTerminal.providerOperationId,
+  refundId: allocatedLateFailedTerminal.refundId,
+  externalRefundId: correctionExternalRefundId,
+  status: "succeeded",
+  amountMinor: allocatedLateSuccessWork.amountMinor,
+  currency: "USD",
+  occurredAt: new Date(allocatedLateBaseTime + 1_000).toISOString(),
+});
+assert.equal(correctionLateSuccess.status, 202);
+assert.equal(correctionLateSuccess.body.status, "manual");
+const correctionLateHolds = await request<{ items: RefundSecurityHold[] }>(
+  "/api/v1/admin/refund-security-holds",
+);
+const correctionLateHold = correctionLateHolds.items.find(
+  (hold) =>
+    hold.refundId === allocatedLateFailedTerminal.refundId &&
+    hold.providerFact.externalRefundId === correctionExternalRefundId,
+);
+assert.ok(correctionLateHold);
+const correctionDismissal = await adjudicateRefundHold(
+  correctionLateHold,
+  "dismiss_provider_claim",
+  "Synthetic administrator initially dismisses the second exact late outflow",
+);
+const allocatedLateCorrections = await request<{ items: RefundDismissalCorrection[] }>(
+  "/api/v1/admin/refund-dismissal-corrections",
+);
+const allocatedLateCorrection = allocatedLateCorrections.items.find(
+  (item) => item.adjudicationId === correctionDismissal.adjudicationId,
+);
+assert.ok(allocatedLateCorrection);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const allocatedLateCorrectionResult = await request<{
+  correctionId: string;
+  status: string;
+}>(
+  `/api/v1/admin/refund-adjudications/${allocatedLateCorrection.adjudicationId}/corrections`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      reason: "Synthetic later evidence confirms the dismissed outflow on the allocated receipt",
+      idempotencyKey: randomUUID(),
+      expectedRefundVersion: allocatedLateCorrection.refundVersion,
+    }),
+  },
+  201,
+);
+assert.equal(allocatedLateCorrectionResult.status, "dismissed_outflow_confirmed");
+const incidentsAfterAllocatedCorrection = await request<{
+  items: RefundReceiptCapacityIncident[];
+}>("/api/v1/admin/refund-receipt-capacity-incidents");
+const allocatedLateCorrectionIncident = incidentsAfterAllocatedCorrection.items.find(
+  (incident) =>
+    incident.source.type === "dismissal_correction" &&
+    incident.source.correctionId === allocatedLateCorrectionResult.correctionId,
+);
+assert.ok(allocatedLateCorrectionIncident);
+assert.equal(allocatedLateCorrectionIncident.receiptId, allocatedLateSuccessWork.receiptId);
+assert.equal(allocatedLateCorrectionIncident.sourceContext, "unclaimed_funds");
+assert.equal(allocatedLateCorrectionIncident.receiptSequence, "2");
+assert.equal(
+  allocatedLateCorrectionIncident.confirmedDispositionMinor,
+  (BigInt(allocatedLateSuccessWork.amountMinor) * 3n).toString(),
+);
+assert.equal(
+  allocatedLateCorrectionIncident.confirmedProviderOutflowMinor,
+  (BigInt(allocatedLateSuccessWork.amountMinor) * 2n).toString(),
+);
+assert.equal(
+  allocatedLateCorrectionIncident.overageMinor,
+  (BigInt(allocatedLateSuccessWork.amountMinor) * 2n).toString(),
+);
+assert.equal(allocatedLateCorrectionIncident.isCurrentSnapshot, true);
+const supersededAllocatedIncident = incidentsAfterAllocatedCorrection.items.find(
+  (incident) => incident.incidentId === allocatedLateIncident.incidentId,
+);
+assert.ok(supersededAllocatedIncident);
+assert.equal(supersededAllocatedIncident.isCurrentSnapshot, false);
+assert.equal(supersededAllocatedIncident.status, "superseded_history");
+
+const receiptBeforeReturn = await corePool.query<{
+  provider_installation_id: string;
+  external_payment_id: string;
+  amount_minor: string;
+  allocated_minor: string;
+  currency: string;
+  occurred_at: Date;
+}>(
+  `SELECT provider_installation_id, external_payment_id, amount_minor::text,
+          allocated_minor::text, currency, occurred_at
+   FROM fund_receipts
+   WHERE id = $1`,
+  [primaryUnclaimed.receiptId],
+);
+const successfulUnclaimedRefund = await requestUnclaimedRefund(afterFailedReturn, {
+  amountMode: "partial",
+  amountMinor: "3",
+  scenario: "success",
+  reason: "Synthetic operator returns part of an unclaimed receipt to its original payment",
+});
+const succeededUnclaimedRefund = await waitForRefundStatus(
+  successfulUnclaimedRefund.refundId,
+  "unclaimed funds Provider success",
+  (refund) => refund.status === "succeeded",
+);
+assert.equal(succeededUnclaimedRefund.sourceContext, "unclaimed_funds");
+const successfulReturnAccounting = await corePool.query<{
+  settlements: string;
+  liability_debit: string;
+  cash_credit: string;
+  sales_refunds_lines: string;
+  debit_total: string;
+  credit_total: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+     COALESCE(sum(line.debit_minor) FILTER (
+       WHERE line.account_code = 'unclaimed_funds_liability'
+     ), 0)::text AS liability_debit,
+     COALESCE(sum(line.credit_minor) FILTER (
+       WHERE line.account_code = 'mock_cash'
+     ), 0)::text AS cash_credit,
+     count(*) FILTER (
+       WHERE line.account_code = 'sales_refunds_and_allowances'
+     )::text AS sales_refunds_lines,
+     COALESCE(sum(line.debit_minor), 0)::text AS debit_total,
+     COALESCE(sum(line.credit_minor), 0)::text AS credit_total
+   FROM ledger_journals journal
+   LEFT JOIN ledger_lines line ON line.journal_id = journal.id
+   WHERE journal.source_type = 'refund' AND journal.source_id = $1`,
+  [successfulUnclaimedRefund.refundId],
+);
+assert.deepEqual(successfulReturnAccounting.rows[0], {
+  settlements: "1",
+  liability_debit: "3",
+  cash_credit: "3",
+  sales_refunds_lines: "0",
+  debit_total: "3",
+  credit_total: "3",
+});
+const receiptAfterReturn = await corePool.query(
+  `SELECT provider_installation_id, external_payment_id, amount_minor::text,
+          allocated_minor::text, currency, occurred_at
+   FROM fund_receipts
+   WHERE id = $1`,
+  [primaryUnclaimed.receiptId],
+);
+assert.deepEqual(receiptAfterReturn.rows[0], receiptBeforeReturn.rows[0]);
+
+const beforeTimeoutReturn = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === primaryUnclaimed.receiptId,
+);
+assert.ok(beforeTimeoutReturn);
+const timeoutUnclaimedRefund = await requestUnclaimedRefund(beforeTimeoutReturn, {
+  amountMode: "partial",
+  amountMinor: "4",
+  scenario: "timeout_success",
+  reason: "Synthetic timeout remains unknown until query reconciliation confirms the outflow",
+});
+await waitForRefundStatus(
+  timeoutUnclaimedRefund.refundId,
+  "unclaimed funds timeout to become unknown",
+  (refund) => refund.status === "unknown",
+);
+const frozenDuringUnknown = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === primaryUnclaimed.receiptId,
+);
+assert.ok(frozenDuringUnknown);
+assert.equal(frozenDuringUnknown.capacityFrozen, true);
+assert.equal(frozenDuringUnknown.availableMinor, "0");
+await request(
+  `/api/v1/admin/funds/${primaryUnclaimed.receiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      action: "convert_to_credit",
+      amountMinor: "1",
+      invoiceId: null,
+      reason: "Synthetic allocation is blocked while the Provider result remains unknown",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  409,
+);
+await request(
+  `/api/v1/admin/funds/${primaryUnclaimed.receiptId}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      amountMode: "partial",
+      amountMinor: "1",
+      expectedAvailableMinor: "1",
+      scenario: "success",
+      reason: "Synthetic second return is blocked while the Provider result remains unknown",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  409,
+);
+await waitForRefundStatus(
+  timeoutUnclaimedRefund.refundId,
+  "unclaimed funds timeout reconciliation",
+  (refund) => refund.status === "succeeded",
+);
+
+const beforeDuplicateReturn = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === primaryUnclaimed.receiptId,
+);
+assert.ok(beforeDuplicateReturn);
+const duplicateUnclaimedRefund = await requestUnclaimedRefund(beforeDuplicateReturn, {
+  amountMode: "partial",
+  amountMinor: "5",
+  scenario: "duplicate_out_of_order",
+  reason: "Synthetic duplicate and older Provider callbacks must not settle the return twice",
+});
+const duplicateTerminal = await waitForRefundStatus(
+  duplicateUnclaimedRefund.refundId,
+  "duplicate and out-of-order unclaimed funds callbacks",
+  (refund) => refund.status === "succeeded",
+);
+await new Promise((resolve) => setTimeout(resolve, 200));
+const duplicateEffects = await corePool.query<{ settlements: string; journals: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+     (SELECT count(*)::text FROM ledger_journals
+       WHERE source_type = 'refund' AND source_id = $1) AS journals`,
+  [duplicateUnclaimedRefund.refundId],
+);
+assert.deepEqual(duplicateEffects.rows[0], { settlements: "1", journals: "1" });
+const duplicateProviderCalls = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_refund_operations WHERE operation_id = $1",
+  [duplicateTerminal.providerOperationId],
+);
+assert.equal(duplicateProviderCalls.rows[0]?.create_calls, 1);
+
+const beforeDoubleRequest = (await readUnclaimedRefundWork()).find(
+  (item) => item.receiptId === primaryUnclaimed.receiptId,
+);
+assert.ok(beforeDoubleRequest);
+await installRefundStartDelay();
+let winningConcurrentRefund: RefundRecord | undefined;
+try {
+  const concurrentBodies = [randomUUID(), randomUUID()].map((idempotencyKey, index) => ({
+    method: "POST",
+    body: JSON.stringify({
+      amountMode: "partial",
+      amountMinor: "7",
+      expectedAvailableMinor: beforeDoubleRequest.availableMinor,
+      scenario: "success",
+      reason: `Synthetic concurrent unclaimed funds return contender ${index + 1}`,
+      idempotencyKey,
+    }),
+  }));
+  const concurrentReturns = await Promise.all(
+    concurrentBodies.map((body) =>
+      rawCoreRequest(`/api/v1/admin/funds/${primaryUnclaimed.receiptId}/refunds`, body),
+    ),
+  );
+  assert.deepEqual(
+    concurrentReturns.map((response) => response.status).sort(),
+    [202, 409],
+  );
+  winningConcurrentRefund = concurrentReturns.find((response) => response.status === 202)
+    ?.body as RefundRecord | undefined;
+  assert.ok(winningConcurrentRefund);
+  await corePool.query(
+    `UPDATE durable_jobs SET available_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [winningConcurrentRefund.refundId],
+  );
+} finally {
+  await dropRefundStartDelay();
+}
+await waitForRefundStatus(
+  winningConcurrentRefund!.refundId,
+  "winning concurrent unclaimed funds return",
+  (refund) => refund.status === "succeeded",
+);
+const concurrentReservationEffects = await corePool.query<{ refunds: string; settlements: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM refunds
+       WHERE source_context = 'unclaimed_funds'
+         AND source_fund_receipt_id = $1
+         AND amount_minor = 7) AS refunds,
+     (SELECT count(*)::text
+        FROM refund_settlements settlement
+        JOIN refunds refund ON refund.id = settlement.refund_id
+       WHERE refund.source_context = 'unclaimed_funds'
+         AND refund.source_fund_receipt_id = $1
+         AND refund.amount_minor = 7) AS settlements`,
+  [primaryUnclaimed.receiptId],
+);
+assert.deepEqual(concurrentReservationEffects.rows[0], { refunds: "1", settlements: "1" });
+
+const raceWork = (await readUnclaimedRefundWork()).find(
+  (item) =>
+    item.receiptId !== primaryUnclaimed.receiptId &&
+    item.clientAccountId === recoveryMe.clientAccountId &&
+    !item.capacityFrozen &&
+    BigInt(item.availableMinor) > 0n &&
+    (providerRemaining.get(item.externalPaymentId) ?? 0n) >= BigInt(item.availableMinor),
+);
+assert.ok(raceWork, "integration needs a second Provider-backed receipt for allocation race");
+cookie = recoveryCookie;
+const allocationRaceOrder = await createOrder(automaticPrice.id, legal);
+cookie = staffCookie;
+const allocationRaceAmount = (
+  BigInt(raceWork.availableMinor) < BigInt(allocationRaceOrder.invoice.dueMinor)
+    ? BigInt(raceWork.availableMinor)
+    : BigInt(allocationRaceOrder.invoice.dueMinor)
+).toString();
+assert.ok(BigInt(allocationRaceAmount) > 0n);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+await installRefundStartDelay();
+let raceRefund: RefundRecord | undefined;
+try {
+  const returnRequest = rawCoreRequest(`/api/v1/admin/funds/${raceWork.receiptId}/refunds`, {
+    method: "POST",
+    body: JSON.stringify({
+      amountMode: "full",
+      amountMinor: null,
+      expectedAvailableMinor: raceWork.availableMinor,
+      scenario: "success",
+      reason: "Synthetic full return races an invoice allocation against one receipt capacity",
+      idempotencyKey: randomUUID(),
+    }),
+  });
+  const allocationRequest = rawCoreRequest(
+    `/api/v1/admin/funds/${raceWork.receiptId}/resolutions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "allocate_invoice",
+        amountMinor: allocationRaceAmount,
+        invoiceId: allocationRaceOrder.invoice.id,
+        reason: "Synthetic invoice allocation races a full original-payment return",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+  );
+  const capacityRace = await Promise.all([returnRequest, allocationRequest]);
+  const successfulRace = capacityRace.filter((response) => [201, 202].includes(response.status));
+  assert.equal(successfulRace.length, 1);
+  assert.equal(capacityRace.filter((response) => response.status === 409).length, 1);
+  const returnWinner = capacityRace.find((response) => response.status === 202);
+  if (returnWinner) {
+    raceRefund = returnWinner.body as RefundRecord;
+    await corePool.query(
+      `UPDATE durable_jobs SET available_at = now()
+       WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+      [raceRefund.refundId],
+    );
+  }
+} finally {
+  await dropRefundStartDelay();
+}
+if (raceRefund) {
+  await waitForRefundStatus(
+    raceRefund.refundId,
+    "return winner in allocation race",
+    (refund) => refund.status === "succeeded",
+  );
+}
+const raceCapacity = await corePool.query<{
+  allocated_minor: string;
+  confirmed_outflow_minor: string;
+  amount_minor: string;
+}>(
+  `SELECT receipt.allocated_minor::text,
+          capacity.confirmed_outflow_minor::text,
+          receipt.amount_minor::text
+   FROM fund_receipts receipt
+   JOIN unclaimed_fund_refund_capacity capacity ON capacity.fund_receipt_id = receipt.id
+   WHERE receipt.id = $1`,
+  [raceWork.receiptId],
+);
+assert.ok(raceCapacity.rows[0]);
+assert.ok(
+  BigInt(raceCapacity.rows[0]!.allocated_minor) +
+      BigInt(raceCapacity.rows[0]!.confirmed_outflow_minor) <=
+    BigInt(raceCapacity.rows[0]!.amount_minor),
+);
+await corePool.query(
+  `UPDATE fund_receipts
+   SET reason = 'Synthetic browser return-ready unclaimed receipt', updated_at = now()
+   WHERE id = $1`,
+  [primaryUnclaimed.receiptId],
+);
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count
