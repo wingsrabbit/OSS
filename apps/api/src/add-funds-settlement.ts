@@ -64,6 +64,57 @@ export async function handleAddFundsPaymentEvent(
   config: Config,
   body: AddFundsPaymentEvent,
 ): Promise<Record<string, unknown>> {
+  const lockPointer = await client.query<{
+    submitted_by_user_id: string;
+    client_account_id: string;
+  }>(
+    `SELECT submitted_by_user_id, client_account_id
+     FROM add_funds_attempts
+     WHERE id = $1 AND provider_installation_id = $2
+     FOR UPDATE`,
+    [body.paymentAttemptId, PROVIDER_INSTALLATION_ID],
+  );
+  const pointer = lockPointer.rows[0];
+  if (pointer) {
+    await client.query(
+      `SELECT id
+       FROM add_funds_commands
+       WHERE add_funds_attempt_id = $1
+       FOR UPDATE`,
+      [body.paymentAttemptId],
+    );
+    await client.query(
+      `SELECT id
+       FROM provider_operations
+       WHERE id = $1
+         AND subject_type = 'add_funds'
+         AND subject_id = $2
+         AND kind = 'payment_create'
+         AND provider_installation_id = $3
+       FOR UPDATE`,
+      [body.providerOperationId, body.paymentAttemptId, PROVIDER_INSTALLATION_ID],
+    );
+    // Match invoice payment settlement: shared identity is always locked in
+    // User -> Client Account -> Membership order before receipt FK writes.
+    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+      pointer.submitted_by_user_id,
+    ]);
+    await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+      pointer.client_account_id,
+    ]);
+  }
+  const lockedMembership = pointer
+    ? await client.query<{
+        role: string;
+        removed_at: Date | null;
+      }>(
+        `SELECT role, removed_at
+         FROM client_memberships
+         WHERE user_id = $1 AND client_account_id = $2
+         FOR UPDATE`,
+        [pointer.submitted_by_user_id, pointer.client_account_id],
+      )
+    : null;
   const attemptResult = await client.query<{
     id: string;
     operation_id: string;
@@ -121,7 +172,6 @@ export async function handleAddFundsPaymentEvent(
       AND po.provider_installation_id = $2
      WHERE afa.id = $1
        AND afa.provider_installation_id = $2
-     FOR UPDATE OF afa, afc, po, u, ca
      FOR SHARE OF afp`,
     [body.paymentAttemptId, PROVIDER_INSTALLATION_ID, body.providerOperationId],
   );
@@ -166,18 +216,9 @@ export async function handleAddFundsPaymentEvent(
     );
     return { rejected: true, reason: "provider_operation_not_started" };
   }
-  const lockedMembership = await client.query<{
-    role: string;
-    removed_at: Date | null;
-  }>(
-    `SELECT role, removed_at
-     FROM client_memberships
-     WHERE user_id = $1 AND client_account_id = $2
-     FOR UPDATE`,
-    [attempt.submitted_by_user_id, attempt.client_account_id],
-  );
-  const membership = lockedMembership.rows[0];
+  const membership = lockedMembership?.rows[0];
 
+  const storedPayload = { ...body, callbackCapability: "[REDACTED]" };
   const inbox = await client.query(
     `INSERT INTO provider_inbox(
        provider_installation_id, external_event_id, event_type, payload
@@ -187,10 +228,32 @@ export async function handleAddFundsPaymentEvent(
     [
       PROVIDER_INSTALLATION_ID,
       body.eventId,
-      { ...body, callbackCapability: "[REDACTED]" },
+      storedPayload,
     ],
   );
-  if (inbox.rowCount !== 1) return { duplicate: true };
+  if (inbox.rowCount !== 1) {
+    const existing = await client.query<{ exact_match: boolean }>(
+      `SELECT (event_type = 'add_funds.payment_status' AND payload = $3::jsonb) AS exact_match
+       FROM provider_inbox
+       WHERE provider_installation_id = $1 AND external_event_id = $2
+       FOR UPDATE`,
+      [PROVIDER_INSTALLATION_ID, body.eventId, JSON.stringify(storedPayload)],
+    );
+    if (existing.rows[0]?.exact_match) return { duplicate: true };
+    await audit(
+      client,
+      "add_funds.event_id_conflict",
+      "add_funds_attempt",
+      attempt.id,
+      "Provider reused an Add Funds event id with a different event type or payload",
+      {
+        eventId: body.eventId,
+        providerOperationId: attempt.operation_id,
+        externalPaymentId: body.externalPaymentId,
+      },
+    );
+    return { rejected: true, reason: "event_id_conflict" };
+  }
 
   const externalOwner = await client.query<{ subject_type: string; subject_id: string }>(
     `SELECT subject_type, subject_id
@@ -245,7 +308,7 @@ export async function handleAddFundsPaymentEvent(
       `UPDATE provider_operations
        SET status = $2, external_reference = COALESCE(external_reference, $3),
            provider_occurred_at = $4, updated_at = now()
-       WHERE id = $1 AND status <> 'succeeded'`,
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
       [
         attempt.operation_id,
         body.status === "processing" ? "running" : "failed",
@@ -406,7 +469,7 @@ export async function handleAddFundsPaymentEvent(
       `UPDATE provider_operations
        SET status = 'unknown', external_reference = COALESCE(external_reference, $2),
            provider_occurred_at = $3, last_error = $4, updated_at = now()
-       WHERE id = $1 AND status <> 'succeeded'`,
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
       [attempt.operation_id, body.externalPaymentId, occurredAt, reason],
     );
     await client.query(

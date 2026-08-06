@@ -33,6 +33,7 @@ const paymentCreateSchema = z.object({
     "timeout_success",
     "duplicate_out_of_order",
     "definitive_reject",
+    "success_then_reject",
     "partial_then_reject",
     "partial_then_timeout",
     "partial",
@@ -131,6 +132,10 @@ await pool.query(`
     occurred_at timestamptz NOT NULL DEFAULT now(),
     create_calls integer NOT NULL DEFAULT 1,
     request_fingerprint text NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS mock_resource_faults (
+    operation_id uuid PRIMARY KEY,
+    behavior text NOT NULL CHECK (behavior IN ('callback_success_then_reject'))
   );
   CREATE TABLE IF NOT EXISTS mock_mail_messages (
     operation_id uuid PRIMARY KEY,
@@ -418,6 +423,11 @@ app.post("/v1/payments", async (request, reply) => {
       60,
       callbackSecret,
     );
+  } else if (body.scenario === "success_then_reject") {
+    await callback("/api/v1/provider-events/payment", event, callbackSecret);
+    return reply.code(400).send({
+      error: "synthetic rejection after Provider already reported full payment success",
+    });
   } else if (body.scenario === "partial_then_reject") {
     await callback("/api/v1/provider-events/payment", event, callbackSecret);
     return reply.code(400).send({
@@ -749,6 +759,18 @@ app.post("/v1/resources", async (request, reply) => {
     ...(operation.ready_at ? { readyAt: operation.ready_at.toISOString() } : {}),
     occurredAt: operation.occurred_at.toISOString(),
   };
+  const injectedFault = await pool.query<{ behavior: string }>(
+    `DELETE FROM mock_resource_faults
+     WHERE operation_id = $1
+     RETURNING behavior`,
+    [body.operationId],
+  );
+  if (injectedFault.rows[0]?.behavior === "callback_success_then_reject") {
+    await callback("/api/v1/provider-events/provisioning", event, callbackSecret);
+    return reply.code(400).send({
+      error: "synthetic rejection after Provider already reported a created resource",
+    });
+  }
   scheduleCallback(
     "/api/v1/provider-events/provisioning",
     event,

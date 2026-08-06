@@ -64,7 +64,7 @@ async function insertInbox(
   eventId: string,
   eventType: string,
   payload: unknown,
-): Promise<boolean> {
+): Promise<"inserted" | "duplicate" | "conflict"> {
   const storedPayload =
     typeof payload === "object" && payload !== null && !Array.isArray(payload)
       ? { ...(payload as Record<string, unknown>), callbackCapability: "[REDACTED]" }
@@ -77,7 +77,15 @@ async function insertInbox(
      RETURNING id`,
     [providerInstallationId, eventId, eventType, storedPayload],
   );
-  return result.rowCount === 1;
+  if (result.rowCount === 1) return "inserted";
+  const existing = await client.query<{ exact_match: boolean }>(
+    `SELECT (event_type = $3 AND payload = $4::jsonb) AS exact_match
+     FROM provider_inbox
+     WHERE provider_installation_id = $1 AND external_event_id = $2
+     FOR UPDATE`,
+    [providerInstallationId, eventId, eventType, JSON.stringify(storedPayload)],
+  );
+  return existing.rows[0]?.exact_match ? "duplicate" : "conflict";
 }
 
 async function insertRefundInbox(
@@ -481,6 +489,9 @@ export async function registerProviderEventRoutes(
     assertProviderSignature(request, config.MOCK_PAYMENT_WEBHOOK_SECRET, body);
 
     const outcome = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `provider-operation:${body.providerOperationId}`,
+      ]);
       const occurredAt = new Date(body.occurredAt);
       const attemptPointer = await client.query<{ invoice_id: string }>(
         `SELECT invoice_id
@@ -515,6 +526,28 @@ export async function registerProviderEventRoutes(
         return { rejected: true, reason: "unknown_payment_attempt" };
       }
       await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
+      await client.query(
+        `SELECT id
+         FROM payment_attempts
+         WHERE id = $1 AND provider_installation_id = $2
+         FOR UPDATE`,
+        [body.paymentAttemptId, MOCK_PAYMENT_INSTALLATION_ID],
+      );
+      await client.query(
+        `SELECT id
+         FROM provider_operations
+         WHERE id = $1
+           AND subject_type = 'payment'
+           AND subject_id = $2
+           AND kind = 'payment_create'
+           AND provider_installation_id = $3
+         FOR UPDATE`,
+        [
+          body.providerOperationId,
+          body.paymentAttemptId,
+          MOCK_PAYMENT_INSTALLATION_ID,
+        ],
+      );
       const attemptResult = await client.query<{
         id: string;
         operation_id: string;
@@ -529,12 +562,24 @@ export async function registerProviderEventRoutes(
         payment_method_code: string | null;
         currency: string;
         provider_occurred_at: Date | null;
+        command_status: string | null;
+        has_prior_receipt: boolean;
       }>(
         `SELECT pa.id, po.id AS operation_id, po.attempt_count AS operation_attempt_count,
                 pa.client_account_id, pa.invoice_id,
                 pa.status, pa.amount_minor, pa.principal_minor::text,
                 pa.fee_basis_points, pa.fee_minor::text,
-                pa.payment_method_code, pa.currency, pa.provider_occurred_at
+                pa.payment_method_code, pa.currency, pa.provider_occurred_at,
+                (
+                  SELECT command.status
+                  FROM invoice_payment_commands command
+                  WHERE command.payment_attempt_id = pa.id
+                ) AS command_status,
+                EXISTS (
+                  SELECT 1
+                  FROM fund_receipts receipt
+                  WHERE receipt.reported_payment_attempt_id = pa.id
+                ) AS has_prior_receipt
          FROM payment_attempts pa
          JOIN provider_operations po
            ON po.subject_type = 'payment'
@@ -543,8 +588,7 @@ export async function registerProviderEventRoutes(
           AND po.id = $3
           AND po.provider_installation_id = $2
          WHERE pa.id = $1
-           AND pa.provider_installation_id = $2
-         FOR UPDATE OF pa, po`,
+           AND pa.provider_installation_id = $2`,
         [
           body.paymentAttemptId,
           MOCK_PAYMENT_INSTALLATION_ID,
@@ -595,16 +639,89 @@ export async function registerProviderEventRoutes(
         );
         return { rejected: true, reason: "provider_operation_not_started" };
       }
+
+      // Acquire the shared business identity rows before inserting any receipt.
+      // The fund_receipts.client_account_id foreign key otherwise takes an
+      // implicit Key Share lock on Client Account before advancePaidInvoice
+      // reaches User, recreating a cross-invoice User/Account lock inversion.
+      const identityPointers = await client.query<{
+        order_id: string;
+        service_id: string;
+        submitted_by_user_id: string;
+        client_account_id: string;
+      }>(
+        `SELECT
+           o.id AS order_id,
+           s.id AS service_id,
+           o.submitted_by_user_id,
+           o.client_account_id
+         FROM invoices i
+         JOIN orders o ON o.id = i.order_id
+         JOIN order_items oi ON oi.order_id = o.id
+         JOIN services s ON s.order_item_id = oi.id
+         WHERE i.id = $1`,
+        [attempt.invoice_id],
+      );
+      const identityPointer = identityPointers.rows[0];
       if (
-        !(await insertInbox(
+        !identityPointer ||
+        identityPointer.client_account_id !== attempt.client_account_id
+      ) {
+        await auditProvider(
           client,
           MOCK_PAYMENT_INSTALLATION_ID,
-          body.eventId,
-          "payment.status",
-          body,
-        ))
-      ) {
+          "payment.event_rejected",
+          "payment",
+          attempt.id,
+          "payment Attempt is linked to inconsistent Core ownership records",
+          { eventId: body.eventId, providerOperationId: attempt.operation_id },
+        );
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        identityPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        identityPointer.service_id,
+      ]);
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        identityPointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        identityPointer.client_account_id,
+      ]);
+      await client.query(
+        `SELECT client_account_id
+         FROM client_memberships
+         WHERE client_account_id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [identityPointer.client_account_id, identityPointer.submitted_by_user_id],
+      );
+      const inboxOutcome = await insertInbox(
+        client,
+        MOCK_PAYMENT_INSTALLATION_ID,
+        body.eventId,
+        "payment.status",
+        body,
+      );
+      if (inboxOutcome === "duplicate") {
         return { duplicate: true };
+      }
+      if (inboxOutcome === "conflict") {
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "payment.event_id_conflict",
+          "payment",
+          attempt.id,
+          "Provider reused a payment event id with a different event type or payload",
+          {
+            eventId: body.eventId,
+            providerOperationId: attempt.operation_id,
+            externalPaymentId: body.externalPaymentId,
+          },
+        );
+        return { rejected: true, reason: "event_id_conflict" };
       }
 
       const externalOwner = await client.query<{ id: string }>(
@@ -638,6 +755,9 @@ export async function registerProviderEventRoutes(
       }
 
       if (body.status !== "succeeded") {
+        if (attempt.command_status === "manual" || attempt.has_prior_receipt) {
+          return { ignored: true, reason: "funds_receipt_requires_manual_review" };
+        }
         if (!isAfter(attempt.provider_occurred_at, occurredAt)) {
           return { ignored: true, reason: "stale_provider_fact" };
         }
@@ -737,7 +857,7 @@ export async function registerProviderEventRoutes(
         await client.query(
           `UPDATE provider_operations
            SET status = 'unknown', last_error = $2, provider_occurred_at = $3, updated_at = now()
-           WHERE id = $1 AND status <> 'succeeded'`,
+           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
           [attempt.operation_id, reason, occurredAt],
         );
         await client.query(
@@ -1616,6 +1736,9 @@ export async function registerProviderEventRoutes(
     const body = provisioningEventSchema.parse(request.body);
     assertProviderSignature(request, config.MOCK_PROVISIONING_WEBHOOK_SECRET, body);
     const outcome = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `provider-operation:${body.providerOperationId}`,
+      ]);
       const occurredAt = new Date(body.occurredAt);
       const operationResult = await client.query<{
         id: string;
@@ -1667,16 +1790,85 @@ export async function registerProviderEventRoutes(
         );
         return { rejected: true, reason: "provider_operation_not_started" };
       }
-      if (
-        !(await insertInbox(
+      const provisionPointers = await client.query<{
+        invoice_id: string;
+        order_id: string;
+        order_item_id: string;
+        submitted_by_user_id: string;
+        client_account_id: string;
+      }>(
+        `SELECT
+           i.id AS invoice_id,
+           o.id AS order_id,
+           oi.id AS order_item_id,
+           o.submitted_by_user_id,
+           o.client_account_id
+         FROM services s
+         JOIN order_items oi ON oi.id = s.order_item_id
+         JOIN orders o ON o.id = oi.order_id
+         JOIN invoices i ON i.order_id = o.id
+         WHERE s.id = $1`,
+        [operation.subject_id],
+      );
+      const provisionPointer = provisionPointers.rows[0];
+      if (!provisionPointer) {
+        await auditProvider(
           client,
           MOCK_PROVISIONING_INSTALLATION_ID,
-          body.eventId,
-          "resource.status",
-          body,
-        ))
-      ) {
+          "provisioning.event_rejected",
+          "service",
+          operation.subject_id,
+          "Provider operation points to inconsistent Core service ownership records",
+          { eventId: body.eventId, providerOperationId: operation.id },
+        );
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        provisionPointer.invoice_id,
+      ]);
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        provisionPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        provisionPointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        operation.subject_id,
+      ]);
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        provisionPointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        provisionPointer.client_account_id,
+      ]);
+      await client.query(
+        `SELECT client_account_id
+         FROM client_memberships
+         WHERE client_account_id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [provisionPointer.client_account_id, provisionPointer.submitted_by_user_id],
+      );
+      const inboxOutcome = await insertInbox(
+        client,
+        MOCK_PROVISIONING_INSTALLATION_ID,
+        body.eventId,
+        "resource.status",
+        body,
+      );
+      if (inboxOutcome === "duplicate") {
         return { duplicate: true };
+      }
+      if (inboxOutcome === "conflict") {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "provisioning.event_id_conflict",
+          "service",
+          operation.subject_id,
+          "Provider reused a provisioning event id with a different event type or payload",
+          { eventId: body.eventId, providerOperationId: operation.id },
+        );
+        return { rejected: true, reason: "event_id_conflict" };
       }
       if (!isAfter(operation.provider_occurred_at, occurredAt)) {
         return { ignored: true, reason: "stale_provider_fact" };
@@ -1706,8 +1898,7 @@ export async function registerProviderEventRoutes(
          JOIN client_memberships cm
            ON cm.client_account_id = o.client_account_id
           AND cm.user_id = o.submitted_by_user_id
-         WHERE s.id = $1
-         FOR UPDATE OF s, o, u, ca, cm`,
+         WHERE s.id = $1`,
         [operation.subject_id],
       );
       const service = serviceResult.rows[0];

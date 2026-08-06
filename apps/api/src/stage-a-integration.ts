@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
@@ -148,6 +149,12 @@ await verifyPublished007Upgrade();
 
 const corePool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
 const providerPool = new pg.Pool({ connectionString: providerDatabaseUrl, max: 2 });
+const deadlockBaseline = await corePool.query<{ deadlocks: string }>(
+  `SELECT deadlocks::text
+   FROM pg_stat_database
+   WHERE datname = current_database()`,
+);
+const initialDeadlocks = deadlockBaseline.rows[0]?.deadlocks ?? "0";
 let cookie = "";
 
 type Catalog = {
@@ -414,6 +421,71 @@ async function submitPaymentFact(
       "X-OSS-Signature": signature,
     },
     body: JSON.stringify(signedBody),
+  });
+}
+
+async function submitPaymentFactAndDiscardResponse(
+  body: Record<string, unknown>,
+): Promise<void> {
+  const paymentAttemptId = String(body.paymentAttemptId);
+  const operationResult = await corePool.query<{ id: string }>(
+    `SELECT id
+     FROM provider_operations
+     WHERE subject_type = 'payment' AND subject_id = $1
+     ORDER BY created_at
+     LIMIT 1`,
+    [paymentAttemptId],
+  );
+  const providerOperationId =
+    typeof body.providerOperationId === "string"
+      ? body.providerOperationId
+      : operationResult.rows[0]?.id;
+  assert.ok(providerOperationId, "response-loss payment fact requires a Provider operation");
+  const signedBody = {
+    eventId: body.eventId,
+    providerOperationId,
+    paymentAttemptId: body.paymentAttemptId,
+    callbackCapability: providerOperationCapability(
+      providerCapabilitySecret!,
+      "mock-payment-v1",
+      providerOperationId,
+    ),
+    externalPaymentId: body.externalPaymentId,
+    status: body.status,
+    amountMinor: body.amountMinor,
+    currency: body.currency,
+    occurredAt: body.occurredAt,
+  };
+  const serialized = JSON.stringify(signedBody);
+  const timestamp = Date.now().toString();
+  await new Promise<void>((resolve, reject) => {
+    let responseStarted = false;
+    const request = httpRequest(
+      new URL("/api/v1/provider-events/payment", coreUrl),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(serialized),
+          "X-OSS-Timestamp": timestamp,
+          "X-OSS-Signature": providerSignature(
+            paymentWebhookSecret!,
+            timestamp,
+            signedBody,
+          ),
+        },
+      },
+      (response) => {
+        responseStarted = true;
+        response.destroy();
+        resolve();
+      },
+    );
+    request.on("error", (error) => {
+      if (responseStarted) resolve();
+      else reject(error);
+    });
+    request.end(serialized);
   });
 }
 
@@ -770,6 +842,7 @@ async function startAddFunds(
     | "cancelled"
     | "timeout_success"
     | "duplicate_out_of_order"
+    | "definitive_reject"
     | "partial_then_reject"
     | "partial_then_timeout"
     | "partial"
@@ -1030,9 +1103,15 @@ const lateSettlementInvariant = await corePool.query<{
   allocations: string;
   debit_minor: string;
   credit_minor: string;
+  attempt_status: string;
+  command_status: string;
+  operation_status: string;
 }>(
   `SELECT
      fr.disposition,
+     pay.status AS attempt_status,
+     command.status AS command_status,
+     po.status AS operation_status,
      (SELECT count(*)::text
         FROM payment_allocations pa
        WHERE pa.payment_attempt_id = fr.reported_payment_attempt_id) AS allocations,
@@ -1045,11 +1124,19 @@ const lateSettlementInvariant = await corePool.query<{
         JOIN ledger_journals lj ON lj.id = ll.journal_id
        WHERE lj.source_type = 'fund_receipt' AND lj.source_id = fr.id) AS credit_minor
    FROM fund_receipts fr
+   JOIN payment_attempts pay ON pay.id = fr.reported_payment_attempt_id
+   JOIN invoice_payment_commands command ON command.payment_attempt_id = pay.id
+   JOIN provider_operations po
+     ON po.subject_type = 'payment'
+    AND po.subject_id = fr.reported_payment_attempt_id
    WHERE fr.external_payment_id = $1`,
   [failedAttemptRow.external_payment_id],
 );
 assert.equal(lateSettlementInvariant.rows[0]?.disposition, "unclaimed");
 assert.equal(lateSettlementInvariant.rows[0]?.allocations, "0");
+assert.equal(lateSettlementInvariant.rows[0]?.attempt_status, "failed");
+assert.equal(lateSettlementInvariant.rows[0]?.command_status, "failed");
+assert.equal(lateSettlementInvariant.rows[0]?.operation_status, "failed");
 assert.equal(
   lateSettlementInvariant.rows[0]?.debit_minor,
   lateSettlementInvariant.rows[0]?.credit_minor,
@@ -1128,6 +1215,15 @@ const settledAttempt = await corePool.query<{
 );
 const settledAttemptRow = settledAttempt.rows[0];
 assert.ok(settledAttemptRow?.external_payment_id);
+await submitPaymentFactAndDiscardResponse({
+  eventId: `response-lost-after-commit:${randomUUID()}`,
+  paymentAttemptId: settledAttemptRow.id,
+  externalPaymentId: settledAttemptRow.external_payment_id,
+  status: "succeeded",
+  amountMinor: settledAttemptRow.amount_minor,
+  currency: settledAttemptRow.currency,
+  occurredAt: new Date().toISOString(),
+});
 const semanticDuplicate = await submitPaymentFact({
   eventId: `semantic-duplicate:${randomUUID()}`,
   paymentAttemptId: settledAttemptRow.id,
@@ -1138,10 +1234,76 @@ const semanticDuplicate = await submitPaymentFact({
   occurredAt: new Date().toISOString(),
 });
 assert.equal(semanticDuplicate.status, 200);
+assert.equal(semanticDuplicate.body.duplicate, true);
 assert.equal(
   (await request<OrderDetail>(`/api/v1/orders/${activeDuplicate.order.id}`)).order.status,
   "completed",
 );
+const responseLossRetryFacts = await corePool.query<{
+  receipts: string;
+  allocations: string;
+  fee_charges: string;
+  paid_events: string;
+  provision_operations: string;
+  provision_jobs: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+        FROM fund_receipts receipt
+        JOIN payment_attempts payment ON payment.id = receipt.reported_payment_attempt_id
+       WHERE payment.invoice_id = $1) AS receipts,
+     (SELECT count(*)::text
+        FROM payment_allocations
+       WHERE invoice_id = $1) AS allocations,
+     (SELECT count(*)::text
+        FROM invoice_fee_charges charge
+        JOIN payment_attempts payment ON payment.id = charge.payment_attempt_id
+       WHERE payment.invoice_id = $1) AS fee_charges,
+     (SELECT count(*)::text
+        FROM outbox
+       WHERE event_type = 'invoice.paid' AND unique_key = $2) AS paid_events,
+     (SELECT count(*)::text
+        FROM provider_operations operation
+        JOIN services service ON service.id = operation.subject_id
+        JOIN order_items item ON item.id = service.order_item_id
+       WHERE operation.subject_type = 'service'
+         AND operation.kind = 'resource_create'
+         AND item.order_id = $3) AS provision_operations,
+     (SELECT count(*)::text
+        FROM durable_jobs job
+        JOIN services service ON service.id::text = job.payload->>'serviceId'
+        JOIN order_items item ON item.id = service.order_item_id
+       WHERE job.job_type = 'provision.start'
+         AND item.order_id = $3) AS provision_jobs`,
+  [
+    activeDuplicate.invoice.id,
+    `invoice:${activeDuplicate.invoice.id}`,
+    activeDuplicate.order.id,
+  ],
+);
+assert.deepEqual(responseLossRetryFacts.rows[0], {
+  receipts: "1",
+  allocations: "1",
+  fee_charges: "1",
+  paid_events: "1",
+  provision_operations: "1",
+  provision_jobs: "1",
+});
+const responseLossProvisionOperation = await corePool.query<{ id: string }>(
+  `SELECT operation.id
+   FROM provider_operations operation
+   JOIN services service ON service.id = operation.subject_id
+   JOIN order_items item ON item.id = service.order_item_id
+   WHERE operation.subject_type = 'service'
+     AND operation.kind = 'resource_create'
+     AND item.order_id = $1`,
+  [activeDuplicate.order.id],
+);
+const responseLossResource = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_resource_operations WHERE operation_id = $1",
+  [responseLossProvisionOperation.rows[0]?.id],
+);
+assert.equal(responseLossResource.rows[0]?.create_calls, 1);
 
 const timeoutOrder = await createOrder(automaticPrice.id, legal);
 await pay(timeoutOrder, "timeout_success");
@@ -1309,17 +1471,120 @@ await providerPool.query(
   ],
 );
 const forgedProvisionReconcileKey = `forged-provision:${paidForgedProvision.service.id}`;
-await corePool.query(
-  `INSERT INTO durable_jobs(job_type, unique_key, payload)
-   VALUES ('provision.reconcile', $1, $2)`,
-  [
-    forgedProvisionReconcileKey,
-    {
-      serviceId: paidForgedProvision.service.id,
-      operationId: forgedProvisionPointer.operation_id,
-    },
-  ],
+const forgedProvisionPayment = await corePool.query<{
+  payment_attempt_id: string;
+  operation_id: string;
+  external_payment_id: string;
+  amount_minor: string;
+  currency: string;
+  provider_occurred_at: Date;
+}>(
+  `SELECT attempt.id AS payment_attempt_id,
+          operation.id AS operation_id,
+          attempt.external_payment_id,
+          attempt.amount_minor::text,
+          attempt.currency,
+          operation.provider_occurred_at
+   FROM payment_attempts attempt
+   JOIN provider_operations operation
+     ON operation.subject_type = 'payment'
+    AND operation.subject_id = attempt.id
+   WHERE attempt.invoice_id = $1
+     AND attempt.status = 'succeeded'`,
+  [paidForgedProvision.invoice.id],
 );
+const forgedProvisionPaymentRecord = forgedProvisionPayment.rows[0];
+assert.ok(forgedProvisionPaymentRecord?.external_payment_id);
+assert.ok(forgedProvisionPaymentRecord.provider_occurred_at);
+const forgedProvisionInvoiceGate = await corePool.connect();
+let forgedProvisionInvoiceGateOpen = false;
+try {
+  await forgedProvisionInvoiceGate.query("BEGIN");
+  forgedProvisionInvoiceGateOpen = true;
+  await forgedProvisionInvoiceGate.query(
+    "SELECT id FROM invoices WHERE id = $1 FOR UPDATE",
+    [paidForgedProvision.invoice.id],
+  );
+  await corePool.query(
+    `INSERT INTO durable_jobs(job_type, unique_key, payload)
+     VALUES ('provision.reconcile', $1, $2)`,
+    [
+      forgedProvisionReconcileKey,
+      {
+        serviceId: paidForgedProvision.service.id,
+        operationId: forgedProvisionPointer.operation_id,
+      },
+    ],
+  );
+  await waitFor(
+    "manual provision reconciliation to wait at Invoice before Order or Service",
+    async () => {
+      const result = await corePool.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
+         FROM pg_stat_activity
+         WHERE application_name = 'opensales-worker'
+           AND state = 'active'
+           AND wait_event_type = 'Lock'
+           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+      );
+      return result.rows[0]?.waiting ?? "0";
+    },
+    (waiting) => BigInt(waiting) >= 1n,
+  );
+  const forgedProvisionTargetProbe = await corePool.connect();
+  try {
+    await forgedProvisionTargetProbe.query("BEGIN");
+    await forgedProvisionTargetProbe.query(
+      "SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT",
+      [paidForgedProvision.order.id],
+    );
+    await forgedProvisionTargetProbe.query(
+      "SELECT id FROM services WHERE id = $1 FOR UPDATE NOWAIT",
+      [paidForgedProvision.service.id],
+    );
+    await forgedProvisionTargetProbe.query("COMMIT");
+  } catch (error) {
+    await forgedProvisionTargetProbe.query("ROLLBACK");
+    throw error;
+  } finally {
+    forgedProvisionTargetProbe.release();
+  }
+  const forgedProvisionPaymentReplayPromise = submitPaymentFact({
+    eventId: `manual-provision-reconcile-duplicate:${randomUUID()}`,
+    providerOperationId: forgedProvisionPaymentRecord.operation_id,
+    paymentAttemptId: forgedProvisionPaymentRecord.payment_attempt_id,
+    externalPaymentId: forgedProvisionPaymentRecord.external_payment_id,
+    status: "succeeded",
+    amountMinor: forgedProvisionPaymentRecord.amount_minor,
+    currency: forgedProvisionPaymentRecord.currency,
+    occurredAt: forgedProvisionPaymentRecord.provider_occurred_at.toISOString(),
+  });
+  await waitFor(
+    "manual provision reconcile and duplicate payment callback to share Invoice root",
+    async () => {
+      const result = await corePool.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
+         FROM pg_stat_activity
+         WHERE application_name IN ('opensales-api', 'opensales-worker')
+           AND state = 'active'
+           AND wait_event_type = 'Lock'
+           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+      );
+      return result.rows[0]?.waiting ?? "0";
+    },
+    (waiting) => BigInt(waiting) >= 2n,
+  );
+  await forgedProvisionInvoiceGate.query("COMMIT");
+  forgedProvisionInvoiceGateOpen = false;
+  const forgedProvisionPaymentReplay = await forgedProvisionPaymentReplayPromise;
+  assert.equal(forgedProvisionPaymentReplay.status, 200);
+  assert.equal(forgedProvisionPaymentReplay.body.duplicate, true);
+} finally {
+  if (forgedProvisionInvoiceGateOpen) {
+    await forgedProvisionInvoiceGate.query("ROLLBACK");
+  }
+  forgedProvisionInvoiceGate.release();
+}
 const forgedProvisionClosed = await waitFor(
   "resource reconciliation without the outbound capability to enter manual Hold",
   async () => {
@@ -1481,6 +1746,152 @@ const recoveredCreateCount = await providerPool.query<{ create_calls: number }>(
   [staleLeaseRecord.rows[0]?.operation_id],
 );
 assert.equal(recoveredCreateCount.rows[0]?.create_calls, 1);
+const staleAttemptFinal = await corePool.query<{
+  external_payment_id: string;
+  amount_minor: string;
+  currency: string;
+  attempt_status: string;
+  command_status: string;
+  operation_status: string;
+}>(
+  `SELECT
+     attempt.external_payment_id,
+     attempt.amount_minor::text,
+     attempt.currency,
+     attempt.status AS attempt_status,
+     command.status AS command_status,
+     operation.status AS operation_status
+   FROM payment_attempts attempt
+   JOIN invoice_payment_commands command ON command.payment_attempt_id = attempt.id
+   JOIN provider_operations operation
+     ON operation.subject_type = 'payment'
+    AND operation.subject_id = attempt.id
+   WHERE attempt.id = $1`,
+  [staleLeasePayment.paymentAttemptId],
+);
+const staleAttempt = staleAttemptFinal.rows[0];
+assert.ok(staleAttempt?.external_payment_id);
+assert.equal(staleAttempt.attempt_status, "succeeded");
+assert.equal(staleAttempt.command_status, "succeeded");
+assert.equal(staleAttempt.operation_status, "succeeded");
+
+// Simulate a response-lost old Worker and its replacement independently
+// reconciling the same Provider fact with different nonces. Core must accept
+// the observations without creating a second financial or service effect.
+const staleReconcileOccurredAt = new Date().toISOString();
+const staleReconcileResults = await Promise.all([
+  submitPaymentFact({
+    eventId: `stale-worker-a:${randomUUID()}`,
+    providerOperationId: staleLeaseRecord.rows[0]!.operation_id,
+    paymentAttemptId: staleLeasePayment.paymentAttemptId,
+    externalPaymentId: staleAttempt.external_payment_id,
+    status: "succeeded",
+    amountMinor: staleAttempt.amount_minor,
+    currency: staleAttempt.currency,
+    occurredAt: staleReconcileOccurredAt,
+  }),
+  submitPaymentFact({
+    eventId: `stale-worker-b:${randomUUID()}`,
+    providerOperationId: staleLeaseRecord.rows[0]!.operation_id,
+    paymentAttemptId: staleLeasePayment.paymentAttemptId,
+    externalPaymentId: staleAttempt.external_payment_id,
+    status: "succeeded",
+    amountMinor: staleAttempt.amount_minor,
+    currency: staleAttempt.currency,
+    occurredAt: staleReconcileOccurredAt,
+  }),
+]);
+assert.equal(staleReconcileResults[0]?.status, 200);
+assert.equal(staleReconcileResults[1]?.status, 200);
+assert.equal(staleReconcileResults[0]?.body.duplicate, true);
+assert.equal(staleReconcileResults[1]?.body.duplicate, true);
+
+const staleCompletion = await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL
+   WHERE id = $1
+     AND status = 'running'
+     AND locked_by = 'synthetic-dead-worker'
+     AND attempts = 1
+   RETURNING id`,
+  [staleLeaseRecord.rows[0]!.job_id],
+);
+const staleDelay = await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'pending', available_at = now() + interval '1 minute',
+       locked_at = NULL, locked_by = NULL
+   WHERE id = $1
+     AND status = 'running'
+     AND locked_by = 'synthetic-dead-worker'
+     AND attempts = 1
+   RETURNING id`,
+  [staleLeaseRecord.rows[0]!.job_id],
+);
+const staleManual = await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'manual', locked_at = NULL, locked_by = NULL
+   WHERE id = $1
+     AND status = 'running'
+     AND locked_by = 'synthetic-dead-worker'
+     AND attempts = 1
+   RETURNING id`,
+  [staleLeaseRecord.rows[0]!.job_id],
+);
+assert.equal(staleCompletion.rowCount, 0);
+assert.equal(staleDelay.rowCount, 0);
+assert.equal(staleManual.rowCount, 0);
+const staleLeaseEffects = await corePool.query<{
+  receipts: string;
+  allocations: string;
+  fee_charges: string;
+  paid_events: string;
+  provision_operations: string;
+  provision_jobs: string;
+  job_status: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM fund_receipts
+       WHERE reported_payment_attempt_id = $1) AS receipts,
+     (SELECT count(*)::text FROM payment_allocations
+       WHERE payment_attempt_id = $1) AS allocations,
+     (SELECT count(*)::text FROM invoice_fee_charges
+       WHERE payment_attempt_id = $1) AS fee_charges,
+     (SELECT count(*)::text FROM outbox
+       WHERE event_type = 'invoice.paid' AND unique_key = $2) AS paid_events,
+     (SELECT count(*)::text FROM provider_operations
+       WHERE subject_type = 'service' AND subject_id = $3) AS provision_operations,
+     (SELECT count(*)::text FROM durable_jobs
+       WHERE job_type = 'provision.start' AND payload->>'serviceId' = $3::text) AS provision_jobs,
+     (SELECT status FROM durable_jobs WHERE id = $4) AS job_status`,
+  [
+    staleLeasePayment.paymentAttemptId,
+    `invoice:${staleLeaseOrder.invoice.id}`,
+    recoveredLease.service.id,
+    staleLeaseRecord.rows[0]!.job_id,
+  ],
+);
+assert.deepEqual(staleLeaseEffects.rows[0], {
+  receipts: "1",
+  allocations: "1",
+  fee_charges: "1",
+  paid_events: "1",
+  provision_operations: "1",
+  provision_jobs: "1",
+  job_status: "completed",
+});
+const staleProvisionOperation = await corePool.query<{ id: string }>(
+  `SELECT id
+   FROM provider_operations
+   WHERE subject_type = 'service'
+     AND kind = 'resource_create'
+     AND subject_id = $1`,
+  [recoveredLease.service.id],
+);
+const staleResourceCreate = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_resource_operations WHERE operation_id = $1",
+  [staleProvisionOperation.rows[0]?.id],
+);
+assert.equal(staleResourceCreate.rows[0]?.create_calls, 1);
 
 const manualOrder = await createOrder(manualPrice.id, legal);
 const paidManual = await pay(manualOrder, "success");
@@ -1518,14 +1929,120 @@ await request(
 );
 const queue = await request<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
 assert.ok(queue.items.some((item) => item.serviceId === paidManual.service.id));
-await request(
-  `/api/v1/admin/services/${paidManual.service.id}/complete-manual`,
-  {
-    method: "POST",
-    body: JSON.stringify({ reason: "Synthetic delivery confirmed by Stage A integration test" }),
-  },
-  200,
+const manualPaymentRecords = await corePool.query<{
+  payment_attempt_id: string;
+  operation_id: string;
+  external_payment_id: string;
+  amount_minor: string;
+  currency: string;
+  provider_occurred_at: Date;
+}>(
+  `SELECT attempt.id AS payment_attempt_id,
+          operation.id AS operation_id,
+          attempt.external_payment_id,
+          attempt.amount_minor::text,
+          attempt.currency,
+          operation.provider_occurred_at
+   FROM payment_attempts attempt
+   JOIN provider_operations operation
+     ON operation.subject_type = 'payment'
+    AND operation.subject_id = attempt.id
+   WHERE attempt.invoice_id = $1
+     AND attempt.status = 'succeeded'`,
+  [paidManual.invoice.id],
 );
+const manualPaymentRecord = manualPaymentRecords.rows[0];
+assert.ok(manualPaymentRecord?.external_payment_id);
+assert.ok(manualPaymentRecord.provider_occurred_at);
+const manualInvoiceGate = await corePool.connect();
+let manualInvoiceGateOpen = false;
+try {
+  await manualInvoiceGate.query("BEGIN");
+  manualInvoiceGateOpen = true;
+  await manualInvoiceGate.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+    paidManual.invoice.id,
+  ]);
+  const manualCompletionPromise = rawCoreRequest(
+    `/api/v1/admin/services/${paidManual.service.id}/complete-manual`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason: "Synthetic delivery confirmed while a duplicate Provider fact waited",
+      }),
+    },
+  );
+  await waitFor(
+    "manual fulfillment to wait at Invoice before Order or Service",
+    async () => {
+      const result = await corePool.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
+         FROM pg_stat_activity
+         WHERE application_name = 'opensales-api'
+           AND state = 'active'
+           AND wait_event_type = 'Lock'
+           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+      );
+      return result.rows[0]?.waiting ?? "0";
+    },
+    (waiting) => BigInt(waiting) >= 1n,
+  );
+  const manualTargetProbe = await corePool.connect();
+  try {
+    await manualTargetProbe.query("BEGIN");
+    await manualTargetProbe.query(
+      "SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT",
+      [paidManual.order.id],
+    );
+    await manualTargetProbe.query(
+      "SELECT id FROM services WHERE id = $1 FOR UPDATE NOWAIT",
+      [paidManual.service.id],
+    );
+    await manualTargetProbe.query("COMMIT");
+  } catch (error) {
+    await manualTargetProbe.query("ROLLBACK");
+    throw error;
+  } finally {
+    manualTargetProbe.release();
+  }
+  const duplicateManualPaymentPromise = submitPaymentFact({
+    eventId: `manual-fulfillment-duplicate:${randomUUID()}`,
+    providerOperationId: manualPaymentRecord.operation_id,
+    paymentAttemptId: manualPaymentRecord.payment_attempt_id,
+    externalPaymentId: manualPaymentRecord.external_payment_id,
+    status: "succeeded",
+    amountMinor: manualPaymentRecord.amount_minor,
+    currency: manualPaymentRecord.currency,
+    occurredAt: manualPaymentRecord.provider_occurred_at.toISOString(),
+  });
+  await waitFor(
+    "manual fulfillment and duplicate payment callback to share the Invoice root lock",
+    async () => {
+      const result = await corePool.query<{ waiting: string }>(
+        `SELECT count(*)::text AS waiting
+         FROM pg_stat_activity
+         WHERE application_name = 'opensales-api'
+           AND state = 'active'
+           AND wait_event_type = 'Lock'
+           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+      );
+      return result.rows[0]?.waiting ?? "0";
+    },
+    (waiting) => BigInt(waiting) >= 2n,
+  );
+  await manualInvoiceGate.query("COMMIT");
+  manualInvoiceGateOpen = false;
+  const [manualCompletion, duplicateManualPayment] = await Promise.all([
+    manualCompletionPromise,
+    duplicateManualPaymentPromise,
+  ]);
+  assert.equal(manualCompletion.status, 200);
+  assert.equal(manualCompletion.body.status, "active");
+  assert.equal(duplicateManualPayment.status, 200);
+  assert.equal(duplicateManualPayment.body.duplicate, true);
+} finally {
+  if (manualInvoiceGateOpen) await manualInvoiceGate.query("ROLLBACK");
+  manualInvoiceGate.release();
+}
 const activeManual = await request<OrderDetail>(`/api/v1/orders/${paidManual.order.id}`);
 assert.equal(activeManual.service.status, "active");
 assert.equal(activeManual.service.activatedAt, activeManual.service.termStart);
@@ -2203,6 +2720,40 @@ assert.equal(mismatchCoreState.rows[0]?.command_status, "manual");
 assert.equal(mismatchCoreState.rows[0]?.attempt_status, "unknown");
 assert.equal(mismatchCoreState.rows[0]?.operation_status, "unknown");
 assert.equal(mismatchCoreState.rows[0]?.receipt_disposition, "unclaimed");
+const lateFailureAfterUnclaimed = await submitPaymentFact({
+  eventId: `wrong-amount-late-failure:${randomUUID()}`,
+  providerOperationId: mismatchRecords.operation_id,
+  paymentAttemptId: mismatchCommand.paymentAttemptId,
+  externalPaymentId: mismatchExternalId,
+  status: "failed",
+  amountMinor: mismatchAmountMinor,
+  currency: mismatchRecords.currency,
+  occurredAt: new Date(Date.now() + 1_000).toISOString(),
+});
+assert.equal(lateFailureAfterUnclaimed.status, 202);
+assert.equal(lateFailureAfterUnclaimed.body.ignored, true);
+assert.equal(lateFailureAfterUnclaimed.body.reason, "funds_receipt_requires_manual_review");
+const mismatchAfterLateFailure = await corePool.query<{
+  command_status: string;
+  attempt_status: string;
+  operation_status: string;
+  receipt_disposition: string;
+}>(
+  `SELECT
+     command.status AS command_status,
+     attempt.status AS attempt_status,
+     operation.status AS operation_status,
+     receipt.disposition AS receipt_disposition
+   FROM invoice_payment_commands command
+   JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+   JOIN provider_operations operation
+     ON operation.subject_type = 'payment'
+    AND operation.subject_id = attempt.id
+   JOIN fund_receipts receipt ON receipt.reported_payment_attempt_id = attempt.id
+   WHERE command.id = $1`,
+  [mismatchCommand.commandId],
+);
+assert.deepEqual(mismatchAfterLateFailure.rows[0], mismatchCoreState.rows[0]);
 const mismatchCapability = providerOperationCapability(
   providerCapabilitySecret,
   "mock-payment-v1",
@@ -2280,6 +2831,20 @@ const mismatchReconciled = await waitFor(
   8_000,
 );
 assert.equal(mismatchReconciled?.command_status, "manual");
+const mismatchReconcileInbox = await corePool.query<{ external_event_id: string }>(
+  `SELECT external_event_id
+   FROM provider_inbox
+   WHERE provider_installation_id = 'mock-payment-v1'
+     AND external_event_id LIKE 'reconcile:' || $1::text || ':%'
+   ORDER BY received_at DESC
+   LIMIT 1`,
+  [mismatchRecords.operation_id],
+);
+assert.match(
+  mismatchReconcileInbox.rows[0]?.external_event_id ?? "",
+  /^reconcile:[0-9a-f-]{36}:[0-9a-f-]{36}$/,
+  "Core reconciliation must use an unpredictable event nonce instead of an enumerable attempt number",
+);
 
 const callbackRaceOrder = await createOrder(automaticPrice.id, legal);
 const callbackRaceQuote = await createPaymentQuote(callbackRaceOrder.invoice.id, "card", false);
@@ -2347,8 +2912,53 @@ const preOutboundFacts = await corePool.query<{
 assert.equal(preOutboundProviderFacts.rows[0]?.operations, "0");
 assert.equal(preOutboundFacts.rows[0]?.receipts, "0");
 assert.equal(preOutboundFacts.rows[0]?.fee_charges, "0");
+const preemptedReconcileEventId = `reconcile-preemption:${randomUUID()}`;
+const preemptedProcessingFact = {
+  eventId: preemptedReconcileEventId,
+  providerOperationId: callbackRaceRecords.operation_id,
+  paymentAttemptId: callbackRaceCommand.paymentAttemptId,
+  externalPaymentId: callbackRaceFact.externalPaymentId,
+  status: "processing",
+  amountMinor: callbackRaceRecords.amount_minor,
+  currency: callbackRaceRecords.currency,
+  occurredAt: new Date().toISOString(),
+};
+const acceptedPreemption = await submitPaymentFact(preemptedProcessingFact);
+assert.equal(acceptedPreemption.status, 202);
+assert.equal(acceptedPreemption.body.status, "processing");
+const exactPreemptionReplay = await submitPaymentFact(preemptedProcessingFact);
+assert.equal(exactPreemptionReplay.status, 200);
+assert.equal(exactPreemptionReplay.body.duplicate, true);
+const conflictingPreemption = await submitPaymentFact({
+  ...preemptedProcessingFact,
+  status: "succeeded",
+  occurredAt: new Date(Date.now() + 1_000).toISOString(),
+});
+assert.equal(conflictingPreemption.status, 202);
+assert.equal(conflictingPreemption.body.rejected, true);
+assert.equal(conflictingPreemption.body.reason, "event_id_conflict");
+const preemptionEvidence = await corePool.query<{
+  receipts: string;
+  conflicts: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+        FROM fund_receipts
+       WHERE reported_payment_attempt_id = $1) AS receipts,
+     (SELECT count(*)::text
+       FROM audit_events
+       WHERE action = 'payment.event_id_conflict'
+         AND target_type = 'payment'
+         AND target_id = $1::text) AS conflicts`,
+  [callbackRaceCommand.paymentAttemptId],
+);
+assert.equal(preemptionEvidence.rows[0]?.receipts, "0");
+assert.equal(preemptionEvidence.rows[0]?.conflicts, "1");
 const [callbackRaceResult, competingConfirmation] = await Promise.all([
-  submitPaymentFact(callbackRaceFact),
+  submitPaymentFact({
+    ...callbackRaceFact,
+    occurredAt: new Date(Date.now() + 2_000).toISOString(),
+  }),
   rawCoreRequest(`/api/v1/invoices/${callbackRaceOrder.invoice.id}/payments`, {
     method: "POST",
     body: JSON.stringify({
@@ -2398,6 +3008,802 @@ await corePool.query(
      AND payload->>'paymentAttemptId' = $1`,
   [callbackRaceCommand.paymentAttemptId],
 );
+
+// Force the original cross-invoice/shared-account interleaving. The callback
+// and Worker have different invoice/attempt/operation roots, so only their
+// shared User/Client Account/Membership rows can serialize them. Holding User
+// makes both real product paths wait at the first shared row; Client Account
+// must remain lockable until User is released.
+const sharedIdentityOriginalCookie = cookie;
+try {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_cross_lock_add_funds ON durable_jobs;
+    CREATE OR REPLACE FUNCTION integration_delay_cross_lock_add_funds()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.job_type = 'add_funds.start' THEN
+        NEW.available_at = now() + interval '1 hour';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER integration_delay_cross_lock_add_funds
+    BEFORE INSERT ON durable_jobs
+    FOR EACH ROW EXECUTE FUNCTION integration_delay_cross_lock_add_funds();
+
+    DROP TRIGGER IF EXISTS integration_delay_cross_lock_provision ON durable_jobs;
+    CREATE OR REPLACE FUNCTION integration_delay_cross_lock_provision()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.job_type = 'provision.start' THEN
+        NEW.available_at = now() + interval '1 hour';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER integration_delay_cross_lock_provision
+    BEFORE INSERT ON durable_jobs
+    FOR EACH ROW EXECUTE FUNCTION integration_delay_cross_lock_provision();
+  `);
+  const sharedIdentityEmail = `cross-invoice-${randomUUID()}@example.invalid`;
+  await request(
+    "/api/v1/auth/register",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        email: sharedIdentityEmail,
+        password,
+        clientName: "Synthetic Cross Invoice Lock Account",
+        locale: "en",
+      }),
+    },
+    201,
+  );
+  await request(
+    "/api/v1/auth/login",
+    {
+      method: "POST",
+      body: JSON.stringify({ email: sharedIdentityEmail, password }),
+    },
+    200,
+  );
+  await corePool.query(
+    "UPDATE users SET email_verified_at = now() WHERE email = $1",
+    [sharedIdentityEmail],
+  );
+  const sharedIdentityMe = await request<{ id: string; clientAccountId: string }>(
+    "/api/v1/auth/me",
+  );
+  const sharedCallbackOrder = await createOrder(automaticPrice.id, legal);
+  const sharedCallbackQuote = await createPaymentQuote(sharedCallbackOrder.invoice.id);
+  const sharedCallbackCommand = await request<PaymentCommand>(
+    `/api/v1/invoices/${sharedCallbackOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: sharedCallbackQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(sharedCallbackCommand.paymentAttemptId);
+  const sharedCallbackRecords = await readPaymentRecords(sharedCallbackCommand.commandId);
+  await corePool.query("UPDATE payment_attempts SET status = 'processing' WHERE id = $1", [
+    sharedCallbackCommand.paymentAttemptId,
+  ]);
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1
+     WHERE id = $1`,
+    [sharedCallbackRecords.operation_id],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', locked_at = NULL, locked_by = NULL
+     WHERE job_type = 'payment.start'
+       AND payload->>'paymentAttemptId' = $1`,
+    [sharedCallbackCommand.paymentAttemptId],
+  );
+
+  const sharedWorkerOrder = await createOrder(automaticPrice.id, legal);
+  const sharedWorkerQuote = await createPaymentQuote(sharedWorkerOrder.invoice.id);
+  const sharedWorkerCommand = await request<PaymentCommand>(
+    `/api/v1/invoices/${sharedWorkerOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: sharedWorkerQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(sharedWorkerCommand.paymentAttemptId);
+
+  const sharedAddFundsWorkerQuote = await createAddFundsQuote("5000", "card");
+  const sharedAddFundsWorkerStarted = await startAddFunds(
+    sharedAddFundsWorkerQuote.quoteId,
+    "success",
+  );
+  const sharedAddFundsWorkerRecords = await corePool.query<{
+    attempt_id: string;
+    operation_id: string;
+  }>(
+    `SELECT attempt.id AS attempt_id, operation.id AS operation_id
+     FROM add_funds_attempts attempt
+     JOIN provider_operations operation
+       ON operation.subject_type = 'add_funds'
+      AND operation.subject_id = attempt.id
+     WHERE attempt.id = $1`,
+    [sharedAddFundsWorkerStarted.command.addFundsAttemptId],
+  );
+  const sharedAddFundsWorkerRecord = sharedAddFundsWorkerRecords.rows[0];
+  assert.ok(sharedAddFundsWorkerRecord);
+
+  const sharedAddFundsQuote = await createAddFundsQuote("5000", "card");
+  const sharedAddFundsStarted = await startAddFunds(sharedAddFundsQuote.quoteId, "success");
+  const sharedAddFundsRecords = await corePool.query<{
+    attempt_id: string;
+    operation_id: string;
+    amount_minor: string;
+    currency: string;
+  }>(
+    `SELECT
+       attempt.id AS attempt_id,
+       operation.id AS operation_id,
+       attempt.amount_minor::text,
+       attempt.currency
+     FROM add_funds_attempts attempt
+     JOIN provider_operations operation
+       ON operation.subject_type = 'add_funds'
+      AND operation.subject_id = attempt.id
+     WHERE attempt.id = $1`,
+    [sharedAddFundsStarted.command.addFundsAttemptId],
+  );
+  const sharedAddFundsRecord = sharedAddFundsRecords.rows[0];
+  assert.ok(sharedAddFundsRecord);
+  await corePool.query(
+    "UPDATE add_funds_attempts SET status = 'processing' WHERE id = $1",
+    [sharedAddFundsRecord.attempt_id],
+  );
+
+  const sharedProvisionOrder = await createOrder(automaticPrice.id, legal);
+  const sharedProvisionQuote = await createPaymentQuote(sharedProvisionOrder.invoice.id);
+  const sharedProvisionPayment = await request<PaymentCommand>(
+    `/api/v1/invoices/${sharedProvisionOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: sharedProvisionQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(sharedProvisionPayment.paymentAttemptId);
+  await releasePaymentStart(sharedProvisionPayment.paymentAttemptId);
+  await waitFor(
+    "provisioning callback lock-order source invoice to become paid",
+    () => request<OrderDetail>(`/api/v1/orders/${sharedProvisionOrder.order.id}`),
+    (value) => value.invoice.status === "paid",
+  );
+  const sharedProvisionRecords = await corePool.query<{
+    service_id: string;
+    operation_id: string;
+    job_id: string;
+  }>(
+    `SELECT
+       service.id AS service_id,
+       operation.id AS operation_id,
+       job.id AS job_id
+     FROM services service
+     JOIN order_items item ON item.id = service.order_item_id
+     JOIN provider_operations operation
+       ON operation.subject_type = 'service'
+      AND operation.subject_id = service.id
+      AND operation.kind = 'resource_create'
+     JOIN durable_jobs job
+       ON job.job_type = 'provision.start'
+      AND job.payload->>'serviceId' = service.id::text
+     WHERE item.order_id = $1`,
+    [sharedProvisionOrder.order.id],
+  );
+  const sharedProvisionRecord = sharedProvisionRecords.rows[0];
+  assert.ok(sharedProvisionRecord);
+
+  const sharedProvisionWorkerOrder = await createOrder(automaticPrice.id, legal);
+  const sharedProvisionWorkerQuote = await createPaymentQuote(
+    sharedProvisionWorkerOrder.invoice.id,
+  );
+  const sharedProvisionWorkerPayment = await request<PaymentCommand>(
+    `/api/v1/invoices/${sharedProvisionWorkerOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: sharedProvisionWorkerQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(sharedProvisionWorkerPayment.paymentAttemptId);
+  await releasePaymentStart(sharedProvisionWorkerPayment.paymentAttemptId);
+  await waitFor(
+    "provisioning Worker lock-order source invoice to become paid",
+    () => request<OrderDetail>(`/api/v1/orders/${sharedProvisionWorkerOrder.order.id}`),
+    (value) => value.invoice.status === "paid",
+  );
+  const sharedProvisionWorkerRecords = await corePool.query<{
+    service_id: string;
+    operation_id: string;
+    job_id: string;
+  }>(
+    `SELECT service.id AS service_id,
+            operation.id AS operation_id,
+            job.id AS job_id
+     FROM services service
+     JOIN order_items item ON item.id = service.order_item_id
+     JOIN provider_operations operation
+       ON operation.subject_type = 'service'
+      AND operation.subject_id = service.id
+      AND operation.kind = 'resource_create'
+     JOIN durable_jobs job
+       ON job.job_type = 'provision.start'
+      AND job.payload->>'serviceId' = service.id::text
+     WHERE item.order_id = $1`,
+    [sharedProvisionWorkerOrder.order.id],
+  );
+  const sharedProvisionWorkerRecord = sharedProvisionWorkerRecords.rows[0];
+  assert.ok(sharedProvisionWorkerRecord);
+  await corePool.query(
+    "UPDATE services SET status = 'provisioning' WHERE id = $1",
+    [sharedProvisionRecord.service_id],
+  );
+  await corePool.query(
+    "UPDATE orders SET status = 'fulfilling' WHERE id = $1",
+    [sharedProvisionOrder.order.id],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1
+     WHERE id = $1`,
+    [sharedProvisionRecord.operation_id],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', locked_at = NULL, locked_by = NULL
+     WHERE id = $1`,
+    [sharedProvisionRecord.job_id],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1
+     WHERE id = $1`,
+    [sharedAddFundsRecord.operation_id],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', locked_at = NULL, locked_by = NULL
+     WHERE job_type = 'add_funds.start'
+       AND payload->>'addFundsAttemptId' = $1`,
+    [sharedAddFundsRecord.attempt_id],
+  );
+
+  const sharedIdentity = await corePool.query<{
+    callback_user_id: string;
+    payment_worker_user_id: string;
+    add_funds_callback_user_id: string;
+    add_funds_worker_user_id: string;
+    provision_callback_user_id: string;
+    provision_worker_user_id: string;
+  }>(
+    `SELECT
+       callback_order.submitted_by_user_id AS callback_user_id,
+       worker_order.submitted_by_user_id AS payment_worker_user_id,
+       add_funds_callback.submitted_by_user_id AS add_funds_callback_user_id,
+       add_funds_worker.submitted_by_user_id AS add_funds_worker_user_id,
+       provision_callback_order.submitted_by_user_id AS provision_callback_user_id,
+       provision_worker_order.submitted_by_user_id AS provision_worker_user_id
+     FROM orders callback_order
+     JOIN orders worker_order ON worker_order.id = $2
+     JOIN add_funds_attempts add_funds_callback ON add_funds_callback.id = $3
+     JOIN add_funds_attempts add_funds_worker ON add_funds_worker.id = $4
+     JOIN orders provision_callback_order ON provision_callback_order.id = $5
+     JOIN orders provision_worker_order ON provision_worker_order.id = $6
+     WHERE callback_order.id = $1`,
+    [
+      sharedCallbackOrder.order.id,
+      sharedWorkerOrder.order.id,
+      sharedAddFundsRecord.attempt_id,
+      sharedAddFundsWorkerRecord.attempt_id,
+      sharedProvisionOrder.order.id,
+      sharedProvisionWorkerOrder.order.id,
+    ],
+  );
+  const sharedUserId = sharedIdentity.rows[0]?.callback_user_id;
+  assert.ok(sharedUserId);
+  assert.equal(sharedIdentity.rows[0]?.payment_worker_user_id, sharedUserId);
+  assert.equal(sharedIdentity.rows[0]?.add_funds_callback_user_id, sharedUserId);
+  assert.equal(sharedIdentity.rows[0]?.add_funds_worker_user_id, sharedUserId);
+  assert.equal(sharedIdentity.rows[0]?.provision_callback_user_id, sharedUserId);
+  assert.equal(sharedIdentity.rows[0]?.provision_worker_user_id, sharedUserId);
+
+  const assertWorkerIdentityLockOrder = async (
+    label: string,
+    release: () => Promise<unknown>,
+    verify: () => Promise<void>,
+  ): Promise<void> => {
+    const userGate = await corePool.connect();
+    let userGateOpen = false;
+    try {
+      await userGate.query("BEGIN");
+      userGateOpen = true;
+      await userGate.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [sharedUserId]);
+      await release();
+      await waitFor(
+        `${label} Worker to wait at the shared User row`,
+        async () => {
+          const result = await corePool.query<{ waiting: string }>(
+            `SELECT count(*)::text AS waiting
+             FROM pg_stat_activity
+             WHERE application_name = 'opensales-worker'
+               AND state = 'active'
+               AND wait_event_type = 'Lock'
+               AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+          );
+          return result.rows[0]?.waiting ?? "0";
+        },
+        (waiting) => BigInt(waiting) >= 1n,
+      );
+      const accountProbe = await corePool.connect();
+      try {
+        await accountProbe.query("BEGIN");
+        const unlockedAccount = await accountProbe.query<{ id: string }>(
+          `SELECT id
+           FROM client_accounts
+           WHERE id = $1
+           FOR UPDATE NOWAIT`,
+          [sharedIdentityMe.clientAccountId],
+        );
+        assert.equal(unlockedAccount.rows[0]?.id, sharedIdentityMe.clientAccountId);
+        await accountProbe.query("COMMIT");
+      } catch (error) {
+        await accountProbe.query("ROLLBACK");
+        throw error;
+      } finally {
+        accountProbe.release();
+      }
+      await userGate.query("COMMIT");
+      userGateOpen = false;
+      await verify();
+    } finally {
+      if (userGateOpen) await userGate.query("ROLLBACK");
+      userGate.release();
+    }
+  };
+
+  await assertWorkerIdentityLockOrder(
+    "Add Funds preflight",
+    () =>
+      corePool.query(
+        `UPDATE durable_jobs
+         SET available_at = now(), status = 'pending', locked_at = NULL, locked_by = NULL
+         WHERE job_type = 'add_funds.start'
+           AND payload->>'addFundsAttemptId' = $1`,
+        [sharedAddFundsWorkerRecord.attempt_id],
+      ),
+    async () => {
+      const settled = await waitForAddFunds(
+        sharedAddFundsWorkerStarted.command.commandId,
+        "succeeded",
+      );
+      assert.equal(settled.result?.principalCreditedMinor, "5000");
+    },
+  );
+  await providerPool.query(
+    `INSERT INTO mock_resource_faults(operation_id, behavior)
+     VALUES ($1, 'callback_success_then_reject')`,
+    [sharedProvisionWorkerRecord.operation_id],
+  );
+  await assertWorkerIdentityLockOrder(
+    "Provision preflight",
+    () =>
+      corePool.query(
+        `UPDATE durable_jobs
+         SET available_at = now(), status = 'pending', locked_at = NULL, locked_by = NULL
+         WHERE id = $1`,
+        [sharedProvisionWorkerRecord.job_id],
+      ),
+    async () => {
+      const active = await waitFor(
+        "Provision Worker lock-order service activation",
+        () => request<OrderDetail>(`/api/v1/orders/${sharedProvisionWorkerOrder.order.id}`),
+        (value) => value.service.status === "active",
+      );
+      assert.equal(active.invoice.status, "paid");
+      assert.equal(active.order.status, "completed");
+      const contradictoryProvision = await waitFor(
+        "Provision success callback to win over the later HTTP rejection",
+        () => corePool.query<{
+          service_status: string;
+          order_status: string;
+          operation_status: string;
+          job_status: string;
+          rejection_audits: string;
+          conflict_audits: string;
+        }>(
+          `SELECT
+             (SELECT status FROM services WHERE id = $3) AS service_status,
+             (SELECT status FROM orders WHERE id = $4) AS order_status,
+             (SELECT status FROM provider_operations WHERE id = $1) AS operation_status,
+             (SELECT status FROM durable_jobs WHERE id = $2) AS job_status,
+             (SELECT count(*)::text
+               FROM audit_events
+               WHERE action = 'provision.provider_create_rejected'
+                 AND target_id = $3::text) AS rejection_audits,
+             (SELECT count(*)::text
+               FROM audit_events
+               WHERE action = 'provision.provider_outcome_conflict'
+                 AND target_id = $3::text) AS conflict_audits`,
+          [
+            sharedProvisionWorkerRecord.operation_id,
+            sharedProvisionWorkerRecord.job_id,
+            sharedProvisionWorkerRecord.service_id,
+            sharedProvisionWorkerOrder.order.id,
+          ],
+        ).then((result) => result.rows[0]),
+        (state) =>
+          state?.service_status === "active" &&
+          state.order_status === "completed" &&
+          state.operation_status === "succeeded" &&
+          state.job_status === "completed" &&
+          state.rejection_audits === "0" &&
+          state.conflict_audits === "1",
+      );
+      assert.deepEqual(contradictoryProvision, {
+        service_status: "active",
+        order_status: "completed",
+        operation_status: "succeeded",
+        job_status: "completed",
+        rejection_audits: "0",
+        conflict_audits: "1",
+      });
+    },
+  );
+
+  const identityGateClient = await corePool.connect();
+  let identityGateOpen = false;
+  let sharedCallbackResult:
+    | { status: number; body: Record<string, unknown> }
+    | undefined;
+  try {
+    await identityGateClient.query("BEGIN");
+    identityGateOpen = true;
+    await identityGateClient.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+      sharedUserId,
+    ]);
+    const callbackPromise = submitPaymentFact({
+      eventId: `cross-invoice-callback:${randomUUID()}`,
+      providerOperationId: sharedCallbackRecords.operation_id,
+      paymentAttemptId: sharedCallbackCommand.paymentAttemptId,
+      externalPaymentId: `cross-invoice-payment-${randomUUID()}`,
+      status: "succeeded",
+      amountMinor: sharedCallbackRecords.amount_minor,
+      currency: sharedCallbackRecords.currency,
+      occurredAt: new Date().toISOString(),
+    });
+    const addFundsCallbackPromise = submitPaymentFact({
+      eventId: `cross-account-add-funds:${randomUUID()}`,
+      providerOperationId: sharedAddFundsRecord.operation_id,
+      paymentAttemptId: sharedAddFundsRecord.attempt_id,
+      externalPaymentId: `cross-account-add-funds-${randomUUID()}`,
+      status: "succeeded",
+      amountMinor: sharedAddFundsRecord.amount_minor,
+      currency: sharedAddFundsRecord.currency,
+      occurredAt: new Date().toISOString(),
+    });
+    const sharedProvisionExternalId = `cross-account-resource-${randomUUID()}`;
+    const provisionCallbackPromise = submitProvisionFact({
+      eventId: `cross-account-provision:${randomUUID()}`,
+      providerOperationId: sharedProvisionRecord.operation_id,
+      status: "succeeded",
+      externalResourceId: sharedProvisionExternalId,
+      readyAt: new Date().toISOString(),
+      occurredAt: new Date().toISOString(),
+    });
+    await waitFor(
+      "Payment, Add Funds, and Provision callbacks to wait at the shared User row",
+      async () => {
+        const result = await corePool.query<{ waiting: string }>(
+          `SELECT count(*)::text AS waiting
+           FROM pg_stat_activity
+           WHERE application_name = 'opensales-api'
+             AND state = 'active'
+             AND wait_event_type = 'Lock'
+             AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+        );
+        return result.rows[0]?.waiting ?? "0";
+      },
+      (waiting) => BigInt(waiting) >= 3n,
+    );
+
+    await releasePaymentStart(sharedWorkerCommand.paymentAttemptId);
+    await waitFor(
+      "three callback types and a Worker to wait at the same User row",
+      async () => {
+        const result = await corePool.query<{ waiting: string }>(
+          `SELECT count(*)::text AS waiting
+           FROM pg_stat_activity
+           WHERE application_name IN ('opensales-api', 'opensales-worker')
+             AND state = 'active'
+             AND wait_event_type = 'Lock'
+             AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+        );
+        return result.rows[0]?.waiting ?? "0";
+      },
+      (waiting) => BigInt(waiting) >= 4n,
+    );
+
+    const accountProbe = await corePool.connect();
+    try {
+      await accountProbe.query("BEGIN");
+      const unlockedAccount = await accountProbe.query<{ id: string }>(
+        `SELECT id
+         FROM client_accounts
+         WHERE id = $1
+         FOR UPDATE NOWAIT`,
+        [sharedIdentityMe.clientAccountId],
+      );
+      assert.equal(unlockedAccount.rows[0]?.id, sharedIdentityMe.clientAccountId);
+      await accountProbe.query("COMMIT");
+    } catch (error) {
+      await accountProbe.query("ROLLBACK");
+      throw error;
+    } finally {
+      accountProbe.release();
+    }
+
+    await identityGateClient.query("COMMIT");
+    identityGateOpen = false;
+    const callbackResults = await Promise.all([
+      callbackPromise,
+      addFundsCallbackPromise,
+      provisionCallbackPromise,
+    ]);
+    sharedCallbackResult = callbackResults[0];
+    assert.equal(callbackResults[1]?.status, 202);
+    assert.equal(callbackResults[1]?.body.status, "succeeded");
+    assert.equal(callbackResults[2]?.status, 202);
+    assert.equal(callbackResults[2]?.body.status, "active");
+  } finally {
+    if (identityGateOpen) await identityGateClient.query("ROLLBACK");
+    identityGateClient.release();
+  }
+  assert.equal(sharedCallbackResult?.status, 202);
+  assert.equal(sharedCallbackResult?.body.status, "succeeded");
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_cross_lock_provision ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_cross_lock_provision();
+  `);
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET available_at = now()
+     WHERE job_type = 'provision.start'
+       AND payload->>'serviceId' = ANY($1::text[])`,
+    [[sharedCallbackOrder.service.id, sharedWorkerOrder.service.id]],
+  );
+  const sharedCallbackActive = await waitFor(
+    "cross-invoice callback service activation",
+    () => request<OrderDetail>(`/api/v1/orders/${sharedCallbackOrder.order.id}`),
+    (value) => value.service.status === "active",
+  );
+  const sharedWorkerActive = await waitFor(
+    "cross-invoice Worker payment and service activation",
+    () => request<OrderDetail>(`/api/v1/orders/${sharedWorkerOrder.order.id}`),
+    (value) => value.service.status === "active",
+    35_000,
+  );
+  assert.equal(sharedCallbackActive.invoice.status, "paid");
+  assert.equal(sharedWorkerActive.invoice.status, "paid");
+  const sharedAddFundsFinal = await waitForAddFunds(
+    sharedAddFundsStarted.command.commandId,
+    "succeeded",
+  );
+  assert.equal(sharedAddFundsFinal.attemptStatus, "succeeded");
+  assert.equal(sharedAddFundsFinal.providerOperationStatus, "succeeded");
+  const sharedAddFundsEffects = await corePool.query<{
+    receipts: string;
+    credit_transactions: string;
+    receipt_journals: string;
+    credit_balance_minor: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+          FROM fund_receipts
+         WHERE reported_add_funds_attempt_id = $1) AS receipts,
+       (SELECT count(*)::text
+          FROM credit_transactions transaction
+          JOIN add_funds_settlements settlement ON settlement.id = transaction.source_id
+         WHERE transaction.kind = 'add_funds'
+           AND transaction.source_type = 'add_funds_settlement'
+           AND settlement.add_funds_attempt_id = $1) AS credit_transactions,
+       (SELECT count(*)::text
+          FROM ledger_journals journal
+          JOIN add_funds_settlements settlement ON settlement.id = journal.source_id
+         WHERE journal.source_type = 'add_funds_settlement'
+           AND settlement.add_funds_attempt_id = $1) AS receipt_journals,
+       (SELECT COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text
+          FROM credit_accounts account
+          LEFT JOIN credit_transactions transaction ON transaction.credit_account_id = account.id
+         WHERE account.client_account_id = $2 AND account.currency = 'USD') AS credit_balance_minor`,
+    [sharedAddFundsRecord.attempt_id, sharedIdentityMe.clientAccountId],
+  );
+  assert.deepEqual(sharedAddFundsEffects.rows[0], {
+    receipts: "1",
+    credit_transactions: "1",
+    receipt_journals: "1",
+    credit_balance_minor: "10000",
+  });
+  const sharedProvisionFinal = await request<OrderDetail>(
+    `/api/v1/orders/${sharedProvisionOrder.order.id}`,
+  );
+  assert.equal(sharedProvisionFinal.service.status, "active");
+  const sharedProvisionEffects = await corePool.query<{
+    service_rows: string;
+    activation_events: string;
+    operation_status: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+          FROM services
+         WHERE id = $1 AND external_resource_id IS NOT NULL) AS service_rows,
+       (SELECT count(*)::text
+          FROM outbox
+         WHERE event_type = 'service.activated'
+           AND unique_key = 'service:' || $1::text) AS activation_events,
+       (SELECT status FROM provider_operations WHERE id = $2) AS operation_status`,
+    [sharedProvisionRecord.service_id, sharedProvisionRecord.operation_id],
+  );
+  assert.deepEqual(sharedProvisionEffects.rows[0], {
+    service_rows: "1",
+    activation_events: "1",
+    operation_status: "succeeded",
+  });
+  const sharedWorkerEffects = await corePool.query<{
+    add_funds_receipts: string;
+    add_funds_credits: string;
+    provision_resources: string;
+    provision_events: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+          FROM fund_receipts
+         WHERE reported_add_funds_attempt_id = $1) AS add_funds_receipts,
+       (SELECT count(*)::text
+          FROM credit_transactions transaction
+          JOIN add_funds_settlements settlement ON settlement.id = transaction.source_id
+         WHERE transaction.kind = 'add_funds'
+           AND transaction.source_type = 'add_funds_settlement'
+           AND settlement.add_funds_attempt_id = $1) AS add_funds_credits,
+       (SELECT count(*)::text
+          FROM services
+         WHERE id = $2 AND external_resource_id IS NOT NULL) AS provision_resources,
+       (SELECT count(*)::text
+          FROM outbox
+         WHERE event_type = 'service.activated'
+           AND unique_key = 'service:' || $2::text) AS provision_events`,
+    [sharedAddFundsWorkerRecord.attempt_id, sharedProvisionWorkerRecord.service_id],
+  );
+  assert.deepEqual(sharedWorkerEffects.rows[0], {
+    add_funds_receipts: "1",
+    add_funds_credits: "1",
+    provision_resources: "1",
+    provision_events: "1",
+  });
+  const sharedWorkerProviderEffects = await providerPool.query<{
+    add_funds_create_calls: number;
+    resource_create_calls: number;
+  }>(
+    `SELECT
+       (SELECT create_calls
+          FROM mock_payment_operations
+         WHERE operation_id = $1) AS add_funds_create_calls,
+       (SELECT create_calls
+          FROM mock_resource_operations
+         WHERE operation_id = $2) AS resource_create_calls`,
+    [sharedAddFundsWorkerRecord.operation_id, sharedProvisionWorkerRecord.operation_id],
+  );
+  assert.deepEqual(sharedWorkerProviderEffects.rows[0], {
+    add_funds_create_calls: 1,
+    resource_create_calls: 1,
+  });
+
+  const sharedEffects = await corePool.query<{
+    order_id: string;
+    receipts: string;
+    allocations: string;
+    fee_charges: string;
+    paid_events: string;
+    provision_operations: string;
+    provision_jobs: string;
+  }>(
+    `SELECT
+       source.order_id,
+       (SELECT count(*)::text
+          FROM fund_receipts receipt
+          JOIN payment_attempts payment ON payment.id = receipt.reported_payment_attempt_id
+         WHERE payment.invoice_id = source.invoice_id) AS receipts,
+       (SELECT count(*)::text
+          FROM payment_allocations allocation
+         WHERE allocation.invoice_id = source.invoice_id) AS allocations,
+       (SELECT count(*)::text
+          FROM invoice_fee_charges charge
+          JOIN payment_attempts payment ON payment.id = charge.payment_attempt_id
+         WHERE payment.invoice_id = source.invoice_id) AS fee_charges,
+       (SELECT count(*)::text
+          FROM outbox
+         WHERE event_type = 'invoice.paid'
+           AND unique_key = 'invoice:' || source.invoice_id::text) AS paid_events,
+       (SELECT count(*)::text
+          FROM provider_operations operation
+         WHERE operation.subject_type = 'service'
+           AND operation.kind = 'resource_create'
+           AND operation.subject_id = source.service_id) AS provision_operations,
+       (SELECT count(*)::text
+          FROM durable_jobs job
+         WHERE job.job_type = 'provision.start'
+           AND job.payload->>'serviceId' = source.service_id::text) AS provision_jobs
+     FROM (
+       SELECT orders.id AS order_id, invoices.id AS invoice_id, services.id AS service_id
+       FROM orders
+       JOIN invoices ON invoices.order_id = orders.id
+       JOIN order_items ON order_items.order_id = orders.id
+       JOIN services ON services.order_item_id = order_items.id
+       WHERE orders.id = ANY($1::uuid[])
+     ) source
+     ORDER BY source.order_id`,
+    [[sharedCallbackOrder.order.id, sharedWorkerOrder.order.id]],
+  );
+  assert.equal(sharedEffects.rowCount, 2);
+  for (const effect of sharedEffects.rows) {
+    assert.deepEqual(
+      {
+        receipts: effect.receipts,
+        allocations: effect.allocations,
+        fee_charges: effect.fee_charges,
+        paid_events: effect.paid_events,
+        provision_operations: effect.provision_operations,
+        provision_jobs: effect.provision_jobs,
+      },
+      {
+        receipts: "1",
+        allocations: "1",
+        fee_charges: "1",
+        paid_events: "1",
+        provision_operations: "1",
+        provision_jobs: "1",
+      },
+      `cross-invoice purchase ${effect.order_id} must have exactly one side effect chain`,
+    );
+  }
+} finally {
+  cookie = sharedIdentityOriginalCookie;
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_cross_lock_add_funds ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_cross_lock_add_funds();
+    DROP TRIGGER IF EXISTS integration_delay_cross_lock_provision ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_cross_lock_provision();
+  `);
+}
 
 await request(
   `/api/v1/admin/client-accounts/${staffMe.clientAccountId}/credit-adjustments`,
@@ -2602,6 +4008,253 @@ assert.equal(definitiveReplay.paymentAttemptId, definitiveCommand.paymentAttempt
 assert.equal(definitiveReplay.status, "failed");
 assert.equal(definitiveReplay.replayed, true);
 
+const paymentCallbackBeforeRejectOrder = await createOrder(automaticPrice.id, legal);
+const paymentCallbackBeforeRejectQuote = await createPaymentQuote(
+  paymentCallbackBeforeRejectOrder.invoice.id,
+  "card",
+  false,
+);
+const paymentCallbackBeforeReject = await request<PaymentCommand>(
+  `/api/v1/invoices/${paymentCallbackBeforeRejectOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: paymentCallbackBeforeRejectQuote.quoteId,
+      scenario: "partial_then_reject",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(paymentCallbackBeforeReject.paymentAttemptId);
+await releasePaymentStart(paymentCallbackBeforeReject.paymentAttemptId);
+const preservedPaymentCallbackBeforeReject = await waitFor(
+  "Worker to preserve unclaimed invoice funds after the create response rejects",
+  async () => {
+    const state = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      invoice_status: string;
+      order_status: string;
+      service_status: string;
+      receipts: string;
+      conflicts: string;
+      rejections: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         CASE
+           WHEN allocation.allocated_minor = 0 THEN 'open'
+           WHEN allocation.allocated_minor < invoice.total_minor THEN 'partially_paid'
+           ELSE 'paid'
+         END AS invoice_status,
+         customer_order.status AS order_status,
+         service.status AS service_status,
+         (SELECT count(*)::text
+            FROM fund_receipts receipt
+           WHERE receipt.reported_payment_attempt_id = attempt.id
+             AND receipt.disposition = 'unclaimed') AS receipts,
+         (SELECT count(*)::text
+            FROM audit_events audit
+           WHERE audit.action = 'payment.provider_outcome_conflict'
+             AND audit.target_id = attempt.id::text) AS conflicts,
+         (SELECT count(*)::text
+            FROM audit_events audit
+           WHERE audit.action = 'payment.provider_create_rejected'
+             AND audit.target_id = attempt.id::text) AS rejections
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN provider_operations operation
+         ON operation.subject_type = 'payment'
+        AND operation.subject_id = attempt.id
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.start'
+        AND job.payload->>'paymentAttemptId' = attempt.id::text
+       JOIN invoices invoice ON invoice.id = attempt.invoice_id
+       JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+       JOIN orders customer_order ON customer_order.id = invoice.order_id
+       JOIN order_items item ON item.order_id = customer_order.id
+       JOIN services service ON service.order_item_id = item.id
+       WHERE command.id = $1`,
+      [paymentCallbackBeforeReject.commandId],
+    );
+    return state.rows[0];
+  },
+  (state) =>
+    state?.command_status === "manual" &&
+    state.attempt_status === "unknown" &&
+    state.operation_status === "unknown" &&
+    state.job_status === "completed" &&
+    state.invoice_status === "open" &&
+    state.order_status === "waiting_payment" &&
+    state.service_status === "pending" &&
+    state.receipts === "1" &&
+    state.conflicts === "1" &&
+    state.rejections === "0",
+  8_000,
+);
+assert.equal(preservedPaymentCallbackBeforeReject?.receipts, "1");
+const paymentCallbackBeforeRejectProvider = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_payment_operations WHERE operation_id = $1",
+  [(await readPaymentRecords(paymentCallbackBeforeReject.commandId)).operation_id],
+);
+assert.equal(paymentCallbackBeforeRejectProvider.rows[0]?.create_calls, 1);
+
+const paymentCallbackBeforeTimeoutOrder = await createOrder(automaticPrice.id, legal);
+const paymentCallbackBeforeTimeoutQuote = await createPaymentQuote(
+  paymentCallbackBeforeTimeoutOrder.invoice.id,
+  "card",
+  false,
+);
+const paymentCallbackBeforeTimeout = await request<PaymentCommand>(
+  `/api/v1/invoices/${paymentCallbackBeforeTimeoutOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: paymentCallbackBeforeTimeoutQuote.quoteId,
+      scenario: "partial_then_timeout",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(paymentCallbackBeforeTimeout.paymentAttemptId);
+await releasePaymentStart(paymentCallbackBeforeTimeout.paymentAttemptId);
+const preservedPaymentCallbackBeforeTimeout = await waitFor(
+  "Worker transport timeout to preserve the earlier unclaimed payment receipt",
+  async () => {
+    const state = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      receipts: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         (SELECT count(*)::text
+            FROM fund_receipts receipt
+           WHERE receipt.reported_payment_attempt_id = attempt.id
+             AND receipt.disposition = 'unclaimed') AS receipts
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN provider_operations operation
+         ON operation.subject_type = 'payment'
+        AND operation.subject_id = attempt.id
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.start'
+        AND job.payload->>'paymentAttemptId' = attempt.id::text
+       WHERE command.id = $1`,
+      [paymentCallbackBeforeTimeout.commandId],
+    );
+    return state.rows[0];
+  },
+  (state) =>
+    state?.command_status === "manual" &&
+    state.attempt_status === "unknown" &&
+    state.operation_status === "unknown" &&
+    state.job_status === "completed" &&
+    state.receipts === "1",
+  30_000,
+);
+assert.equal(preservedPaymentCallbackBeforeTimeout?.command_status, "manual");
+const paymentCallbackBeforeTimeoutProvider = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_payment_operations WHERE operation_id = $1",
+  [(await readPaymentRecords(paymentCallbackBeforeTimeout.commandId)).operation_id],
+);
+assert.equal(paymentCallbackBeforeTimeoutProvider.rows[0]?.create_calls, 1);
+
+const paymentSuccessBeforeRejectOrder = await createOrder(automaticPrice.id, legal);
+const paymentSuccessBeforeRejectQuote = await createPaymentQuote(
+  paymentSuccessBeforeRejectOrder.invoice.id,
+  "card",
+  false,
+);
+const paymentSuccessBeforeReject = await request<PaymentCommand>(
+  `/api/v1/invoices/${paymentSuccessBeforeRejectOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: paymentSuccessBeforeRejectQuote.quoteId,
+      scenario: "success_then_reject",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(paymentSuccessBeforeReject.paymentAttemptId);
+await releasePaymentStart(paymentSuccessBeforeReject.paymentAttemptId);
+const preservedPaymentSuccessBeforeReject = await waitFor(
+  "Worker to preserve and audit full payment success after the create response rejects",
+  async () => {
+    const state = await corePool.query<{
+      command_status: string;
+      attempt_status: string;
+      operation_status: string;
+      job_status: string;
+      order_status: string;
+      service_status: string;
+      conflicts: string;
+      rejections: string;
+    }>(
+      `SELECT
+         command.status AS command_status,
+         attempt.status AS attempt_status,
+         operation.status AS operation_status,
+         job.status AS job_status,
+         customer_order.status AS order_status,
+         service.status AS service_status,
+         (SELECT count(*)::text
+            FROM audit_events audit
+           WHERE audit.action = 'payment.provider_outcome_conflict'
+             AND audit.target_id = attempt.id::text) AS conflicts,
+         (SELECT count(*)::text
+            FROM audit_events audit
+           WHERE audit.action = 'payment.provider_create_rejected'
+             AND audit.target_id = attempt.id::text) AS rejections
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN provider_operations operation
+         ON operation.subject_type = 'payment'
+        AND operation.subject_id = attempt.id
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.start'
+        AND job.payload->>'paymentAttemptId' = attempt.id::text
+       JOIN invoices invoice ON invoice.id = attempt.invoice_id
+       JOIN orders customer_order ON customer_order.id = invoice.order_id
+       JOIN order_items item ON item.order_id = customer_order.id
+       JOIN services service ON service.order_item_id = item.id
+       WHERE command.id = $1`,
+      [paymentSuccessBeforeReject.commandId],
+    );
+    return state.rows[0];
+  },
+  (state) =>
+    state?.command_status === "succeeded" &&
+    state.attempt_status === "succeeded" &&
+    state.operation_status === "succeeded" &&
+    state.job_status === "completed" &&
+    state.order_status === "completed" &&
+    state.service_status === "active" &&
+    state.conflicts === "1" &&
+    state.rejections === "0",
+  30_000,
+);
+assert.equal(preservedPaymentSuccessBeforeReject?.service_status, "active");
+const paymentSuccessBeforeRejectProvider = await providerPool.query<{ create_calls: number }>(
+  "SELECT create_calls FROM mock_payment_operations WHERE operation_id = $1",
+  [(await readPaymentRecords(paymentSuccessBeforeReject.commandId)).operation_id],
+);
+assert.equal(paymentSuccessBeforeRejectProvider.rows[0]?.create_calls, 1);
+
 await dropPaymentStartDelay();
 
 await corePool.query("UPDATE users SET restricted_at = now() WHERE email = $1", [email]);
@@ -2738,17 +4391,26 @@ const initialAddFundsFacts = await corePool.query<{
           ON transaction.credit_account_id = account.id
        WHERE account.client_account_id = $1 AND account.currency = 'USD') AS balance_minor,
      (SELECT count(*)::text
-        FROM credit_transactions
-       WHERE kind = 'add_funds'
-         AND source_type = 'add_funds_settlement') AS credits,
-     (SELECT count(*)::text FROM add_funds_settlements) AS settlements,
+        FROM credit_transactions transaction
+        JOIN credit_accounts account ON account.id = transaction.credit_account_id
+       WHERE transaction.kind = 'add_funds'
+         AND transaction.source_type = 'add_funds_settlement'
+         AND account.client_account_id = $1) AS credits,
+     (SELECT count(*)::text
+        FROM add_funds_settlements settlement
+        JOIN add_funds_attempts attempt ON attempt.id = settlement.add_funds_attempt_id
+       WHERE attempt.client_account_id = $1) AS settlements,
      (SELECT count(*)::text
         FROM fund_receipts
        WHERE reported_add_funds_attempt_id IS NOT NULL
-         AND disposition = 'allocated') AS receipts,
+         AND disposition = 'allocated'
+         AND client_account_id = $1) AS receipts,
      (SELECT count(*)::text
-        FROM ledger_journals
-       WHERE source_type = 'add_funds_settlement') AS journals,
+        FROM ledger_journals journal
+        JOIN add_funds_settlements settlement ON settlement.id = journal.source_id
+        JOIN add_funds_attempts attempt ON attempt.id = settlement.add_funds_attempt_id
+       WHERE journal.source_type = 'add_funds_settlement'
+         AND attempt.client_account_id = $1) AS journals,
      (SELECT count(*)::text
         FROM payment_allocations allocation
         JOIN payment_attempts attempt ON attempt.id = allocation.payment_attempt_id
@@ -2844,6 +4506,51 @@ assert.match(
 );
 
 const callbackBeforeRejectQuote = await createAddFundsQuote("5000", "card");
+const definitiveAddFundsQuote = await createAddFundsQuote("5000", "card");
+const definitiveAddFunds = await startAddFunds(
+  definitiveAddFundsQuote.quoteId,
+  "definitive_reject",
+);
+await waitForAddFunds(definitiveAddFunds.command.commandId, "failed");
+const definitiveAddFundsFacts = await corePool.query<{
+  attempt_status: string;
+  command_status: string;
+  operation_status: string;
+  job_status: string;
+  receipts: string;
+  audits: string;
+}>(
+  `SELECT attempt.status AS attempt_status,
+          command.status AS command_status,
+          operation.status AS operation_status,
+          job.status AS job_status,
+          (SELECT count(*)::text
+             FROM fund_receipts receipt
+            WHERE receipt.reported_add_funds_attempt_id = attempt.id) AS receipts,
+          (SELECT count(*)::text
+            FROM audit_events audit
+           WHERE audit.action = 'add_funds.known_unsent_rejected'
+              AND audit.target_id = attempt.id::text) AS audits
+   FROM add_funds_attempts attempt
+   JOIN add_funds_commands command ON command.add_funds_attempt_id = attempt.id
+   JOIN provider_operations operation
+     ON operation.subject_type = 'add_funds'
+    AND operation.subject_id = attempt.id
+   JOIN durable_jobs job
+     ON job.job_type = 'add_funds.start'
+    AND job.payload->>'addFundsAttemptId' = attempt.id::text
+   WHERE command.id = $1`,
+  [definitiveAddFunds.command.commandId],
+);
+assert.deepEqual(definitiveAddFundsFacts.rows[0], {
+  attempt_status: "failed",
+  command_status: "failed",
+  operation_status: "failed",
+  job_status: "completed",
+  receipts: "0",
+  audits: "1",
+});
+
 const callbackBeforeReject = await startAddFunds(
   callbackBeforeRejectQuote.quoteId,
   "partial_then_reject",
@@ -3825,14 +5532,10 @@ try {
       },
       (waiting) => BigInt(waiting) > 0n,
     );
-    const unlockedStaffAccount = await corePool.query<{ id: string }>(
-      `SELECT id
-       FROM client_accounts
-       WHERE id = $1
-       FOR UPDATE NOWAIT`,
-      [staffMe.clientAccountId],
-    );
-    assert.equal(unlockedStaffAccount.rows[0]?.id, staffMe.clientAccountId);
+    // The Provider callback now deliberately owns User and Client Account
+    // before inserting its receipt (foreign keys would otherwise acquire the
+    // Account row first implicitly). The staff allocation is observed waiting
+    // on Invoice above, so it cannot have reached its later Account lock.
 
     await accountGateClient.query("COMMIT");
     accountGateOpen = false;
@@ -6824,6 +8527,16 @@ assert.equal(
   rejectedReceiptFactMutation,
   true,
   "database must reject mutation of original fund receipt facts",
+);
+const deadlockFinal = await corePool.query<{ deadlocks: string }>(
+  `SELECT deadlocks::text
+   FROM pg_stat_database
+   WHERE datname = current_database()`,
+);
+assert.equal(
+  deadlockFinal.rows[0]?.deadlocks,
+  initialDeadlocks,
+  "the full payment, reconciliation, settlement, and recovery journey must not add a PostgreSQL deadlock",
 );
 
 await corePool.end();
