@@ -2167,44 +2167,6 @@ async function preflightRefund(
       await manualJobWithClient(client, job.id, "refund job references a missing refund");
       return { kind: "halted" };
     }
-    let authorizationValid = true;
-    if (mode === "start") {
-      const authorization = await client.query(
-        `SELECT 1
-         FROM users user_record
-         JOIN staff_members staff ON staff.user_id = user_record.id
-         JOIN sessions session_record
-           ON session_record.id = $2
-          AND session_record.user_id = user_record.id
-         JOIN client_memberships membership
-           ON membership.user_id = user_record.id
-          AND membership.client_account_id = $3
-          AND membership.removed_at IS NULL
-         JOIN client_accounts account
-           ON account.id = membership.client_account_id
-         JOIN reauth_grants reauth
-           ON reauth.user_id = user_record.id
-          AND reauth.session_id = session_record.id
-          AND reauth.invalidated_at IS NULL
-          AND reauth.expires_at > now()
-         WHERE user_record.id = $1
-           AND user_record.email_verified_at IS NOT NULL
-           AND user_record.restricted_at IS NULL
-           AND account.restricted_at IS NULL
-           AND staff.active
-           AND (staff.permissions ? '*' OR staff.permissions ? 'billing.refund_manage')
-           AND session_record.revoked_at IS NULL
-           AND session_record.expires_at > now()
-         LIMIT 1
-         FOR UPDATE OF user_record, staff, session_record, membership, account, reauth`,
-        [
-          initial.requested_by_user_id,
-          initial.requested_session_id,
-          initial.requested_client_account_id,
-        ],
-      );
-      authorizationValid = authorization.rowCount === 1;
-    }
     const receiptId = initial.source_fund_receipt_id;
     await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
     const result = await client.query<{
@@ -2327,6 +2289,111 @@ async function preflightRefund(
       );
       return { kind: "halted" };
     }
+    const capacity = await client.query<{ reserved_other_minor: string }>(
+      `SELECT
+         CASE
+           WHEN EXISTS (
+             SELECT 1
+             FROM refund_receipt_security_holds security_hold
+             WHERE security_hold.source_fund_receipt_id = receipt.id
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM refund_security_hold_adjudications adjudication
+                 WHERE adjudication.receipt_security_hold_id = security_hold.id
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM refunds competing_manual
+             WHERE competing_manual.source_fund_receipt_id = receipt.id
+               AND competing_manual.id <> $2
+               AND competing_manual.status = 'manual'
+           )
+           THEN receipt.amount_minor
+           ELSE COALESCE((
+             SELECT sum(reserved_outflow.amount_minor)
+             FROM (
+               SELECT competing.amount_minor
+               FROM refunds competing
+               WHERE competing.source_fund_receipt_id = receipt.id
+                 AND competing.id <> $2
+                 AND competing.status IN ('queued', 'processing', 'unknown', 'succeeded')
+               UNION ALL
+               SELECT discrepancy.amount_minor
+               FROM refunds unexpected_refund
+               JOIN refund_discrepancy_settlements discrepancy
+                 ON discrepancy.refund_id = unexpected_refund.id
+               JOIN refund_security_hold_adjudications adjudication
+                 ON adjudication.discrepancy_settlement_id = discrepancy.id
+                AND adjudication.decision = 'record_unexpected_outflow'
+               WHERE unexpected_refund.source_fund_receipt_id = receipt.id
+                 AND discrepancy.currency = receipt.currency
+               UNION ALL
+               SELECT corrected_discrepancy.amount_minor
+               FROM refunds corrected_refund
+               JOIN refund_discrepancy_settlements corrected_discrepancy
+                 ON corrected_discrepancy.refund_id = corrected_refund.id
+               JOIN refund_adjudication_corrections correction
+                 ON correction.discrepancy_settlement_id = corrected_discrepancy.id
+               WHERE corrected_refund.source_fund_receipt_id = receipt.id
+                 AND corrected_discrepancy.currency = receipt.currency
+             ) reserved_outflow
+           ), 0)
+         END::text AS reserved_other_minor
+       FROM fund_receipts receipt
+       WHERE receipt.id = $1`,
+      [receiptId, refundId],
+    );
+    const reservedOtherMinor = capacity.rows[0]?.reserved_other_minor;
+    if (
+      reservedOtherMinor === undefined ||
+      BigInt(reservedOtherMinor) + BigInt(refund.amount_minor) >
+        BigInt(refund.receipt_amount_minor)
+    ) {
+      await failKnownUnsentRefund(
+        client,
+        job,
+        refundId,
+        operationId,
+        "Refund capacity changed before Provider create; request stopped without an external side effect",
+      );
+      return { kind: "halted" };
+    }
+    const authorization = await client.query(
+      `SELECT 1
+       FROM users user_record
+       JOIN staff_members staff ON staff.user_id = user_record.id
+       JOIN sessions session_record
+         ON session_record.id = $2
+        AND session_record.user_id = user_record.id
+       JOIN client_memberships membership
+         ON membership.user_id = user_record.id
+        AND membership.client_account_id = $3
+        AND membership.removed_at IS NULL
+       JOIN client_accounts account
+         ON account.id = membership.client_account_id
+       JOIN reauth_grants reauth
+         ON reauth.user_id = user_record.id
+        AND reauth.session_id = session_record.id
+        AND reauth.invalidated_at IS NULL
+        AND reauth.expires_at > now()
+       WHERE user_record.id = $1
+         AND user_record.email_verified_at IS NOT NULL
+         AND user_record.restricted_at IS NULL
+         AND account.restricted_at IS NULL
+         AND staff.active
+         AND (staff.permissions ? '*' OR staff.permissions ? 'billing.refund_manage')
+         AND session_record.revoked_at IS NULL
+         AND session_record.expires_at > now()
+       LIMIT 1
+       FOR UPDATE OF user_record, staff, session_record, membership, account, reauth`,
+      [
+        initial.requested_by_user_id,
+        initial.requested_session_id,
+        initial.requested_client_account_id,
+      ],
+    );
+    const authorizationValid = authorization.rowCount === 1;
     if (!authorizationValid) {
       await failKnownUnsentRefund(
         client,

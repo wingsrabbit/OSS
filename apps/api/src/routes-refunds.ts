@@ -7,6 +7,7 @@ import { requireUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import { freezeCompetingRefunds } from "./refund-safety.js";
 import {
   requireRecentReauth,
   requireStaffActionLocked,
@@ -1396,6 +1397,8 @@ export async function registerRefundRoutes(
           provider_occurred_at: Date;
           discrepancy_id: string | null;
           correction_id: string | null;
+          provider_operation_id: string;
+          provider_operation_status: string;
         }>(
           `SELECT
              adjudication.id AS adjudication_id,
@@ -1408,7 +1411,9 @@ export async function registerRefundRoutes(
              fact.currency AS provider_currency,
              fact.occurred_at AS provider_occurred_at,
              discrepancy.id AS discrepancy_id,
-             correction.id AS correction_id
+             correction.id AS correction_id,
+             operation.id AS provider_operation_id,
+             operation.status AS provider_operation_status
            FROM refund_security_hold_adjudications adjudication
            JOIN refund_receipt_security_holds security_hold
              ON security_hold.id = adjudication.receipt_security_hold_id
@@ -1417,12 +1422,16 @@ export async function registerRefundRoutes(
            JOIN refund_provider_facts fact
              ON fact.id = security_hold.refund_provider_fact_id
             AND fact.refund_id = refund.id
+           JOIN provider_operations operation
+             ON operation.subject_type = 'refund'
+            AND operation.subject_id = refund.id
+            AND operation.kind = 'refund_create'
            LEFT JOIN refund_discrepancy_settlements discrepancy
              ON discrepancy.refund_provider_fact_id = fact.id
            LEFT JOIN refund_adjudication_corrections correction
              ON correction.adjudication_id = adjudication.id
            WHERE adjudication.id = $1
-           FOR UPDATE OF adjudication, security_hold, refund, fact`,
+           FOR UPDATE OF adjudication, security_hold, refund, fact, operation`,
           [params.adjudicationId],
         );
         const state = stateResult.rows[0];
@@ -1538,6 +1547,31 @@ export async function registerRefundRoutes(
           [journalId, state.provider_amount_minor],
         );
         await client.query(
+          `UPDATE provider_operations
+           SET status = 'succeeded',
+               external_reference = $2,
+               provider_occurred_at = COALESCE(
+                 GREATEST(provider_occurred_at, $3::timestamptz),
+                 $3::timestamptz
+               ),
+               last_error = NULL,
+               updated_at = now()
+           WHERE id = $1`,
+          [
+            state.provider_operation_id,
+            target.external_refund_id,
+            state.provider_occurred_at,
+          ],
+        );
+        const frozenRefundIds = await freezeCompetingRefunds(client, {
+          heldRefundId: state.refund_id,
+          receiptId: target.receipt_id,
+          reason:
+            "Refund stopped because a previously dismissed Provider outflow was later confirmed and consumed source receipt capacity",
+          cause: "dismissal_correction",
+          correctionId: correction.id,
+        });
+        const changedRefund = await client.query(
           `UPDATE refunds
            SET last_error = 'A dismissed Provider outflow was later confirmed',
                result = result || $2::jsonb, updated_at = now(), version = version + 1
@@ -1548,10 +1582,18 @@ export async function registerRefundRoutes(
               correctedAdjudicationId: state.adjudication_id,
               correctionId: correction.id,
               discrepancySettlementId: discrepancyId,
+              frozenRefundIds,
+              providerOperationStatus: "succeeded",
             }),
             body.expectedRefundVersion,
           ],
         );
+        if (changedRefund.rowCount !== 1) {
+          throw Object.assign(new Error("Refund changed during dismissal correction"), {
+            statusCode: 409,
+            code: "REFUND_VERSION_CONFLICT",
+          });
+        }
         await client.query(
           `INSERT INTO refund_events(
              refund_id, event_type, actor_type, actor_id, reason, metadata
@@ -1565,6 +1607,10 @@ export async function registerRefundRoutes(
               correctionId: correction.id,
               discrepancySettlementId: discrepancyId,
               journalId,
+              providerOperationId: state.provider_operation_id,
+              previousProviderOperationStatus: state.provider_operation_status,
+              providerOperationStatus: "succeeded",
+              frozenRefundIds,
             },
           ],
         );
@@ -1582,6 +1628,10 @@ export async function registerRefundRoutes(
               providerFactId: state.provider_fact_id,
               discrepancySettlementId: discrepancyId,
               journalId,
+              providerOperationId: state.provider_operation_id,
+              previousProviderOperationStatus: state.provider_operation_status,
+              providerOperationStatus: "succeeded",
+              frozenRefundIds,
             },
           ],
         );

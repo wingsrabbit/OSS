@@ -23,7 +23,9 @@ All notable project changes will be documented here. Project release numbering a
   reconciliation exhausted, without replaying the Provider create request.
 - Append-only correction of a dismissed Provider success when later evidence
   confirms the cash outflow, restoring discrepancy suspense and same-currency
-  receipt capacity without erasing the original decision or posting twice.
+  receipt capacity without erasing the original decision or posting twice; the
+  correction freezes competing requests and records the Provider Operation as
+  succeeded without mislabeling the intended Refund as successful.
 - Forward migration `008_stage_b_refund_reconciliation`, including serialized
   migration execution and API/Worker fail-closed schema compatibility checks.
 - Add Funds settlement and reconciliation, configured limits, external fees,
@@ -39,12 +41,17 @@ All notable project changes will be documented here. Project release numbering a
 
 - Refund capacity serializes on the immutable Fund Receipt; queued, processing,
   unknown, manual, and succeeded refunds reserve capacity, while only a
-  definitive Provider failure releases it.
+  definitive Provider failure releases it. The Worker rechecks aggregate
+  capacity immediately before a Provider create and rejects stale queued work
+  without an external side effect.
 - Refund submissions bind the displayed available balance and deduplicate the
   same decision across idempotency-key aliases.
 - Capability-authorized refund facts are append-only. Contradictory success is
   booked to discrepancy suspense, places a sticky receipt hold, and freezes
   competing operations without allowing a Provider callback to clear the hold.
+- Stale or implausibly timed refund facts remain immutable evidence and produce
+  an audit event, but cannot regress terminal state or time high-water marks and
+  cannot automatically post a cash outflow.
 - Automatic discrepancy posting is limited to one exact authorized outflow per
   refund. Each distinct additional success claim receives its own fact-bound
   hold; wrong, extra, duplicate, or reused identities cannot create arbitrary

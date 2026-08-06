@@ -275,6 +275,13 @@ test("staff dismisses then corrects a later-confirmed Provider outflow", async (
   await expect(
     admin.getByTestId("refund-dismissal-correction").filter({ hasText: dismissalFactMarker }),
   ).toHaveCount(0);
+  const correctedRefund = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: dismissalFactMarker });
+  await expect(correctedRefund).toContainText("Refund failed · Provider succeeded");
+  await expect(correctedRefund).toContainText(
+    "A dismissed Provider outflow was later confirmed",
+  );
 });
 
 test("staff records a verified unexpected Provider outflow without settling the refund", async ({

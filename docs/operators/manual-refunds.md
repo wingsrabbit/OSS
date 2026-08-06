@@ -95,7 +95,18 @@ Cr mock_cash
 This restores the real cash reduction exactly once and reserves only a source
 receipt with the same currency. A EUR discrepancy, for example, remains in its
 EUR suspense ledger and is not subtracted from a USD refundable balance without
-an explicit future FX/allocation fact.
+an explicit future FX/allocation fact. Core marks the Provider Operation as a
+confirmed success while leaving the intended Refund failed, so the page states
+both facts instead of claiming that the Provider failed. Under the same receipt
+lock, Core cancels queued known-unsent competitors and moves any possibly-sent
+competitor into a sticky manual hold. The Worker independently recalculates the
+aggregate receipt reservation immediately before every Provider create; a stale
+queued request that no longer fits is failed without making an external call.
+
+Provider timestamps are high-water marks. An older fact, or a timestamp outside
+the accepted operation window, is retained as immutable evidence and audited,
+but cannot move a Refund or Provider Operation backward, replace the high-water
+mark, create discrepancy cash entries, or consume refundable capacity.
 
 Wrong-amount, wrong-currency, or second outflow claims cannot be accepted as the
 authorized refund. After checking independent Provider evidence, the operator

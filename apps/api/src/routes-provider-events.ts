@@ -15,6 +15,7 @@ import { transaction, type DatabaseClient, type DatabasePool } from "./database.
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertProviderSignature } from "./provider-signature.js";
+import { freezeCompetingRefunds } from "./refund-safety.js";
 import {
   handleAddFundsPaymentEvent,
   type AddFundsPaymentEvent,
@@ -249,97 +250,6 @@ async function postRefundDiscrepancy(
     [journalId, input.amountMinor],
   );
   return true;
-}
-
-async function freezeCompetingRefunds(
-  client: DatabaseClient,
-  input: {
-    heldRefundId: string;
-    receiptId: string;
-    reason: string;
-  },
-): Promise<string[]> {
-  const candidates = await client.query<{
-    id: string;
-    status: string;
-    operation_id: string | null;
-    attempt_count: number | null;
-  }>(
-    `SELECT
-       competing.id,
-       competing.status,
-       operation.id AS operation_id,
-       operation.attempt_count
-     FROM refunds competing
-     LEFT JOIN provider_operations operation
-       ON operation.subject_type = 'refund'
-      AND operation.subject_id = competing.id
-      AND operation.kind = 'refund_create'
-     WHERE competing.source_fund_receipt_id = $1
-       AND competing.id <> $2
-       AND competing.status IN ('queued', 'processing', 'unknown')
-     ORDER BY competing.id
-     FOR UPDATE OF competing`,
-    [input.receiptId, input.heldRefundId],
-  );
-  const frozenIds: string[] = [];
-  for (const competing of candidates.rows) {
-    const knownUnsent =
-      competing.status === "queued" &&
-      competing.operation_id !== null &&
-      competing.attempt_count === 0;
-    const nextStatus = knownUnsent ? "failed" : "manual";
-    await client.query(
-      `UPDATE refunds
-       SET status = $2,
-           security_hold = $3,
-           last_error = $4,
-           result = result || $5::jsonb,
-           updated_at = now(),
-           version = version + 1
-       WHERE id = $1`,
-      [
-        competing.id,
-        nextStatus,
-        false,
-        input.reason,
-        JSON.stringify({ frozenByRefundId: input.heldRefundId }),
-      ],
-    );
-    if (competing.operation_id) {
-      await client.query(
-        `UPDATE provider_operations
-         SET status = $2, last_error = $3, updated_at = now()
-         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
-        [competing.operation_id, knownUnsent ? "failed" : "unknown", input.reason],
-      );
-    }
-    await client.query(
-      `UPDATE durable_jobs
-       SET status = $2,
-           locked_at = NULL,
-           locked_by = NULL,
-           last_error = $3,
-           updated_at = now()
-       WHERE payload->>'refundId' = $1
-         AND job_type IN ('refund.start', 'refund.reconcile')
-         AND status NOT IN ('completed', 'manual')`,
-      [competing.id, knownUnsent ? "completed" : "manual", input.reason],
-    );
-    await client.query(
-      `INSERT INTO refund_events(
-         refund_id, event_type, actor_type, actor_id, reason, metadata
-       ) VALUES ($1, $2, 'system', 'refund-security-freeze', $3, $4)`,
-      [
-        competing.id,
-        knownUnsent ? "failed" : "manual",
-        input.reason,
-        { heldRefundId: input.heldRefundId, knownUnsent },
-      ],
-    );
-    frozenIds.push(competing.id);
-  }
-  return frozenIds;
 }
 
 async function holdRefundReceipt(
@@ -1144,6 +1054,53 @@ export async function registerProviderEventRoutes(
       if (adjudicatedFact.rowCount !== 0) {
         return { ignored: true, reason: "provider_fact_already_adjudicated" };
       }
+      const ignoreTemporallyInvalidFact = async (
+        reason: string,
+        reasonCode: "stale_provider_fact" | "implausible_provider_occurrence_time",
+      ): Promise<Record<string, unknown>> => {
+        const metadata = {
+          eventId: body.eventId,
+          status: body.status,
+          providerFactId,
+          reportedOccurredAt: body.occurredAt,
+          previousProviderOccurredAt: refund.provider_occurred_at?.toISOString() ?? null,
+          operationCreatedAt: refund.operation_created_at.toISOString(),
+          inboxConflict: inboxOutcome === "conflict",
+          statePreserved: true,
+          cashPostingCreated: false,
+        };
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata
+           ) VALUES ($1, 'provider_fact_ignored', 'provider', $2, $3, $4)`,
+          [refund.id, MOCK_PAYMENT_INSTALLATION_ID, reason, metadata],
+        );
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "refund.temporal_fact_ignored",
+          "refund",
+          refund.id,
+          reason,
+          metadata,
+        );
+        return { ignored: true, reason: reasonCode };
+      };
+      if (
+        occurredAt.getTime() < refund.operation_created_at.getTime() - 60_000 ||
+        occurredAt.getTime() > Date.now() + 5 * 60_000
+      ) {
+        return ignoreTemporallyInvalidFact(
+          "Provider supplied an implausible refund occurrence time; Core preserved the current state and high-water mark",
+          "implausible_provider_occurrence_time",
+        );
+      }
+      if (!isAfter(refund.provider_occurred_at, occurredAt)) {
+        return ignoreTemporallyInvalidFact(
+          "Provider fact is stale; Core preserved the current state and high-water mark",
+          "stale_provider_fact",
+        );
+      }
       const placeSecurityHold = async (
         reason: string,
         action: string,
@@ -1453,38 +1410,6 @@ export async function registerProviderEventRoutes(
           "Provider reported success after previously confirming that the refund failed",
           "refund.terminal_fact_conflict",
           { eventId: body.eventId, reportedStatus: body.status },
-        );
-      }
-      if (!isAfter(refund.provider_occurred_at, occurredAt)) {
-        if (body.status === "succeeded") {
-          return placeSecurityHold(
-            "Provider reported an outflow with stale ordering metadata",
-            "refund.stale_success_conflict",
-            { eventId: body.eventId, reportedStatus: body.status },
-          );
-        }
-        await client.query(
-          `INSERT INTO refund_events(
-             refund_id, event_type, actor_type, actor_id, reason, metadata, occurred_at
-           ) VALUES ($1, 'provider_fact_ignored', 'provider', $2, $3, $4, $5)`,
-          [
-            refund.id,
-            MOCK_PAYMENT_INSTALLATION_ID,
-            "Provider fact is stale",
-            { eventId: body.eventId, status: body.status, providerFactId },
-            occurredAt,
-          ],
-        );
-        return { ignored: true, reason: "stale_provider_fact" };
-      }
-      if (
-        occurredAt.getTime() < refund.operation_created_at.getTime() - 60_000 ||
-        occurredAt.getTime() > Date.now() + 5 * 60_000
-      ) {
-        return placeSecurityHold(
-          "Provider supplied an implausible refund occurrence time",
-          "refund.occurrence_time_rejected",
-          { eventId: body.eventId, reportedOccurredAt: body.occurredAt },
         );
       }
       const snapshotMatches =
