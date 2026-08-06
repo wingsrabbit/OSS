@@ -8,6 +8,36 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Administrator manual refunds for fully allocated invoice receipts, including
+  full/partial amounts, original-payment or Credit destinations, an explicit
+  no-refund decision, and a reference-only remaining-service calculation.
+- Refund Provider Operations, timeout reconciliation, duplicate/out-of-order
+  callback handling, append-only settlements/events, and balanced refund
+  journals without changing the original paid invoice or service.
+- A web refund queue showing the maximum refundable amount, advisory reference,
+  password confirmation, reason, Provider fault scenario, and live outcome.
+- An append-only refund security-hold queue with impact preview, independent
+  adjudication permission, fixed-window password confirmation, optimistic
+  concurrency, semantic replay, and compensating or reclassification journals.
+- Query-only retry and audited no-outflow decisions for refunds whose bounded
+  reconciliation exhausted, without replaying the Provider create request.
+- Append-only correction of a dismissed Provider success when later evidence
+  confirms the cash outflow, restoring discrepancy suspense and same-currency
+  receipt capacity without erasing the original decision or posting twice; the
+  correction freezes competing requests and records the Provider Operation as
+  succeeded without mislabeling the intended Refund as successful.
+- Forward migrations `008_stage_b_refund_reconciliation` and
+  `009_stage_b_refund_capacity_incidents`, including serialized migration
+  execution and API/Worker fail-closed schema compatibility checks.
+- Callback-first receipt-capacity incidents retain every established cash or
+  Credit compensation and expose the immutable receipt/confirmed/overage amounts in the administrator
+  page, and require a reauthenticated, reasoned, idempotent acknowledgement for
+  manual financial recovery without changing any financial fact or hiding the
+  still-outstanding recovery. Only the latest cumulative snapshot for each
+  receipt is actionable, selected by a locked monotonic receipt sequence rather
+  than transaction time; older snapshots remain labelled as non-additive history.
+- Add Funds settlement and reconciliation, configured limits, external fees,
+  unclaimed-funds review, and audited allocation or Credit conversion.
 - Append-only per-account Credit movements, invoice Credit allocations, and
   balanced journals for audited administrator adjustments and customer use.
 - Versioned payment-method configuration with immutable invoice payment Quotes.
@@ -17,6 +47,43 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Security
 
+- Refund capacity serializes on the immutable Fund Receipt; queued, processing,
+  unknown, manual, and succeeded refunds reserve capacity, while only a
+  definitive Provider failure releases it. The Worker rechecks aggregate
+  capacity immediately before a Provider create and rejects stale queued work
+  without an external side effect.
+- Refund submissions bind the displayed available balance and deduplicate the
+  same decision across idempotency-key aliases.
+- Capability-authorized refund facts are append-only. Contradictory success is
+  booked to discrepancy suspense, places a sticky receipt hold, and freezes
+  competing operations without allowing a Provider callback to clear the hold.
+- Stale or implausibly timed refund facts remain immutable evidence and produce
+  an audit event, but cannot regress terminal state or time high-water marks and
+  cannot automatically post a cash outflow.
+- Automatic discrepancy posting is limited to one exact authorized outflow per
+  refund. Each distinct additional success claim receives its own fact-bound
+  hold; wrong, extra, duplicate, or reused identities cannot create arbitrary
+  cash entries or reuse a dismissed discrepancy. A separately authorized human
+  can record a verified unexpected outflow into suspense without creating a
+  normal refund settlement.
+- Provider external refund identities are serialized and mutually owned across
+  settlements and discrepancies. A dismissed fact can be corrected once with
+  reauthentication, version conflict protection, a reason, and an append-only
+  compensating journal; wrong-currency suspense is never summed as USD capacity.
+- A correction that discovers a competing settlement already consumed the
+  receipt creates an append-only overage incident. Its acknowledgement is also
+  append-only, remains operationally visible, and cannot erase cash, Credit,
+  settlements, discrepancies, or journals. A later unexpected outflow creates a
+  new current incident rather than mutating the prior snapshot; the prior
+  cumulative amount becomes superseded history and cannot be acknowledged again.
+- The web client erases a successfully used password immediately, so repeated
+  high-risk actions cannot silently renew the fixed 15-minute reauth window.
+- Original-payment refunds use the receipt's Provider and external payment
+  identity, call Provider create at most once, and reconcile unknown results by
+  query. Third-party destinations are rejected until authenticated ticket
+  authorization and two-person approval exist.
+- The first refund scope deliberately rejects Add Funds and unclaimed receipts
+  so consumed Credit or unassigned liabilities cannot be erased.
 - Credit writes serialize on the Client Account and Credit Account, reject
   negative balances, and bind every command to a request fingerprint.
 - Payment confirmation rejects expired Quotes and any changed invoice,
@@ -39,8 +106,8 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Still planned
 
-- Remaining Add Funds, renewal, suspension, cancellation, refund, customer
-  operations, plugin, and two-VPS laboratory stages.
+- Chargeback, renewal, suspension/recovery, cancellation/termination, saved
+  payment methods, customer operations, plugin, and two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 

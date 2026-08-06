@@ -28,18 +28,41 @@ The first runnable vertical slice is implemented:
   duplicate, and out-of-order scenarios;
 - a settled payment creates one balanced journal and invoice allocation before
   Core decides whether the order may proceed;
+- a customer can combine Credit with an external payment, see the configured
+  payment fee, add synthetic funds, and keep late or mismatched money isolated
+  for staff review;
+- an administrator can re-confirm their password, resolve unclaimed funds,
+  adjust Credit, and make a full, partial, Credit, original-payment, or explicit
+  no-refund decision from the web interface;
+- confirmed refunds are separate append-only facts: they do not rewrite the
+  original payment, paid invoice, order, service, or service term;
+- refund confirmation binds the displayed refundable balance, and replaying the
+  same human decision returns the original result even with a different
+  transport idempotency key;
+- contradictory Provider success is retained as an immutable fact, booked to
+  refund discrepancy suspense, and freezes the source receipt for human review;
+- staff can see the Provider evidence and financial impact, then use a separate
+  permission, recent password confirmation, reason, and append-only adjudication
+  to accept one exact authorized outflow or dismiss and compensate the claim;
+- if a competing refund settles before a dismissed real outflow is corrected,
+  staff see the resulting receipt overage and can accept responsibility for
+  manual recovery without deleting or reversing either established outflow;
+  only the latest cumulative snapshot for a receipt is actionable, while older
+  snapshots stay visible as non-additive history;
 - automatic products create one stable Provider operation; a timeout becomes
   `unknown`/`confirming` and is reconciled instead of creating a second resource;
 - a service becomes Active only after a Ready for Service fact, and its term
   starts at that time.
 
-The React customer page shows Order, Invoice, Payment, Provider Operation, and
-Service as separate facts. It never presents payment success as service
-activation.
+The React customer and administrator page shows Order, Invoice, Payment,
+Provider Operation, Refund, and Service as separate facts. It never presents
+payment success as service activation, or a refund as implicit cancellation.
 
-This code passes strict TypeScript checks, production builds, and initial exact
-money/state tests. The PostgreSQL journey and two-VPS deployment are not yet
-verified, so this version is not the final Laboratory Release Candidate.
+This code is protected by strict TypeScript checks, production builds, and
+PostgreSQL exact-money/state journeys. The two-VPS deployment, remaining billing
+lifecycle, customer operations, plugin developer journey, and recovery drills
+are not yet complete, so this version is not the final Laboratory Release
+Candidate.
 
 ## Quick start
 

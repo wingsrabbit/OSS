@@ -2,12 +2,16 @@
 
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { readdir, readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
+import { assertSchemaCompatible, runMigrations } from "./database.js";
 import { providerSignature } from "./provider-signature.js";
 
 const coreUrl = process.env.CORE_TEST_URL ?? "http://127.0.0.1:3000";
 const databaseUrl = process.env.DATABASE_URL;
+const adminDatabaseUrl = process.env.ADMIN_DATABASE_URL;
 const providerDatabaseUrl = process.env.PROVIDER_DATABASE_URL;
 const providerUrl = process.env.MOCK_PAYMENT_PROVIDER_URL;
 const paymentProviderToken = process.env.MOCK_PAYMENT_PROVIDER_TOKEN;
@@ -16,6 +20,7 @@ const provisioningWebhookSecret = process.env.MOCK_PROVISIONING_WEBHOOK_SECRET;
 const providerCapabilitySecret = process.env.PROVIDER_OPERATION_CAPABILITY_SECRET;
 if (
   !databaseUrl ||
+  !adminDatabaseUrl ||
   !providerDatabaseUrl ||
   !providerUrl ||
   !paymentProviderToken ||
@@ -25,6 +30,121 @@ if (
 ) {
   throw new Error("Database and Mock Payment Provider test configuration are required");
 }
+const requiredAdminDatabaseUrl = adminDatabaseUrl;
+
+async function verifyPublished007Upgrade(): Promise<void> {
+  const databaseName = `oss_upgrade_${randomUUID().replaceAll("-", "")}`;
+  const admin = new pg.Client({ connectionString: requiredAdminDatabaseUrl });
+  const upgradeUrl = new URL(requiredAdminDatabaseUrl);
+  upgradeUrl.pathname = `/${databaseName}`;
+  let upgradePool: pg.Pool | null = null;
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE "${databaseName}"`);
+    upgradePool = new pg.Pool({ connectionString: upgradeUrl.toString(), max: 4 });
+    await upgradePool.query(
+      "CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+    );
+    const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
+    const publishedMigrations = (await readdir(migrationsDirectory))
+      .filter((file) => /^00[1-7]_[a-z0-9_]+\.sql$/.test(file))
+      .sort();
+    assert.equal(publishedMigrations.at(-1), "007_stage_b_manual_refunds.sql");
+    for (const migrationFile of publishedMigrations) {
+      const migration = await readFile(
+        new URL(`../migrations/${migrationFile}`, import.meta.url),
+        "utf8",
+      );
+      await upgradePool.query("BEGIN");
+      try {
+        await upgradePool.query(migration);
+        await upgradePool.query("INSERT INTO schema_migrations(version) VALUES ($1)", [
+          migrationFile.replace(/\.sql$/, ""),
+        ]);
+        await upgradePool.query("COMMIT");
+      } catch (error) {
+        await upgradePool.query("ROLLBACK");
+        throw error;
+      }
+    }
+    const oldSchema = await upgradePool.query<{
+      version: string;
+      manual_actions: string | null;
+    }>(
+      `SELECT
+         max(version) AS version,
+         to_regclass('public.refund_manual_actions')::text AS manual_actions
+       FROM schema_migrations`,
+    );
+    assert.equal(oldSchema.rows[0]?.version, "007_stage_b_manual_refunds");
+    assert.equal(oldSchema.rows[0]?.manual_actions, null);
+
+    await Promise.all([runMigrations(upgradePool), runMigrations(upgradePool)]);
+    await assertSchemaCompatible(upgradePool);
+    const upgraded = await upgradePool.query<{
+      version: string;
+      manual_actions: string | null;
+      corrections: string | null;
+      capacity_incidents: string | null;
+      capacity_acknowledgements: string | null;
+      capacity_acknowledgement_aliases: string | null;
+      old_discrepancy_unique: string | null;
+    }>(
+      `SELECT
+         max(version) AS version,
+         to_regclass('public.refund_manual_actions')::text AS manual_actions,
+         to_regclass('public.refund_adjudication_corrections')::text AS corrections,
+         to_regclass('public.refund_receipt_capacity_incidents')::text
+           AS capacity_incidents,
+         to_regclass('public.refund_receipt_capacity_acknowledgements')::text
+           AS capacity_acknowledgements,
+         to_regclass('public.refund_receipt_capacity_acknowledgement_aliases')::text
+           AS capacity_acknowledgement_aliases,
+         (
+           SELECT constraint_name
+           FROM information_schema.table_constraints
+           WHERE table_schema = 'public'
+             AND table_name = 'refund_discrepancy_settlements'
+             AND constraint_name = 'refund_discrepancy_settlements_refund_id_key'
+         ) AS old_discrepancy_unique
+       FROM schema_migrations`,
+    );
+    assert.equal(upgraded.rows[0]?.version, "009_stage_b_refund_capacity_incidents");
+    assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
+    assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
+    assert.equal(
+      upgraded.rows[0]?.capacity_incidents,
+      "refund_receipt_capacity_incidents",
+    );
+    assert.equal(
+      upgraded.rows[0]?.capacity_acknowledgements,
+      "refund_receipt_capacity_acknowledgements",
+    );
+    assert.equal(
+      upgraded.rows[0]?.capacity_acknowledgement_aliases,
+      "refund_receipt_capacity_acknowledgement_aliases",
+    );
+    assert.equal(upgraded.rows[0]?.old_discrepancy_unique, null);
+  } finally {
+    await upgradePool?.end().catch(() => undefined);
+    upgradePool = null;
+    let remainingConnections = -1;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const activity = await admin.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname = $1",
+        [databaseName],
+      );
+      remainingConnections = Number(activity.rows[0]?.count ?? "-1");
+      if (remainingConnections === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(remainingConnections, 0, "upgrade migration pool must close before database drop");
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+    await admin.end();
+  }
+}
+
+await verifyPublished007Upgrade();
 
 const corePool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
 const providerPool = new pg.Pool({ connectionString: providerDatabaseUrl, max: 2 });
@@ -108,6 +228,97 @@ type PaymentRecords = {
   job_status: string;
   amount_minor: string;
   currency: string;
+};
+type RefundCandidate = {
+  receiptId: string;
+  invoiceId: string;
+  refundableMinor: string;
+  referenceRefundMinor: string | null;
+};
+type RefundRecord = {
+  refundId: string;
+  invoiceId: string;
+  receiptId: string;
+  destination: "original_payment" | "credit" | "none";
+  amountMinor: string;
+  status: string;
+  version: number;
+  securityHold: boolean;
+  securityHoldReason: string | null;
+  providerOperationId: string | null;
+  providerOperationStatus: string | null;
+  externalRefundId: string | null;
+  replayed: boolean;
+};
+type RefundSecurityHold = {
+  holdId: string;
+  receiptId: string;
+  receiptAmountMinor: string;
+  confirmedSettlementMinor: string;
+  refundId: string;
+  refundStatus: string;
+  refundVersion: number;
+  refundAmountMinor: string;
+  refundCurrency: string;
+  reason: string;
+  providerFact: {
+    factId: string;
+    eventId: string;
+    externalRefundId: string;
+    status: "succeeded" | "failed";
+    amountMinor: string;
+    currency: string;
+  };
+  providerFacts: Array<{
+    factId: string;
+    eventId: string;
+    externalRefundId: string;
+    status: "succeeded" | "failed";
+    amountMinor: string;
+    currency: string;
+  }>;
+  discrepancy: { discrepancyId: string; amountMinor: string; currency: string } | null;
+  allowedDecisions: Array<
+    | "accept_authorized_outflow"
+    | "record_unexpected_outflow"
+    | "dismiss_provider_claim"
+  >;
+};
+type RefundDismissalCorrection = {
+  adjudicationId: string;
+  holdId: string;
+  refundId: string;
+  refundVersion: number;
+  providerFact: {
+    factId: string;
+    externalRefundId: string;
+    amountMinor: string;
+    currency: string;
+  };
+  discrepancyId: string | null;
+};
+type RefundReceiptCapacityIncident = {
+  incidentId: string;
+  receiptId: string;
+  receiptSequence: string;
+  source:
+    | { type: "dismissal_correction"; correctionId: string }
+    | { type: "unexpected_outflow_adjudication"; adjudicationId: string };
+  refundId: string;
+  confirmedCompensationMinor: string;
+  receiptAmountMinor: string;
+  overageMinor: string;
+  currency: string;
+  isCurrentSnapshot: boolean;
+  status:
+    | "awaiting_acknowledgement"
+    | "acknowledged_recovery_outstanding"
+    | "superseded_history";
+  acknowledgement: {
+    acknowledgementId: string;
+    recoveryOutstanding: boolean;
+  } | null;
+  allowedAction: "acknowledge_manual_recovery" | null;
 };
 
 async function request<T>(
@@ -241,6 +452,72 @@ async function submitProvisionFact(
   });
 }
 
+async function submitRefundFact(
+  body: Record<string, unknown>,
+  secret = paymentWebhookSecret!,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const providerOperationId = String(body.providerOperationId);
+  const callbackCapability =
+    typeof body.callbackCapability === "string"
+      ? body.callbackCapability
+      : providerOperationCapability(
+          providerCapabilitySecret!,
+          "mock-payment-v1",
+          providerOperationId,
+        );
+  const signedBody = {
+    eventId: body.eventId,
+    providerOperationId,
+    refundId: body.refundId,
+    callbackCapability,
+    externalRefundId: body.externalRefundId,
+    status: body.status,
+    amountMinor: body.amountMinor,
+    currency: body.currency,
+    occurredAt: body.occurredAt,
+  };
+  const timestamp = Date.now().toString();
+  return rawCoreRequest("/api/v1/provider-events/refund", {
+    method: "POST",
+    headers: {
+      "X-OSS-Timestamp": timestamp,
+      "X-OSS-Signature": providerSignature(secret, timestamp, signedBody),
+    },
+    body: JSON.stringify(signedBody),
+  });
+}
+
+async function adjudicateRefundHold(
+  hold: RefundSecurityHold,
+  decision:
+    | "accept_authorized_outflow"
+    | "record_unexpected_outflow"
+    | "dismiss_provider_claim",
+  reason: string,
+  idempotencyKey = randomUUID(),
+  expectedStatus = 201,
+): Promise<{
+  adjudicationId: string;
+  holdId: string;
+  refundId: string;
+  decision: string;
+  replayed: boolean;
+}> {
+  return request(
+    `/api/v1/admin/refund-security-holds/${hold.holdId}/adjudications`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision,
+        reason,
+        idempotencyKey,
+        expectedRefundVersion: hold.refundVersion,
+      }),
+    },
+    expectedStatus,
+  );
+}
+
 async function waitFor<T>(
   description: string,
   read: () => Promise<T>,
@@ -346,6 +623,33 @@ async function dropPaymentStartDelay(): Promise<void> {
   await corePool.query(`
     DROP TRIGGER IF EXISTS integration_delay_security_payment_start ON durable_jobs;
     DROP FUNCTION IF EXISTS integration_delay_security_payment_start();
+  `);
+}
+
+async function installRefundStartDelay(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_refund_start ON durable_jobs;
+    CREATE OR REPLACE FUNCTION integration_delay_refund_start()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.job_type = 'refund.start' THEN
+        NEW.available_at = now() + interval '1 hour';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER integration_delay_refund_start
+    BEFORE INSERT ON durable_jobs
+    FOR EACH ROW EXECUTE FUNCTION integration_delay_refund_start();
+  `);
+}
+
+async function dropRefundStartDelay(): Promise<void> {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_refund_start ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_refund_start();
   `);
 }
 
@@ -522,8 +826,8 @@ assert.equal(
   "Remote Hands must remain hidden until Colocation and authenticated ticket prerequisites exist",
 );
 
-const email = `stage-a-${randomUUID()}@example.invalid`;
-const password = `Synthetic-${randomBytes(12).toString("hex")}!`;
+const email = "stage-a-browser-admin@example.invalid";
+const password = "Synthetic-Stage-A-Browser-Admin-Only!";
 await request(
   "/api/v1/auth/register",
   {
@@ -3570,6 +3874,2900 @@ try {
   assert.equal(accountLockFinal.rows[0]?.invoice_allocated_minor, accountLockRecords.amount_minor);
 } finally {
   await dropPaymentStartDelay();
+}
+
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const refundOrder = await createOrder(automaticPrice.id, legal);
+const paidRefundOrder = await pay(refundOrder, "success");
+assert.equal(paidRefundOrder.invoice.status, "paid");
+const activeRefundOrder = await waitFor(
+  "refund source service activation",
+  () => request<OrderDetail>(`/api/v1/orders/${refundOrder.order.id}`),
+  (current) => current.service.status === "active",
+);
+assert.equal(activeRefundOrder.service.status, "active");
+const refundCandidates = await request<{ items: RefundCandidate[] }>(
+  "/api/v1/admin/refund-candidates",
+);
+const refundCandidate = refundCandidates.items.find(
+  (candidate) => candidate.invoiceId === refundOrder.invoice.id,
+);
+assert.ok(refundCandidate, "the paid invoice receipt must be available for a manual refund");
+assert.ok(refundCandidate.referenceRefundMinor, "an active single service should have a reference");
+const refundableReceiptId = refundCandidate.receiptId;
+const refundSourceBefore = await corePool.query<{
+  payment_status: string;
+  receipt_amount_minor: string;
+  receipt_allocated_minor: string;
+  allocation_amount_minor: string;
+  invoice_total_minor: string;
+  service_status: string;
+  service_term_start: Date;
+  service_term_end: Date;
+  credit_balance_minor: string;
+}>(
+  `SELECT
+     payment.status AS payment_status,
+     receipt.amount_minor::text AS receipt_amount_minor,
+     receipt.allocated_minor::text AS receipt_allocated_minor,
+     allocation.amount_minor::text AS allocation_amount_minor,
+     invoice.total_minor::text AS invoice_total_minor,
+     service.status AS service_status,
+     service.term_start AS service_term_start,
+     service.term_end AS service_term_end,
+     COALESCE((
+       SELECT sum(transaction.credit_minor - transaction.debit_minor)
+       FROM credit_accounts account
+       LEFT JOIN credit_transactions transaction ON transaction.credit_account_id = account.id
+       WHERE account.client_account_id = invoice.client_account_id
+         AND account.currency = invoice.currency
+     ), 0)::text AS credit_balance_minor
+   FROM fund_receipts receipt
+   JOIN payment_attempts payment ON payment.id = receipt.reported_payment_attempt_id
+   JOIN payment_allocations allocation ON allocation.payment_attempt_id = payment.id
+   JOIN invoices invoice ON invoice.id = allocation.invoice_id
+   JOIN orders order_record ON order_record.id = invoice.order_id
+   JOIN order_items item ON item.order_id = order_record.id
+   JOIN services service ON service.order_item_id = item.id
+   WHERE receipt.id = $1`,
+  [refundableReceiptId],
+);
+const refundSourceSnapshot = refundSourceBefore.rows[0];
+assert.ok(refundSourceSnapshot);
+
+const thirdPartyRefund = await rawCoreRequest(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      receiptId: refundableReceiptId,
+      destination: "third_party",
+      amountMode: "partial",
+      amountMinor: "25",
+      expectedRefundableMinor: refundCandidate.refundableMinor,
+      scenario: null,
+      reason: "Synthetic third-party destination must require ticket and dual review",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(thirdPartyRefund.status, 422);
+assert.equal(
+  thirdPartyRefund.body.code,
+  "THIRD_PARTY_REFUND_DESTINATION_NOT_AVAILABLE",
+);
+
+const creditRefundKey = randomUUID();
+const creditRefundBody = {
+  receiptId: refundableReceiptId,
+  destination: "credit",
+  amountMode: "partial",
+  amountMinor: "75",
+  expectedRefundableMinor: refundCandidate.refundableMinor,
+  scenario: null,
+  reason: "Synthetic administrator selected a partial refund to customer Credit",
+  idempotencyKey: creditRefundKey,
+};
+const creditRefund = await request<RefundRecord>(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  { method: "POST", body: JSON.stringify(creditRefundBody) },
+  201,
+);
+assert.equal(creditRefund.status, "succeeded");
+assert.equal(creditRefund.destination, "credit");
+assert.equal(creditRefund.providerOperationId, null);
+const creditRefundReplay = await request<RefundRecord>(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  { method: "POST", body: JSON.stringify(creditRefundBody) },
+  200,
+);
+assert.equal(creditRefundReplay.refundId, creditRefund.refundId);
+assert.equal(creditRefundReplay.replayed, true);
+const semanticCreditRefundAliasKey = randomUUID();
+const candidatesAfterLostCreditResponse = await request<{ items: RefundCandidate[] }>(
+  "/api/v1/admin/refund-candidates",
+);
+const refreshedCreditCandidate = candidatesAfterLostCreditResponse.items.find(
+  (candidate) => candidate.receiptId === refundableReceiptId,
+);
+assert.ok(refreshedCreditCandidate);
+assert.notEqual(
+  refreshedCreditCandidate.refundableMinor,
+  creditRefundBody.expectedRefundableMinor,
+  "the refreshed optimistic snapshot should change after the first partial refund",
+);
+const semanticCreditRefundReplay = await request<RefundRecord>(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...creditRefundBody,
+      expectedRefundableMinor: refreshedCreditCandidate.refundableMinor,
+      idempotencyKey: semanticCreditRefundAliasKey,
+    }),
+  },
+  200,
+);
+assert.equal(semanticCreditRefundReplay.refundId, creditRefund.refundId);
+assert.equal(semanticCreditRefundReplay.replayed, true);
+const semanticAliasConflict = await rawCoreRequest(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...creditRefundBody,
+      amountMinor: "74",
+      idempotencyKey: semanticCreditRefundAliasKey,
+    }),
+  },
+);
+assert.equal(semanticAliasConflict.status, 409);
+assert.equal(semanticAliasConflict.body.code, "IDEMPOTENCY_CONFLICT");
+const creditRefundConflict = await rawCoreRequest(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({ ...creditRefundBody, amountMinor: "76" }),
+  },
+);
+assert.equal(creditRefundConflict.status, 409);
+assert.equal(creditRefundConflict.body.code, "IDEMPOTENCY_CONFLICT");
+const staleFullRefund = await rawCoreRequest(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      receiptId: refundableReceiptId,
+      destination: "original_payment",
+      amountMode: "full",
+      amountMinor: null,
+      expectedRefundableMinor: refundCandidate.refundableMinor,
+      scenario: "success",
+      reason: "Synthetic stale full-refund confirmation must never increase silently",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(staleFullRefund.status, 409);
+assert.equal(staleFullRefund.body.code, "REFUNDABLE_AMOUNT_CHANGED");
+
+const noRefundDecision = await request<RefundRecord>(
+  `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      receiptId: refundableReceiptId,
+      destination: "none",
+      amountMode: "none",
+      amountMinor: null,
+      expectedRefundableMinor: null,
+      scenario: null,
+      reason: "Synthetic administrator recorded an explicit decision not to refund",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+assert.equal(noRefundDecision.status, "declined");
+assert.equal(noRefundDecision.amountMinor, "0");
+
+async function createOriginalRefund(
+  amountMinor: string,
+  scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order",
+): Promise<RefundRecord> {
+  const currentCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const currentCandidate = currentCandidates.items.find(
+    (candidate) => candidate.receiptId === refundableReceiptId,
+  );
+  assert.ok(currentCandidate, "refund source should retain available capacity");
+  const created = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: refundableReceiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor,
+        expectedRefundableMinor: currentCandidate.refundableMinor,
+        scenario,
+        reason: `Synthetic original-payment refund scenario ${scenario}`,
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  return waitFor(
+    `manual refund scenario ${scenario}`,
+    () => request<RefundRecord>(`/api/v1/admin/refunds/${created.refundId}`),
+    (refund) => ["succeeded", "failed", "manual"].includes(refund.status),
+    35_000,
+  );
+}
+
+const originalSuccessRefund = await createOriginalRefund("80", "success");
+assert.equal(originalSuccessRefund.status, "succeeded");
+assert.ok(originalSuccessRefund.externalRefundId);
+const duplicateOutOfOrderRefund = await createOriginalRefund("70", "duplicate_out_of_order");
+assert.equal(duplicateOutOfOrderRefund.status, "succeeded");
+await new Promise((resolve) => setTimeout(resolve, 1_000));
+const duplicateOutOfOrderAfterLateFact = await request<RefundRecord>(
+  `/api/v1/admin/refunds/${duplicateOutOfOrderRefund.refundId}`,
+);
+assert.equal(duplicateOutOfOrderAfterLateFact.status, "succeeded");
+const timeoutSuccessRefund = await createOriginalRefund("60", "timeout_success");
+assert.equal(timeoutSuccessRefund.status, "succeeded");
+const failedRefund = await createOriginalRefund("40", "failed");
+assert.equal(failedRefund.status, "failed");
+
+const providerRefundCalls = await providerPool.query<{
+  refund_id: string;
+  create_calls: number;
+}>(
+  `SELECT refund_id, create_calls
+   FROM mock_refund_operations
+   WHERE refund_id = ANY($1::uuid[])`,
+  [
+    [
+      originalSuccessRefund.refundId,
+      duplicateOutOfOrderRefund.refundId,
+      timeoutSuccessRefund.refundId,
+      failedRefund.refundId,
+    ],
+  ],
+);
+assert.equal(providerRefundCalls.rowCount, 4);
+for (const refund of providerRefundCalls.rows) {
+  assert.equal(refund.create_calls, 1, `refund ${refund.refund_id} must call create exactly once`);
+}
+
+const afterScenarios = await request<{ items: RefundCandidate[] }>(
+  "/api/v1/admin/refund-candidates",
+);
+const remainingCandidate = afterScenarios.items.find(
+  (candidate) => candidate.receiptId === refundableReceiptId,
+);
+assert.ok(remainingCandidate);
+const concurrentAmount = BigInt(remainingCandidate.refundableMinor) / 2n + 1n;
+const concurrentRefundResults = await Promise.all([
+  rawCoreRequest(`/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`, {
+    method: "POST",
+    body: JSON.stringify({
+      receiptId: refundableReceiptId,
+      destination: "credit",
+      amountMode: "partial",
+      amountMinor: concurrentAmount.toString(),
+      expectedRefundableMinor: remainingCandidate.refundableMinor,
+      scenario: null,
+      reason: "Synthetic first concurrent refund competing for the remaining receipt",
+      idempotencyKey: randomUUID(),
+    }),
+  }),
+  rawCoreRequest(`/api/v1/admin/invoices/${refundOrder.invoice.id}/refunds`, {
+    method: "POST",
+    body: JSON.stringify({
+      receiptId: refundableReceiptId,
+      destination: "credit",
+      amountMode: "partial",
+      amountMinor: concurrentAmount.toString(),
+      expectedRefundableMinor: remainingCandidate.refundableMinor,
+      scenario: null,
+      reason: "Synthetic second concurrent refund competing for the remaining receipt",
+      idempotencyKey: randomUUID(),
+    }),
+  }),
+]);
+assert.deepEqual(
+  concurrentRefundResults.map((result) => result.status).sort((left, right) => left - right),
+  [201, 409],
+);
+
+const refundFacts = await corePool.query<{
+  credit_refund_transactions: string;
+  original_settlements: string;
+  refund_journals: string;
+  provider_operations: string;
+  failed_refund_journals: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+      FROM credit_transactions
+      WHERE kind = 'refund' AND source_id = $1) AS credit_refund_transactions,
+     (SELECT count(*)::text
+      FROM refund_settlements
+      WHERE refund_id = ANY($2::uuid[])
+        AND destination = 'original_payment') AS original_settlements,
+     (SELECT count(*)::text
+      FROM ledger_journals
+      WHERE source_type = 'refund'
+        AND source_id = ANY($3::uuid[])) AS refund_journals,
+     (SELECT count(*)::text
+      FROM provider_operations
+      WHERE subject_type = 'refund'
+        AND subject_id = ANY($2::uuid[])) AS provider_operations,
+     (SELECT count(*)::text
+      FROM ledger_journals
+      WHERE source_type = 'refund' AND source_id = $4) AS failed_refund_journals`,
+  [
+    creditRefund.refundId,
+    [
+      originalSuccessRefund.refundId,
+      duplicateOutOfOrderRefund.refundId,
+      timeoutSuccessRefund.refundId,
+      failedRefund.refundId,
+    ],
+    [
+      creditRefund.refundId,
+      originalSuccessRefund.refundId,
+      duplicateOutOfOrderRefund.refundId,
+      timeoutSuccessRefund.refundId,
+    ],
+    failedRefund.refundId,
+  ],
+);
+assert.equal(refundFacts.rows[0]?.credit_refund_transactions, "1");
+assert.equal(refundFacts.rows[0]?.original_settlements, "3");
+assert.equal(refundFacts.rows[0]?.refund_journals, "4");
+assert.equal(refundFacts.rows[0]?.provider_operations, "4");
+assert.equal(refundFacts.rows[0]?.failed_refund_journals, "0");
+
+const refundSourceAfter = await corePool.query<{
+  payment_status: string;
+  receipt_amount_minor: string;
+  receipt_allocated_minor: string;
+  allocation_amount_minor: string;
+  invoice_total_minor: string;
+  service_status: string;
+  service_term_start: Date;
+  service_term_end: Date;
+  credit_balance_minor: string;
+}>(
+  `SELECT
+     payment.status AS payment_status,
+     receipt.amount_minor::text AS receipt_amount_minor,
+     receipt.allocated_minor::text AS receipt_allocated_minor,
+     allocation.amount_minor::text AS allocation_amount_minor,
+     invoice.total_minor::text AS invoice_total_minor,
+     service.status AS service_status,
+     service.term_start AS service_term_start,
+     service.term_end AS service_term_end,
+     COALESCE((
+       SELECT sum(transaction.credit_minor - transaction.debit_minor)
+       FROM credit_accounts account
+       LEFT JOIN credit_transactions transaction ON transaction.credit_account_id = account.id
+       WHERE account.client_account_id = invoice.client_account_id
+         AND account.currency = invoice.currency
+     ), 0)::text AS credit_balance_minor
+   FROM fund_receipts receipt
+   JOIN payment_attempts payment ON payment.id = receipt.reported_payment_attempt_id
+   JOIN payment_allocations allocation ON allocation.payment_attempt_id = payment.id
+   JOIN invoices invoice ON invoice.id = allocation.invoice_id
+   JOIN orders order_record ON order_record.id = invoice.order_id
+   JOIN order_items item ON item.order_id = order_record.id
+   JOIN services service ON service.order_item_id = item.id
+   WHERE receipt.id = $1`,
+  [refundableReceiptId],
+);
+const refundSourceFinal = refundSourceAfter.rows[0];
+assert.ok(refundSourceFinal);
+assert.equal(refundSourceFinal.payment_status, refundSourceSnapshot.payment_status);
+assert.equal(refundSourceFinal.receipt_amount_minor, refundSourceSnapshot.receipt_amount_minor);
+assert.equal(refundSourceFinal.receipt_allocated_minor, refundSourceSnapshot.receipt_allocated_minor);
+assert.equal(refundSourceFinal.allocation_amount_minor, refundSourceSnapshot.allocation_amount_minor);
+assert.equal(refundSourceFinal.invoice_total_minor, refundSourceSnapshot.invoice_total_minor);
+assert.equal(refundSourceFinal.service_status, refundSourceSnapshot.service_status);
+assert.equal(
+  refundSourceFinal.service_term_start.toISOString(),
+  refundSourceSnapshot.service_term_start.toISOString(),
+);
+assert.equal(
+  refundSourceFinal.service_term_end.toISOString(),
+  refundSourceSnapshot.service_term_end.toISOString(),
+);
+assert.ok(
+  BigInt(refundSourceFinal.credit_balance_minor) >
+    BigInt(refundSourceSnapshot.credit_balance_minor),
+);
+
+const refundGuardClient = await corePool.connect();
+let rejectedRefundDelete = false;
+try {
+  await refundGuardClient.query("BEGIN");
+  await refundGuardClient.query("DELETE FROM refund_settlements WHERE refund_id = $1", [
+    originalSuccessRefund.refundId,
+  ]);
+  await refundGuardClient.query("COMMIT");
+} catch {
+  rejectedRefundDelete = true;
+  await refundGuardClient.query("ROLLBACK");
+} finally {
+  refundGuardClient.release();
+}
+assert.equal(rejectedRefundDelete, true, "confirmed refund settlements must be append-only");
+const allocationGuardClient = await corePool.connect();
+let rejectedRefundSourceMutation = false;
+try {
+  await allocationGuardClient.query("BEGIN");
+  await allocationGuardClient.query(
+    `UPDATE payment_allocations
+     SET amount_minor = amount_minor + 1
+     WHERE payment_attempt_id = (
+       SELECT reported_payment_attempt_id
+       FROM fund_receipts
+       WHERE id = $1
+     )`,
+    [refundableReceiptId],
+  );
+  await allocationGuardClient.query("COMMIT");
+} catch {
+  rejectedRefundSourceMutation = true;
+  await allocationGuardClient.query("ROLLBACK");
+} finally {
+  allocationGuardClient.release();
+}
+assert.equal(
+  rejectedRefundSourceMutation,
+  true,
+  "refund source allocations must be append-only",
+);
+
+await installRefundStartDelay();
+try {
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  const securityRefundOrder = await createOrder(automaticPrice.id, legal);
+  const paidSecurityRefundOrder = await pay(securityRefundOrder, "success");
+  assert.equal(paidSecurityRefundOrder.invoice.status, "paid");
+  const securityCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const securityCandidate = securityCandidates.items.find(
+    (candidate) => candidate.invoiceId === securityRefundOrder.invoice.id,
+  );
+  assert.ok(securityCandidate);
+
+  const failedThenSucceeded = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${securityRefundOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: securityCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "90",
+        expectedRefundableMinor: securityCandidate.refundableMinor,
+        scenario: "failed",
+        reason: "Synthetic refund first fails before a contradictory late success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(failedThenSucceeded.providerOperationId);
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET available_at = now(), updated_at = now()
+     WHERE job_type = 'refund.start'
+       AND payload->>'refundId' = $1
+       AND status = 'pending'`,
+    [failedThenSucceeded.refundId],
+  );
+  const initiallyFailed = await waitFor(
+    "refund Provider to report a definitive failure",
+    () => request<RefundRecord>(`/api/v1/admin/refunds/${failedThenSucceeded.refundId}`),
+    (refund) => refund.status === "failed",
+    35_000,
+  );
+  assert.equal(initiallyFailed.securityHold, false);
+  const failedHighWater = await corePool.query<{
+    refund_status: string;
+    refund_version: number;
+    refund_provider_occurred_at: Date;
+    operation_status: string;
+    operation_created_at: Date;
+    operation_provider_occurred_at: Date;
+  }>(
+    `SELECT
+       refund.status AS refund_status,
+       refund.version AS refund_version,
+       refund.provider_occurred_at AS refund_provider_occurred_at,
+       operation.status AS operation_status,
+       operation.created_at AS operation_created_at,
+       operation.provider_occurred_at AS operation_provider_occurred_at
+     FROM refunds refund
+     JOIN provider_operations operation
+       ON operation.subject_type = 'refund'
+      AND operation.subject_id = refund.id
+      AND operation.kind = 'refund_create'
+     WHERE refund.id = $1`,
+    [failedThenSucceeded.refundId],
+  );
+  const failedHighWaterState = failedHighWater.rows[0];
+  assert.ok(failedHighWaterState);
+  assert.equal(failedHighWaterState.refund_status, "failed");
+  assert.equal(failedHighWaterState.operation_status, "failed");
+
+  const staleSuccess = await submitRefundFact({
+    eventId: `refund-older-success-after-newer-failure:${randomUUID()}`,
+    providerOperationId: failedThenSucceeded.providerOperationId,
+    refundId: failedThenSucceeded.refundId,
+    externalRefundId: `mock-refund-stale-success:${failedThenSucceeded.refundId}`,
+    status: "succeeded",
+    amountMinor: "90",
+    currency: "USD",
+    occurredAt: failedHighWaterState.refund_provider_occurred_at.toISOString(),
+  });
+  assert.equal(staleSuccess.status, 202);
+  assert.equal(staleSuccess.body.reason, "stale_provider_fact");
+  const implausibleFutureSuccess = await submitRefundFact({
+    eventId: `refund-implausible-future-success:${randomUUID()}`,
+    providerOperationId: failedThenSucceeded.providerOperationId,
+    refundId: failedThenSucceeded.refundId,
+    externalRefundId: `mock-refund-implausible-success:${failedThenSucceeded.refundId}`,
+    status: "succeeded",
+    amountMinor: "90",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+  });
+  assert.equal(implausibleFutureSuccess.status, 202);
+  assert.equal(
+    implausibleFutureSuccess.body.reason,
+    "implausible_provider_occurrence_time",
+  );
+  const temporallyRejectedState = await corePool.query<{
+    refund_status: string;
+    refund_version: number;
+    refund_provider_occurred_at: Date;
+    operation_status: string;
+    operation_provider_occurred_at: Date;
+    provider_facts: string;
+    discrepancies: string;
+    receipt_holds: string;
+    temporal_audits: string;
+  }>(
+    `SELECT
+       refund.status AS refund_status,
+       refund.version AS refund_version,
+       refund.provider_occurred_at AS refund_provider_occurred_at,
+       operation.status AS operation_status,
+       operation.provider_occurred_at AS operation_provider_occurred_at,
+       (SELECT count(*)::text FROM refund_provider_facts fact
+        WHERE fact.refund_id = refund.id) AS provider_facts,
+       (SELECT count(*)::text FROM refund_discrepancy_settlements discrepancy
+        WHERE discrepancy.refund_id = refund.id) AS discrepancies,
+       (SELECT count(*)::text FROM refund_receipt_security_holds security_hold
+        WHERE security_hold.refund_id = refund.id) AS receipt_holds,
+       (SELECT count(*)::text FROM audit_events audit
+        WHERE audit.target_type = 'refund'
+          AND audit.target_id = refund.id::text
+          AND audit.action = 'refund.temporal_fact_ignored') AS temporal_audits
+     FROM refunds refund
+     JOIN provider_operations operation
+       ON operation.subject_type = 'refund'
+      AND operation.subject_id = refund.id
+      AND operation.kind = 'refund_create'
+     WHERE refund.id = $1`,
+    [failedThenSucceeded.refundId],
+  );
+  const rejectedTemporalState = temporallyRejectedState.rows[0];
+  assert.ok(rejectedTemporalState);
+  assert.equal(rejectedTemporalState.refund_status, "failed");
+  assert.equal(rejectedTemporalState.refund_version, failedHighWaterState.refund_version);
+  assert.equal(rejectedTemporalState.operation_status, "failed");
+  assert.equal(
+    rejectedTemporalState.refund_provider_occurred_at.toISOString(),
+    failedHighWaterState.refund_provider_occurred_at.toISOString(),
+  );
+  assert.equal(
+    rejectedTemporalState.operation_provider_occurred_at.toISOString(),
+    failedHighWaterState.operation_provider_occurred_at.toISOString(),
+  );
+  assert.equal(rejectedTemporalState.provider_facts, "3");
+  assert.equal(rejectedTemporalState.discrepancies, "0");
+  assert.equal(rejectedTemporalState.receipt_holds, "0");
+  assert.equal(rejectedTemporalState.temporal_audits, "2");
+
+  const afterFailureCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const afterFailureCandidate = afterFailureCandidates.items.find(
+    (candidate) => candidate.receiptId === securityCandidate.receiptId,
+  );
+  assert.ok(afterFailureCandidate, "a definitive failure should release capacity");
+  const possiblySentAmount = (BigInt(afterFailureCandidate.refundableMinor) - 40n).toString();
+  assert.ok(BigInt(possiblySentAmount) > 0n);
+  const competingPossiblySent = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${securityRefundOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: securityCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: possiblySentAmount,
+        expectedRefundableMinor: afterFailureCandidate.refundableMinor,
+        scenario: "success",
+        reason: "Synthetic possibly-sent refund is quarantined behind a receipt hold",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  const afterPossiblySentCandidate = (
+    await request<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates")
+  ).items.find((candidate) => candidate.receiptId === securityCandidate.receiptId);
+  assert.ok(afterPossiblySentCandidate);
+  const competingResumable = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${securityRefundOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: securityCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "20",
+        expectedRefundableMinor: afterPossiblySentCandidate.refundableMinor,
+        scenario: "timeout_success",
+        reason: "Synthetic sent refund must resume with query only after all holds close",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  for (const possiblySent of [competingPossiblySent, competingResumable]) {
+    assert.ok(possiblySent.providerOperationId);
+    await corePool.query(
+      `UPDATE refunds
+       SET status = 'processing', updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = 'queued'`,
+      [possiblySent.refundId],
+    );
+    await corePool.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = 1, updated_at = now()
+       WHERE id = $1 AND status = 'queued'`,
+      [possiblySent.providerOperationId],
+    );
+    await corePool.query(
+      `UPDATE durable_jobs
+       SET status = 'manual', last_error = 'synthetic request may have been sent', updated_at = now()
+       WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+      [possiblySent.refundId],
+    );
+  }
+  const afterSentReservations = (
+    await request<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates")
+  ).items.find((candidate) => candidate.receiptId === securityCandidate.receiptId);
+  assert.ok(afterSentReservations);
+  assert.equal(afterSentReservations.refundableMinor, "20");
+  const competingQueued = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${securityRefundOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: securityCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "20",
+        expectedRefundableMinor: afterSentReservations.refundableMinor,
+        scenario: "success",
+        reason: "Synthetic competing refund remains known-unsent during late success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.equal(competingQueued.status, "queued");
+  assert.ok(competingQueued.providerOperationId);
+  const invalidRefundCapability = await submitRefundFact({
+    eventId: `refund-invalid-capability:${randomUUID()}`,
+    providerOperationId: competingQueued.providerOperationId,
+    refundId: competingQueued.refundId,
+    callbackCapability: "A".repeat(43),
+    externalRefundId: `mock-refund-forged:${competingQueued.refundId}`,
+    status: "succeeded",
+    amountMinor: "20",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(invalidRefundCapability.status, 202);
+  assert.equal(invalidRefundCapability.body.reason, "invalid_operation_capability");
+  const preOutboundRefundFact = await submitRefundFact({
+    eventId: `refund-pre-outbound:${randomUUID()}`,
+    providerOperationId: competingQueued.providerOperationId,
+    refundId: competingQueued.refundId,
+    externalRefundId: `mock-refund-pre-outbound:${competingQueued.refundId}`,
+    status: "succeeded",
+    amountMinor: "20",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(preOutboundRefundFact.status, 202);
+  assert.equal(preOutboundRefundFact.body.reason, "provider_operation_not_started");
+
+  const lateExternalRefundId = `mock-refund-late:${failedThenSucceeded.refundId}`;
+  const lateSuccess = await submitRefundFact({
+    eventId: `refund-late-success:${randomUUID()}`,
+    providerOperationId: failedThenSucceeded.providerOperationId,
+    refundId: failedThenSucceeded.refundId,
+    externalRefundId: lateExternalRefundId,
+    status: "succeeded",
+    amountMinor: "90",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(lateSuccess.status, 202);
+  assert.equal(lateSuccess.body.status, "manual");
+
+  const securityHeld = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${failedThenSucceeded.refundId}`,
+  );
+  assert.equal(securityHeld.status, "manual");
+  assert.equal(securityHeld.securityHold, true);
+  const competingFrozen = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingQueued.refundId}`,
+  );
+  assert.equal(competingFrozen.status, "failed");
+  assert.equal(competingFrozen.securityHold, true);
+  const possiblySentFrozen = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingPossiblySent.refundId}`,
+  );
+  assert.equal(possiblySentFrozen.status, "manual");
+  assert.equal(possiblySentFrozen.securityHold, true);
+  const resumableFrozen = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}`,
+  );
+  assert.equal(resumableFrozen.status, "manual");
+  assert.equal(resumableFrozen.securityHold, true);
+
+  const possiblySentSuccess = await submitRefundFact({
+    eventId: `refund-possibly-sent-success:${randomUUID()}`,
+    providerOperationId: competingPossiblySent.providerOperationId,
+    refundId: competingPossiblySent.refundId,
+    externalRefundId: `mock-refund-possibly-sent:${competingPossiblySent.refundId}`,
+    status: "succeeded",
+    amountMinor: possiblySentAmount,
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(possiblySentSuccess.status, 202);
+  assert.equal(possiblySentSuccess.body.status, "manual");
+  assert.equal(possiblySentSuccess.body.reason, "refund.receipt_capacity_conflict");
+  const possiblySentHeld = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingPossiblySent.refundId}`,
+  );
+  assert.equal(possiblySentHeld.status, "manual");
+  assert.equal(possiblySentHeld.securityHold, true);
+
+  const collisionEventId = `refund-event-collision:${randomUUID()}`;
+  const laterFailure = await submitRefundFact({
+    eventId: collisionEventId,
+    providerOperationId: failedThenSucceeded.providerOperationId,
+    refundId: failedThenSucceeded.refundId,
+    externalRefundId: lateExternalRefundId,
+    status: "failed",
+    amountMinor: "90",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 1_000).toISOString(),
+  });
+  assert.equal(laterFailure.status, 202);
+  assert.equal(laterFailure.body.status, "manual");
+  const conflictingSameEventId = await submitRefundFact({
+    eventId: collisionEventId,
+    providerOperationId: failedThenSucceeded.providerOperationId,
+    refundId: failedThenSucceeded.refundId,
+    externalRefundId: lateExternalRefundId,
+    status: "succeeded",
+    amountMinor: "90",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 2_000).toISOString(),
+  });
+  assert.equal(conflictingSameEventId.status, 202);
+  assert.equal(conflictingSameEventId.body.status, "manual");
+  const stillSecurityHeld = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${failedThenSucceeded.refundId}`,
+  );
+  assert.equal(stillSecurityHeld.status, "manual");
+  assert.equal(stillSecurityHeld.securityHold, true);
+
+  const repeatedClaimOccurredAt = new Date(Date.now() + 3_000).toISOString();
+  const repeatedClaimExternalId = `mock-refund-repeat-a:${failedThenSucceeded.refundId}`;
+  for (const [externalRefundId, occurredAt] of [
+    [repeatedClaimExternalId, repeatedClaimOccurredAt],
+    [`mock-refund-repeat-b:${failedThenSucceeded.refundId}`, new Date(Date.now() + 4_000).toISOString()],
+    [repeatedClaimExternalId, repeatedClaimOccurredAt],
+  ] as const) {
+    const repeatedClaim = await submitRefundFact({
+      eventId: `refund-repeat-claim:${randomUUID()}`,
+      providerOperationId: failedThenSucceeded.providerOperationId,
+      refundId: failedThenSucceeded.refundId,
+      externalRefundId,
+      status: "succeeded",
+      amountMinor: "90",
+      currency: "USD",
+      occurredAt,
+    });
+    assert.equal(repeatedClaim.status, 202);
+    assert.equal(repeatedClaim.body.status, "manual");
+  }
+
+  const securityAccounting = await corePool.query<{
+    provider_facts: string;
+    conflicting_event_facts: string;
+    discrepancy_settlements: string;
+    receipt_security_holds: string;
+    suspense_debit_minor: string;
+    cash_credit_minor: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+        FROM refund_provider_facts
+        WHERE refund_id = $1) AS provider_facts,
+       (SELECT count(*)::text
+        FROM refund_provider_facts
+        WHERE refund_id = $1
+          AND external_event_id = $3) AS conflicting_event_facts,
+       (SELECT count(*)::text
+        FROM refund_discrepancy_settlements
+        WHERE refund_id = $1
+          AND external_refund_id = $2
+          AND amount_minor = 90
+          AND currency = 'USD') AS discrepancy_settlements,
+       (SELECT count(*)::text
+        FROM refund_receipt_security_holds
+        WHERE source_fund_receipt_id = $4) AS receipt_security_holds,
+       COALESCE((
+         SELECT sum(line.debit_minor)::text
+         FROM refund_discrepancy_settlements discrepancy
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+          AND journal.currency = discrepancy.currency
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'refund_discrepancy_suspense'
+         WHERE discrepancy.refund_id = $1
+       ), '0') AS suspense_debit_minor,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_discrepancy_settlements discrepancy
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+          AND journal.currency = discrepancy.currency
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'mock_cash'
+         WHERE discrepancy.refund_id = $1
+       ), '0') AS cash_credit_minor`,
+    [
+      failedThenSucceeded.refundId,
+      lateExternalRefundId,
+      collisionEventId,
+      securityCandidate.receiptId,
+    ],
+  );
+  assert.equal(securityAccounting.rows[0]?.provider_facts, "8");
+  assert.equal(securityAccounting.rows[0]?.conflicting_event_facts, "2");
+  assert.equal(securityAccounting.rows[0]?.discrepancy_settlements, "1");
+  assert.equal(securityAccounting.rows[0]?.receipt_security_holds, "5");
+  assert.equal(securityAccounting.rows[0]?.suspense_debit_minor, "90");
+  assert.equal(securityAccounting.rows[0]?.cash_credit_minor, "90");
+  const competingProviderCalls = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+     FROM mock_refund_operations
+     WHERE refund_id = $1`,
+    [competingQueued.refundId],
+  );
+  assert.equal(competingProviderCalls.rows[0]?.count, "0");
+
+  const heldCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  assert.equal(
+    heldCandidates.items.some(
+      (candidate) => candidate.receiptId === securityCandidate.receiptId,
+    ),
+    false,
+  );
+
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  const activeSecurityHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const refundSecurityHolds = activeSecurityHolds.items.filter(
+    (hold) => hold.refundId === failedThenSucceeded.refundId,
+  );
+  assert.equal(refundSecurityHolds.length, 4);
+  const acceptableHold = refundSecurityHolds.find((hold) =>
+    hold.allowedDecisions.includes("accept_authorized_outflow"),
+  );
+  assert.ok(acceptableHold);
+  assert.equal(acceptableHold.providerFacts.length, 8);
+  const staleAdjudication = await rawCoreRequest(
+    `/api/v1/admin/refund-security-holds/${acceptableHold.holdId}/adjudications`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision: "accept_authorized_outflow",
+        reason: "Synthetic human accepted the exact authorized Provider outflow",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: acceptableHold.refundVersion - 1,
+      }),
+    },
+  );
+  assert.equal(staleAdjudication.status, 409);
+  assert.equal(staleAdjudication.body.code, "REFUND_VERSION_CONFLICT");
+
+  const acceptReason = "Synthetic human accepted the exact authorized Provider outflow";
+  const acceptKey = randomUUID();
+  const acceptedAdjudication = await adjudicateRefundHold(
+    acceptableHold,
+    "accept_authorized_outflow",
+    acceptReason,
+    acceptKey,
+  );
+  assert.equal(acceptedAdjudication.decision, "accept_authorized_outflow");
+  const acceptedReplay = await adjudicateRefundHold(
+    acceptableHold,
+    "accept_authorized_outflow",
+    acceptReason,
+    acceptKey,
+    200,
+  );
+  assert.equal(acceptedReplay.adjudicationId, acceptedAdjudication.adjudicationId);
+  assert.equal(acceptedReplay.replayed, true);
+  const acceptedSemanticReplay = await adjudicateRefundHold(
+    acceptableHold,
+    "accept_authorized_outflow",
+    acceptReason,
+    randomUUID(),
+    200,
+  );
+  assert.equal(acceptedSemanticReplay.adjudicationId, acceptedAdjudication.adjudicationId);
+  assert.equal(acceptedSemanticReplay.replayed, true);
+
+  const holdsAfterAccept = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const remainingProviderClaims = holdsAfterAccept.items.filter(
+    (hold) => hold.refundId === failedThenSucceeded.refundId,
+  );
+  assert.equal(remainingProviderClaims.length, 3);
+  for (const remainingProviderClaim of remainingProviderClaims) {
+    assert.equal(remainingProviderClaim.discrepancy, null);
+    assert.deepEqual(remainingProviderClaim.allowedDecisions, [
+      "record_unexpected_outflow",
+      "dismiss_provider_claim",
+    ]);
+    await adjudicateRefundHold(
+      remainingProviderClaim,
+      "dismiss_provider_claim",
+      "Synthetic human dismissed one additional unverified Provider success claim",
+    );
+  }
+  const holdsAfterProviderClaimDismissals = await request<{
+    items: RefundSecurityHold[];
+  }>("/api/v1/admin/refund-security-holds");
+  assert.equal(
+    holdsAfterProviderClaimDismissals.items.some(
+      (hold) => hold.refundId === failedThenSucceeded.refundId,
+    ),
+    false,
+  );
+  const overCapacityHold = holdsAfterProviderClaimDismissals.items.find(
+    (hold) => hold.refundId === competingPossiblySent.refundId,
+  );
+  assert.ok(overCapacityHold);
+  assert.deepEqual(overCapacityHold.allowedDecisions, [
+    "record_unexpected_outflow",
+    "dismiss_provider_claim",
+  ]);
+  assert.equal(overCapacityHold.confirmedSettlementMinor, "90");
+  await adjudicateRefundHold(
+    overCapacityHold,
+    "dismiss_provider_claim",
+    "Synthetic human rejected the outflow that would exceed the source receipt",
+  );
+  const overCapacityResolved = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingPossiblySent.refundId}`,
+  );
+  assert.equal(overCapacityResolved.status, "failed");
+  assert.equal(overCapacityResolved.securityHold, false);
+  const overCapacityAccounting = await corePool.query<{
+    settlements: string;
+    discrepancy_cash_credit: string;
+    compensating_cash_debit: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_discrepancy_settlements discrepancy
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id AND line.account_code = 'mock_cash'
+         WHERE discrepancy.refund_id = $1
+       ), '0') AS discrepancy_cash_credit,
+       COALESCE((
+         SELECT sum(line.debit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_security_adjudication'
+          AND journal.source_id = adjudication.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id AND line.account_code = 'mock_cash'
+         WHERE adjudication.refund_id = $1
+       ), '0') AS compensating_cash_debit`,
+    [competingPossiblySent.refundId],
+  );
+  assert.equal(overCapacityAccounting.rows[0]?.settlements, "0");
+  assert.equal(overCapacityAccounting.rows[0]?.discrepancy_cash_credit, possiblySentAmount);
+  assert.equal(overCapacityAccounting.rows[0]?.compensating_cash_debit, possiblySentAmount);
+
+  const resumedQueryOnly = await waitFor(
+    "last receipt hold to resume every frozen possibly-sent refund with query only",
+    async () => {
+      const result = await corePool.query<{
+        start_status: string;
+        reconcile_status: string;
+        reconcile_attempts: number;
+        still_frozen: boolean;
+      }>(
+        `SELECT
+           start_job.status AS start_status,
+           reconcile_job.status AS reconcile_status,
+           reconcile_job.attempts AS reconcile_attempts,
+           refund.result ? 'frozenByRefundId' AS still_frozen
+         FROM durable_jobs start_job
+         JOIN durable_jobs reconcile_job
+           ON reconcile_job.job_type = 'refund.reconcile'
+          AND reconcile_job.unique_key = start_job.unique_key
+         JOIN refunds refund ON refund.id = $1::uuid
+         WHERE start_job.job_type = 'refund.start'
+           AND start_job.payload->>'refundId' = $1::text`,
+        [competingResumable.refundId],
+      );
+      return result.rows[0];
+    },
+    (state) =>
+      state?.start_status === "completed" &&
+      ["pending", "running"].includes(state.reconcile_status),
+    15_000,
+  );
+  assert.ok(resumedQueryOnly);
+  assert.equal(resumedQueryOnly.still_frozen, false);
+  const resumedProviderCreates = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM mock_refund_operations WHERE refund_id = $1`,
+    [competingResumable.refundId],
+  );
+  assert.equal(resumedProviderCreates.rows[0]?.count, "0");
+  const resumableManual = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}`,
+  );
+  assert.equal(resumableManual.status, "manual");
+  assert.equal(resumableManual.securityHold, false);
+  const confirmedNoOutflow = await request<{
+    action: string;
+    status: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}/manual-actions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "confirm_no_outflow",
+        reason: "Synthetic administrator confirmed the query-only operation never left cash",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: resumableManual.version,
+      }),
+    },
+    201,
+  );
+  assert.equal(confirmedNoOutflow.action, "confirm_no_outflow");
+  assert.equal(confirmedNoOutflow.status, "confirmed_no_outflow");
+  const confirmedNoOutflowRefund = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${competingResumable.refundId}`,
+  );
+  assert.equal(confirmedNoOutflowRefund.status, "failed");
+  const afterAdjudication = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${failedThenSucceeded.refundId}`,
+  );
+  assert.equal(afterAdjudication.status, "succeeded");
+  assert.equal(afterAdjudication.securityHold, false);
+  assert.equal(afterAdjudication.externalRefundId, lateExternalRefundId);
+  const adjudicationAccounting = await corePool.query<{
+    settlements: string;
+    adjudications: string;
+    discrepancy_cash_credit: string;
+    suspense_debit: string;
+    suspense_credit: string;
+    refund_expense_debit: string;
+    adjudication_cash_credit: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+       (SELECT count(*)::text FROM refund_security_hold_adjudications WHERE refund_id = $1)
+         AS adjudications,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_discrepancy_settlements discrepancy
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id AND line.account_code = 'mock_cash'
+         WHERE discrepancy.refund_id = $1
+       ), '0') AS discrepancy_cash_credit,
+       COALESCE((
+         SELECT sum(line.debit_minor)::text
+         FROM refund_discrepancy_settlements discrepancy
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'refund_discrepancy_suspense'
+         WHERE discrepancy.refund_id = $1
+       ), '0') AS suspense_debit,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_security_adjudication'
+          AND journal.source_id = adjudication.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'refund_discrepancy_suspense'
+         WHERE adjudication.refund_id = $1
+       ), '0') AS suspense_credit,
+       COALESCE((
+         SELECT sum(line.debit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_security_adjudication'
+          AND journal.source_id = adjudication.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'sales_refunds_and_allowances'
+         WHERE adjudication.refund_id = $1
+       ), '0') AS refund_expense_debit,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_security_adjudication'
+          AND journal.source_id = adjudication.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id AND line.account_code = 'mock_cash'
+         WHERE adjudication.refund_id = $1
+       ), '0') AS adjudication_cash_credit`,
+    [failedThenSucceeded.refundId],
+  );
+  assert.equal(adjudicationAccounting.rows[0]?.settlements, "1");
+  assert.equal(adjudicationAccounting.rows[0]?.adjudications, "4");
+  assert.equal(adjudicationAccounting.rows[0]?.discrepancy_cash_credit, "90");
+  assert.equal(adjudicationAccounting.rows[0]?.suspense_debit, "90");
+  assert.equal(adjudicationAccounting.rows[0]?.suspense_credit, "90");
+  assert.equal(adjudicationAccounting.rows[0]?.refund_expense_debit, "90");
+  assert.equal(adjudicationAccounting.rows[0]?.adjudication_cash_credit, "0");
+  const releasedCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  assert.equal(
+    releasedCandidates.items.some(
+      (candidate) => candidate.receiptId === securityCandidate.receiptId,
+    ),
+    true,
+  );
+
+  const adjudicationGuardClient = await corePool.connect();
+  let rejectedAdjudicationMutation = false;
+  try {
+    await adjudicationGuardClient.query("BEGIN");
+    await adjudicationGuardClient.query(
+      `UPDATE refund_security_hold_adjudications
+       SET reason = reason || ' forbidden'
+       WHERE id = $1`,
+      [acceptedAdjudication.adjudicationId],
+    );
+    await adjudicationGuardClient.query("COMMIT");
+  } catch {
+    rejectedAdjudicationMutation = true;
+    await adjudicationGuardClient.query("ROLLBACK");
+  } finally {
+    adjudicationGuardClient.release();
+  }
+  assert.equal(rejectedAdjudicationMutation, true);
+
+  const externalReuseOrder = await createOrder(automaticPrice.id, legal);
+  const paidExternalReuseOrder = await pay(externalReuseOrder, "success");
+  assert.equal(paidExternalReuseOrder.invoice.status, "paid");
+  const externalReuseCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const externalReuseCandidate = externalReuseCandidates.items.find(
+    (candidate) => candidate.invoiceId === externalReuseOrder.invoice.id,
+  );
+  assert.ok(externalReuseCandidate);
+  const externalReuseRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${externalReuseOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: externalReuseCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "25",
+        expectedRefundableMinor: externalReuseCandidate.refundableMinor,
+        scenario: "success",
+        reason: "Synthetic refund tests failed-fact external id ownership enforcement",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(externalReuseRefund.providerOperationId);
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'processing', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'queued'`,
+    [externalReuseRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1, updated_at = now()
+     WHERE id = $1 AND status = 'queued'`,
+    [externalReuseRefund.providerOperationId],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'manual', last_error = 'synthetic callback ownership gate', updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [externalReuseRefund.refundId],
+  );
+  const reusedExternalIdFailure = await submitRefundFact({
+    eventId: `refund-failed-external-reuse:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: originalSuccessRefund.externalRefundId,
+    status: "failed",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(reusedExternalIdFailure.status, 202);
+  assert.equal(reusedExternalIdFailure.body.status, "manual");
+  assert.equal(reusedExternalIdFailure.body.reason, "refund.external_id_conflict");
+  const externalReuseHeld = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${externalReuseRefund.refundId}`,
+  );
+  assert.equal(externalReuseHeld.status, "manual");
+  assert.equal(externalReuseHeld.securityHold, true);
+  const externalReuseHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const externalReuseHold = externalReuseHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(externalReuseHold);
+  assert.equal(externalReuseHold.discrepancy, null);
+  await adjudicateRefundHold(
+    externalReuseHold,
+    "dismiss_provider_claim",
+    "Synthetic human dismissed a failed fact that reused another refund identity",
+  );
+  const externalReuseResolved = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${externalReuseRefund.refundId}`,
+  );
+  assert.equal(externalReuseResolved.status, "failed");
+  assert.equal(externalReuseResolved.securityHold, false);
+
+  const settledExternalIdReuse = await submitRefundFact({
+    eventId: `refund-success-settled-external-reuse:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: originalSuccessRefund.externalRefundId,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 500).toISOString(),
+  });
+  assert.equal(settledExternalIdReuse.status, 202);
+  assert.equal(settledExternalIdReuse.body.status, "manual");
+  assert.equal(settledExternalIdReuse.body.reason, "refund.external_id_conflict");
+  const settledExternalIdReuseHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const settledExternalIdReuseHold = settledExternalIdReuseHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(settledExternalIdReuseHold);
+  const rejectedSettledExternalIdRecord = await rawCoreRequest(
+    `/api/v1/admin/refund-security-holds/${settledExternalIdReuseHold.holdId}/adjudications`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision: "record_unexpected_outflow",
+        reason: "Synthetic reused Provider identity must never reduce mock cash twice",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: settledExternalIdReuseHold.refundVersion,
+      }),
+    },
+  );
+  assert.equal(rejectedSettledExternalIdRecord.status, 422);
+  assert.equal(rejectedSettledExternalIdRecord.body.code, "REFUND_EXTERNAL_ID_ALREADY_OWNED");
+  const settledExternalOwner = await corePool.query<{
+    settlements: string;
+    discrepancies: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_settlements
+        WHERE provider_installation_id = 'mock-payment-v1'
+          AND external_refund_id = $1) AS settlements,
+       (SELECT count(*)::text FROM refund_discrepancy_settlements
+        WHERE provider_installation_id = 'mock-payment-v1'
+          AND external_refund_id = $1) AS discrepancies`,
+    [originalSuccessRefund.externalRefundId],
+  );
+  assert.equal(settledExternalOwner.rows[0]?.settlements, "1");
+  assert.equal(settledExternalOwner.rows[0]?.discrepancies, "0");
+  await adjudicateRefundHold(
+    settledExternalIdReuseHold,
+    "dismiss_provider_claim",
+    "Synthetic human dismissed a success claim that reused a settled Provider identity",
+  );
+
+  const dismissedSuccessOccurredAt = new Date(Date.now() + 1_000).toISOString();
+  const dismissedSuccessExternalId = `mock-refund-dismissed-success:${externalReuseRefund.refundId}`;
+  const successAfterDismissal = await submitRefundFact({
+    eventId: `refund-success-after-dismissal:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: dismissedSuccessExternalId,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: dismissedSuccessOccurredAt,
+  });
+  assert.equal(successAfterDismissal.status, 202);
+  assert.equal(successAfterDismissal.body.status, "manual");
+  const successAfterDismissalHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const successAfterDismissalHold = successAfterDismissalHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(successAfterDismissalHold);
+  const dismissedSuccessAdjudication = await adjudicateRefundHold(
+    successAfterDismissalHold,
+    "dismiss_provider_claim",
+    "Synthetic human dismissed a late Provider success after reconciliation",
+  );
+  const correctionRaceCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const correctionRaceCandidate = correctionRaceCandidates.items.find(
+    (candidate) => candidate.receiptId === externalReuseCandidate.receiptId,
+  );
+  assert.ok(correctionRaceCandidate);
+  const correctionPossiblySentRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${externalReuseOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: correctionRaceCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "20",
+        expectedRefundableMinor: correctionRaceCandidate.refundableMinor,
+        scenario: "success",
+        reason:
+          "Synthetic competing refund may have reached the Provider before dismissal correction",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(correctionPossiblySentRefund.providerOperationId);
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'processing', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'queued'`,
+    [correctionPossiblySentRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'unknown', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'processing'`,
+    [correctionPossiblySentRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'unknown', attempt_count = 1,
+         last_error = 'Synthetic ambiguous Provider transport result', updated_at = now()
+     WHERE id = $1 AND status = 'queued'`,
+    [correctionPossiblySentRefund.providerOperationId],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'manual', last_error = 'Synthetic ambiguous Provider transport result',
+         updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [correctionPossiblySentRefund.refundId],
+  );
+  const correctionKnownUnsentCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const correctionKnownUnsentCandidate = correctionKnownUnsentCandidates.items.find(
+    (candidate) => candidate.receiptId === externalReuseCandidate.receiptId,
+  );
+  assert.ok(correctionKnownUnsentCandidate);
+  const correctionCompetingRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${externalReuseOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: correctionKnownUnsentCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "full",
+        amountMinor: null,
+        expectedRefundableMinor: correctionKnownUnsentCandidate.refundableMinor,
+        scenario: "success",
+        reason:
+          "Synthetic full refund queues before a dismissed Provider outflow is corrected",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.equal(correctionCompetingRefund.status, "queued");
+  assert.ok(correctionCompetingRefund.providerOperationId);
+  const correctableDismissals = await request<{ items: RefundDismissalCorrection[] }>(
+    "/api/v1/admin/refund-dismissal-corrections",
+  );
+  const correctableDismissal = correctableDismissals.items.find(
+    (item) => item.adjudicationId === dismissedSuccessAdjudication.adjudicationId,
+  );
+  assert.ok(correctableDismissal);
+  assert.equal(correctableDismissal.discrepancyId !== null, true);
+  const correctionIdempotencyKey = randomUUID();
+  const correctedDismissal = await request<{
+    correctionId: string;
+    status: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refund-adjudications/${correctableDismissal.adjudicationId}/corrections`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason: "Synthetic later evidence confirmed the dismissed Provider cash outflow",
+        idempotencyKey: correctionIdempotencyKey,
+        expectedRefundVersion: correctableDismissal.refundVersion,
+      }),
+    },
+    201,
+  );
+  assert.equal(correctedDismissal.status, "dismissed_outflow_confirmed");
+  assert.equal(correctedDismissal.replayed, false);
+  const correctedDismissalReplay = await request<{
+    correctionId: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refund-adjudications/${correctableDismissal.adjudicationId}/corrections`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason: "Synthetic later evidence confirmed the dismissed Provider cash outflow",
+        idempotencyKey: correctionIdempotencyKey,
+        expectedRefundVersion: correctableDismissal.refundVersion,
+      }),
+    },
+    200,
+  );
+  assert.equal(correctedDismissalReplay.correctionId, correctedDismissal.correctionId);
+  assert.equal(correctedDismissalReplay.replayed, true);
+  const correctionAccounting = await corePool.query<{
+    corrections: string;
+    suspense_debit: string;
+    cash_credit: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_adjudication_corrections
+        WHERE adjudication_id = $1) AS corrections,
+       COALESCE(sum(line.debit_minor) FILTER (
+         WHERE line.account_code = 'refund_discrepancy_suspense'
+       ), 0)::text AS suspense_debit,
+       COALESCE(sum(line.credit_minor) FILTER (
+         WHERE line.account_code = 'mock_cash'
+       ), 0)::text AS cash_credit
+     FROM refund_adjudication_corrections correction
+     JOIN ledger_journals journal
+       ON journal.source_type = 'refund_adjudication_correction'
+      AND journal.source_id = correction.id
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE correction.adjudication_id = $1`,
+    [correctableDismissal.adjudicationId],
+  );
+  assert.equal(correctionAccounting.rows[0]?.corrections, "1");
+  assert.equal(correctionAccounting.rows[0]?.suspense_debit, "25");
+  assert.equal(correctionAccounting.rows[0]?.cash_credit, "25");
+  const correctedOperation = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${externalReuseRefund.refundId}`,
+  );
+  assert.equal(correctedOperation.status, "failed");
+  assert.equal(correctedOperation.providerOperationStatus, "succeeded");
+  assert.equal(correctedOperation.externalRefundId, dismissedSuccessExternalId);
+  const frozenCorrectionCompetitor = await corePool.query<{
+    refund_status: string;
+    refund_security_hold: boolean;
+    frozen_by_correction_id: string | null;
+    operation_status: string;
+    operation_attempt_count: number;
+    job_status: string;
+  }>(
+    `SELECT
+       refund.status AS refund_status,
+       refund.security_hold AS refund_security_hold,
+       refund.result->>'frozenByCorrectionId' AS frozen_by_correction_id,
+       operation.status AS operation_status,
+       operation.attempt_count AS operation_attempt_count,
+       job.status AS job_status
+     FROM refunds refund
+     JOIN provider_operations operation
+       ON operation.subject_type = 'refund'
+      AND operation.subject_id = refund.id
+      AND operation.kind = 'refund_create'
+     JOIN durable_jobs job
+       ON job.job_type = 'refund.start'
+      AND job.payload->>'refundId' = refund.id::text
+     WHERE refund.id = $1`,
+    [correctionCompetingRefund.refundId],
+  );
+  const frozenCorrectionState = frozenCorrectionCompetitor.rows[0];
+  assert.ok(frozenCorrectionState);
+  assert.equal(frozenCorrectionState.refund_status, "failed");
+  assert.equal(frozenCorrectionState.refund_security_hold, false);
+  assert.equal(
+    frozenCorrectionState.frozen_by_correction_id,
+    correctedDismissal.correctionId,
+  );
+  assert.equal(frozenCorrectionState.operation_status, "failed");
+  assert.equal(frozenCorrectionState.operation_attempt_count, 0);
+  assert.equal(frozenCorrectionState.job_status, "completed");
+  const possiblySentCorrectionState = await corePool.query<{
+    refund_status: string;
+    refund_security_hold: boolean;
+    frozen_by_correction_id: string | null;
+    operation_status: string;
+    operation_attempt_count: number;
+    job_status: string;
+  }>(
+    `SELECT
+       refund.status AS refund_status,
+       refund.security_hold AS refund_security_hold,
+       refund.result->>'frozenByCorrectionId' AS frozen_by_correction_id,
+       operation.status AS operation_status,
+       operation.attempt_count AS operation_attempt_count,
+       job.status AS job_status
+     FROM refunds refund
+     JOIN provider_operations operation ON operation.id = $2
+     JOIN durable_jobs job
+       ON job.job_type = 'refund.start' AND job.payload->>'refundId' = refund.id::text
+     WHERE refund.id = $1`,
+    [correctionPossiblySentRefund.refundId, correctionPossiblySentRefund.providerOperationId],
+  );
+  assert.equal(possiblySentCorrectionState.rows[0]?.refund_status, "manual");
+  assert.equal(possiblySentCorrectionState.rows[0]?.refund_security_hold, false);
+  assert.equal(
+    possiblySentCorrectionState.rows[0]?.frozen_by_correction_id,
+    correctedDismissal.correctionId,
+  );
+  assert.equal(possiblySentCorrectionState.rows[0]?.operation_status, "unknown");
+  assert.equal(possiblySentCorrectionState.rows[0]?.operation_attempt_count, 1);
+  assert.equal(possiblySentCorrectionState.rows[0]?.job_status, "manual");
+  const possiblySentManualRecord = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${correctionPossiblySentRefund.refundId}`,
+  );
+  const possiblySentNoOutflow = await request<{ status: string; replayed: boolean }>(
+    `/api/v1/admin/refunds/${correctionPossiblySentRefund.refundId}/manual-actions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "confirm_no_outflow",
+        reason:
+          "Synthetic administrator queried the Provider and confirmed the frozen request had no outflow",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: possiblySentManualRecord.version,
+      }),
+    },
+    201,
+  );
+  assert.equal(possiblySentNoOutflow.status, "confirmed_no_outflow");
+  assert.equal(possiblySentNoOutflow.replayed, false);
+  const correctionRaceProviderCalls = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count
+     FROM mock_refund_operations
+     WHERE refund_id IN ($1, $2)`,
+    [correctionCompetingRefund.refundId, correctionPossiblySentRefund.refundId],
+  );
+  assert.equal(correctionRaceProviderCalls.rows[0]?.count, "0");
+  const dismissedFactReplay = await submitRefundFact({
+    eventId: `refund-dismissed-fact-replay:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: dismissedSuccessExternalId,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: dismissedSuccessOccurredAt,
+  });
+  assert.equal(dismissedFactReplay.status, 202);
+  assert.equal(dismissedFactReplay.body.reason, "provider_fact_already_adjudicated");
+  const dismissedFactReplayState = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${externalReuseRefund.refundId}`,
+  );
+  assert.equal(dismissedFactReplayState.status, "failed");
+  assert.equal(dismissedFactReplayState.securityHold, false);
+  const dismissedFactReplayHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  assert.equal(
+    dismissedFactReplayHolds.items.some(
+      (hold) => hold.refundId === externalReuseRefund.refundId,
+    ),
+    false,
+  );
+
+  const secondDistinctSuccess = await submitRefundFact({
+    eventId: `refund-distinct-success-after-dismissal:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: `mock-refund-distinct-after-dismissal:${externalReuseRefund.refundId}`,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date(Date.now() + 2_000).toISOString(),
+  });
+  assert.equal(secondDistinctSuccess.status, 202);
+  assert.equal(secondDistinctSuccess.body.status, "manual");
+  const distinctSuccessHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const distinctSuccessHold = distinctSuccessHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(distinctSuccessHold);
+  assert.equal(distinctSuccessHold.discrepancy, null);
+  assert.deepEqual(distinctSuccessHold.allowedDecisions, [
+    "record_unexpected_outflow",
+    "dismiss_provider_claim",
+  ]);
+  const rejectedOldDiscrepancyReuse = await rawCoreRequest(
+    `/api/v1/admin/refund-security-holds/${distinctSuccessHold.holdId}/adjudications`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision: "accept_authorized_outflow",
+        reason: "Synthetic old discrepancy must not be accepted for a distinct Provider fact",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: distinctSuccessHold.refundVersion,
+      }),
+    },
+  );
+  assert.equal(rejectedOldDiscrepancyReuse.status, 422);
+  assert.equal(rejectedOldDiscrepancyReuse.body.code, "REFUND_OUTFLOW_NOT_ACCEPTABLE");
+  await adjudicateRefundHold(
+    distinctSuccessHold,
+    "record_unexpected_outflow",
+    "Synthetic human verified the separate unexpected Provider cash outflow",
+  );
+  const recordedUnexpectedOutflow = await corePool.query<{
+    settlements: string;
+    suspense_debit: string;
+    cash_credit: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+       COALESCE((
+         SELECT sum(line.debit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN refund_discrepancy_settlements discrepancy
+           ON discrepancy.id = adjudication.discrepancy_settlement_id
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'refund_discrepancy_suspense'
+         WHERE adjudication.refund_id = $1
+           AND adjudication.decision = 'record_unexpected_outflow'
+       ), '0') AS suspense_debit,
+       COALESCE((
+         SELECT sum(line.credit_minor)::text
+         FROM refund_security_hold_adjudications adjudication
+         JOIN refund_discrepancy_settlements discrepancy
+           ON discrepancy.id = adjudication.discrepancy_settlement_id
+         JOIN ledger_journals journal
+           ON journal.source_type = 'refund_provider_discrepancy'
+          AND journal.source_id = discrepancy.id
+         JOIN ledger_lines line
+           ON line.journal_id = journal.id
+          AND line.account_code = 'mock_cash'
+         WHERE adjudication.refund_id = $1
+           AND adjudication.decision = 'record_unexpected_outflow'
+       ), '0') AS cash_credit`,
+    [externalReuseRefund.refundId],
+  );
+  assert.equal(recordedUnexpectedOutflow.rows[0]?.settlements, "0");
+  assert.equal(recordedUnexpectedOutflow.rows[0]?.suspense_debit, "25");
+  assert.equal(recordedUnexpectedOutflow.rows[0]?.cash_credit, "25");
+
+  const wrongCurrencySuccess = await submitRefundFact({
+    eventId: `refund-wrong-currency-unexpected-outflow:${randomUUID()}`,
+    providerOperationId: externalReuseRefund.providerOperationId,
+    refundId: externalReuseRefund.refundId,
+    externalRefundId: `mock-refund-wrong-currency:${externalReuseRefund.refundId}`,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "EUR",
+    occurredAt: new Date(Date.now() + 3_000).toISOString(),
+  });
+  assert.equal(wrongCurrencySuccess.status, 202);
+  assert.equal(wrongCurrencySuccess.body.status, "manual");
+  const wrongCurrencyHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const wrongCurrencyHold = wrongCurrencyHolds.items.find(
+    (hold) => hold.refundId === externalReuseRefund.refundId,
+  );
+  assert.ok(wrongCurrencyHold);
+  assert.equal(wrongCurrencyHold.providerFact.currency, "EUR");
+  assert.equal(wrongCurrencyHold.discrepancy, null);
+  await adjudicateRefundHold(
+    wrongCurrencyHold,
+    "record_unexpected_outflow",
+    "Synthetic human verified a wrong-currency Provider outflow without an FX allocation",
+  );
+  const wrongCurrencyLedger = await corePool.query<{
+    suspense_debit: string;
+    cash_credit: string;
+  }>(
+    `SELECT
+       COALESCE(sum(line.debit_minor) FILTER (
+         WHERE line.account_code = 'refund_discrepancy_suspense'
+       ), 0)::text AS suspense_debit,
+       COALESCE(sum(line.credit_minor) FILTER (
+         WHERE line.account_code = 'mock_cash'
+       ), 0)::text AS cash_credit
+     FROM refund_security_hold_adjudications adjudication
+     JOIN refund_discrepancy_settlements discrepancy
+       ON discrepancy.id = adjudication.discrepancy_settlement_id
+      AND discrepancy.currency = 'EUR'
+     JOIN ledger_journals journal
+       ON journal.source_type = 'refund_provider_discrepancy'
+      AND journal.source_id = discrepancy.id
+      AND journal.currency = discrepancy.currency
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE adjudication.refund_id = $1
+       AND adjudication.decision = 'record_unexpected_outflow'`,
+    [externalReuseRefund.refundId],
+  );
+  assert.equal(wrongCurrencyLedger.rows[0]?.suspense_debit, "25");
+  assert.equal(wrongCurrencyLedger.rows[0]?.cash_credit, "25");
+
+  const staleStartCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const staleStartCandidate = staleStartCandidates.items.find(
+    (candidate) => candidate.receiptId === externalReuseCandidate.receiptId,
+  );
+  assert.ok(staleStartCandidate);
+  assert.equal(
+    BigInt(staleStartCandidate.refundableMinor),
+    BigInt(externalReuseCandidate.refundableMinor) - 50n,
+  );
+  const staleKnownUnsent = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${externalReuseOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: staleStartCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "20",
+        expectedRefundableMinor: staleStartCandidate.refundableMinor,
+        scenario: "success",
+        reason: "Synthetic known-unsent stale refund start exhausts safely",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'running', attempts = 8,
+         locked_at = now() - interval '10 seconds', locked_by = 'dead-refund-worker',
+         updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [staleKnownUnsent.refundId],
+  );
+  const recoveredKnownUnsent = await waitFor(
+    "stale known-unsent refund start to fail without a Provider call",
+    async () => {
+      const result = await corePool.query<{
+        refund_status: string;
+        operation_status: string;
+        attempt_count: number;
+        job_status: string;
+        events: string;
+        audits: string;
+      }>(
+        `SELECT
+           refund.status AS refund_status,
+           operation.status AS operation_status,
+           operation.attempt_count,
+           job.status AS job_status,
+           (SELECT count(*)::text FROM refund_events event
+            WHERE event.refund_id = refund.id AND event.event_type = 'failed') AS events,
+           (SELECT count(*)::text FROM audit_events audit
+            WHERE audit.target_type = 'refund' AND audit.target_id = refund.id::text
+              AND audit.action = 'refund.known_unsent_rejected') AS audits
+         FROM refunds refund
+         JOIN provider_operations operation
+           ON operation.subject_type = 'refund'
+          AND operation.subject_id = refund.id
+          AND operation.kind = 'refund_create'
+         JOIN durable_jobs job
+           ON job.job_type = 'refund.start' AND job.payload->>'refundId' = refund.id::text
+         WHERE refund.id = $1`,
+        [staleKnownUnsent.refundId],
+      );
+      return result.rows[0];
+    },
+    (state) => state?.refund_status === "failed" && state.job_status === "completed",
+    15_000,
+  );
+  assert.ok(recoveredKnownUnsent);
+  assert.equal(recoveredKnownUnsent.operation_status, "failed");
+  assert.equal(recoveredKnownUnsent.attempt_count, 0);
+  assert.equal(recoveredKnownUnsent.events, "1");
+  assert.equal(recoveredKnownUnsent.audits, "1");
+  const knownUnsentProviderCalls = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM mock_refund_operations WHERE refund_id = $1`,
+    [staleKnownUnsent.refundId],
+  );
+  assert.equal(knownUnsentProviderCalls.rows[0]?.count, "0");
+
+  const staleReconcileCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const staleReconcileCandidate = staleReconcileCandidates.items.find(
+    (candidate) => candidate.receiptId === externalReuseCandidate.receiptId,
+  );
+  assert.ok(staleReconcileCandidate);
+  const staleReconcileRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${externalReuseOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: staleReconcileCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "20",
+        expectedRefundableMinor: staleReconcileCandidate.refundableMinor,
+        scenario: "timeout_success",
+        reason: "Synthetic stale refund reconciliation exhausts into manual review",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(staleReconcileRefund.providerOperationId);
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'processing', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'queued'`,
+    [staleReconcileRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'unknown', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'processing'`,
+    [staleReconcileRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'unknown', attempt_count = 1, updated_at = now()
+     WHERE id = $1 AND status = 'queued'`,
+    [staleReconcileRefund.providerOperationId],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [staleReconcileRefund.refundId],
+  );
+  await corePool.query(
+    `INSERT INTO durable_jobs(
+       job_type, unique_key, payload, status, attempts, locked_at, locked_by
+     ) VALUES (
+       'refund.reconcile', $1, $2, 'running', 8,
+       now() - interval '10 seconds', 'dead-refund-reconcile-worker'
+     )`,
+    [
+      `refund:${staleReconcileRefund.refundId}`,
+      {
+        refundId: staleReconcileRefund.refundId,
+        operationId: staleReconcileRefund.providerOperationId,
+      },
+    ],
+  );
+  const recoveredReconcile = await waitFor(
+    "stale refund reconciliation exhaustion to synchronize the manual queue",
+    async () => {
+      const result = await corePool.query<{
+        refund_status: string;
+        operation_status: string;
+        job_status: string;
+        events: string;
+        audits: string;
+      }>(
+        `SELECT
+           refund.status AS refund_status,
+           operation.status AS operation_status,
+           job.status AS job_status,
+           (SELECT count(*)::text FROM refund_events event
+            WHERE event.refund_id = refund.id AND event.event_type = 'manual') AS events,
+           (SELECT count(*)::text FROM audit_events audit
+            WHERE audit.target_type = 'refund' AND audit.target_id = refund.id::text
+              AND audit.action = 'refund.reconciliation_exhausted') AS audits
+         FROM refunds refund
+         JOIN provider_operations operation ON operation.id = $2
+         JOIN durable_jobs job
+           ON job.job_type = 'refund.reconcile' AND job.unique_key = $3
+         WHERE refund.id = $1`,
+        [
+          staleReconcileRefund.refundId,
+          staleReconcileRefund.providerOperationId,
+          `refund:${staleReconcileRefund.refundId}`,
+        ],
+      );
+      return result.rows[0];
+    },
+    (state) => state?.refund_status === "manual" && state.job_status === "manual",
+    15_000,
+  );
+  assert.ok(recoveredReconcile);
+  assert.equal(recoveredReconcile.operation_status, "unknown");
+  assert.equal(recoveredReconcile.events, "1");
+  assert.equal(recoveredReconcile.audits, "1");
+  const staleManualRefund = await request<RefundRecord>(
+    `/api/v1/admin/refunds/${staleReconcileRefund.refundId}`,
+  );
+  const retryQueryKey = randomUUID();
+  const retryQueryBody = {
+    action: "retry_query",
+    reason: "Synthetic administrator retried the exhausted refund using Provider query only",
+    idempotencyKey: retryQueryKey,
+    expectedRefundVersion: staleManualRefund.version,
+  };
+  const retryQuery = await request<{ actionId: string; status: string; replayed: boolean }>(
+    `/api/v1/admin/refunds/${staleReconcileRefund.refundId}/manual-actions`,
+    { method: "POST", body: JSON.stringify(retryQueryBody) },
+    201,
+  );
+  assert.equal(retryQuery.status, "query_scheduled");
+  const retryQueryReplay = await request<{
+    actionId: string;
+    status: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refunds/${staleReconcileRefund.refundId}/manual-actions`,
+    { method: "POST", body: JSON.stringify(retryQueryBody) },
+    200,
+  );
+  assert.equal(retryQueryReplay.actionId, retryQuery.actionId);
+  assert.equal(retryQueryReplay.replayed, true);
+  const staleRetryProviderCreates = await providerPool.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM mock_refund_operations WHERE refund_id = $1`,
+    [staleReconcileRefund.refundId],
+  );
+  assert.equal(staleRetryProviderCreates.rows[0]?.count, "0");
+
+  const callbackFirstOrder = await createOrder(automaticPrice.id, legal);
+  const paidCallbackFirstOrder = await pay(callbackFirstOrder, "success");
+  assert.equal(paidCallbackFirstOrder.invoice.status, "paid");
+  const callbackFirstCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const callbackFirstCandidate = callbackFirstCandidates.items.find(
+    (candidate) => candidate.invoiceId === callbackFirstOrder.invoice.id,
+  );
+  assert.ok(callbackFirstCandidate);
+  const callbackFirstDismissedRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${callbackFirstOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: callbackFirstCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "25",
+        expectedRefundableMinor: callbackFirstCandidate.refundableMinor,
+        scenario: "failed",
+        reason:
+          "Synthetic first refund fails before a later success is dismissed and corrected",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(callbackFirstDismissedRefund.providerOperationId);
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'processing', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'queued'`,
+    [callbackFirstDismissedRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1, updated_at = now()
+     WHERE id = $1 AND status = 'queued'`,
+    [callbackFirstDismissedRefund.providerOperationId],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'manual', last_error = 'Synthetic callback controls this operation',
+         updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [callbackFirstDismissedRefund.refundId],
+  );
+  const callbackFirstBaseTime = Date.now() + 5_000;
+  const callbackFirstFailure = await submitRefundFact({
+    eventId: `refund-callback-first-failure:${randomUUID()}`,
+    providerOperationId: callbackFirstDismissedRefund.providerOperationId,
+    refundId: callbackFirstDismissedRefund.refundId,
+    externalRefundId: `mock-refund-callback-first-failed:${callbackFirstDismissedRefund.refundId}`,
+    status: "failed",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date(callbackFirstBaseTime).toISOString(),
+  });
+  assert.equal(callbackFirstFailure.status, 202);
+  assert.equal(callbackFirstFailure.body.status, "failed");
+  const callbackFirstLateSuccess = await submitRefundFact({
+    eventId: `refund-callback-first-late-success:${randomUUID()}`,
+    providerOperationId: callbackFirstDismissedRefund.providerOperationId,
+    refundId: callbackFirstDismissedRefund.refundId,
+    externalRefundId: `mock-refund-browser-capacity-overage:${callbackFirstDismissedRefund.refundId}`,
+    status: "succeeded",
+    amountMinor: "25",
+    currency: "USD",
+    occurredAt: new Date(callbackFirstBaseTime + 1_000).toISOString(),
+  });
+  assert.equal(callbackFirstLateSuccess.status, 202);
+  assert.equal(callbackFirstLateSuccess.body.status, "manual");
+  const callbackFirstHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const callbackFirstHold = callbackFirstHolds.items.find(
+    (hold) => hold.refundId === callbackFirstDismissedRefund.refundId,
+  );
+  assert.ok(callbackFirstHold);
+  const callbackFirstDismissal = await adjudicateRefundHold(
+    callbackFirstHold,
+    "dismiss_provider_claim",
+    "Synthetic administrator initially dismissed the callback-first Provider success",
+  );
+  const callbackFirstFullCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const callbackFirstFullCandidate = callbackFirstFullCandidates.items.find(
+    (candidate) => candidate.receiptId === callbackFirstCandidate.receiptId,
+  );
+  assert.ok(callbackFirstFullCandidate);
+  const callbackFirstWinningRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${callbackFirstOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: callbackFirstFullCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "full",
+        amountMinor: null,
+        expectedRefundableMinor: callbackFirstFullCandidate.refundableMinor,
+        scenario: "success",
+        reason:
+          "Synthetic competing full refund succeeds before the dismissed outflow correction",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(callbackFirstWinningRefund.providerOperationId);
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'processing', updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'queued'`,
+    [callbackFirstWinningRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'running', attempt_count = 1, updated_at = now()
+     WHERE id = $1 AND status = 'queued'`,
+    [callbackFirstWinningRefund.providerOperationId],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'manual', last_error = 'Synthetic callback controls this operation',
+         updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [callbackFirstWinningRefund.refundId],
+  );
+  const callbackFirstWinningSuccess = await submitRefundFact({
+    eventId: `refund-callback-first-winning-success:${randomUUID()}`,
+    providerOperationId: callbackFirstWinningRefund.providerOperationId,
+    refundId: callbackFirstWinningRefund.refundId,
+    externalRefundId: `mock-refund-callback-first-winning:${callbackFirstWinningRefund.refundId}`,
+    status: "succeeded",
+    amountMinor: callbackFirstFullCandidate.refundableMinor,
+    currency: "USD",
+    occurredAt: new Date(callbackFirstBaseTime + 2_000).toISOString(),
+  });
+  assert.equal(callbackFirstWinningSuccess.status, 202);
+  assert.equal(callbackFirstWinningSuccess.body.status, "succeeded");
+  const callbackFirstCorrectable = await request<{ items: RefundDismissalCorrection[] }>(
+    "/api/v1/admin/refund-dismissal-corrections",
+  );
+  const callbackFirstCorrection = callbackFirstCorrectable.items.find(
+    (item) => item.adjudicationId === callbackFirstDismissal.adjudicationId,
+  );
+  assert.ok(callbackFirstCorrection);
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  const callbackFirstCorrectionResult = await request<{
+    correctionId: string;
+    status: string;
+  }>(
+    `/api/v1/admin/refund-adjudications/${callbackFirstCorrection.adjudicationId}/corrections`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason:
+          "Synthetic later evidence confirms the first real outflow after the competing callback won",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: callbackFirstCorrection.refundVersion,
+      }),
+    },
+    201,
+  );
+  assert.equal(callbackFirstCorrectionResult.status, "dismissed_outflow_confirmed");
+  const callbackFirstIncidents = await request<{
+    items: RefundReceiptCapacityIncident[];
+  }>("/api/v1/admin/refund-receipt-capacity-incidents");
+  const callbackFirstIncident = callbackFirstIncidents.items.find(
+    (incident) =>
+      incident.source.type === "dismissal_correction" &&
+      incident.source.correctionId === callbackFirstCorrectionResult.correctionId,
+  );
+  assert.ok(callbackFirstIncident);
+  assert.equal(callbackFirstIncident.refundId, callbackFirstDismissedRefund.refundId);
+  assert.equal(callbackFirstIncident.receiptId, callbackFirstCandidate.receiptId);
+  assert.equal(callbackFirstIncident.receiptSequence, "1");
+  assert.equal(callbackFirstIncident.receiptAmountMinor, callbackFirstFullCandidate.refundableMinor);
+  assert.equal(callbackFirstIncident.overageMinor, "25");
+  assert.equal(
+    callbackFirstIncident.confirmedCompensationMinor,
+    (BigInt(callbackFirstFullCandidate.refundableMinor) + 25n).toString(),
+  );
+  const callbackFirstLedger = await corePool.query<{
+    settlements: string;
+    corrections: string;
+    incidents: string;
+    acknowledgements: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text
+        FROM refunds refund
+        JOIN refund_settlements settlement ON settlement.refund_id = refund.id
+        WHERE refund.source_fund_receipt_id = $1) AS settlements,
+       (SELECT count(*)::text
+        FROM refunds refund
+        JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+        JOIN refund_adjudication_corrections correction
+          ON correction.discrepancy_settlement_id = discrepancy.id
+        WHERE refund.source_fund_receipt_id = $1) AS corrections,
+       (SELECT count(*)::text FROM refund_receipt_capacity_incidents
+        WHERE source_fund_receipt_id = $1) AS incidents,
+       (SELECT count(*)::text
+        FROM refund_receipt_capacity_acknowledgements acknowledgement
+        JOIN refund_receipt_capacity_incidents incident
+          ON incident.id = acknowledgement.incident_id
+        WHERE incident.source_fund_receipt_id = $1) AS acknowledgements`,
+    [callbackFirstCandidate.receiptId],
+  );
+  assert.equal(callbackFirstLedger.rows[0]?.settlements, "1");
+  assert.equal(callbackFirstLedger.rows[0]?.corrections, "1");
+  assert.equal(callbackFirstLedger.rows[0]?.incidents, "1");
+  assert.equal(callbackFirstLedger.rows[0]?.acknowledgements, "0");
+  assert.equal(callbackFirstIncident.isCurrentSnapshot, true);
+  assert.equal(callbackFirstIncident.status, "awaiting_acknowledgement");
+  assert.equal(callbackFirstIncident.allowedAction, "acknowledge_manual_recovery");
+  const capacityFinancialSnapshot = async () => {
+    const snapshot = await corePool.query<{
+      settlements: string;
+      discrepancies: string;
+      corrections: string;
+      cash_credits: string;
+      credit_liability_credits: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::text
+          FROM refunds refund
+          JOIN refund_settlements settlement ON settlement.refund_id = refund.id
+          WHERE refund.source_fund_receipt_id = $1) AS settlements,
+         (SELECT count(*)::text
+          FROM refunds refund
+          JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+          WHERE refund.source_fund_receipt_id = $1) AS discrepancies,
+         (SELECT count(*)::text
+          FROM refunds refund
+          JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+          JOIN refund_adjudication_corrections correction
+            ON correction.discrepancy_settlement_id = discrepancy.id
+          WHERE refund.source_fund_receipt_id = $1) AS corrections,
+         COALESCE((
+           SELECT sum(line.credit_minor)::text
+           FROM ledger_journals journal
+           JOIN ledger_lines line ON line.journal_id = journal.id
+           WHERE line.account_code = 'mock_cash'
+             AND (
+               (journal.source_type = 'refund' AND EXISTS (
+                 SELECT 1
+                 FROM refunds refund
+                 WHERE refund.source_fund_receipt_id = $1
+                   AND refund.id = journal.source_id
+               ))
+               OR
+               (journal.source_type = 'refund_provider_discrepancy' AND EXISTS (
+                 SELECT 1
+                 FROM refunds refund
+                 JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+                 WHERE refund.source_fund_receipt_id = $1
+                   AND discrepancy.id = journal.source_id
+               ))
+               OR
+               (journal.source_type = 'refund_adjudication_correction' AND EXISTS (
+                 SELECT 1
+                 FROM refunds refund
+                 JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+                 JOIN refund_adjudication_corrections correction
+                   ON correction.discrepancy_settlement_id = discrepancy.id
+                 WHERE refund.source_fund_receipt_id = $1
+                   AND correction.id = journal.source_id
+               ))
+             )
+         ), '0') AS cash_credits,
+         COALESCE((
+           SELECT sum(line.credit_minor)::text
+           FROM ledger_journals journal
+           JOIN ledger_lines line ON line.journal_id = journal.id
+           WHERE line.account_code = 'client_credit_liability'
+             AND journal.source_type = 'refund'
+             AND EXISTS (
+               SELECT 1
+               FROM refunds refund
+               WHERE refund.source_fund_receipt_id = $1
+                 AND refund.id = journal.source_id
+             )
+         ), '0') AS credit_liability_credits`,
+      [callbackFirstCandidate.receiptId],
+    );
+    return snapshot.rows[0];
+  };
+  const beforeCapacityAcknowledgement = await capacityFinancialSnapshot();
+  const capacityAcknowledgementKey = randomUUID();
+  const capacityAcknowledgementBody = {
+    reason:
+      "Synthetic administrator owns the current receipt overage while recovery remains outstanding",
+    idempotencyKey: capacityAcknowledgementKey,
+    expectedConfirmedCompensationMinor:
+      callbackFirstIncident.confirmedCompensationMinor,
+    expectedOverageMinor: callbackFirstIncident.overageMinor,
+  };
+  const capacityAcknowledgement = await request<{
+    acknowledgementId: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
+    { method: "POST", body: JSON.stringify(capacityAcknowledgementBody) },
+    201,
+  );
+  assert.equal(capacityAcknowledgement.replayed, false);
+  const capacityAcknowledgementReplay = await request<{
+    acknowledgementId: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
+    { method: "POST", body: JSON.stringify(capacityAcknowledgementBody) },
+    200,
+  );
+  assert.equal(
+    capacityAcknowledgementReplay.acknowledgementId,
+    capacityAcknowledgement.acknowledgementId,
+  );
+  assert.equal(capacityAcknowledgementReplay.replayed, true);
+  const semanticCapacityReplay = await request<{
+    acknowledgementId: string;
+    replayed: boolean;
+  }>(
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...capacityAcknowledgementBody,
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    200,
+  );
+  assert.equal(
+    semanticCapacityReplay.acknowledgementId,
+    capacityAcknowledgement.acknowledgementId,
+  );
+  assert.equal(semanticCapacityReplay.replayed, true);
+  await request(
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...capacityAcknowledgementBody,
+        reason: "Synthetic conflicting reuse tries to change the acknowledged ownership decision",
+      }),
+    },
+    409,
+  );
+  const afterCapacityAcknowledgement = await capacityFinancialSnapshot();
+  assert.deepEqual(afterCapacityAcknowledgement, beforeCapacityAcknowledgement);
+  const incidentsAfterAcknowledgement = await request<{
+    items: RefundReceiptCapacityIncident[];
+  }>("/api/v1/admin/refund-receipt-capacity-incidents");
+  const acknowledgedFirstIncident = incidentsAfterAcknowledgement.items.find(
+    (incident) => incident.incidentId === callbackFirstIncident.incidentId,
+  );
+  assert.ok(acknowledgedFirstIncident);
+  assert.equal(acknowledgedFirstIncident.isCurrentSnapshot, true);
+  assert.equal(acknowledgedFirstIncident.status, "acknowledged_recovery_outstanding");
+  assert.equal(acknowledgedFirstIncident.acknowledgement?.recoveryOutstanding, true);
+  const laterUnexpectedExternalId =
+    `mock-refund-callback-first-later-unexpected:${callbackFirstWinningRefund.refundId}`;
+  const laterUnexpectedSuccess = await submitRefundFact({
+    eventId: `refund-callback-first-later-unexpected:${randomUUID()}`,
+    providerOperationId: callbackFirstWinningRefund.providerOperationId,
+    refundId: callbackFirstWinningRefund.refundId,
+    externalRefundId: laterUnexpectedExternalId,
+    status: "succeeded",
+    amountMinor: "7",
+    currency: "USD",
+    occurredAt: new Date(callbackFirstBaseTime + 3_000).toISOString(),
+  });
+  assert.equal(laterUnexpectedSuccess.status, 202);
+  assert.equal(laterUnexpectedSuccess.body.status, "succeeded");
+  assert.equal(laterUnexpectedSuccess.body.securityHold, true);
+  const laterUnexpectedHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const laterUnexpectedHold = laterUnexpectedHolds.items.find(
+    (hold) =>
+      hold.refundId === callbackFirstWinningRefund.refundId &&
+      hold.providerFact.externalRefundId === laterUnexpectedExternalId,
+  );
+  assert.ok(laterUnexpectedHold);
+  const laterUnexpectedAdjudication = await adjudicateRefundHold(
+    laterUnexpectedHold,
+    "record_unexpected_outflow",
+    "Synthetic administrator records a later real outflow after the first capacity incident",
+  );
+  const incidentsAfterLaterOutflow = await request<{
+    items: RefundReceiptCapacityIncident[];
+  }>("/api/v1/admin/refund-receipt-capacity-incidents");
+  const laterUnexpectedIncident = incidentsAfterLaterOutflow.items.find(
+    (incident) =>
+      incident.source.type === "unexpected_outflow_adjudication" &&
+      incident.source.adjudicationId === laterUnexpectedAdjudication.adjudicationId,
+  );
+  assert.ok(laterUnexpectedIncident);
+  assert.equal(laterUnexpectedIncident.overageMinor, "32");
+  assert.equal(laterUnexpectedIncident.receiptSequence, "2");
+  assert.equal(
+    laterUnexpectedIncident.confirmedCompensationMinor,
+    (BigInt(callbackFirstFullCandidate.refundableMinor) + 32n).toString(),
+  );
+  assert.equal(
+    incidentsAfterLaterOutflow.items.filter(
+      (incident) => incident.receiptId === callbackFirstCandidate.receiptId,
+    ).length,
+    2,
+  );
+  const supersededFirstIncident = incidentsAfterLaterOutflow.items.find(
+    (incident) => incident.incidentId === callbackFirstIncident.incidentId,
+  );
+  assert.ok(supersededFirstIncident);
+  assert.equal(supersededFirstIncident.isCurrentSnapshot, false);
+  assert.equal(supersededFirstIncident.status, "superseded_history");
+  assert.equal(supersededFirstIncident.allowedAction, null);
+  assert.equal(supersededFirstIncident.acknowledgement?.recoveryOutstanding, false);
+  assert.equal(laterUnexpectedIncident.isCurrentSnapshot, true);
+  assert.equal(laterUnexpectedIncident.status, "awaiting_acknowledgement");
+  assert.equal(laterUnexpectedIncident.allowedAction, "acknowledge_manual_recovery");
+  await request(
+    `/api/v1/admin/refund-receipt-capacity-incidents/${callbackFirstIncident.incidentId}/acknowledgements`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason: "Synthetic administrator must not acknowledge a superseded cumulative snapshot",
+        idempotencyKey: randomUUID(),
+        expectedConfirmedCompensationMinor:
+          callbackFirstIncident.confirmedCompensationMinor,
+        expectedOverageMinor: callbackFirstIncident.overageMinor,
+      }),
+    },
+    409,
+  );
+  await assert.rejects(
+    corePool.query(
+      `INSERT INTO refund_receipt_capacity_acknowledgements(
+         incident_id, staff_user_id, staff_session_id, reason, idempotency_key,
+         request_fingerprint, expected_confirmed_compensation_minor,
+         expected_overage_minor
+       )
+       SELECT incident_id, staff_user_id, staff_session_id,
+              'Synthetic direct acknowledgement must reject a superseded snapshot',
+              $2, $3, expected_confirmed_compensation_minor, expected_overage_minor
+       FROM refund_receipt_capacity_acknowledgements
+       WHERE id = $1`,
+      [capacityAcknowledgement.acknowledgementId, randomUUID(), randomUUID()],
+    ),
+    /current incident snapshot/i,
+  );
+  await assert.rejects(
+    corePool.query(
+      `INSERT INTO refund_receipt_capacity_incidents(
+         source_fund_receipt_id, receipt_sequence, triggering_correction_id,
+         confirmed_compensation_minor, receipt_amount_minor, overage_minor,
+         currency, reason
+       ) VALUES ($1, 4, $2, $3, $4, $5, 'USD',
+         'Synthetic non-monotonic receipt sequence must be rejected')`,
+      [
+        callbackFirstCandidate.receiptId,
+        callbackFirstCorrectionResult.correctionId,
+        laterUnexpectedIncident.confirmedCompensationMinor,
+        laterUnexpectedIncident.receiptAmountMinor,
+        laterUnexpectedIncident.overageMinor,
+      ],
+    ),
+    /current confirmed overage/i,
+  );
+  const wrongCurrencyExternalId =
+    `mock-refund-callback-first-wrong-currency:${callbackFirstWinningRefund.refundId}`;
+  const callbackFirstWrongCurrencySuccess = await submitRefundFact({
+    eventId: `refund-callback-first-wrong-currency:${randomUUID()}`,
+    providerOperationId: callbackFirstWinningRefund.providerOperationId,
+    refundId: callbackFirstWinningRefund.refundId,
+    externalRefundId: wrongCurrencyExternalId,
+    status: "succeeded",
+    amountMinor: "9",
+    currency: "EUR",
+    occurredAt: new Date(callbackFirstBaseTime + 4_000).toISOString(),
+  });
+  assert.equal(callbackFirstWrongCurrencySuccess.status, 202);
+  assert.equal(callbackFirstWrongCurrencySuccess.body.securityHold, true);
+  const callbackFirstWrongCurrencyHolds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const callbackFirstWrongCurrencyHold = callbackFirstWrongCurrencyHolds.items.find(
+    (hold) =>
+      hold.refundId === callbackFirstWinningRefund.refundId &&
+      hold.providerFact.externalRefundId === wrongCurrencyExternalId,
+  );
+  assert.ok(callbackFirstWrongCurrencyHold);
+  const callbackFirstWrongCurrencyDismissal = await adjudicateRefundHold(
+    callbackFirstWrongCurrencyHold,
+    "dismiss_provider_claim",
+    "Synthetic administrator initially dismisses the wrong-currency Provider outflow",
+  );
+  const callbackFirstWrongCurrencyCorrectable = await request<{
+    items: RefundDismissalCorrection[];
+  }>("/api/v1/admin/refund-dismissal-corrections");
+  const callbackFirstWrongCurrencyCorrection =
+    callbackFirstWrongCurrencyCorrectable.items.find(
+      (item) => item.adjudicationId === callbackFirstWrongCurrencyDismissal.adjudicationId,
+    );
+  assert.ok(callbackFirstWrongCurrencyCorrection);
+  await request(
+    "/api/v1/auth/reauth",
+    { method: "POST", body: JSON.stringify({ password }) },
+    200,
+  );
+  const callbackFirstWrongCurrencyCorrectionResult = await request<{
+    correctionId: string;
+    status: string;
+  }>(
+    `/api/v1/admin/refund-adjudications/${callbackFirstWrongCurrencyCorrection.adjudicationId}/corrections`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reason:
+          "Synthetic later evidence confirms EUR cash without consuming the USD receipt capacity",
+        idempotencyKey: randomUUID(),
+        expectedRefundVersion: callbackFirstWrongCurrencyCorrection.refundVersion,
+      }),
+    },
+    201,
+  );
+  assert.equal(
+    callbackFirstWrongCurrencyCorrectionResult.status,
+    "dismissed_outflow_confirmed",
+  );
+  const incidentsAfterWrongCurrencyCorrection = await request<{
+    items: RefundReceiptCapacityIncident[];
+  }>("/api/v1/admin/refund-receipt-capacity-incidents");
+  const callbackReceiptIncidentsAfterWrongCurrency =
+    incidentsAfterWrongCurrencyCorrection.items.filter(
+      (incident) => incident.receiptId === callbackFirstCandidate.receiptId,
+    );
+  assert.equal(callbackReceiptIncidentsAfterWrongCurrency.length, 2);
+  assert.equal(
+    callbackReceiptIncidentsAfterWrongCurrency.find(
+      (incident) => incident.isCurrentSnapshot,
+    )?.incidentId,
+    laterUnexpectedIncident.incidentId,
+  );
+  const wrongCurrencyCorrectionAccounting = await corePool.query<{
+    discrepancy_currency: string;
+    cash_credit: string;
+  }>(
+    `SELECT discrepancy.currency AS discrepancy_currency,
+            sum(line.credit_minor) FILTER (
+              WHERE line.account_code = 'mock_cash'
+            )::text AS cash_credit
+     FROM refund_adjudication_corrections correction
+     JOIN refund_discrepancy_settlements discrepancy
+       ON discrepancy.id = correction.discrepancy_settlement_id
+     JOIN ledger_journals journal
+       ON journal.source_type = 'refund_adjudication_correction'
+      AND journal.source_id = correction.id
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE correction.id = $1
+     GROUP BY discrepancy.currency`,
+    [callbackFirstWrongCurrencyCorrectionResult.correctionId],
+  );
+  assert.equal(wrongCurrencyCorrectionAccounting.rows[0]?.discrepancy_currency, "EUR");
+  assert.equal(wrongCurrencyCorrectionAccounting.rows[0]?.cash_credit, "9");
+  await assert.rejects(
+    corePool.query(
+      `INSERT INTO refund_receipt_capacity_incidents(
+         source_fund_receipt_id, receipt_sequence, triggering_correction_id,
+         confirmed_compensation_minor, receipt_amount_minor, overage_minor,
+         currency, reason
+       ) VALUES ($1, 3, $2, $3, $4, $5, 'USD',
+         'Synthetic EUR correction must not forge a USD receipt overage')`,
+      [
+        callbackFirstCandidate.receiptId,
+        callbackFirstWrongCurrencyCorrectionResult.correctionId,
+        laterUnexpectedIncident.confirmedCompensationMinor,
+        laterUnexpectedIncident.receiptAmountMinor,
+        laterUnexpectedIncident.overageMinor,
+      ],
+    ),
+    /must match its correction and receipt/i,
+  );
+} finally {
+  await dropRefundStartDelay();
+}
+
+assert.ok(originalSuccessRefund.providerOperationId);
+assert.ok(originalSuccessRefund.externalRefundId);
+const settledConflict = await submitRefundFact({
+  eventId: `refund-settled-conflict:${randomUUID()}`,
+  providerOperationId: originalSuccessRefund.providerOperationId,
+  refundId: originalSuccessRefund.refundId,
+  externalRefundId: `mock-refund-conflict:${originalSuccessRefund.refundId}`,
+  status: "failed",
+  amountMinor: "81",
+  currency: "EUR",
+  occurredAt: new Date(Date.now() + 20_000).toISOString(),
+});
+assert.equal(settledConflict.status, 202);
+assert.equal(settledConflict.body.status, "succeeded");
+assert.equal(settledConflict.body.securityHold, true);
+const settledConflictRecord = await request<RefundRecord>(
+  `/api/v1/admin/refunds/${originalSuccessRefund.refundId}`,
+);
+assert.equal(settledConflictRecord.status, "succeeded");
+assert.equal(settledConflictRecord.securityHold, true);
+assert.match(settledConflictRecord.securityHoldReason ?? "", /canonical settled refund/i);
+const settledConflictHolds = await request<{ items: RefundSecurityHold[] }>(
+  "/api/v1/admin/refund-security-holds",
+);
+const settledConflictHold = settledConflictHolds.items.find(
+  (hold) => hold.refundId === originalSuccessRefund.refundId,
+);
+assert.ok(settledConflictHold);
+assert.equal(settledConflictHold.discrepancy, null);
+assert.deepEqual(settledConflictHold.allowedDecisions, ["dismiss_provider_claim"]);
+await adjudicateRefundHold(
+  settledConflictHold,
+  "dismiss_provider_claim",
+  "Synthetic human dismissed a stale conflicting claim on a settled refund",
+);
+const settledAfterDismissal = await request<RefundRecord>(
+  `/api/v1/admin/refunds/${originalSuccessRefund.refundId}`,
+);
+assert.equal(settledAfterDismissal.status, "succeeded");
+assert.equal(settledAfterDismissal.securityHold, false);
+assert.equal(settledAfterDismissal.externalRefundId, originalSuccessRefund.externalRefundId);
+const settledConflictAccounting = await corePool.query<{
+  settlements: string;
+  discrepancy_settlements: string;
+  adjudication_journals: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM refund_settlements WHERE refund_id = $1) AS settlements,
+     (SELECT count(*)::text FROM refund_discrepancy_settlements WHERE refund_id = $1)
+       AS discrepancy_settlements,
+     (SELECT count(*)::text
+      FROM refund_security_hold_adjudications adjudication
+      JOIN ledger_journals journal
+        ON journal.source_type = 'refund_security_adjudication'
+       AND journal.source_id = adjudication.id
+      WHERE adjudication.refund_id = $1) AS adjudication_journals`,
+  [originalSuccessRefund.refundId],
+);
+assert.equal(settledConflictAccounting.rows[0]?.settlements, "1");
+assert.equal(settledConflictAccounting.rows[0]?.discrepancy_settlements, "0");
+assert.equal(settledConflictAccounting.rows[0]?.adjudication_journals, "0");
+
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const browserAdjudicationOrder = await createOrder(automaticPrice.id, legal);
+const paidBrowserAdjudicationOrder = await pay(browserAdjudicationOrder, "success");
+assert.equal(paidBrowserAdjudicationOrder.invoice.status, "paid");
+const browserAdjudicationCandidates = await request<{ items: RefundCandidate[] }>(
+  "/api/v1/admin/refund-candidates",
+);
+const browserAdjudicationCandidate = browserAdjudicationCandidates.items.find(
+  (candidate) => candidate.invoiceId === browserAdjudicationOrder.invoice.id,
+);
+assert.ok(browserAdjudicationCandidate);
+const browserFailedRefund = await request<RefundRecord>(
+  `/api/v1/admin/invoices/${browserAdjudicationOrder.invoice.id}/refunds`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      receiptId: browserAdjudicationCandidate.receiptId,
+      destination: "original_payment",
+      amountMode: "partial",
+      amountMinor: "35",
+      expectedRefundableMinor: browserAdjudicationCandidate.refundableMinor,
+      scenario: "failed",
+      reason: "Synthetic browser refund first fails before an exact late cash outflow",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+const browserInitiallyFailed = await waitFor(
+  "browser refund Provider to report a definitive failure",
+  () => request<RefundRecord>(`/api/v1/admin/refunds/${browserFailedRefund.refundId}`),
+  (refund) => refund.status === "failed",
+  35_000,
+);
+assert.ok(browserInitiallyFailed.providerOperationId);
+const browserAdjudicationConflict = await submitRefundFact({
+  eventId: `refund-browser-adjudication:${randomUUID()}`,
+  providerOperationId: browserInitiallyFailed.providerOperationId,
+  refundId: browserInitiallyFailed.refundId,
+  externalRefundId: `mock-refund-browser-outflow:${browserInitiallyFailed.refundId}`,
+  status: "succeeded",
+  amountMinor: "35",
+  currency: "USD",
+  occurredAt: new Date().toISOString(),
+});
+assert.equal(browserAdjudicationConflict.status, 202);
+assert.equal(browserAdjudicationConflict.body.securityHold, true);
+const browserAdjudicationHolds = await request<{ items: RefundSecurityHold[] }>(
+  "/api/v1/admin/refund-security-holds",
+);
+const browserAdjudicationHold = browserAdjudicationHolds.items.find(
+  (hold) => hold.refundId === browserInitiallyFailed.refundId,
+);
+assert.ok(browserAdjudicationHold, "the browser journey must receive a persisted cash hold");
+assert.ok(browserAdjudicationHold.discrepancy);
+assert.deepEqual(browserAdjudicationHold.allowedDecisions, [
+  "accept_authorized_outflow",
+  "record_unexpected_outflow",
+  "dismiss_provider_claim",
+]);
+
+async function createBrowserLateSuccessHold(input: {
+  authorizedAmountMinor: string;
+  reportedAmountMinor: string;
+  reportedCurrency: string;
+  label: string;
+}): Promise<RefundSecurityHold> {
+  const order = await createOrder(automaticPrice!.id, legal);
+  const paidOrder = await pay(order, "success");
+  assert.equal(paidOrder.invoice.status, "paid");
+  const candidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const candidate = candidates.items.find((item) => item.invoiceId === order.invoice.id);
+  assert.ok(candidate);
+  const failedRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${order.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: candidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: input.authorizedAmountMinor,
+        expectedRefundableMinor: candidate.refundableMinor,
+        scenario: "failed",
+        reason: `Synthetic browser ${input.label} first records a definitive Provider failure`,
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  const terminal = await waitFor(
+    `browser ${input.label} refund failure`,
+    () => request<RefundRecord>(`/api/v1/admin/refunds/${failedRefund.refundId}`),
+    (refund) => refund.status === "failed",
+    35_000,
+  );
+  assert.ok(terminal.providerOperationId);
+  const providerFact = await submitRefundFact({
+    eventId: `refund-browser-${input.label}:${randomUUID()}`,
+    providerOperationId: terminal.providerOperationId,
+    refundId: terminal.refundId,
+    externalRefundId: `mock-refund-browser-${input.label}:${terminal.refundId}`,
+    status: "succeeded",
+    amountMinor: input.reportedAmountMinor,
+    currency: input.reportedCurrency,
+    occurredAt: new Date().toISOString(),
+  });
+  assert.equal(providerFact.status, 202);
+  const holds = await request<{ items: RefundSecurityHold[] }>(
+    "/api/v1/admin/refund-security-holds",
+  );
+  const hold = holds.items.find((item) => item.refundId === terminal.refundId);
+  assert.ok(hold);
+  return hold;
+}
+
+const browserDismissalHold = await createBrowserLateSuccessHold({
+  authorizedAmountMinor: "31",
+  reportedAmountMinor: "31",
+  reportedCurrency: "USD",
+  label: "dismissal-correction",
+});
+assert.ok(browserDismissalHold.discrepancy);
+
+const browserUnexpectedHold = await createBrowserLateSuccessHold({
+  authorizedAmountMinor: "29",
+  reportedAmountMinor: "17",
+  reportedCurrency: "EUR",
+  label: "unexpected-outflow",
+});
+assert.equal(browserUnexpectedHold.discrepancy, null);
+
+await installRefundStartDelay();
+try {
+  const browserManualOrder = await createOrder(automaticPrice.id, legal);
+  const paidBrowserManualOrder = await pay(browserManualOrder, "success");
+  assert.equal(paidBrowserManualOrder.invoice.status, "paid");
+  const browserManualCandidates = await request<{ items: RefundCandidate[] }>(
+    "/api/v1/admin/refund-candidates",
+  );
+  const browserManualCandidate = browserManualCandidates.items.find(
+    (candidate) => candidate.invoiceId === browserManualOrder.invoice.id,
+  );
+  assert.ok(browserManualCandidate);
+  const browserManualRefund = await request<RefundRecord>(
+    `/api/v1/admin/invoices/${browserManualOrder.invoice.id}/refunds`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        receiptId: browserManualCandidate.receiptId,
+        destination: "original_payment",
+        amountMode: "partial",
+        amountMinor: "19",
+        expectedRefundableMinor: browserManualCandidate.refundableMinor,
+        scenario: "timeout_success",
+        reason: "Synthetic browser manual refund awaits a confirm-no-outflow decision",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(browserManualRefund.providerOperationId);
+  await corePool.query(
+    `UPDATE refunds SET status = 'processing', version = version + 1, updated_at = now()
+     WHERE id = $1 AND status = 'queued'`,
+    [browserManualRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE refunds SET status = 'unknown', version = version + 1, updated_at = now()
+     WHERE id = $1 AND status = 'processing'`,
+    [browserManualRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE refunds
+     SET status = 'manual', last_error = 'Synthetic exhausted query for browser confirmation',
+         version = version + 1, updated_at = now()
+     WHERE id = $1 AND status = 'unknown'`,
+    [browserManualRefund.refundId],
+  );
+  await corePool.query(
+    `UPDATE provider_operations
+     SET status = 'unknown', attempt_count = 1,
+         last_error = 'Synthetic exhausted query for browser confirmation', updated_at = now()
+     WHERE id = $1`,
+    [browserManualRefund.providerOperationId],
+  );
+  await corePool.query(
+    `UPDATE durable_jobs
+     SET status = 'manual', attempts = 8,
+         last_error = 'Synthetic exhausted query for browser confirmation', updated_at = now()
+     WHERE job_type = 'refund.start' AND payload->>'refundId' = $1`,
+    [browserManualRefund.refundId],
+  );
+} finally {
+  await dropRefundStartDelay();
 }
 
 const unbalancedJournals = await corePool.query<{ count: string }>(

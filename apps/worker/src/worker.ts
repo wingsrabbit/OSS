@@ -41,6 +41,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
+const REQUIRED_SCHEMA_VERSION = "009_stage_b_refund_capacity_incidents";
 
 type Job = {
   id: string;
@@ -100,7 +101,11 @@ async function manualJobWithClient(
 
 async function enqueueReconcileWithClient(
   client: DatabaseClient,
-  jobType: "payment.reconcile" | "add_funds.reconcile" | "provision.reconcile",
+  jobType:
+    | "payment.reconcile"
+    | "add_funds.reconcile"
+    | "provision.reconcile"
+    | "refund.reconcile",
   uniqueKey: string,
   payload: Record<string, string>,
   delaySeconds: number,
@@ -132,6 +137,7 @@ async function recoverStaleJobs(): Promise<number> {
        FROM durable_jobs
        WHERE status = 'running'
          AND locked_at < now() - make_interval(secs => $1)
+         AND job_type NOT IN ('refund.start', 'refund.reconcile')
        ORDER BY locked_at, created_at
        LIMIT 50
        FOR UPDATE SKIP LOCKED`,
@@ -298,6 +304,230 @@ async function recoverStaleJobs(): Promise<number> {
     }
     return result.rowCount ?? 0;
   });
+}
+
+async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
+  const refundId = candidate.payload.refundId;
+  const operationId = candidate.payload.operationId ?? candidate.payload.providerOperationId;
+  if (!refundId || !operationId) {
+    return transaction(async (client) => {
+      const locked = await client.query(
+        `SELECT id
+         FROM durable_jobs
+         WHERE id = $1
+           AND status = 'running'
+           AND locked_at < now() - make_interval(secs => $2)
+         FOR UPDATE`,
+        [candidate.id, config.JOB_LOCK_TIMEOUT_SECONDS],
+      );
+      if (locked.rowCount !== 1) return false;
+      await manualJobWithClient(
+        client,
+        candidate.id,
+        "stale refund job has an invalid payload; manual inspection required",
+      );
+      return true;
+    });
+  }
+
+  return transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `refund:${refundId}`,
+    ]);
+    const pointer = await client.query<{ source_fund_receipt_id: string }>(
+      "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
+      [refundId],
+    );
+    const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+    if (receiptId) {
+      await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+    }
+    const state = await client.query<{
+      refund_status: string;
+      operation_status: string;
+      attempt_count: number;
+    }>(
+      `SELECT
+         refund.status AS refund_status,
+         operation.status AS operation_status,
+         operation.attempt_count
+       FROM refunds refund
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'refund'
+        AND operation.subject_id = refund.id
+        AND operation.kind = 'refund_create'
+       WHERE refund.id = $1
+       FOR UPDATE OF refund, operation`,
+      [refundId, operationId],
+    );
+    const currentJob = await client.query<Job>(
+      `SELECT id, job_type, unique_key, payload, attempts
+       FROM durable_jobs
+       WHERE id = $1
+         AND status = 'running'
+         AND locked_at < now() - make_interval(secs => $2)
+       FOR UPDATE`,
+      [candidate.id, config.JOB_LOCK_TIMEOUT_SECONDS],
+    );
+    const job = currentJob.rows[0];
+    if (!job) return false;
+    const record = state.rows[0];
+    if (!receiptId || !record) {
+      await manualJobWithClient(
+        client,
+        job.id,
+        !receiptId
+          ? "stale refund job references a missing refund"
+          : "stale refund job references a mismatched Provider operation",
+      );
+      return true;
+    }
+    if (
+      record.refund_status === "succeeded" ||
+      record.refund_status === "failed" ||
+      record.operation_status === "succeeded" ||
+      record.operation_status === "failed"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return true;
+    }
+    if (job.job_type === "refund.reconcile") {
+      const manual = job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
+      if (manual) {
+        const reason =
+          "refund reconciliation exhausted after a stale worker lock; human review is required";
+        const changed = await client.query(
+          `UPDATE refunds
+           SET status = 'manual', last_error = $2,
+               result = result || $3::jsonb,
+               updated_at = now(), version = version + 1
+           WHERE id = $1
+             AND status IN ('queued', 'processing', 'unknown')
+             AND security_hold = false`,
+          [refundId, reason, JSON.stringify({ reconciliationExhausted: true })],
+        );
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'unknown', last_error = $2, updated_at = now()
+           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+          [operationId, reason],
+        );
+        if ((changed.rowCount ?? 0) > 0) {
+          await client.query(
+            `INSERT INTO refund_events(
+               refund_id, event_type, actor_type, actor_id, reason, metadata
+             ) VALUES ($1, 'manual', 'system', $2, $3, $4)`,
+            [
+              refundId,
+              config.WORKER_ID,
+              reason,
+              { providerOperationId: operationId, reconciliationExhausted: true },
+            ],
+          );
+          await client.query(
+            `INSERT INTO audit_events(
+               actor_type, actor_id, action, target_type, target_id, reason, metadata
+             ) VALUES ('system', $1, 'refund.reconciliation_exhausted', 'refund', $2, $3, $4)`,
+            [
+              config.WORKER_ID,
+              refundId,
+              reason,
+              { providerOperationId: operationId, attempts: job.attempts },
+            ],
+          );
+        }
+        await manualJobWithClient(client, job.id, reason);
+        return true;
+      }
+      await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending',
+             available_at = now() + make_interval(secs => $2),
+             locked_at = NULL,
+             locked_by = NULL,
+             last_error = 'worker lock expired during refund reconciliation; safe GET may resume',
+             updated_at = now()
+         WHERE id = $1`,
+        [job.id, reconcileDelaySeconds(job.attempts)],
+      );
+      return true;
+    }
+    if (record.operation_status === "queued" && record.attempt_count === 0) {
+      const manual = job.attempts >= config.MAX_JOB_ATTEMPTS;
+      if (manual) {
+        await failKnownUnsentRefund(
+          client,
+          job,
+          refundId,
+          operationId,
+          "refund create never began before stale-lock retry exhaustion; no Provider outflow was sent",
+        );
+        return true;
+      }
+      await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending',
+             available_at = now() + make_interval(secs => $2),
+             locked_at = NULL,
+             locked_by = NULL,
+             last_error = 'worker lock expired before refund create began',
+             updated_at = now()
+         WHERE id = $1`,
+        [job.id, reconcileDelaySeconds(job.attempts)],
+      );
+      return true;
+    }
+
+    const reason =
+      "worker lock expired after a possible refund request; reconciliation required";
+    await client.query(
+      `UPDATE refunds
+       SET status = 'unknown', last_error = $2,
+           updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = 'processing'`,
+      [refundId, reason],
+    );
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [operationId, reason],
+    );
+    await client.query(
+      `INSERT INTO refund_events(
+         refund_id, event_type, actor_type, actor_id, reason, metadata
+       ) VALUES ($1, 'unknown', 'system', $2, $3, $4)`,
+      [refundId, config.WORKER_ID, reason, { providerOperationId: operationId }],
+    );
+    await enqueueReconcileWithClient(
+      client,
+      "refund.reconcile",
+      job.unique_key,
+      { ...job.payload, operationId },
+      config.RECONCILE_BASE_DELAY_SECONDS,
+    );
+    await completeJobWithClient(client, job.id);
+    return true;
+  });
+}
+
+async function recoverStaleRefundJobs(): Promise<number> {
+  const candidates = await pool.query<Job>(
+    `SELECT id, job_type, unique_key, payload, attempts
+     FROM durable_jobs
+     WHERE status = 'running'
+       AND job_type IN ('refund.start', 'refund.reconcile')
+       AND locked_at < now() - make_interval(secs => $1)
+     ORDER BY locked_at, created_at
+     LIMIT 50`,
+    [config.JOB_LOCK_TIMEOUT_SECONDS],
+  );
+  let recovered = 0;
+  for (const candidate of candidates.rows) {
+    if (await recoverOneStaleRefundJob(candidate)) recovered += 1;
+  }
+  return recovered;
 }
 
 async function claimJob(): Promise<Job | null> {
@@ -1198,7 +1428,11 @@ async function preflightProvision(
 async function finishStartWithWatchdog(
   job: Job,
   operationId: string,
-  reconcileType: "payment.reconcile" | "add_funds.reconcile" | "provision.reconcile",
+  reconcileType:
+    | "payment.reconcile"
+    | "add_funds.reconcile"
+    | "provision.reconcile"
+    | "refund.reconcile",
 ): Promise<void> {
   await transaction(async (client) => {
     const operation = await client.query<{ status: string }>(
@@ -1851,6 +2085,625 @@ async function preflightAddFunds(
   });
 }
 
+type RefundCall = {
+  originalExternalPaymentId: string;
+  amountMinor: string;
+  currency: string;
+  scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order";
+};
+
+async function failKnownUnsentRefund(
+  client: DatabaseClient,
+  job: Job,
+  refundId: string,
+  operationId: string,
+  reason: string,
+): Promise<void> {
+  await client.query(
+    `UPDATE refunds
+     SET status = 'failed', last_error = $2, result = result || $3::jsonb,
+         updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'queued'`,
+    [refundId, reason.slice(0, 1_000), JSON.stringify({ knownUnsent: true })],
+  );
+  await client.query(
+    `UPDATE provider_operations
+     SET status = 'failed', last_error = $2, updated_at = now()
+     WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+    [operationId, reason.slice(0, 1_000)],
+  );
+  await client.query(
+    `INSERT INTO refund_events(
+       refund_id, event_type, actor_type, actor_id, reason, metadata
+     ) VALUES ($1, 'failed', 'system', $2, $3, $4)`,
+    [
+      refundId,
+      config.WORKER_ID,
+      reason.slice(0, 1_000),
+      { providerOperationId: operationId, knownUnsent: true },
+    ],
+  );
+  await client.query(
+    `INSERT INTO audit_events(
+       actor_type, actor_id, action, target_type, target_id, reason, metadata
+     ) VALUES ('system', $1, 'refund.known_unsent_rejected', 'refund', $2, $3, $4)`,
+    [
+      config.WORKER_ID,
+      refundId,
+      reason.slice(0, 1_000),
+      { providerOperationId: operationId },
+    ],
+  );
+  await completeJobWithClient(client, job.id);
+}
+
+async function preflightRefund(
+  job: Job,
+  refundId: string,
+  operationId: string,
+  mode: "start" | "reconcile",
+): Promise<PreflightResult<RefundCall>> {
+  return transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `refund:${refundId}`,
+    ]);
+    const pointer = await client.query<{
+      source_fund_receipt_id: string;
+      requested_by_user_id: string;
+      requested_session_id: string;
+      requested_client_account_id: string;
+    }>(
+      `SELECT
+         source_fund_receipt_id,
+         requested_by_user_id,
+         requested_session_id,
+         requested_client_account_id
+       FROM refunds
+       WHERE id = $1`,
+      [refundId],
+    );
+    const initial = pointer.rows[0];
+    if (!initial) {
+      await manualJobWithClient(client, job.id, "refund job references a missing refund");
+      return { kind: "halted" };
+    }
+    let authorizationValid = true;
+    if (mode === "start") {
+      const authorization = await client.query(
+        `SELECT 1
+         FROM users user_record
+         JOIN staff_members staff ON staff.user_id = user_record.id
+         JOIN sessions session_record
+           ON session_record.id = $2
+          AND session_record.user_id = user_record.id
+         JOIN client_memberships membership
+           ON membership.user_id = user_record.id
+          AND membership.client_account_id = $3
+          AND membership.removed_at IS NULL
+         JOIN client_accounts account
+           ON account.id = membership.client_account_id
+         JOIN reauth_grants reauth
+           ON reauth.user_id = user_record.id
+          AND reauth.session_id = session_record.id
+          AND reauth.invalidated_at IS NULL
+          AND reauth.expires_at > now()
+         WHERE user_record.id = $1
+           AND user_record.email_verified_at IS NOT NULL
+           AND user_record.restricted_at IS NULL
+           AND account.restricted_at IS NULL
+           AND staff.active
+           AND (staff.permissions ? '*' OR staff.permissions ? 'billing.refund_manage')
+           AND session_record.revoked_at IS NULL
+           AND session_record.expires_at > now()
+         LIMIT 1
+         FOR UPDATE OF user_record, staff, session_record, membership, account, reauth`,
+        [
+          initial.requested_by_user_id,
+          initial.requested_session_id,
+          initial.requested_client_account_id,
+        ],
+      );
+      authorizationValid = authorization.rowCount === 1;
+    }
+    const receiptId = initial.source_fund_receipt_id;
+    await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+    const result = await client.query<{
+      id: string;
+      status: string;
+      source_fund_receipt_id: string;
+      provider_installation_id: string;
+      original_external_payment_id: string;
+      amount_minor: string;
+      currency: string;
+      scenario: RefundCall["scenario"];
+      requested_by_user_id: string;
+      requested_session_id: string;
+      receipt_provider_installation_id: string;
+      receipt_external_payment_id: string;
+      receipt_amount_minor: string;
+      receipt_currency: string;
+      operation_status: string;
+      operation_attempt_count: number;
+      operation_provider_installation_id: string;
+      operation_subject_id: string;
+      operation_kind: string;
+    }>(
+      `SELECT
+         refund.id,
+         refund.status,
+         refund.source_fund_receipt_id,
+         refund.provider_installation_id,
+         refund.original_external_payment_id,
+         refund.amount_minor::text,
+         refund.currency,
+         refund.scenario,
+         refund.requested_by_user_id,
+         refund.requested_session_id,
+         receipt.provider_installation_id AS receipt_provider_installation_id,
+         receipt.external_payment_id AS receipt_external_payment_id,
+         receipt.amount_minor::text AS receipt_amount_minor,
+         receipt.currency AS receipt_currency,
+         operation.status AS operation_status,
+         operation.attempt_count AS operation_attempt_count,
+         operation.provider_installation_id AS operation_provider_installation_id,
+         operation.subject_id AS operation_subject_id,
+         operation.kind AS operation_kind
+       FROM refunds refund
+       JOIN fund_receipts receipt ON receipt.id = refund.source_fund_receipt_id
+       JOIN provider_operations operation ON operation.id = $2
+       WHERE refund.id = $1
+       FOR UPDATE OF refund, operation`,
+      [refundId, operationId],
+    );
+    const refund = result.rows[0];
+    if (
+      !refund ||
+      refund.operation_subject_id !== refundId ||
+      refund.operation_kind !== "refund_create" ||
+      refund.provider_installation_id !== "mock-payment-v1" ||
+      refund.operation_provider_installation_id !== refund.provider_installation_id ||
+      refund.receipt_provider_installation_id !== refund.provider_installation_id ||
+      refund.receipt_external_payment_id !== refund.original_external_payment_id ||
+      refund.receipt_currency !== refund.currency ||
+      BigInt(refund.amount_minor) <= 0n ||
+      BigInt(refund.amount_minor) > BigInt(refund.receipt_amount_minor)
+    ) {
+      if (mode === "start" && refund?.operation_status === "queued") {
+        await failKnownUnsentRefund(
+          client,
+          job,
+          refundId,
+          operationId,
+          "Refund snapshot or Provider ownership is invalid before Provider create",
+        );
+      } else {
+        await manualJobWithClient(
+          client,
+          job.id,
+          "Refund snapshot or Provider ownership is invalid during reconciliation",
+        );
+      }
+      return { kind: "halted" };
+    }
+
+    if (
+      refund.status === "succeeded" ||
+      refund.status === "failed" ||
+      refund.operation_status === "succeeded" ||
+      refund.operation_status === "failed"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return { kind: "halted" };
+    }
+    if (mode === "reconcile") {
+      if (refund.operation_attempt_count === 0) {
+        await manualJobWithClient(
+          client,
+          job.id,
+          "Refund reconciliation cannot run before the Provider create attempt",
+        );
+        return { kind: "halted" };
+      }
+      return {
+        kind: "call",
+        value: {
+          originalExternalPaymentId: refund.original_external_payment_id,
+          amountMinor: refund.amount_minor,
+          currency: refund.currency,
+          scenario: refund.scenario,
+        },
+      };
+    }
+
+    if (
+      refund.status !== "queued" ||
+      refund.operation_status !== "queued" ||
+      refund.operation_attempt_count !== 0
+    ) {
+      await manualJobWithClient(
+        client,
+        job.id,
+        "Refund create was already attempted; reconciliation is required instead of replay",
+      );
+      return { kind: "halted" };
+    }
+    const capacity = await client.query<{ reserved_other_minor: string }>(
+      `SELECT
+         CASE
+           WHEN EXISTS (
+             SELECT 1
+             FROM refund_receipt_security_holds security_hold
+             WHERE security_hold.source_fund_receipt_id = receipt.id
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM refund_security_hold_adjudications adjudication
+                 WHERE adjudication.receipt_security_hold_id = security_hold.id
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM refunds competing_manual
+             WHERE competing_manual.source_fund_receipt_id = receipt.id
+               AND competing_manual.id <> $2
+               AND competing_manual.status = 'manual'
+           )
+           THEN receipt.amount_minor
+           ELSE COALESCE((
+             SELECT sum(reserved_outflow.amount_minor)
+             FROM (
+               SELECT competing.amount_minor
+               FROM refunds competing
+               WHERE competing.source_fund_receipt_id = receipt.id
+                 AND competing.id <> $2
+                 AND competing.status IN ('queued', 'processing', 'unknown', 'succeeded')
+               UNION ALL
+               SELECT discrepancy.amount_minor
+               FROM refunds unexpected_refund
+               JOIN refund_discrepancy_settlements discrepancy
+                 ON discrepancy.refund_id = unexpected_refund.id
+               JOIN refund_security_hold_adjudications adjudication
+                 ON adjudication.discrepancy_settlement_id = discrepancy.id
+                AND adjudication.decision = 'record_unexpected_outflow'
+               WHERE unexpected_refund.source_fund_receipt_id = receipt.id
+                 AND discrepancy.currency = receipt.currency
+               UNION ALL
+               SELECT corrected_discrepancy.amount_minor
+               FROM refunds corrected_refund
+               JOIN refund_discrepancy_settlements corrected_discrepancy
+                 ON corrected_discrepancy.refund_id = corrected_refund.id
+               JOIN refund_adjudication_corrections correction
+                 ON correction.discrepancy_settlement_id = corrected_discrepancy.id
+               WHERE corrected_refund.source_fund_receipt_id = receipt.id
+                 AND corrected_discrepancy.currency = receipt.currency
+             ) reserved_outflow
+           ), 0)
+         END::text AS reserved_other_minor
+       FROM fund_receipts receipt
+       WHERE receipt.id = $1`,
+      [receiptId, refundId],
+    );
+    const reservedOtherMinor = capacity.rows[0]?.reserved_other_minor;
+    if (
+      reservedOtherMinor === undefined ||
+      BigInt(reservedOtherMinor) + BigInt(refund.amount_minor) >
+        BigInt(refund.receipt_amount_minor)
+    ) {
+      await failKnownUnsentRefund(
+        client,
+        job,
+        refundId,
+        operationId,
+        "Refund capacity changed before Provider create; request stopped without an external side effect",
+      );
+      return { kind: "halted" };
+    }
+    if (!authorizationValid) {
+      await failKnownUnsentRefund(
+        client,
+        job,
+        refundId,
+        operationId,
+        "Staff authorization or password confirmation was revoked before refund left Core",
+      );
+      return { kind: "halted" };
+    }
+
+    await client.query(
+      `UPDATE refunds
+       SET status = 'processing', last_error = NULL,
+           updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = 'queued'`,
+      [refundId],
+    );
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = attempt_count + 1,
+           last_error = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+      [operationId],
+    );
+    await client.query(
+      `INSERT INTO refund_events(
+         refund_id, event_type, actor_type, actor_id, reason, metadata
+       ) VALUES ($1, 'processing', 'system', $2, $3, $4)`,
+      [
+        refundId,
+        config.WORKER_ID,
+        "Refund request sent to the approved Mock Payment Provider",
+        { providerOperationId: operationId },
+      ],
+    );
+    return {
+      kind: "call",
+      value: {
+        originalExternalPaymentId: refund.original_external_payment_id,
+        amountMinor: refund.amount_minor,
+        currency: refund.currency,
+        scenario: refund.scenario,
+      },
+    };
+  });
+}
+
+async function markRefundUnknown(
+  job: Job,
+  refundId: string,
+  operationId: string,
+  reason: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `refund:${refundId}`,
+    ]);
+    const pointer = await client.query<{ source_fund_receipt_id: string }>(
+      "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
+      [refundId],
+    );
+    const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+    if (!receiptId) throw new Error("Refund disappeared while marking an unknown result");
+    await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+    const state = await client.query<{
+      refund_status: string;
+      operation_status: string;
+    }>(
+      `SELECT
+         refund.status AS refund_status,
+         operation.status AS operation_status
+       FROM refunds refund
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'refund'
+        AND operation.subject_id = refund.id
+        AND operation.kind = 'refund_create'
+       WHERE refund.id = $1
+       FOR UPDATE OF refund, operation`,
+      [refundId, operationId],
+    );
+    const current = state.rows[0];
+    if (
+      !current ||
+      current.refund_status === "succeeded" ||
+      current.refund_status === "failed" ||
+      current.operation_status === "succeeded" ||
+      current.operation_status === "failed"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return;
+    }
+    await client.query(
+      `UPDATE refunds
+       SET status = 'unknown', last_error = $2,
+           updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = 'processing'`,
+      [refundId, reason.slice(0, 1_000)],
+    );
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [operationId, reason.slice(0, 1_000)],
+    );
+    await client.query(
+      `INSERT INTO refund_events(
+         refund_id, event_type, actor_type, actor_id, reason, metadata
+       ) VALUES ($1, 'unknown', 'system', $2, $3, $4)`,
+      [
+        refundId,
+        config.WORKER_ID,
+        reason.slice(0, 1_000),
+        { providerOperationId: operationId },
+      ],
+    );
+    await enqueueReconcileWithClient(
+      client,
+      "refund.reconcile",
+      job.unique_key,
+      { ...job.payload, operationId },
+      config.RECONCILE_BASE_DELAY_SECONDS,
+    );
+    await completeJobWithClient(client, job.id);
+  });
+}
+
+async function finishRefundStartWithWatchdog(
+  job: Job,
+  refundId: string,
+  operationId: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `refund:${refundId}`,
+    ]);
+    const pointer = await client.query<{ source_fund_receipt_id: string }>(
+      "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
+      [refundId],
+    );
+    const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+    if (!receiptId) {
+      await manualJobWithClient(client, job.id, "Refund disappeared after Provider create");
+      return;
+    }
+    await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+    const state = await client.query<{ refund_status: string; operation_status: string }>(
+      `SELECT
+         refund.status AS refund_status,
+         operation.status AS operation_status
+       FROM refunds refund
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'refund'
+        AND operation.subject_id = refund.id
+        AND operation.kind = 'refund_create'
+       WHERE refund.id = $1
+       FOR UPDATE OF refund, operation`,
+      [refundId, operationId],
+    );
+    const current = state.rows[0];
+    if (
+      current &&
+      current.refund_status !== "succeeded" &&
+      current.refund_status !== "failed" &&
+      current.operation_status !== "succeeded" &&
+      current.operation_status !== "failed"
+    ) {
+      await enqueueReconcileWithClient(
+        client,
+        "refund.reconcile",
+        job.unique_key,
+        { ...job.payload, operationId },
+        config.WATCHDOG_DELAY_SECONDS,
+      );
+    }
+    await completeJobWithClient(client, job.id);
+  });
+}
+
+async function startRefund(job: Job): Promise<void> {
+  const refundId = job.payload.refundId;
+  const operationId = job.payload.providerOperationId;
+  if (!refundId || !operationId) throw new Error("Invalid refund.start payload");
+  const preflight = await preflightRefund(job, refundId, operationId, "start");
+  if (preflight.kind === "halted") return;
+  const callbackCapability = providerOperationCapability(
+    config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+    "mock-payment-v1",
+    operationId,
+  );
+  try {
+    const response = await providerRequest(
+      config.MOCK_PAYMENT_PROVIDER_URL,
+      config.MOCK_PAYMENT_PROVIDER_TOKEN,
+      "/v1/refunds",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": operationId },
+        body: JSON.stringify({
+          operationId,
+          refundId,
+          callbackCapability,
+          originalExternalPaymentId: preflight.value.originalExternalPaymentId,
+          amountMinor: preflight.value.amountMinor,
+          currency: preflight.value.currency,
+          scenario: preflight.value.scenario,
+        }),
+      },
+    );
+    if (!response.ok) {
+      if (
+        response.status === 408 ||
+        response.status === 409 ||
+        response.status === 425 ||
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        await markRefundUnknown(
+          job,
+          refundId,
+          operationId,
+          `Refund create returned ambiguous HTTP ${response.status}; reconciliation required`,
+        );
+        return;
+      }
+      await transaction(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `refund:${refundId}`,
+        ]);
+        const pointer = await client.query<{ source_fund_receipt_id: string }>(
+          "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
+          [refundId],
+        );
+        const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+        if (receiptId) {
+          await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+        }
+        const current = await client.query<{
+          refund_status: string;
+          operation_status: string;
+        }>(
+          `SELECT
+             refund.status AS refund_status,
+             operation.status AS operation_status
+           FROM refunds refund
+           JOIN provider_operations operation
+             ON operation.id = $2
+            AND operation.subject_type = 'refund'
+            AND operation.subject_id = refund.id
+            AND operation.kind = 'refund_create'
+           WHERE refund.id = $1
+           FOR UPDATE OF refund, operation`,
+          [refundId, operationId],
+        );
+        const terminal = current.rows[0];
+        if (
+          !terminal ||
+          terminal.refund_status === "succeeded" ||
+          terminal.refund_status === "failed" ||
+          terminal.operation_status === "succeeded" ||
+          terminal.operation_status === "failed"
+        ) {
+          await completeJobWithClient(client, job.id);
+          return;
+        }
+        await client.query(
+          `UPDATE refunds
+           SET status = 'failed', last_error = $2,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'processing'`,
+          [refundId, `Provider definitively rejected refund with HTTP ${response.status}`],
+        );
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed', last_error = $2, updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [operationId, `Provider definitively rejected refund with HTTP ${response.status}`],
+        );
+        await client.query(
+          `INSERT INTO refund_events(
+             refund_id, event_type, actor_type, actor_id, reason, metadata
+           ) VALUES ($1, 'failed', 'system', $2, $3, $4)`,
+          [
+            refundId,
+            config.WORKER_ID,
+            "Provider definitively rejected refund before settlement",
+            { providerOperationId: operationId, httpStatus: response.status },
+          ],
+        );
+        await completeJobWithClient(client, job.id);
+      });
+      return;
+    }
+    await finishRefundStartWithWatchdog(job, refundId, operationId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await markRefundUnknown(
+      job,
+      refundId,
+      operationId,
+      `Refund create transport result is unknown (${message}); reconciliation required`,
+    );
+  }
+}
+
 async function startAddFunds(job: Job): Promise<void> {
   const addFundsAttemptId = job.payload.addFundsAttemptId;
   const providerOperationId = job.payload.providerOperationId;
@@ -2320,6 +3173,230 @@ async function manualProvisionReconcile(
   });
 }
 
+async function delayRefundReconcile(
+  job: Job,
+  refundId: string,
+  operationId: string,
+  reason: string,
+  forceManual = false,
+): Promise<void> {
+  await transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `refund:${refundId}`,
+    ]);
+    const pointer = await client.query<{ source_fund_receipt_id: string }>(
+      "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
+      [refundId],
+    );
+    const receiptId = pointer.rows[0]?.source_fund_receipt_id;
+    if (!receiptId) {
+      await manualJobWithClient(client, job.id, "Refund disappeared during reconciliation");
+      return;
+    }
+    await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
+    const state = await client.query<{
+      refund_status: string;
+      operation_status: string;
+    }>(
+      `SELECT
+         refund.status AS refund_status,
+         operation.status AS operation_status
+       FROM refunds refund
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'refund'
+        AND operation.subject_id = refund.id
+        AND operation.kind = 'refund_create'
+       WHERE refund.id = $1
+       FOR UPDATE OF refund, operation`,
+      [refundId, operationId],
+    );
+    const current = state.rows[0];
+    if (
+      !current ||
+      current.refund_status === "succeeded" ||
+      current.refund_status === "failed" ||
+      current.operation_status === "succeeded" ||
+      current.operation_status === "failed"
+    ) {
+      await completeJobWithClient(client, job.id);
+      return;
+    }
+    const manual = forceManual || job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
+    if (manual) {
+      await client.query(
+        `UPDATE refunds
+         SET status = 'manual', last_error = $2,
+             updated_at = now(), version = version + 1
+         WHERE id = $1 AND status IN ('processing', 'unknown', 'manual')`,
+        [refundId, reason.slice(0, 1_000)],
+      );
+      await client.query(
+        `INSERT INTO refund_events(
+           refund_id, event_type, actor_type, actor_id, reason, metadata
+         ) VALUES ($1, 'manual', 'system', $2, $3, $4)`,
+        [
+          refundId,
+          config.WORKER_ID,
+          reason.slice(0, 1_000),
+          { providerOperationId: operationId },
+        ],
+      );
+    }
+    await client.query(
+      `UPDATE provider_operations
+       SET last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [operationId, reason.slice(0, 1_000)],
+    );
+    await client.query(
+      `UPDATE durable_jobs
+       SET status = $2,
+           available_at = CASE
+             WHEN $2 = 'pending' THEN now() + make_interval(secs => $3)
+             ELSE available_at
+           END,
+           locked_at = NULL,
+           locked_by = NULL,
+           last_error = $4,
+           updated_at = now()
+       WHERE id = $1`,
+      [
+        job.id,
+        manual ? "manual" : "pending",
+        reconcileDelaySeconds(job.attempts),
+        reason.slice(0, 1_000),
+      ],
+    );
+  });
+}
+
+async function reconcileRefund(job: Job): Promise<void> {
+  const refundId = job.payload.refundId;
+  const operationId = job.payload.operationId ?? job.payload.providerOperationId;
+  if (!refundId || !operationId) throw new Error("Invalid refund.reconcile payload");
+  const preflight = await preflightRefund(job, refundId, operationId, "reconcile");
+  if (preflight.kind === "halted") return;
+
+  let response: Response;
+  try {
+    response = await providerRequest(
+      config.MOCK_PAYMENT_PROVIDER_URL,
+      config.MOCK_PAYMENT_PROVIDER_TOKEN,
+      `/v1/refunds/${encodeURIComponent(operationId)}`,
+      { method: "GET" },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      `Refund reconciliation transport failed: ${message}`,
+    );
+    return;
+  }
+  if (response.status === 404 || response.status === 408 || response.status === 425) {
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      `Refund operation is not terminal at Provider (HTTP ${response.status})`,
+    );
+    return;
+  }
+  if (response.status === 429 || response.status >= 500) {
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      `Refund reconciliation is temporarily unavailable (HTTP ${response.status})`,
+    );
+    return;
+  }
+  if (!response.ok) {
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      `Refund reconciliation requires manual intervention (HTTP ${response.status})`,
+      true,
+    );
+    return;
+  }
+  let fact: {
+    callbackCapability: string;
+    externalRefundId: string;
+    status: "processing" | "succeeded" | "failed";
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+  };
+  try {
+    fact = z
+      .object({
+        callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+        externalRefundId: z.string().min(1),
+        status: z.enum(["processing", "succeeded", "failed"]),
+        amountMinor: z.string().regex(/^[1-9]\d*$/),
+        currency: z.string().regex(/^[A-Z]{3}$/),
+        occurredAt: z.string(),
+      })
+      .parse(await response.json());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid Provider response";
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      `Refund reconciliation response is invalid: ${message}`,
+      true,
+    );
+    return;
+  }
+  if (
+    !providerOperationCapabilityMatches(
+      fact.callbackCapability,
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+      "mock-payment-v1",
+      operationId,
+    )
+  ) {
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      "Refund reconciliation returned an invalid operation capability",
+      true,
+    );
+    return;
+  }
+  if (fact.status === "processing") {
+    await delayRefundReconcile(
+      job,
+      refundId,
+      operationId,
+      "Refund remains processing at Provider",
+    );
+    return;
+  }
+  const coreOutcome = await submitReconciledEvent(
+    "/api/v1/provider-events/refund",
+    {
+      eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      providerOperationId: operationId,
+      refundId,
+      ...fact,
+    },
+    config.MOCK_PAYMENT_WEBHOOK_SECRET,
+  );
+  if (coreOutcome.kind === "retry") {
+    await delayRefundReconcile(job, refundId, operationId, coreOutcome.reason);
+    return;
+  }
+  await completeJob(job.id);
+}
+
 async function reconcileAddFunds(job: Job): Promise<void> {
   const operationId = job.payload.operationId ?? job.payload.providerOperationId;
   const addFundsAttemptId = job.payload.addFundsAttemptId;
@@ -2727,6 +3804,8 @@ async function sendNotification(job: Job): Promise<void> {
 
 async function processJob(job: Job): Promise<void> {
   if (job.job_type === "notification.send") return sendNotification(job);
+  if (job.job_type === "refund.start") return startRefund(job);
+  if (job.job_type === "refund.reconcile") return reconcileRefund(job);
   if (job.job_type === "payment.start") return startPayment(job);
   if (job.job_type === "payment.reconcile") return reconcilePayment(job);
   if (job.job_type === "add_funds.start") return startAddFunds(job);
@@ -2744,12 +3823,21 @@ process.on("SIGINT", () => {
   stopping = true;
 });
 
+const schema = await pool.query<{ version: string | null }>(
+  "SELECT max(version) AS version FROM schema_migrations",
+);
+if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
+  throw new Error(
+    `OpenSales schema ${schema.rows[0]?.version ?? "missing"} is incompatible with worker requirement ${REQUIRED_SCHEMA_VERSION}`,
+  );
+}
+
 console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`);
 let nextRecoveryAt = 0;
 while (!stopping) {
   if (Date.now() >= nextRecoveryAt) {
     try {
-      const recovered = await recoverStaleJobs();
+      const recovered = (await recoverStaleJobs()) + (await recoverStaleRefundJobs());
       if (recovered > 0) {
         console.warn("recovered stale durable jobs", { count: recovered });
       }

@@ -9,6 +9,7 @@ import type { Config } from "./config.js";
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
+export const REQUIRED_SCHEMA_VERSION = "009_stage_b_refund_capacity_incidents";
 
 export function createPool(config: Config): DatabasePool {
   return new Pool({
@@ -39,25 +40,54 @@ export async function transaction<T>(
 }
 
 export async function runMigrations(pool: DatabasePool): Promise<void> {
-  await pool.query(
-    "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
-  );
-  const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
-  const migrationFiles = (await readdir(migrationsDirectory))
-    .filter((file) => /^\d{3}_[a-z0-9_]+\.sql$/.test(file))
-    .sort();
-  for (const migrationFile of migrationFiles) {
-    const version = migrationFile.replace(/\.sql$/, "");
-    const migration = await readFile(resolve(migrationsDirectory, migrationFile), "utf8");
-    await transaction(pool, async (client) => {
-      const existing = await client.query<{ version: string }>(
-        "SELECT version FROM schema_migrations WHERE version = $1",
-        [version],
-      );
-      if (existing.rowCount === 0) {
-        await client.query(migration);
-        await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [version]);
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
+    );
+    await client.query(
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+    );
+    const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
+    const migrationFiles = (await readdir(migrationsDirectory))
+      .filter((file) => /^\d{3}_[a-z0-9_]+\.sql$/.test(file))
+      .sort();
+    for (const migrationFile of migrationFiles) {
+      const version = migrationFile.replace(/\.sql$/, "");
+      const migration = await readFile(resolve(migrationsDirectory, migrationFile), "utf8");
+      await client.query("BEGIN");
+      try {
+        const existing = await client.query<{ version: string }>(
+          "SELECT version FROM schema_migrations WHERE version = $1",
+          [version],
+        );
+        if (existing.rowCount === 0) {
+          await client.query(migration);
+          await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [version]);
+        }
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
       }
-    });
+    }
+  } finally {
+    await client
+      .query("SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0))")
+      .catch(() => undefined);
+    client.release();
+  }
+}
+
+export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> {
+  const result = await pool.query<{ version: string | null }>(
+    `SELECT max(version) AS version
+     FROM schema_migrations`,
+  );
+  const installed = result.rows[0]?.version ?? null;
+  if (installed !== REQUIRED_SCHEMA_VERSION) {
+    throw new Error(
+      `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
+    );
   }
 }
