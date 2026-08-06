@@ -41,6 +41,39 @@ export async function advancePaidInvoice(
      ON CONFLICT (event_type, unique_key) DO NOTHING`,
     [`invoice:${invoiceId}`, { invoiceId, orderId: invoice.order_id }],
   );
+  const lockPointers = await client.query<{
+    order_id: string;
+    service_id: string;
+    submitted_by_user_id: string;
+    client_account_id: string;
+  }>(
+    `SELECT o.id AS order_id, s.id AS service_id,
+            o.submitted_by_user_id, o.client_account_id
+     FROM orders o
+     JOIN order_items oi ON oi.order_id = o.id
+     JOIN services s ON s.order_item_id = oi.id
+     WHERE o.id = $1`,
+    [invoice.order_id],
+  );
+  const lockPointer = lockPointers.rows[0];
+  if (!lockPointer) throw new Error("Invoice is linked to an invalid order");
+  await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [lockPointer.order_id]);
+  await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+    lockPointer.service_id,
+  ]);
+  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+    lockPointer.submitted_by_user_id,
+  ]);
+  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+    lockPointer.client_account_id,
+  ]);
+  await client.query(
+    `SELECT client_account_id
+     FROM client_memberships
+     WHERE client_account_id = $1 AND user_id = $2
+     FOR UPDATE`,
+    [lockPointer.client_account_id, lockPointer.submitted_by_user_id],
+  );
   const orderResult = await client.query<{
     id: string;
     status: string;
@@ -63,8 +96,7 @@ export async function advancePaidInvoice(
      JOIN client_memberships cm
        ON cm.client_account_id = o.client_account_id
       AND cm.user_id = o.submitted_by_user_id
-     WHERE o.id = $1
-     FOR UPDATE OF o, s, u, ca, cm`,
+     WHERE o.id = $1`,
     [invoice.order_id],
   );
   const order = orderResult.rows[0];

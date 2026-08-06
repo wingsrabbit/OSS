@@ -789,7 +789,60 @@ export async function registerAdminRoutes(
     const body = manualCompletionSchema.parse(request.body);
 
     const result = await transaction(pool, async (client) => {
+      const lockPointers = await client.query<{
+        invoice_id: string;
+        order_id: string;
+        order_item_id: string;
+        submitted_by_user_id: string;
+        client_account_id: string;
+      }>(
+        `SELECT i.id AS invoice_id,
+                o.id AS order_id,
+                oi.id AS order_item_id,
+                o.submitted_by_user_id,
+                o.client_account_id
+         FROM services s
+         JOIN order_items oi ON oi.id = s.order_item_id
+         JOIN orders o ON o.id = oi.order_id
+         JOIN invoices i ON i.order_id = o.id
+         WHERE s.id = $1`,
+        [params.serviceId],
+      );
+      const lockPointer = lockPointers.rows[0];
+      if (lockPointer) {
+        // Payment callbacks for this order also begin with Invoice. Taking the
+        // same root lock before staff/target rows prevents Invoice/Order ABBA
+        // when a duplicate Provider fact races manual completion.
+        await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+          lockPointer.invoice_id,
+        ]);
+      }
       await requireStaffActionLocked(client, user, "services.manual_fulfillment");
+      if (!lockPointer) {
+        throw Object.assign(new Error("Service not found"), { statusCode: 404 });
+      }
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        params.serviceId,
+      ]);
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        lockPointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        lockPointer.client_account_id,
+      ]);
+      await client.query(
+        `SELECT client_account_id
+         FROM client_memberships
+         WHERE client_account_id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [lockPointer.client_account_id, lockPointer.submitted_by_user_id],
+      );
       const serviceResult = await client.query<{
         service_id: string;
         service_status: string;
@@ -828,8 +881,7 @@ export async function registerAdminRoutes(
          JOIN client_memberships cm
            ON cm.client_account_id = o.client_account_id
           AND cm.user_id = o.submitted_by_user_id
-         WHERE s.id = $1
-         FOR UPDATE OF s, o, i, customer, ca, cm`,
+         WHERE s.id = $1`,
         [params.serviceId],
       );
       const service = serviceResult.rows[0];

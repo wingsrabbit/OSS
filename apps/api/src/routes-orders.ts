@@ -34,6 +34,9 @@ const paymentSchema = z.object({
       "timeout_success",
       "duplicate_out_of_order",
       "definitive_reject",
+      "success_then_reject",
+      "partial_then_reject",
+      "partial_then_timeout",
     ])
     .default("success"),
   idempotencyKey: z.string().min(8).max(128),
@@ -155,6 +158,20 @@ async function assertEligibilityLocked(
   userId: string,
   clientAccountId: string,
 ): Promise<void> {
+  // Keep the shared identity lock order explicit. PostgreSQL does not promise
+  // the row-lock order of a multi-relation FOR UPDATE join, and payment
+  // settlement takes these same shared rows for other invoices.
+  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
+  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+    clientAccountId,
+  ]);
+  await client.query(
+    `SELECT client_account_id
+     FROM client_memberships
+     WHERE user_id = $1 AND client_account_id = $2
+     FOR UPDATE`,
+    [userId, clientAccountId],
+  );
   const result = await client.query<{
     email_verified_at: Date | null;
     user_restricted_at: Date | null;
@@ -169,8 +186,7 @@ async function assertEligibilityLocked(
      FROM users u
      JOIN client_memberships cm ON cm.user_id = u.id AND cm.client_account_id = $2
      JOIN client_accounts ca ON ca.id = cm.client_account_id
-     WHERE u.id = $1
-     FOR UPDATE OF u, cm, ca`,
+     WHERE u.id = $1`,
     [userId, clientAccountId],
   );
   const state = result.rows[0];

@@ -53,6 +53,13 @@ type Job = {
 
 type DatabaseClient = pg.PoolClient;
 
+class LostJobLeaseError extends Error {
+  constructor(jobId: string) {
+    super(`durable job lease was lost: ${jobId}`);
+    this.name = "LostJobLeaseError";
+  }
+}
+
 async function transaction<T>(work: (client: DatabaseClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
@@ -68,6 +75,26 @@ async function transaction<T>(work: (client: DatabaseClient) => Promise<T>): Pro
   }
 }
 
+async function lockProviderOperation(client: DatabaseClient, operationId: string): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    `provider-operation:${operationId}`,
+  ]);
+}
+
+async function assertJobLeaseWithClient(client: DatabaseClient, job: Job): Promise<void> {
+  const result = await client.query(
+    `SELECT id
+     FROM durable_jobs
+     WHERE id = $1
+       AND status = 'running'
+       AND locked_by = $2
+       AND attempts = $3
+     FOR UPDATE`,
+    [job.id, config.WORKER_ID, job.attempts],
+  );
+  if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
+}
+
 function reconcileDelaySeconds(attempts: number): number {
   return Math.min(
     300,
@@ -75,28 +102,38 @@ function reconcileDelaySeconds(attempts: number): number {
   );
 }
 
-async function completeJobWithClient(client: DatabaseClient, jobId: string): Promise<void> {
-  await client.query(
+async function completeJobWithClient(client: DatabaseClient, job: Job): Promise<void> {
+  const result = await client.query(
     `UPDATE durable_jobs
      SET status = 'completed', locked_at = NULL, locked_by = NULL, last_error = NULL,
          updated_at = now()
-     WHERE id = $1`,
-    [jobId],
+     WHERE id = $1
+       AND status = 'running'
+       AND locked_by = $2
+       AND attempts = $3
+     RETURNING id`,
+    [job.id, config.WORKER_ID, job.attempts],
   );
+  if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
 
 async function manualJobWithClient(
   client: DatabaseClient,
-  jobId: string,
+  job: Job,
   reason: string,
 ): Promise<void> {
-  await client.query(
+  const result = await client.query(
     `UPDATE durable_jobs
      SET status = 'manual', locked_at = NULL, locked_by = NULL, last_error = $2,
          updated_at = now()
-     WHERE id = $1`,
-    [jobId, reason.slice(0, 1_000)],
+     WHERE id = $1
+       AND status = 'running'
+       AND locked_by = $3
+       AND attempts = $4
+     RETURNING id`,
+    [job.id, reason.slice(0, 1_000), config.WORKER_ID, job.attempts],
   );
+  if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
 
 async function enqueueReconcileWithClient(
@@ -130,180 +167,215 @@ async function enqueueReconcileWithClient(
   );
 }
 
-async function recoverStaleJobs(): Promise<number> {
-  return transaction(async (client) => {
-    const result = await client.query<Job>(
-      `SELECT id, job_type, unique_key, payload, attempts
-       FROM durable_jobs
-       WHERE status = 'running'
-         AND locked_at < now() - make_interval(secs => $1)
-         AND job_type NOT IN ('refund.start', 'refund.reconcile')
-       ORDER BY locked_at, created_at
-       LIMIT 50
-       FOR UPDATE SKIP LOCKED`,
-      [config.JOB_LOCK_TIMEOUT_SECONDS],
-    );
+async function lockStaleJobWithClient(
+  client: DatabaseClient,
+  candidate: Job,
+): Promise<Job | null> {
+  const result = await client.query<Job>(
+    `SELECT id, job_type, unique_key, payload, attempts
+     FROM durable_jobs
+     WHERE id = $1
+       AND status = 'running'
+       AND attempts = $2
+       AND locked_at < now() - make_interval(secs => $3)
+     FOR UPDATE`,
+    [candidate.id, candidate.attempts, config.JOB_LOCK_TIMEOUT_SECONDS],
+  );
+  return result.rows[0] ?? null;
+}
 
-    for (const job of result.rows) {
-      if (
-        job.job_type === "payment.start" ||
-        job.job_type === "add_funds.start" ||
-        job.job_type === "provision.start"
-      ) {
-        const payment = job.job_type === "payment.start";
-        const addFunds = job.job_type === "add_funds.start";
-        const subjectId = payment
-          ? job.payload.paymentAttemptId
-          : addFunds
-            ? job.payload.addFundsAttemptId
-            : job.payload.serviceId;
-        const operationId = job.payload.providerOperationId;
-        if (!subjectId || !operationId) {
-          await manualJobWithClient(
-            client,
-            job.id,
-            "stale side-effecting job has an invalid payload; manual inspection required",
-          );
-          continue;
-        }
+async function completeRecoveredJobWithClient(client: DatabaseClient, job: Job): Promise<void> {
+  await client.query(
+    `UPDATE durable_jobs
+     SET status = 'completed', locked_at = NULL, locked_by = NULL, last_error = NULL,
+         updated_at = now()
+     WHERE id = $1 AND status = 'running' AND attempts = $2`,
+    [job.id, job.attempts],
+  );
+}
 
-        const operation = await client.query<{ status: string; attempt_count: number }>(
-          `SELECT status, attempt_count
-           FROM provider_operations
-           WHERE id = $1
-           FOR UPDATE`,
-          [operationId],
-        );
-        const operationRecord = operation.rows[0];
-        if (!operationRecord) {
-          await manualJobWithClient(
-            client,
-            job.id,
-            "stale side-effecting job references a missing provider operation",
-          );
-          continue;
-        }
-        if (operationRecord.status === "succeeded" || operationRecord.status === "failed") {
-          await completeJobWithClient(client, job.id);
-          continue;
-        }
-        if (operationRecord.status === "queued" && operationRecord.attempt_count === 0) {
-          const manual = job.attempts >= config.MAX_JOB_ATTEMPTS;
-          await client.query(
-            `UPDATE durable_jobs
-             SET status = $2,
-                 available_at = CASE
-                   WHEN $2 = 'pending' THEN now() + make_interval(secs => $3)
-                   ELSE available_at
-                 END,
-                 locked_at = NULL,
-                 locked_by = NULL,
-                 last_error = 'worker lock expired before the provider create attempt began',
-                 updated_at = now()
-             WHERE id = $1`,
-            [
-              job.id,
-              manual ? "manual" : "pending",
-              reconcileDelaySeconds(job.attempts),
-            ],
-          );
-          continue;
-        }
+async function manualRecoveredJobWithClient(
+  client: DatabaseClient,
+  job: Job,
+  reason: string,
+): Promise<void> {
+  await client.query(
+    `UPDATE durable_jobs
+     SET status = 'manual', locked_at = NULL, locked_by = NULL, last_error = $3,
+         updated_at = now()
+     WHERE id = $1 AND status = 'running' AND attempts = $2`,
+    [job.id, job.attempts, reason.slice(0, 1_000)],
+  );
+}
 
-        await client.query(
-          `UPDATE provider_operations
-           SET status = 'unknown',
-               last_error = 'worker lock expired after a possible provider request; reconciliation required',
-               updated_at = now()
-           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
-          [operationId],
-        );
-        if (payment) {
-          await client.query(
-            `UPDATE payment_attempts
-             SET status = 'unknown', updated_at = now(), version = version + 1
-             WHERE id = $1
-               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
-            [subjectId],
-          );
-          await client.query(
-            `UPDATE invoice_payment_commands
-             SET status = 'unknown', result = $2, updated_at = now()
-             WHERE payment_attempt_id = $1
-               AND status NOT IN ('succeeded', 'failed')`,
-            [
-              subjectId,
-              {
-                paymentStatus: "unknown",
-                reason: "worker lock expired after a possible Provider request",
-              },
-            ],
-          );
-        } else if (addFunds) {
-          await client.query(
-            `UPDATE add_funds_attempts
-             SET status = 'unknown', updated_at = now(), version = version + 1
-             WHERE id = $1
-               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
-            [subjectId],
-          );
-          await client.query(
-            `UPDATE add_funds_commands
-             SET status = 'unknown', result = $2, updated_at = now()
-             WHERE add_funds_attempt_id = $1
-               AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
-            [
-              subjectId,
-              {
-                paymentStatus: "unknown",
-                reason: "worker lock expired after a possible Provider request",
-              },
-            ],
-          );
-        } else {
-          await client.query(
-            `UPDATE services
-             SET status = 'confirming', updated_at = now(), version = version + 1
-             WHERE id = $1 AND status IN ('pending', 'provisioning', 'confirming')`,
-            [subjectId],
-          );
-        }
-        await enqueueReconcileWithClient(
-          client,
-          payment
-            ? "payment.reconcile"
-            : addFunds
-              ? "add_funds.reconcile"
-              : "provision.reconcile",
-          job.unique_key,
-          { ...job.payload, operationId },
-          config.RECONCILE_BASE_DELAY_SECONDS,
-        );
-        await completeJobWithClient(client, job.id);
-        continue;
-      }
-
+async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
+  const sideEffecting = ["payment.start", "add_funds.start", "provision.start"].includes(
+    candidate.job_type,
+  );
+  if (!sideEffecting) {
+    return transaction(async (client) => {
+      const job = await lockStaleJobWithClient(client, candidate);
+      if (!job) return false;
       const maxAttempts = job.job_type.endsWith(".reconcile")
         ? config.RECONCILE_MAX_ATTEMPTS
         : config.MAX_JOB_ATTEMPTS;
       const manual = job.attempts >= maxAttempts;
       await client.query(
         `UPDATE durable_jobs
-         SET status = $2,
+         SET status = $3,
              available_at = CASE
-               WHEN $2 = 'pending' THEN now() + make_interval(secs => $3)
+               WHEN $3 = 'pending' THEN now() + make_interval(secs => $4)
                ELSE available_at
              END,
              locked_at = NULL,
              locked_by = NULL,
              last_error = 'worker lock expired; job recovered without replaying a create operation',
              updated_at = now()
-         WHERE id = $1`,
-        [job.id, manual ? "manual" : "pending", reconcileDelaySeconds(job.attempts)],
+         WHERE id = $1 AND status = 'running' AND attempts = $2`,
+        [job.id, job.attempts, manual ? "manual" : "pending", reconcileDelaySeconds(job.attempts)],
+      );
+      return true;
+    });
+  }
+
+  const payment = candidate.job_type === "payment.start";
+  const addFunds = candidate.job_type === "add_funds.start";
+  const subjectId = payment
+    ? candidate.payload.paymentAttemptId
+    : addFunds
+      ? candidate.payload.addFundsAttemptId
+      : candidate.payload.serviceId;
+  const operationId = candidate.payload.providerOperationId;
+  if (!subjectId || !operationId) {
+    return transaction(async (client) => {
+      const job = await lockStaleJobWithClient(client, candidate);
+      if (!job) return false;
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale side-effecting job has an invalid payload; manual inspection required",
+      );
+      return true;
+    });
+  }
+
+  return transaction(async (client) => {
+    await lockProviderOperation(client, operationId);
+    const operation = await client.query<{ status: string; attempt_count: number }>(
+      `SELECT status, attempt_count
+       FROM provider_operations
+       WHERE id = $1
+       FOR UPDATE`,
+      [operationId],
+    );
+    const job = await lockStaleJobWithClient(client, candidate);
+    if (!job) return false;
+    const operationRecord = operation.rows[0];
+    if (!operationRecord) {
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale side-effecting job references a missing provider operation",
+      );
+      return true;
+    }
+    if (operationRecord.status === "succeeded" || operationRecord.status === "failed") {
+      await completeRecoveredJobWithClient(client, job);
+      return true;
+    }
+    if (operationRecord.status === "queued" && operationRecord.attempt_count === 0) {
+      const manual = job.attempts >= config.MAX_JOB_ATTEMPTS;
+      await client.query(
+        `UPDATE durable_jobs
+         SET status = $3,
+             available_at = CASE
+               WHEN $3 = 'pending' THEN now() + make_interval(secs => $4)
+               ELSE available_at
+             END,
+             locked_at = NULL,
+             locked_by = NULL,
+             last_error = 'worker lock expired before the provider create attempt began',
+             updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2`,
+        [job.id, job.attempts, manual ? "manual" : "pending", reconcileDelaySeconds(job.attempts)],
+      );
+      return true;
+    }
+
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown',
+           last_error = 'worker lock expired after a possible provider request; reconciliation required',
+           updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [operationId],
+    );
+    if (payment) {
+      await client.query(
+        `UPDATE payment_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [subjectId],
+      );
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE payment_attempt_id = $1
+           AND status NOT IN ('manual', 'succeeded', 'failed')`,
+        [subjectId, { paymentStatus: "unknown", reason: "worker lock expired after a possible Provider request" }],
+      );
+    } else if (addFunds) {
+      await client.query(
+        `UPDATE add_funds_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
+        [subjectId],
+      );
+      await client.query(
+        `UPDATE add_funds_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE add_funds_attempt_id = $1
+           AND status NOT IN ('manual', 'succeeded', 'failed', 'cancelled', 'expired')`,
+        [subjectId, { paymentStatus: "unknown", reason: "worker lock expired after a possible Provider request" }],
+      );
+    } else {
+      await client.query(
+        `UPDATE services
+         SET status = 'confirming', updated_at = now(), version = version + 1
+         WHERE id = $1 AND status IN ('pending', 'provisioning', 'confirming')`,
+        [subjectId],
       );
     }
-    return result.rowCount ?? 0;
+    await enqueueReconcileWithClient(
+      client,
+      payment ? "payment.reconcile" : addFunds ? "add_funds.reconcile" : "provision.reconcile",
+      job.unique_key,
+      { ...job.payload, operationId },
+      config.RECONCILE_BASE_DELAY_SECONDS,
+    );
+    await completeRecoveredJobWithClient(client, job);
+    return true;
   });
+}
+
+async function recoverStaleJobs(): Promise<number> {
+  const candidates = await pool.query<Job>(
+    `SELECT id, job_type, unique_key, payload, attempts
+     FROM durable_jobs
+     WHERE status = 'running'
+       AND locked_at < now() - make_interval(secs => $1)
+       AND job_type NOT IN ('refund.start', 'refund.reconcile')
+     ORDER BY locked_at, created_at
+     LIMIT 50`,
+    [config.JOB_LOCK_TIMEOUT_SECONDS],
+  );
+  let recovered = 0;
+  for (const candidate of candidates.rows) {
+    if (await recoverOneStaleJob(candidate)) recovered += 1;
+  }
+  return recovered;
 }
 
 async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
@@ -311,19 +383,11 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
   const operationId = candidate.payload.operationId ?? candidate.payload.providerOperationId;
   if (!refundId || !operationId) {
     return transaction(async (client) => {
-      const locked = await client.query(
-        `SELECT id
-         FROM durable_jobs
-         WHERE id = $1
-           AND status = 'running'
-           AND locked_at < now() - make_interval(secs => $2)
-         FOR UPDATE`,
-        [candidate.id, config.JOB_LOCK_TIMEOUT_SECONDS],
-      );
-      if (locked.rowCount !== 1) return false;
-      await manualJobWithClient(
+      const job = await lockStaleJobWithClient(client, candidate);
+      if (!job) return false;
+      await manualRecoveredJobWithClient(
         client,
-        candidate.id,
+        job,
         "stale refund job has an invalid payload; manual inspection required",
       );
       return true;
@@ -366,17 +430,18 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
        FROM durable_jobs
        WHERE id = $1
          AND status = 'running'
-         AND locked_at < now() - make_interval(secs => $2)
+         AND attempts = $2
+         AND locked_at < now() - make_interval(secs => $3)
        FOR UPDATE`,
-      [candidate.id, config.JOB_LOCK_TIMEOUT_SECONDS],
+      [candidate.id, candidate.attempts, config.JOB_LOCK_TIMEOUT_SECONDS],
     );
     const job = currentJob.rows[0];
     if (!job) return false;
     const record = state.rows[0];
     if (!receiptId || !record) {
-      await manualJobWithClient(
+      await manualRecoveredJobWithClient(
         client,
-        job.id,
+        job,
         !receiptId
           ? "stale refund job references a missing refund"
           : "stale refund job references a mismatched Provider operation",
@@ -389,7 +454,7 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
       record.operation_status === "succeeded" ||
       record.operation_status === "failed"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeRecoveredJobWithClient(client, job);
       return true;
     }
     if (job.job_type === "refund.reconcile") {
@@ -437,7 +502,7 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
             ],
           );
         }
-        await manualJobWithClient(client, job.id, reason);
+        await manualRecoveredJobWithClient(client, job, reason);
         return true;
       }
       await client.query(
@@ -462,6 +527,7 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
           refundId,
           operationId,
           "refund create never began before stale-lock retry exhaustion; no Provider outflow was sent",
+          true,
         );
         return true;
       }
@@ -507,7 +573,7 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
       { ...job.payload, operationId },
       config.RECONCILE_BASE_DELAY_SECONDS,
     );
-    await completeJobWithClient(client, job.id);
+    await completeRecoveredJobWithClient(client, job);
     return true;
   });
 }
@@ -554,14 +620,19 @@ async function claimJob(): Promise<Job | null> {
   return result.rows[0] ?? null;
 }
 
-async function completeJob(jobId: string): Promise<void> {
-  await pool.query(
+async function completeJob(job: Job): Promise<void> {
+  const result = await pool.query(
     `UPDATE durable_jobs
      SET status = 'completed', locked_at = NULL, locked_by = NULL, last_error = NULL,
          updated_at = now()
-     WHERE id = $1`,
-    [jobId],
+     WHERE id = $1
+       AND status = 'running'
+       AND locked_by = $2
+       AND attempts = $3
+     RETURNING id`,
+    [job.id, config.WORKER_ID, job.attempts],
   );
+  if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
 
 async function failJob(job: Job, error: unknown): Promise<void> {
@@ -571,7 +642,7 @@ async function failJob(job: Job, error: unknown): Promise<void> {
     : config.MAX_JOB_ATTEMPTS;
   const manual = job.attempts >= maxAttempts;
   const delaySeconds = Math.min(300, 2 ** Math.min(job.attempts, 8));
-  await pool.query(
+  const result = await pool.query(
     `UPDATE durable_jobs
      SET status = $2,
          available_at = now() + make_interval(secs => $3),
@@ -579,9 +650,26 @@ async function failJob(job: Job, error: unknown): Promise<void> {
          locked_by = NULL,
          last_error = $4,
          updated_at = now()
-     WHERE id = $1`,
-    [job.id, manual ? "manual" : "pending", delaySeconds, message],
+     WHERE id = $1
+       AND status = 'running'
+       AND locked_by = $5
+       AND attempts = $6`,
+    [
+      job.id,
+      manual ? "manual" : "pending",
+      delaySeconds,
+      message,
+      config.WORKER_ID,
+      job.attempts,
+    ],
   );
+  if (result.rowCount !== 1) {
+    console.warn("discarded job failure after durable job lease loss", {
+      jobId: job.id,
+      jobType: job.job_type,
+      attempts: job.attempts,
+    });
+  }
 }
 
 async function providerRequest(
@@ -612,6 +700,8 @@ async function markUnknown(
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
+    await lockProviderOperation(client, operationId);
+    await assertJobLeaseWithClient(client, job);
     await client.query(
       `UPDATE provider_operations
        SET status = 'unknown', last_error = $2,
@@ -630,7 +720,7 @@ async function markUnknown(
         `UPDATE invoice_payment_commands
          SET status = 'unknown', result = $2, updated_at = now()
          WHERE payment_attempt_id = $1
-           AND status NOT IN ('succeeded', 'failed')`,
+           AND status NOT IN ('manual', 'succeeded', 'failed')`,
         [subjectId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
       );
     } else if (subjectTable === "add_funds_attempts") {
@@ -662,7 +752,7 @@ async function markUnknown(
       { ...job.payload, operationId },
       config.RECONCILE_BASE_DELAY_SECONDS,
     );
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
   });
 }
 
@@ -814,7 +904,7 @@ async function cancelKnownUnsentPaymentWithClient(
       { providerOperationId: operationId, orderId, creditRestoredMinor, holdOrder },
     ],
   );
-  await completeJobWithClient(client, job.id);
+  await completeJobWithClient(client, job);
   return { kind: "halted" };
 }
 
@@ -860,7 +950,7 @@ async function holdPaymentWithClient(
        AND status NOT IN ('succeeded', 'failed')`,
     [operationId, { paymentStatus: "unknown", reason: reason.slice(0, 1_000) }],
   );
-  await manualJobWithClient(client, job.id, reason);
+  await manualJobWithClient(client, job, reason);
   return { kind: "halted" };
 }
 
@@ -871,16 +961,53 @@ async function preflightPayment(
   mode: "start" | "reconcile",
 ): Promise<PreflightResult<PaymentCall>> {
   return transaction(async (client) => {
+    await lockProviderOperation(client, providerOperationId);
+    await assertJobLeaseWithClient(client, job);
     const paymentPointer = await client.query<{ invoice_id: string }>(
       "SELECT invoice_id FROM payment_attempts WHERE id = $1",
       [paymentAttemptId],
     );
     const invoiceId = paymentPointer.rows[0]?.invoice_id;
     if (!invoiceId) {
-      await manualJobWithClient(client, job.id, "payment job references a missing Payment Attempt");
+      await manualJobWithClient(client, job, "payment job references a missing Payment Attempt");
       return { kind: "halted" };
     }
     await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
+    await client.query("SELECT id FROM payment_attempts WHERE id = $1 FOR UPDATE", [
+      paymentAttemptId,
+    ]);
+    await client.query(
+      `SELECT id
+       FROM provider_operations
+       WHERE id = $1
+         AND subject_type = 'payment'
+         AND subject_id = $2
+       FOR UPDATE`,
+      [providerOperationId, paymentAttemptId],
+    );
+    const lockPointers = await client.query<{
+      order_id: string;
+      submitted_by_user_id: string;
+      client_account_id: string;
+    }>(
+      `SELECT o.id AS order_id, o.submitted_by_user_id, o.client_account_id
+       FROM invoices i
+       JOIN orders o ON o.id = i.order_id
+       WHERE i.id = $1`,
+      [invoiceId],
+    );
+    const lockPointer = lockPointers.rows[0];
+    if (lockPointer) {
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        lockPointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        lockPointer.client_account_id,
+      ]);
+    }
     const result = await client.query<{
       payment_status: string;
       amount_minor: string;
@@ -931,28 +1058,27 @@ async function preflightPayment(
          ON po.id = $2
         AND po.subject_type = 'payment'
         AND po.subject_id = pa.id
-       WHERE pa.id = $1
-       FOR UPDATE OF pa, i, o, u, ca, po`,
+       WHERE pa.id = $1`,
       [paymentAttemptId, providerOperationId],
     );
     const payment = result.rows[0];
     if (!payment) {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "payment job references missing or inconsistent Core records",
       );
       return { kind: "halted" };
     }
 
     if (payment.operation_status === "succeeded" || payment.operation_status === "failed") {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
     if (payment.operation_kind !== "payment_create") {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "payment reconciliation references an incompatible provider operation",
       );
       return { kind: "halted" };
@@ -1013,7 +1139,7 @@ async function preflightPayment(
       payment.payment_status === "cancelled" ||
       payment.payment_status === "expired"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
     if (!knownUnsent) {
@@ -1036,7 +1162,7 @@ async function preflightPayment(
         `UPDATE invoice_payment_commands
          SET status = 'unknown', result = $2, updated_at = now()
          WHERE payment_attempt_id = $1
-           AND status NOT IN ('succeeded', 'failed')`,
+           AND status NOT IN ('manual', 'succeeded', 'failed')`,
         [
           paymentAttemptId,
           {
@@ -1052,7 +1178,7 @@ async function preflightPayment(
         { ...job.payload, operationId: providerOperationId },
         config.RECONCILE_BASE_DELAY_SECONDS,
       );
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
     if (!consistentOwnership || !consistentProvider) {
@@ -1204,7 +1330,7 @@ async function holdProvisionWithClient(
      WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
     [operationId, reason.slice(0, 1_000)],
   );
-  await manualJobWithClient(client, job.id, reason);
+  await manualJobWithClient(client, job, reason);
   return { kind: "halted" };
 }
 
@@ -1215,6 +1341,67 @@ async function preflightProvision(
   mode: "start" | "reconcile",
 ): Promise<PreflightResult<undefined>> {
   return transaction(async (client) => {
+    await lockProviderOperation(client, providerOperationId);
+    await assertJobLeaseWithClient(client, job);
+    const lockPointers = await client.query<{
+      invoice_id: string;
+      order_id: string;
+      order_item_id: string;
+      submitted_by_user_id: string;
+      client_account_id: string;
+    }>(
+      `SELECT
+         i.id AS invoice_id,
+         o.id AS order_id,
+         oi.id AS order_item_id,
+         o.submitted_by_user_id,
+         o.client_account_id
+       FROM services s
+       JOIN order_items oi ON oi.id = s.order_item_id
+       JOIN orders o ON o.id = oi.order_id
+       JOIN invoices i ON i.order_id = o.id
+       WHERE s.id = $1`,
+      [serviceId],
+    );
+    const lockPointer = lockPointers.rows[0];
+    if (lockPointer) {
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        lockPointer.invoice_id,
+      ]);
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [serviceId]);
+      await client.query(
+        `SELECT id
+         FROM provider_operations
+         WHERE id = $1
+           AND subject_type = 'service'
+           AND subject_id = $2
+         FOR UPDATE`,
+        [providerOperationId, serviceId],
+      );
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        lockPointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        lockPointer.client_account_id,
+      ]);
+    }
+    const lockedMembership = lockPointer
+      ? await client.query<{
+          removed_at: Date | null;
+        }>(
+          `SELECT removed_at
+           FROM client_memberships
+           WHERE user_id = $1 AND client_account_id = $2
+           FOR UPDATE`,
+          [lockPointer.submitted_by_user_id, lockPointer.client_account_id],
+        )
+      : null;
     const result = await client.query<{
       service_status: string;
       service_client_account_id: string;
@@ -1255,15 +1442,14 @@ async function preflightProvision(
          ON po.id = $2
         AND po.subject_type = 'service'
         AND po.subject_id = s.id
-       WHERE s.id = $1
-       FOR UPDATE OF s, oi, o, i, u, ca, po`,
+       WHERE s.id = $1`,
       [serviceId, providerOperationId],
     );
     const service = result.rows[0];
     if (!service) {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "provisioning job references missing or inconsistent Core records",
       );
       return { kind: "halted" };
@@ -1277,13 +1463,13 @@ async function preflightProvision(
       service.service_status === "confirming";
 
     if (service.operation_status === "succeeded" || service.operation_status === "failed") {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
     if (service.operation_kind !== "resource_create") {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "provision reconciliation references an incompatible provider operation",
       );
       return { kind: "halted" };
@@ -1303,7 +1489,7 @@ async function preflightProvision(
       if (!potentiallySent) {
         await manualJobWithClient(
           client,
-          job.id,
+          job,
           "provision reconciliation has no evidence that a provider create was sent",
         );
         return { kind: "halted" };
@@ -1311,18 +1497,11 @@ async function preflightProvision(
       return { kind: "call", value: undefined };
     }
     if (service.service_status === "active" || service.service_status === "terminated") {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
 
-    const membership = await client.query<{ removed_at: Date | null }>(
-      `SELECT removed_at
-       FROM client_memberships
-       WHERE client_account_id = $1 AND user_id = $2
-       FOR UPDATE`,
-      [service.order_client_account_id, service.submitted_by_user_id],
-    );
-    const member = membership.rows[0];
+    const member = lockedMembership?.rows[0];
     const eligible =
       Boolean(service.email_verified_at) &&
       !service.user_restricted_at &&
@@ -1398,7 +1577,7 @@ async function preflightProvision(
           { ...job.payload, operationId: providerOperationId },
           config.RECONCILE_BASE_DELAY_SECONDS,
         );
-        await completeJobWithClient(client, job.id);
+        await completeJobWithClient(client, job);
         return { kind: "halted" };
       }
       await client.query(
@@ -1435,6 +1614,13 @@ async function finishStartWithWatchdog(
     | "refund.reconcile",
 ): Promise<void> {
   await transaction(async (client) => {
+    if (reconcileType === "refund.reconcile" && job.payload.refundId) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `refund:${job.payload.refundId}`,
+      ]);
+    }
+    await lockProviderOperation(client, operationId);
+    await assertJobLeaseWithClient(client, job);
     const operation = await client.query<{ status: string }>(
       "SELECT status FROM provider_operations WHERE id = $1 FOR UPDATE",
       [operationId],
@@ -1449,7 +1635,7 @@ async function finishStartWithWatchdog(
         config.WATCHDOG_DELAY_SECONDS,
       );
     }
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
   });
 }
 
@@ -1460,6 +1646,8 @@ async function rejectPaymentStartManually(
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
+    await lockProviderOperation(client, operationId);
+    await assertJobLeaseWithClient(client, job);
     const pointer = await client.query<{ invoice_id: string; order_id: string }>(
       `SELECT i.id AS invoice_id, o.id AS order_id
        FROM payment_attempts pa
@@ -1470,30 +1658,176 @@ async function rejectPaymentStartManually(
     );
     const invoiceId = pointer.rows[0]?.invoice_id;
     const orderId = pointer.rows[0]?.order_id;
-    if (invoiceId) {
-      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
+    if (!invoiceId || !orderId) {
+      await manualJobWithClient(
+        client,
+        job,
+        "Payment Provider outcome references inconsistent Core records",
+      );
+      return;
     }
-    const locked = await client.query<{
+    await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [invoiceId]);
+    await client.query("SELECT id FROM payment_attempts WHERE id = $1 FOR UPDATE", [
+      paymentAttemptId,
+    ]);
+    await client.query(
+      `SELECT id
+       FROM provider_operations
+       WHERE id = $1
+         AND subject_type = 'payment'
+         AND subject_id = $2
+       FOR UPDATE`,
+      [operationId, paymentAttemptId],
+    );
+    await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [orderId]);
+    await client.query(
+      `SELECT id
+       FROM invoice_payment_commands
+       WHERE payment_attempt_id = $1
+       FOR UPDATE`,
+      [paymentAttemptId],
+    );
+    const currentResult = await client.query<{
+      command_status: string;
       payment_status: string;
       operation_status: string;
+      has_receipt: boolean;
     }>(
-      `SELECT pa.status AS payment_status, po.status AS operation_status
-       FROM payment_attempts pa
-       JOIN orders o ON o.id = $2
-       JOIN provider_operations po ON po.id = $3
-       WHERE pa.id = $1
-         AND po.subject_type = 'payment'
-         AND po.subject_id = pa.id
-       FOR UPDATE OF pa, o, po`,
-      [paymentAttemptId, orderId, operationId],
+      `SELECT command.status AS command_status,
+              attempt.status AS payment_status,
+              operation.status AS operation_status,
+              EXISTS (
+                SELECT 1
+                FROM fund_receipts receipt
+                WHERE receipt.reported_payment_attempt_id = attempt.id
+              ) AS has_receipt
+       FROM invoice_payment_commands command
+       JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'payment'
+        AND operation.subject_id = attempt.id
+       WHERE attempt.id = $1`,
+      [paymentAttemptId, operationId],
     );
-    const current = locked.rows[0];
+    const current = currentResult.rows[0];
+    if (!current) {
+      await manualJobWithClient(
+        client,
+        job,
+        "Payment Provider outcome references inconsistent Core records",
+      );
+      return;
+    }
     if (
-      !current ||
+      current.command_status === "succeeded" ||
       current.payment_status === "succeeded" ||
       current.operation_status === "succeeded"
     ) {
-      await completeJobWithClient(client, job.id);
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('system', $1, 'payment.provider_outcome_conflict',
+                   'payment', $2, $3, $4)`,
+        [
+          config.WORKER_ID,
+          paymentAttemptId,
+          "Provider returned a rejection after Core accepted its successful payment callback; success was preserved",
+          { providerOperationId: operationId, orderId, workerReason: reason.slice(0, 1_000) },
+        ],
+      );
+      await completeJobWithClient(client, job);
+      return;
+    }
+    if (current.command_status === "manual" || current.has_receipt) {
+      const conflictReason =
+        "Provider response contradicted an already-recorded funds receipt; manual review preserved";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [operationId, conflictReason],
+      );
+      await client.query(
+        `UPDATE payment_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired', 'unknown')`,
+        [paymentAttemptId],
+      );
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET status = 'manual', result = $2, updated_at = now()
+         WHERE payment_attempt_id = $1
+           AND status NOT IN ('succeeded', 'failed', 'manual')`,
+        [
+          paymentAttemptId,
+          { paymentStatus: "unknown", reason: conflictReason },
+        ],
+      );
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('system', $1, 'payment.provider_outcome_conflict',
+                   'payment', $2, $3, $4)`,
+        [
+          config.WORKER_ID,
+          paymentAttemptId,
+          "Provider response arrived after Core recorded funds; original manual result was preserved",
+          {
+            providerOperationId: operationId,
+            orderId,
+            workerReason: reason.slice(0, 1_000),
+            hasReceipt: current.has_receipt,
+          },
+        ],
+      );
+      await completeJobWithClient(client, job);
+      return;
+    }
+    const recordedTerminal =
+      ["failed", "cancelled", "expired"].includes(current.payment_status) ||
+      current.command_status === "failed" ||
+      current.operation_status === "failed";
+    if (recordedTerminal) {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    const definitiveFailureCanClose =
+      ["created", "processing"].includes(current.command_status) &&
+      ["created", "processing"].includes(current.payment_status) &&
+      ["queued", "running"].includes(current.operation_status);
+    if (!definitiveFailureCanClose) {
+      const conflictReason =
+        "Provider rejection raced with an unknown payment outcome; reconciliation is required";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [operationId, conflictReason],
+      );
+      await client.query(
+        `UPDATE payment_attempts
+         SET status = 'unknown', updated_at = now(), version = version + 1
+         WHERE id = $1
+           AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired', 'unknown')`,
+        [paymentAttemptId],
+      );
+      await client.query(
+        `UPDATE invoice_payment_commands
+         SET status = 'unknown', result = $2, updated_at = now()
+         WHERE payment_attempt_id = $1
+           AND status NOT IN ('manual', 'succeeded', 'failed')`,
+        [paymentAttemptId, { paymentStatus: "unknown", reason: conflictReason }],
+      );
+      await enqueueReconcileWithClient(
+        client,
+        "payment.reconcile",
+        job.unique_key,
+        { ...job.payload, operationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeJobWithClient(client, job);
       return;
     }
     const creditRestoredMinor = await reverseInvoiceCreditApplicationWithClient(
@@ -1522,15 +1856,13 @@ async function rejectPaymentStartManually(
         { paymentStatus: "failed", reason: reason.slice(0, 1_000), creditRestoredMinor },
       ],
     );
-    if (orderId) {
-      await client.query(
-        `UPDATE orders
-         SET status = 'on_hold', updated_at = now(), version = version + 1
-         WHERE id = $1
-           AND status IN ('waiting_payment', 'accepted', 'awaiting_manual', 'fulfilling')`,
-        [orderId],
-      );
-    }
+    await client.query(
+      `UPDATE orders
+       SET status = 'on_hold', updated_at = now(), version = version + 1
+       WHERE id = $1
+         AND status IN ('waiting_payment', 'accepted', 'awaiting_manual', 'fulfilling')`,
+      [orderId],
+    );
     await client.query(
       `INSERT INTO audit_events(
          actor_type, actor_id, action, target_type, target_id, reason, metadata
@@ -1541,12 +1873,12 @@ async function rejectPaymentStartManually(
         reason.slice(0, 1_000),
         {
           providerOperationId: operationId,
-          orderId: orderId ?? null,
+          orderId,
           creditRestoredMinor,
         },
       ],
     );
-    await manualJobWithClient(client, job.id, reason);
+    await manualJobWithClient(client, job, reason);
   });
 }
 
@@ -1557,20 +1889,136 @@ async function rejectProvisionStartManually(
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
-    const result = await client.query<{ order_id: string }>(
-      `SELECT o.id AS order_id
+    await lockProviderOperation(client, operationId);
+    await assertJobLeaseWithClient(client, job);
+    const pointerResult = await client.query<{
+      invoice_id: string;
+      order_id: string;
+      order_item_id: string;
+    }>(
+      `SELECT i.id AS invoice_id, o.id AS order_id, oi.id AS order_item_id
        FROM services s
        JOIN order_items oi ON oi.id = s.order_item_id
        JOIN orders o ON o.id = oi.order_id
+       JOIN invoices i ON i.order_id = o.id
        WHERE s.id = $1
-       FOR UPDATE OF s, o`,
+      `,
       [serviceId],
     );
-    const orderId = result.rows[0]?.order_id;
+    const pointer = pointerResult.rows[0];
+    if (pointer) {
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        pointer.invoice_id,
+      ]);
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        pointer.order_id,
+      ]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        pointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [serviceId]);
+    }
+    await client.query(
+      `SELECT id
+       FROM provider_operations
+       WHERE id = $1
+         AND subject_type = 'service'
+         AND subject_id = $2
+         AND kind = 'resource_create'
+       FOR UPDATE`,
+      [operationId, serviceId],
+    );
+    const currentResult = await client.query<{
+      service_status: string;
+      order_id: string;
+      order_status: string;
+      operation_status: string;
+    }>(
+      `SELECT s.status AS service_status,
+              o.id AS order_id,
+              o.status AS order_status,
+              operation.status AS operation_status
+       FROM services s
+       JOIN order_items oi ON oi.id = s.order_item_id
+       JOIN orders o ON o.id = oi.order_id
+       JOIN provider_operations operation
+         ON operation.id = $2
+        AND operation.subject_type = 'service'
+        AND operation.subject_id = s.id
+        AND operation.kind = 'resource_create'
+       WHERE s.id = $1`,
+      [serviceId, operationId],
+    );
+    const current = currentResult.rows[0];
+    if (!current) {
+      await manualJobWithClient(
+        client,
+        job,
+        "Provisioning Provider outcome references inconsistent Core records",
+      );
+      return;
+    }
+    const successfulService = ["active", "provisioned_hold"].includes(
+      current.service_status,
+    );
+    if (current.operation_status === "succeeded" && successfulService) {
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('system', $1, 'provision.provider_outcome_conflict',
+                   'service', $2, $3, $4)`,
+        [
+          config.WORKER_ID,
+          serviceId,
+          "Provider returned a rejection after Core accepted its success callback; success was preserved",
+          { providerOperationId: operationId, workerReason: reason.slice(0, 1_000) },
+        ],
+      );
+      await completeJobWithClient(client, job);
+      return;
+    }
+    if (
+      current.operation_status === "failed" &&
+      current.service_status === "provision_failed"
+    ) {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    const orderId = current.order_id;
+    if (
+      current.operation_status !== "running" ||
+      current.service_status !== "provisioning" ||
+      !["accepted", "fulfilling"].includes(current.order_status)
+    ) {
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('system', $1, 'provision.provider_outcome_conflict',
+                   'service', $2, $3, $4)`,
+        [
+          config.WORKER_ID,
+          serviceId,
+          "Provider rejection contradicted the current provisioning state; manual review preserved",
+          {
+            providerOperationId: operationId,
+            workerReason: reason.slice(0, 1_000),
+            operationStatus: current.operation_status,
+            serviceStatus: current.service_status,
+            orderStatus: current.order_status,
+          },
+        ],
+      );
+      await manualJobWithClient(
+        client,
+        job,
+        "Provider rejection contradicted the current provisioning state; manual review required",
+      );
+      return;
+    }
     await client.query(
       `UPDATE provider_operations
        SET status = 'failed', last_error = $2, updated_at = now()
-       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+       WHERE id = $1 AND status = 'running'`,
       [operationId, reason.slice(0, 1_000)],
     );
     await client.query(
@@ -1598,7 +2046,7 @@ async function rejectProvisionStartManually(
         { providerOperationId: operationId, orderId: orderId ?? null },
       ],
     );
-    await manualJobWithClient(client, job.id, reason);
+    await manualJobWithClient(client, job, reason);
   });
 }
 
@@ -1609,6 +2057,27 @@ async function failKnownUnsentAddFunds(
   addFundsAttemptId: string,
   reason: string,
 ): Promise<void> {
+  await lockProviderOperation(client, operationId);
+  await assertJobLeaseWithClient(client, job);
+  await client.query("SELECT id FROM add_funds_attempts WHERE id = $1 FOR UPDATE", [
+    addFundsAttemptId,
+  ]);
+  await client.query(
+    `SELECT id
+     FROM add_funds_commands
+     WHERE add_funds_attempt_id = $1
+     FOR UPDATE`,
+    [addFundsAttemptId],
+  );
+  await client.query(
+    `SELECT id
+     FROM provider_operations
+     WHERE id = $1
+       AND subject_type = 'add_funds'
+       AND subject_id = $2
+     FOR UPDATE`,
+    [operationId, addFundsAttemptId],
+  );
   const currentResult = await client.query<{
     command_status: string;
     attempt_status: string;
@@ -1629,16 +2098,15 @@ async function failKnownUnsentAddFunds(
      JOIN provider_operations operation
        ON operation.id = $2
       AND operation.subject_type = 'add_funds'
-      AND operation.subject_id = attempt.id
-     WHERE command.add_funds_attempt_id = $1
-     FOR UPDATE OF command, attempt, operation`,
+     AND operation.subject_id = attempt.id
+     WHERE command.add_funds_attempt_id = $1`,
     [addFundsAttemptId, operationId],
   );
   const current = currentResult.rows[0];
   if (!current) {
     await manualJobWithClient(
       client,
-      job.id,
+      job,
       "Add Funds Provider outcome references inconsistent Core records",
     );
     return;
@@ -1671,7 +2139,7 @@ async function failKnownUnsentAddFunds(
         { providerOperationId: operationId, workerReason: reason.slice(0, 1_000) },
       ],
     );
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
     return;
   }
   const recordedTerminal =
@@ -1679,7 +2147,7 @@ async function failKnownUnsentAddFunds(
     ["failed", "cancelled", "expired"].includes(current.attempt_status) ||
     current.operation_status === "failed";
   if (recordedTerminal) {
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
     return;
   }
   const definitiveFailureCanClose =
@@ -1719,7 +2187,7 @@ async function failKnownUnsentAddFunds(
       { ...job.payload, operationId },
       config.RECONCILE_BASE_DELAY_SECONDS,
     );
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
     return;
   }
   await client.query(
@@ -1756,7 +2224,7 @@ async function failKnownUnsentAddFunds(
       { providerOperationId: operationId },
     ],
   );
-  await completeJobWithClient(client, job.id);
+  await completeJobWithClient(client, job);
 }
 
 async function preflightAddFunds(
@@ -1766,6 +2234,55 @@ async function preflightAddFunds(
   mode: "start" | "reconcile",
 ): Promise<PreflightResult<PaymentCall>> {
   return transaction(async (client) => {
+    await lockProviderOperation(client, providerOperationId);
+    await assertJobLeaseWithClient(client, job);
+    const lockPointer = await client.query<{
+      submitted_by_user_id: string;
+      client_account_id: string;
+    }>(
+      `SELECT submitted_by_user_id, client_account_id
+       FROM add_funds_attempts
+       WHERE id = $1
+       FOR UPDATE`,
+      [addFundsAttemptId],
+    );
+    const pointer = lockPointer.rows[0];
+    if (pointer) {
+      await client.query(
+        `SELECT id
+         FROM add_funds_commands
+         WHERE add_funds_attempt_id = $1
+         FOR UPDATE`,
+        [addFundsAttemptId],
+      );
+      await client.query(
+        `SELECT id
+         FROM provider_operations
+         WHERE id = $1
+           AND subject_type = 'add_funds'
+           AND subject_id = $2
+         FOR UPDATE`,
+        [providerOperationId, addFundsAttemptId],
+      );
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        pointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        pointer.client_account_id,
+      ]);
+    }
+    const lockedMembership = pointer
+      ? await client.query<{
+          role: string;
+          removed_at: Date | null;
+        }>(
+          `SELECT role, removed_at
+           FROM client_memberships
+           WHERE user_id = $1 AND client_account_id = $2
+           FOR UPDATE`,
+          [pointer.submitted_by_user_id, pointer.client_account_id],
+        )
+      : null;
     const result = await client.query<{
       status: string;
       expires_at: Date;
@@ -1841,7 +2358,6 @@ async function preflightAddFunds(
        JOIN add_funds_policies afp ON afp.currency = afa.currency
        JOIN provider_operations po ON po.id = $2
        WHERE afa.id = $1
-       FOR UPDATE OF afa, afc, u, ca, po
        FOR SHARE OF pm, afp`,
       [addFundsAttemptId, providerOperationId],
     );
@@ -1849,28 +2365,18 @@ async function preflightAddFunds(
     if (!attempt) {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "Add Funds job references missing or inconsistent Core records",
       );
       return { kind: "halted" };
     }
-    const lockedMembership = await client.query<{
-      role: string;
-      removed_at: Date | null;
-    }>(
-      `SELECT role, removed_at
-       FROM client_memberships
-       WHERE user_id = $1 AND client_account_id = $2
-       FOR UPDATE`,
-      [attempt.submitted_by_user_id, attempt.client_account_id],
-    );
-    const membership = lockedMembership.rows[0];
+    const membership = lockedMembership?.rows[0];
     if (
       attempt.operation_status === "succeeded" ||
       attempt.operation_status === "failed" ||
       attempt.status === "succeeded"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
     const ownershipConsistent =
@@ -1904,7 +2410,7 @@ async function preflightAddFunds(
            AND status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')`,
         [addFundsAttemptId, { reason }],
       );
-      await manualJobWithClient(client, job.id, reason);
+      await manualJobWithClient(client, job, reason);
       return { kind: "halted" };
     }
 
@@ -1961,7 +2467,7 @@ async function preflightAddFunds(
         { ...job.payload, operationId: providerOperationId },
         config.RECONCILE_BASE_DELAY_SECONDS,
       );
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
 
@@ -2098,6 +2604,7 @@ async function failKnownUnsentRefund(
   refundId: string,
   operationId: string,
   reason: string,
+  recoveredJob = false,
 ): Promise<void> {
   await client.query(
     `UPDATE refunds
@@ -2134,7 +2641,11 @@ async function failKnownUnsentRefund(
       { providerOperationId: operationId },
     ],
   );
-  await completeJobWithClient(client, job.id);
+  if (recoveredJob) {
+    await completeRecoveredJobWithClient(client, job);
+  } else {
+    await completeJobWithClient(client, job);
+  }
 }
 
 async function preflightRefund(
@@ -2147,6 +2658,7 @@ async function preflightRefund(
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
       `refund:${refundId}`,
     ]);
+    await assertJobLeaseWithClient(client, job);
     const pointer = await client.query<{
       source_fund_receipt_id: string;
       requested_by_user_id: string;
@@ -2164,7 +2676,7 @@ async function preflightRefund(
     );
     const initial = pointer.rows[0];
     if (!initial) {
-      await manualJobWithClient(client, job.id, "refund job references a missing refund");
+      await manualJobWithClient(client, job, "refund job references a missing refund");
       return { kind: "halted" };
     }
     let authorizationValid = true;
@@ -2279,7 +2791,7 @@ async function preflightRefund(
       } else {
         await manualJobWithClient(
           client,
-          job.id,
+          job,
           "Refund snapshot or Provider ownership is invalid during reconciliation",
         );
       }
@@ -2292,14 +2804,14 @@ async function preflightRefund(
       refund.operation_status === "succeeded" ||
       refund.operation_status === "failed"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return { kind: "halted" };
     }
     if (mode === "reconcile") {
       if (refund.operation_attempt_count === 0) {
         await manualJobWithClient(
           client,
-          job.id,
+          job,
           "Refund reconciliation cannot run before the Provider create attempt",
         );
         return { kind: "halted" };
@@ -2322,7 +2834,7 @@ async function preflightRefund(
     ) {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "Refund create was already attempted; reconciliation is required instead of replay",
       );
       return { kind: "halted" };
@@ -2455,6 +2967,7 @@ async function markRefundUnknown(
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
       `refund:${refundId}`,
     ]);
+    await assertJobLeaseWithClient(client, job);
     const pointer = await client.query<{ source_fund_receipt_id: string }>(
       "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
       [refundId],
@@ -2487,7 +3000,7 @@ async function markRefundUnknown(
       current.operation_status === "succeeded" ||
       current.operation_status === "failed"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return;
     }
     await client.query(
@@ -2521,7 +3034,7 @@ async function markRefundUnknown(
       { ...job.payload, operationId },
       config.RECONCILE_BASE_DELAY_SECONDS,
     );
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
   });
 }
 
@@ -2534,13 +3047,14 @@ async function finishRefundStartWithWatchdog(
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
       `refund:${refundId}`,
     ]);
+    await assertJobLeaseWithClient(client, job);
     const pointer = await client.query<{ source_fund_receipt_id: string }>(
       "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
       [refundId],
     );
     const receiptId = pointer.rows[0]?.source_fund_receipt_id;
     if (!receiptId) {
-      await manualJobWithClient(client, job.id, "Refund disappeared after Provider create");
+      await manualJobWithClient(client, job, "Refund disappeared after Provider create");
       return;
     }
     await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
@@ -2574,7 +3088,7 @@ async function finishRefundStartWithWatchdog(
         config.WATCHDOG_DELAY_SECONDS,
       );
     }
-    await completeJobWithClient(client, job.id);
+    await completeJobWithClient(client, job);
   });
 }
 
@@ -2661,7 +3175,7 @@ async function startRefund(job: Job): Promise<void> {
           terminal.operation_status === "succeeded" ||
           terminal.operation_status === "failed"
         ) {
-          await completeJobWithClient(client, job.id);
+          await completeJobWithClient(client, job);
           return;
         }
         await client.query(
@@ -2688,7 +3202,7 @@ async function startRefund(job: Job): Promise<void> {
             { providerOperationId: operationId, httpStatus: response.status },
           ],
         );
-        await completeJobWithClient(client, job.id);
+        await completeJobWithClient(client, job);
       });
       return;
     }
@@ -3041,6 +3555,8 @@ async function delayReconcile(
   forceManual = false,
 ): Promise<void> {
   await transaction(async (client) => {
+    await lockProviderOperation(client, operationId);
+    await assertJobLeaseWithClient(client, job);
     const manual = forceManual || job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
     await client.query(
       `UPDATE provider_operations
@@ -3048,7 +3564,7 @@ async function delayReconcile(
        WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
       [operationId, reason.slice(0, 1_000)],
     );
-    await client.query(
+    const updatedJob = await client.query(
       `UPDATE durable_jobs
        SET status = $2,
            available_at = CASE
@@ -3059,14 +3575,21 @@ async function delayReconcile(
            locked_by = NULL,
            last_error = $4,
            updated_at = now()
-       WHERE id = $1`,
+       WHERE id = $1
+         AND status = 'running'
+         AND locked_by = $5
+         AND attempts = $6
+       RETURNING id`,
       [
         job.id,
         manual ? "manual" : "pending",
         reconcileDelaySeconds(job.attempts),
         reason.slice(0, 1_000),
+        config.WORKER_ID,
+        job.attempts,
       ],
     );
+    if (updatedJob.rowCount !== 1) throw new LostJobLeaseError(job.id);
     if (manual) {
       await client.query(
         `UPDATE invoice_payment_commands
@@ -3101,6 +3624,45 @@ async function manualProvisionReconcile(
   reason: string,
 ): Promise<void> {
   await transaction(async (client) => {
+    await lockProviderOperation(client, operationId);
+    await assertJobLeaseWithClient(client, job);
+    const lockPointers = await client.query<{
+      invoice_id: string;
+      order_id: string;
+      order_item_id: string;
+    }>(
+      `SELECT invoice.id AS invoice_id,
+              customer_order.id AS order_id,
+              item.id AS order_item_id
+       FROM services service
+       JOIN order_items item ON item.id = service.order_item_id
+       JOIN orders customer_order ON customer_order.id = item.order_id
+       JOIN invoices invoice ON invoice.order_id = customer_order.id
+       WHERE service.id = $1`,
+      [serviceId],
+    );
+    const lockPointer = lockPointers.rows[0];
+    if (lockPointer) {
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        lockPointer.invoice_id,
+      ]);
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [serviceId]);
+    }
+    await client.query(
+      `SELECT id
+       FROM provider_operations
+       WHERE id = $1
+         AND subject_type = 'service'
+         AND subject_id = $2
+       FOR UPDATE`,
+      [operationId, serviceId],
+    );
     const result = await client.query<{
       order_id: string;
       service_status: string;
@@ -3117,15 +3679,14 @@ async function manualProvisionReconcile(
          ON operation.id = $2
         AND operation.subject_type = 'service'
         AND operation.subject_id = service.id
-       WHERE service.id = $1
-       FOR UPDATE OF service, customer_order, operation`,
+       WHERE service.id = $1`,
       [serviceId, operationId],
     );
     const current = result.rows[0];
     if (!current) {
       await manualJobWithClient(
         client,
-        job.id,
+        job,
         "provision reconciliation references missing or inconsistent Core records",
       );
       return;
@@ -3136,7 +3697,7 @@ async function manualProvisionReconcile(
       current.service_status === "active" ||
       current.service_status === "terminated"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return;
     }
     const orderId = current.order_id;
@@ -3169,7 +3730,7 @@ async function manualProvisionReconcile(
         { providerOperationId: operationId, orderId },
       ],
     );
-    await manualJobWithClient(client, job.id, reason);
+    await manualJobWithClient(client, job, reason);
   });
 }
 
@@ -3184,13 +3745,14 @@ async function delayRefundReconcile(
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
       `refund:${refundId}`,
     ]);
+    await assertJobLeaseWithClient(client, job);
     const pointer = await client.query<{ source_fund_receipt_id: string }>(
       "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
       [refundId],
     );
     const receiptId = pointer.rows[0]?.source_fund_receipt_id;
     if (!receiptId) {
-      await manualJobWithClient(client, job.id, "Refund disappeared during reconciliation");
+      await manualJobWithClient(client, job, "Refund disappeared during reconciliation");
       return;
     }
     await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
@@ -3219,7 +3781,7 @@ async function delayRefundReconcile(
       current.operation_status === "succeeded" ||
       current.operation_status === "failed"
     ) {
-      await completeJobWithClient(client, job.id);
+      await completeJobWithClient(client, job);
       return;
     }
     const manual = forceManual || job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
@@ -3249,7 +3811,7 @@ async function delayRefundReconcile(
        WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
       [operationId, reason.slice(0, 1_000)],
     );
-    await client.query(
+    const updatedJob = await client.query(
       `UPDATE durable_jobs
        SET status = $2,
            available_at = CASE
@@ -3260,14 +3822,21 @@ async function delayRefundReconcile(
            locked_by = NULL,
            last_error = $4,
            updated_at = now()
-       WHERE id = $1`,
+       WHERE id = $1
+         AND status = 'running'
+         AND locked_by = $5
+         AND attempts = $6
+       RETURNING id`,
       [
         job.id,
         manual ? "manual" : "pending",
         reconcileDelaySeconds(job.attempts),
         reason.slice(0, 1_000),
+        config.WORKER_ID,
+        job.attempts,
       ],
     );
+    if (updatedJob.rowCount !== 1) throw new LostJobLeaseError(job.id);
   });
 }
 
@@ -3383,7 +3952,7 @@ async function reconcileRefund(job: Job): Promise<void> {
   const coreOutcome = await submitReconciledEvent(
     "/api/v1/provider-events/refund",
     {
-      eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      eventId: `reconcile:${operationId}:${randomUUID()}`,
       providerOperationId: operationId,
       refundId,
       ...fact,
@@ -3394,7 +3963,7 @@ async function reconcileRefund(job: Job): Promise<void> {
     await delayRefundReconcile(job, refundId, operationId, coreOutcome.reason);
     return;
   }
-  await completeJob(job.id);
+  await completeJob(job);
 }
 
 async function reconcileAddFunds(job: Job): Promise<void> {
@@ -3509,7 +4078,7 @@ async function reconcileAddFunds(job: Job): Promise<void> {
   const coreOutcome = await submitReconciledEvent(
     "/api/v1/provider-events/payment",
     {
-      eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      eventId: `reconcile:${operationId}:${randomUUID()}`,
       providerOperationId: operationId,
       paymentAttemptId: addFundsAttemptId,
       ...fact,
@@ -3520,7 +4089,7 @@ async function reconcileAddFunds(job: Job): Promise<void> {
     await delayReconcile(job, operationId, coreOutcome.reason);
     return;
   }
-  await completeJob(job.id);
+  await completeJob(job);
 }
 
 async function reconcilePayment(job: Job): Promise<void> {
@@ -3620,7 +4189,7 @@ async function reconcilePayment(job: Job): Promise<void> {
   const coreOutcome = await submitReconciledEvent(
     "/api/v1/provider-events/payment",
     {
-      eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      eventId: `reconcile:${operationId}:${randomUUID()}`,
       providerOperationId: operationId,
       paymentAttemptId,
       ...fact,
@@ -3631,7 +4200,7 @@ async function reconcilePayment(job: Job): Promise<void> {
     await delayReconcile(job, operationId, coreOutcome.reason);
     return;
   }
-  await completeJob(job.id);
+  await completeJob(job);
 }
 
 async function reconcileProvision(job: Job): Promise<void> {
@@ -3729,7 +4298,7 @@ async function reconcileProvision(job: Job): Promise<void> {
   const coreOutcome = await submitReconciledEvent(
     "/api/v1/provider-events/provisioning",
     {
-      eventId: `reconcile:${operationId}:${fact.status}:attempt:${job.attempts}`,
+      eventId: `reconcile:${operationId}:${randomUUID()}`,
       providerOperationId: operationId,
       ...fact,
     },
@@ -3739,7 +4308,7 @@ async function reconcileProvision(job: Job): Promise<void> {
     await delayReconcile(job, operationId, coreOutcome.reason);
     return;
   }
-  await completeJob(job.id);
+  await completeJob(job);
 }
 
 async function sendNotification(job: Job): Promise<void> {
@@ -3762,7 +4331,7 @@ async function sendNotification(job: Job): Promise<void> {
   );
   const outbox = result.rows[0];
   if (!outbox || outbox.published_at) {
-    await completeJob(job.id);
+    await completeJob(job);
     return;
   }
   if (
@@ -3799,7 +4368,7 @@ async function sendNotification(job: Job): Promise<void> {
   await pool.query("UPDATE outbox SET published_at = now() WHERE id = $1 AND published_at IS NULL", [
     outboxId,
   ]);
-  await completeJob(job.id);
+  await completeJob(job);
 }
 
 async function processJob(job: Job): Promise<void> {
@@ -3857,6 +4426,14 @@ while (!stopping) {
   try {
     await processJob(job);
   } catch (error) {
+    if (error instanceof LostJobLeaseError) {
+      console.warn("discarded stale worker result after durable job lease loss", {
+        jobId: job.id,
+        jobType: job.job_type,
+        attempts: job.attempts,
+      });
+      continue;
+    }
     console.error("job failed", {
       jobId: job.id,
       jobType: job.job_type,
