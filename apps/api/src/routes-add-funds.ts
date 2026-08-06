@@ -24,6 +24,8 @@ const commandSchema = z.object({
       "timeout_success",
       "duplicate_out_of_order",
       "definitive_reject",
+      "delayed_definitive_reject",
+      "reconcile_manual",
       "partial_then_reject",
       "partial_then_timeout",
       "partial",

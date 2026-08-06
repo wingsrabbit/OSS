@@ -92,6 +92,9 @@ async function verifyPublished007Upgrade(): Promise<void> {
       unclaimed_refund_capacity: string | null;
       refund_source_context: string | null;
       old_discrepancy_unique: string | null;
+      chargeback_effects: string | null;
+      debt_transactions: string | null;
+      account_restrictions: string | null;
     }>(
       `SELECT
          max(version) AS version,
@@ -119,9 +122,15 @@ async function verifyPublished007Upgrade(): Promise<void> {
              AND table_name = 'refund_discrepancy_settlements'
              AND constraint_name = 'refund_discrepancy_settlements_refund_id_key'
          ) AS old_discrepancy_unique
+         ,to_regclass('public.add_funds_chargeback_effects')::text
+           AS chargeback_effects
+         ,to_regclass('public.client_account_debt_transactions')::text
+           AS debt_transactions
+         ,to_regclass('public.client_account_restrictions')::text
+           AS account_restrictions
        FROM schema_migrations`,
     );
-    assert.equal(upgraded.rows[0]?.version, "010_stage_b_unclaimed_refunds");
+    assert.equal(upgraded.rows[0]?.version, "011_stage_b_add_funds_chargebacks");
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
@@ -139,6 +148,12 @@ async function verifyPublished007Upgrade(): Promise<void> {
     assert.equal(upgraded.rows[0]?.unclaimed_refund_capacity, "unclaimed_fund_refund_capacity");
     assert.equal(upgraded.rows[0]?.refund_source_context, "source_context");
     assert.equal(upgraded.rows[0]?.old_discrepancy_unique, null);
+    assert.equal(upgraded.rows[0]?.chargeback_effects, "add_funds_chargeback_effects");
+    assert.equal(
+      upgraded.rows[0]?.debt_transactions,
+      "client_account_debt_transactions",
+    );
+    assert.equal(upgraded.rows[0]?.account_restrictions, "client_account_restrictions");
   } finally {
     await upgradePool?.end().catch(() => undefined);
     upgradePool = null;
@@ -239,6 +254,25 @@ type AddFundsStatus = {
   feeMinor: string;
   externalDueMinor: string;
   result: Record<string, unknown> | null;
+};
+type ChargebackStatus = {
+  clientAccountId: string;
+  restricted: boolean;
+  creditBalanceMinor: string;
+  debtBalanceMinor: string;
+  chargebacks: Array<{
+    chargebackEffectId: string;
+    externalAmountMinor: string;
+    creditRecoveredMinor: string;
+    debtMinor: string;
+    restrictionActive: boolean;
+  }>;
+  unclaimedChargebacks: Array<{
+    unclaimedChargebackEffectId: string;
+    fundReceiptId: string;
+    externalAmountMinor: string;
+  }>;
+  manualHolds: Array<{ holdId: string; reason: string }>;
 };
 type PaymentRecords = {
   command_status: string;
@@ -505,6 +539,42 @@ async function submitPaymentFactAndDiscardResponse(
       else reject(error);
     });
     request.end(serialized);
+  });
+}
+
+async function submitAddFundsChargebackFact(
+  body: {
+    eventId: string;
+    providerOperationId: string;
+    addFundsAttemptId: string;
+    originalExternalPaymentId: string;
+    externalChargebackId: string;
+    amountMinor: string;
+    currency: string;
+    occurredAt: string;
+    callbackCapability?: string;
+  },
+  secret = paymentWebhookSecret!,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const signedBody = {
+    ...body,
+    callbackCapability:
+      body.callbackCapability ??
+      providerOperationCapability(
+        providerCapabilitySecret!,
+        "mock-payment-v1",
+        body.providerOperationId,
+      ),
+    status: "succeeded" as const,
+  };
+  const timestamp = Date.now().toString();
+  return rawCoreRequest("/api/v1/provider-events/add-funds-chargeback", {
+    method: "POST",
+    headers: {
+      "X-OSS-Timestamp": timestamp,
+      "X-OSS-Signature": providerSignature(secret, timestamp, signedBody),
+    },
+    body: JSON.stringify(signedBody),
   });
 }
 
@@ -862,6 +932,8 @@ async function startAddFunds(
     | "timeout_success"
     | "duplicate_out_of_order"
     | "definitive_reject"
+    | "delayed_definitive_reject"
+    | "reconcile_manual"
     | "partial_then_reject"
     | "partial_then_timeout"
     | "partial"
@@ -948,6 +1020,12 @@ const unverifiedBillingSummary = await rawCoreRequest("/api/v1/billing/summary",
 });
 assert.equal(unverifiedBillingSummary.status, 403);
 assert.equal(unverifiedBillingSummary.body.code, "EMAIL_VERIFICATION_REQUIRED");
+const unverifiedChargebackStatus = await rawCoreRequest(
+  "/api/v1/billing/chargeback-status",
+  { method: "GET" },
+);
+assert.equal(unverifiedChargebackStatus.status, 403);
+assert.equal(unverifiedChargebackStatus.body.code, "EMAIL_VERIFICATION_REQUIRED");
 const unverifiedAddFunds = await rawCoreRequest("/api/v1/billing/add-funds/quotes", {
   method: "POST",
   body: JSON.stringify({ principalMinor: "5000", paymentMethod: "card" }),
@@ -9487,6 +9565,1406 @@ await corePool.query(
    WHERE id = $1`,
   [primaryUnclaimed.receiptId],
 );
+
+cookie = "";
+const pendingChargebackEmail = `pending-chargeback-${randomUUID()}@example.invalid`;
+await request(
+  "/api/v1/auth/register",
+  {
+    method: "POST",
+    body: JSON.stringify({
+      email: pendingChargebackEmail,
+      password,
+      clientName: "Synthetic Pending Chargeback Client",
+      locale: "en",
+    }),
+  },
+  201,
+);
+await corePool.query("UPDATE users SET email_verified_at = now() WHERE email = $1", [
+  pendingChargebackEmail,
+]);
+await request(
+  "/api/v1/auth/login",
+  { method: "POST", body: JSON.stringify({ email: pendingChargebackEmail, password }) },
+  200,
+);
+await corePool.query(`
+  CREATE OR REPLACE FUNCTION integration_delay_pending_chargeback_add_funds()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF NEW.job_type = 'add_funds.start' THEN
+      NEW.available_at = now() + interval '1 hour';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS integration_delay_pending_chargeback_add_funds ON durable_jobs;
+  CREATE TRIGGER integration_delay_pending_chargeback_add_funds
+  BEFORE INSERT ON durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION integration_delay_pending_chargeback_add_funds();
+`);
+let pendingChargebackAddFunds: {
+  command: AddFundsCommand;
+  idempotencyKey: string;
+} | null = null;
+let terminalChargebackAddFunds: {
+  command: AddFundsCommand;
+  idempotencyKey: string;
+} | null = null;
+let manualChargebackAddFunds: {
+  command: AddFundsCommand;
+  idempotencyKey: string;
+} | null = null;
+let unclaimedPendingChargebackAddFunds: {
+  command: AddFundsCommand;
+  idempotencyKey: string;
+} | null = null;
+try {
+  const pendingQuote = await createAddFundsQuote("5000", "card");
+  pendingChargebackAddFunds = await startAddFunds(pendingQuote.quoteId, "success");
+  const unclaimedPendingQuote = await createAddFundsQuote("5000", "card");
+  unclaimedPendingChargebackAddFunds = await startAddFunds(
+    unclaimedPendingQuote.quoteId,
+    "success",
+  );
+} finally {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_pending_chargeback_add_funds ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_pending_chargeback_add_funds();
+  `);
+}
+const terminalQuote = await createAddFundsQuote("5000", "card");
+terminalChargebackAddFunds = await startAddFunds(
+  terminalQuote.quoteId,
+  "delayed_definitive_reject",
+);
+assert.ok(pendingChargebackAddFunds);
+assert.ok(terminalChargebackAddFunds);
+assert.ok(unclaimedPendingChargebackAddFunds);
+const pendingChargebackOperation = await corePool.query<{ id: string }>(
+  `UPDATE provider_operations
+   SET status = 'running', attempt_count = 1, updated_at = now()
+   WHERE subject_type = 'add_funds'
+     AND subject_id = $1
+     AND kind = 'payment_create'
+   RETURNING id`,
+  [pendingChargebackAddFunds.command.addFundsAttemptId],
+);
+const pendingChargebackOperationId = pendingChargebackOperation.rows[0]?.id;
+assert.ok(pendingChargebackOperationId);
+const pendingOriginalPaymentId = `mock-pay-pending-${randomUUID()}`;
+const pendingPaymentOccurredAt = new Date();
+const pendingChargebackOccurredAt = new Date(pendingPaymentOccurredAt.getTime() + 1_000);
+const pendingChargebackFact = await submitAddFundsChargebackFact({
+  eventId: `chargeback-pending-source:${randomUUID()}`,
+  providerOperationId: pendingChargebackOperationId,
+  addFundsAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+  originalExternalPaymentId: pendingOriginalPaymentId,
+  externalChargebackId: `mock-chargeback-pending-${randomUUID()}`,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: pendingChargebackOccurredAt.toISOString(),
+});
+assert.equal(pendingChargebackFact.status, 202);
+assert.equal(pendingChargebackFact.body.status, "pending_source");
+
+const terminalChargebackOperation = await corePool.query<{ id: string }>(
+  `SELECT id
+   FROM provider_operations
+   WHERE subject_type = 'add_funds'
+     AND subject_id = $1
+     AND kind = 'payment_create'`,
+  [terminalChargebackAddFunds.command.addFundsAttemptId],
+);
+const terminalChargebackOperationId = terminalChargebackOperation.rows[0]?.id;
+assert.ok(terminalChargebackOperationId);
+await waitFor(
+  "Mock Provider definitive rejection gate",
+  () =>
+    providerPool.query<{ operation_id: string }>(
+      `SELECT operation_id
+       FROM mock_payment_fault_gates
+       WHERE operation_id = $1`,
+      [terminalChargebackOperationId],
+    ),
+  (result) => result.rowCount === 1,
+  8_000,
+);
+const terminalStarted = await corePool.query<{ status: string; attempt_count: number }>(
+  `SELECT status, attempt_count
+   FROM provider_operations
+   WHERE id = $1`,
+  [terminalChargebackOperationId],
+);
+assert.deepEqual(terminalStarted.rows[0], { status: "running", attempt_count: 1 });
+let terminalPendingFact:
+  | { status: number; body: Record<string, unknown> }
+  | undefined;
+try {
+  terminalPendingFact = await submitAddFundsChargebackFact({
+    eventId: `chargeback-terminal-pending:${randomUUID()}`,
+    providerOperationId: terminalChargebackOperationId,
+    addFundsAttemptId: terminalChargebackAddFunds.command.addFundsAttemptId,
+    originalExternalPaymentId: `mock-pay-terminal-pending-${randomUUID()}`,
+    externalChargebackId: `mock-chargeback-terminal-pending-${randomUUID()}`,
+    amountMinor: "5175",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  });
+} finally {
+  await providerPool.query(
+    `UPDATE mock_payment_fault_gates
+     SET released_at = now()
+     WHERE operation_id = $1 AND released_at IS NULL`,
+    [terminalChargebackOperationId],
+  );
+}
+assert.ok(terminalPendingFact);
+assert.equal(terminalPendingFact.status, 202);
+assert.equal(terminalPendingFact.body.status, "pending_source");
+const terminalPendingDisposition = await waitFor(
+  "Worker definitive rejection to hold the pending Chargeback",
+  () => corePool.query<{
+  attempt_status: string;
+  operation_status: string;
+  job_status: string;
+  facts: string;
+  holds: string;
+}>(
+  `SELECT
+     attempt.status AS attempt_status,
+     operation.status AS operation_status,
+     job.status AS job_status,
+     (SELECT count(*)::text FROM add_funds_chargeback_facts fact
+       WHERE fact.add_funds_attempt_id = attempt.id) AS facts,
+     (SELECT count(*)::text
+        FROM add_funds_chargeback_holds hold_record
+        JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.add_funds_attempt_id = attempt.id) AS holds
+   FROM add_funds_attempts attempt
+   JOIN provider_operations operation
+     ON operation.subject_type = 'add_funds'
+    AND operation.subject_id = attempt.id
+    AND operation.kind = 'payment_create'
+   JOIN durable_jobs job
+     ON job.job_type = 'add_funds.start'
+    AND job.payload->>'addFundsAttemptId' = attempt.id::text
+  WHERE attempt.id = $1`,
+  [terminalChargebackAddFunds.command.addFundsAttemptId],
+  ),
+  (result) =>
+    result.rows[0]?.attempt_status === "failed" &&
+    result.rows[0]?.operation_status === "failed" &&
+    result.rows[0]?.job_status === "completed" &&
+    result.rows[0]?.holds === "1",
+  8_000,
+);
+await providerPool.query("DELETE FROM mock_payment_fault_gates WHERE operation_id = $1", [
+  terminalChargebackOperationId,
+]);
+assert.deepEqual(terminalPendingDisposition.rows[0], {
+  attempt_status: "failed",
+  operation_status: "failed",
+  job_status: "completed",
+  facts: "1",
+  holds: "1",
+});
+
+await corePool.query(`
+  CREATE OR REPLACE FUNCTION integration_delay_chargeback_reconcile_job()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF NEW.job_type = 'add_funds.reconcile' THEN
+      NEW.available_at = now() + interval '1 hour';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS integration_delay_chargeback_reconcile_job ON durable_jobs;
+  CREATE TRIGGER integration_delay_chargeback_reconcile_job
+  BEFORE INSERT ON durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION integration_delay_chargeback_reconcile_job();
+`);
+try {
+  const manualQuote = await createAddFundsQuote("5000", "card");
+  const manualStarted = await startAddFunds(manualQuote.quoteId, "reconcile_manual");
+  manualChargebackAddFunds = manualStarted;
+  await waitFor(
+    "ambiguous Add Funds create to queue a delayed reconciliation",
+    () =>
+      corePool.query<{ attempt_status: string; job_status: string }>(
+        `SELECT attempt.status AS attempt_status, job.status AS job_status
+         FROM add_funds_attempts attempt
+         JOIN durable_jobs job
+           ON job.job_type = 'add_funds.reconcile'
+          AND job.payload->>'addFundsAttemptId' = attempt.id::text
+         WHERE attempt.id = $1`,
+        [manualStarted.command.addFundsAttemptId],
+      ),
+    (result) =>
+      result.rows[0]?.attempt_status === "unknown" &&
+      result.rows[0]?.job_status === "pending",
+    8_000,
+  );
+} finally {
+  await corePool.query(`
+    DROP TRIGGER IF EXISTS integration_delay_chargeback_reconcile_job ON durable_jobs;
+    DROP FUNCTION IF EXISTS integration_delay_chargeback_reconcile_job();
+  `);
+}
+assert.ok(manualChargebackAddFunds);
+
+const manualChargebackOperation = await corePool.query<{ id: string }>(
+  `SELECT id
+   FROM provider_operations
+   WHERE subject_type = 'add_funds'
+     AND subject_id = $1
+     AND kind = 'payment_create'
+     AND status = 'unknown'
+     AND attempt_count = 1`,
+  [manualChargebackAddFunds.command.addFundsAttemptId],
+);
+const manualChargebackOperationId = manualChargebackOperation.rows[0]?.id;
+assert.ok(manualChargebackOperationId);
+const manualPendingPaymentId = `mock-pay-manual-pending-${randomUUID()}`;
+const manualPendingPaymentAt = new Date();
+const manualPendingFact = await submitAddFundsChargebackFact({
+  eventId: `chargeback-manual-pending:${randomUUID()}`,
+  providerOperationId: manualChargebackOperationId,
+  addFundsAttemptId: manualChargebackAddFunds.command.addFundsAttemptId,
+  originalExternalPaymentId: manualPendingPaymentId,
+  externalChargebackId: `mock-chargeback-manual-pending-${randomUUID()}`,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date(manualPendingPaymentAt.getTime() + 1_000).toISOString(),
+});
+assert.equal(manualPendingFact.status, 202);
+assert.equal(manualPendingFact.body.status, "pending_source");
+await corePool.query(
+  `UPDATE durable_jobs
+   SET available_at = now(), updated_at = now()
+   WHERE job_type = 'add_funds.reconcile'
+     AND payload->>'addFundsAttemptId' = $1
+     AND status = 'pending'`,
+  [manualChargebackAddFunds.command.addFundsAttemptId],
+);
+const manualPendingDisposition = await waitFor(
+  "Worker reconciliation exhaustion to hold the pending Chargeback",
+  () => corePool.query<{
+  attempt_status: string;
+  command_status: string;
+  job_status: string;
+  facts: string;
+  holds: string;
+}>(
+  `SELECT
+     attempt.status AS attempt_status,
+     command.status AS command_status,
+     job.status AS job_status,
+     (SELECT count(*)::text FROM add_funds_chargeback_facts fact
+       WHERE fact.add_funds_attempt_id = attempt.id) AS facts,
+     (SELECT count(*)::text
+        FROM add_funds_chargeback_holds hold_record
+        JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.add_funds_attempt_id = attempt.id) AS holds
+   FROM add_funds_attempts attempt
+   JOIN add_funds_commands command ON command.add_funds_attempt_id = attempt.id
+   JOIN durable_jobs job
+     ON job.job_type = 'add_funds.reconcile'
+    AND job.payload->>'addFundsAttemptId' = attempt.id::text
+   WHERE attempt.id = $1`,
+  [manualChargebackAddFunds.command.addFundsAttemptId],
+  ),
+  (result) =>
+    result.rows[0]?.attempt_status === "unknown" &&
+    result.rows[0]?.command_status === "manual" &&
+    result.rows[0]?.job_status === "manual" &&
+    result.rows[0]?.holds === "1",
+  8_000,
+);
+assert.deepEqual(manualPendingDisposition.rows[0], {
+  attempt_status: "unknown",
+  command_status: "manual",
+  job_status: "manual",
+  facts: "1",
+  holds: "1",
+});
+
+const customerHoldsBeforeLateManual = await request<ChargebackStatus>(
+  "/api/v1/billing/chargeback-status",
+);
+const lateManualQuote = await createAddFundsQuote("5000", "card");
+const lateManualStarted = await startAddFunds(lateManualQuote.quoteId, "reconcile_manual");
+const lateManualState = await waitForAddFunds(lateManualStarted.command.commandId, "manual");
+assert.equal(lateManualState.attemptStatus, "unknown");
+assert.equal(lateManualState.providerOperationStatus, "unknown");
+const lateManualExternalPaymentId = `mock-pay-late-after-manual-${randomUUID()}`;
+const lateManualExternalChargebackId = `mock-chargeback-late-after-manual-${randomUUID()}`;
+const lateAfterManualFact = await submitAddFundsChargebackFact({
+  eventId: `chargeback-late-after-manual:${randomUUID()}`,
+  providerOperationId: lateManualState.providerOperationId,
+  addFundsAttemptId: lateManualState.addFundsAttemptId,
+  originalExternalPaymentId: lateManualExternalPaymentId,
+  externalChargebackId: lateManualExternalChargebackId,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date().toISOString(),
+});
+assert.equal(lateAfterManualFact.status, 202);
+assert.equal(lateAfterManualFact.body.status, "manual");
+assert.match(String(lateAfterManualFact.body.reason), /manual review/i);
+const customerHoldsAfterLateManual = await request<ChargebackStatus>(
+  "/api/v1/billing/chargeback-status",
+);
+assert.equal(
+  customerHoldsAfterLateManual.manualHolds.length,
+  customerHoldsBeforeLateManual.manualHolds.length + 1,
+);
+assert.equal(
+  customerHoldsAfterLateManual.manualHolds.some((hold) => /manual review/i.test(hold.reason)),
+  true,
+);
+cookie = staffCookie;
+const adminLateManualChargeback = await request<{
+  manualHolds: Array<{ externalChargebackId: string; clientAccountId: string | null }>;
+}>("/api/v1/admin/add-funds-chargebacks");
+assert.equal(
+  adminLateManualChargeback.manualHolds.some(
+    (hold) =>
+      hold.externalChargebackId === lateManualExternalChargebackId &&
+      hold.clientAccountId === customerHoldsAfterLateManual.clientAccountId,
+  ),
+  true,
+);
+cookie = "";
+await request(
+  "/api/v1/auth/login",
+  { method: "POST", body: JSON.stringify({ email: pendingChargebackEmail, password }) },
+  200,
+);
+
+const manualLatePayment = await submitPaymentFact({
+  eventId: `add-funds-manual-late:${randomUUID()}`,
+  providerOperationId: manualChargebackOperationId,
+  paymentAttemptId: manualChargebackAddFunds.command.addFundsAttemptId,
+  externalPaymentId: manualPendingPaymentId,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: manualPendingPaymentAt.toISOString(),
+});
+assert.equal(manualLatePayment.status, 202);
+assert.equal(manualLatePayment.body.status, "unclaimed");
+const manualLateReceiptSafety = await corePool.query<{
+  effects: string;
+  holds: string;
+  disposition: string;
+  capacity_frozen: boolean;
+  available_minor: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM add_funds_unclaimed_chargeback_effects effect
+       WHERE effect.fund_receipt_id = receipt.id) AS effects,
+     (SELECT count(*)::text
+        FROM add_funds_chargeback_holds hold_record
+        JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.add_funds_attempt_id = $2) AS holds,
+     receipt.disposition,
+     capacity.capacity_frozen,
+     capacity.available_minor::text
+   FROM fund_receipts receipt
+   JOIN unclaimed_fund_refund_capacity capacity
+     ON capacity.fund_receipt_id = receipt.id
+   WHERE receipt.external_payment_id = $1`,
+  [manualPendingPaymentId, manualChargebackAddFunds.command.addFundsAttemptId],
+);
+assert.deepEqual(manualLateReceiptSafety.rows[0], {
+  effects: "0",
+  holds: "1",
+  disposition: "unclaimed",
+  capacity_frozen: true,
+  available_minor: "0",
+});
+const beforePendingSource = await corePool.query<{ facts: string; effects: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM add_funds_chargeback_facts
+       WHERE add_funds_attempt_id = $1) AS facts,
+     (SELECT count(*)::text
+        FROM add_funds_chargeback_effects effect
+        JOIN add_funds_settlements settlement
+          ON settlement.id = effect.add_funds_settlement_id
+       WHERE settlement.add_funds_attempt_id = $1) AS effects`,
+  [pendingChargebackAddFunds.command.addFundsAttemptId],
+);
+assert.deepEqual(beforePendingSource.rows[0], { facts: "1", effects: "0" });
+const pendingSourceSettlement = await submitPaymentFact({
+  eventId: `add-funds-pending-source:${randomUUID()}`,
+  providerOperationId: pendingChargebackOperationId,
+  paymentAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+  externalPaymentId: pendingOriginalPaymentId,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: pendingPaymentOccurredAt.toISOString(),
+});
+assert.equal(pendingSourceSettlement.status, 202);
+assert.equal(pendingSourceSettlement.body.status, "succeeded");
+const pendingSourceStatus = await request<ChargebackStatus>(
+  "/api/v1/billing/chargeback-status",
+);
+assert.equal(pendingSourceStatus.restricted, false);
+assert.equal(pendingSourceStatus.creditBalanceMinor, "0");
+assert.equal(pendingSourceStatus.debtBalanceMinor, "0");
+assert.deepEqual(
+  pendingSourceStatus.chargebacks.map((chargeback) => ({
+    externalAmountMinor: chargeback.externalAmountMinor,
+    creditRecoveredMinor: chargeback.creditRecoveredMinor,
+    debtMinor: chargeback.debtMinor,
+  })),
+  [{ externalAmountMinor: "5175", creditRecoveredMinor: "5000", debtMinor: "0" }],
+);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET status = 'completed', locked_at = NULL, locked_by = NULL, updated_at = now()
+   WHERE job_type = 'add_funds.start'
+     AND payload->>'addFundsAttemptId' = $1`,
+  [pendingChargebackAddFunds.command.addFundsAttemptId],
+);
+
+const secondUnclaimedPaymentId = `mock-pay-second-unclaimed-${randomUUID()}`;
+const secondUnclaimedPaymentAt = new Date();
+const secondUnclaimedPayment = await submitPaymentFact({
+  eventId: `add-funds-second-unclaimed:${randomUUID()}`,
+  providerOperationId: pendingChargebackOperationId,
+  paymentAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+  externalPaymentId: secondUnclaimedPaymentId,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: secondUnclaimedPaymentAt.toISOString(),
+});
+assert.equal(secondUnclaimedPayment.status, 202);
+assert.equal(secondUnclaimedPayment.body.status, "unclaimed");
+const secondUnclaimedChargeback = await submitAddFundsChargebackFact({
+  eventId: `chargeback-second-unclaimed:${randomUUID()}`,
+  providerOperationId: pendingChargebackOperationId,
+  addFundsAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+  originalExternalPaymentId: secondUnclaimedPaymentId,
+  externalChargebackId: `mock-chargeback-second-unclaimed-${randomUUID()}`,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date(secondUnclaimedPaymentAt.getTime() + 1_000).toISOString(),
+});
+assert.equal(secondUnclaimedChargeback.status, 202);
+assert.equal(secondUnclaimedChargeback.body.status, "succeeded");
+const unclaimedChargebackState = await corePool.query<{
+  effects: string;
+  receipt_disposition: string;
+  liability_debit: string;
+  cash_credit: string;
+  capacity_frozen: boolean;
+  available_minor: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+        FROM add_funds_unclaimed_chargeback_effects effect
+       WHERE effect.fund_receipt_id = receipt.id) AS effects,
+     receipt.disposition AS receipt_disposition,
+     (SELECT COALESCE(sum(line.debit_minor), 0)::text
+        FROM ledger_journals journal
+        JOIN ledger_lines line ON line.journal_id = journal.id
+       WHERE journal.source_type = 'add_funds_unclaimed_chargeback_effect'
+         AND journal.source_id IN (
+           SELECT id FROM add_funds_unclaimed_chargeback_effects
+            WHERE fund_receipt_id = receipt.id
+         )
+         AND line.account_code = 'unclaimed_funds_liability') AS liability_debit,
+     (SELECT COALESCE(sum(line.credit_minor), 0)::text
+        FROM ledger_journals journal
+        JOIN ledger_lines line ON line.journal_id = journal.id
+       WHERE journal.source_type = 'add_funds_unclaimed_chargeback_effect'
+         AND journal.source_id IN (
+           SELECT id FROM add_funds_unclaimed_chargeback_effects
+            WHERE fund_receipt_id = receipt.id
+         )
+         AND line.account_code = 'mock_cash') AS cash_credit,
+     capacity.capacity_frozen,
+     capacity.available_minor::text
+   FROM fund_receipts receipt
+   JOIN unclaimed_fund_refund_capacity capacity
+     ON capacity.fund_receipt_id = receipt.id
+   WHERE receipt.external_payment_id = $1`,
+  [secondUnclaimedPaymentId],
+);
+assert.deepEqual(unclaimedChargebackState.rows[0], {
+  effects: "1",
+  receipt_disposition: "charged_back",
+  liability_debit: "5175",
+  cash_credit: "5175",
+  capacity_frozen: true,
+  available_minor: "0",
+});
+const secondUnclaimedCustomerStatus = await request<ChargebackStatus>(
+  "/api/v1/billing/chargeback-status",
+);
+assert.equal(
+  secondUnclaimedCustomerStatus.unclaimedChargebacks.some(
+    (effect) => effect.externalAmountMinor === "5175",
+  ),
+  true,
+);
+
+const refundFirstPaymentId = `mock-pay-refund-first-${randomUUID()}`;
+const refundFirstPaymentAt = new Date();
+const refundFirstPayment = await submitPaymentFact({
+  eventId: `add-funds-refund-first:${randomUUID()}`,
+  providerOperationId: pendingChargebackOperationId,
+  paymentAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+  externalPaymentId: refundFirstPaymentId,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: refundFirstPaymentAt.toISOString(),
+});
+assert.equal(refundFirstPayment.status, 202);
+assert.equal(refundFirstPayment.body.status, "unclaimed");
+const pendingCustomerCookie = cookie;
+cookie = staffCookie;
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const refundFirstWork = (await readUnclaimedRefundWork()).find(
+  (item) => item.externalPaymentId === refundFirstPaymentId,
+);
+assert.ok(refundFirstWork);
+await installRefundStartDelay();
+let refundFirst: RefundRecord | null = null;
+try {
+  refundFirst = await requestUnclaimedRefund(refundFirstWork, {
+    amountMode: "full",
+    amountMinor: null,
+    scenario: "success",
+    reason: "Synthetic queued return must stop when a matching Chargeback arrives",
+  });
+  assert.equal(refundFirst.status, "queued");
+  cookie = pendingCustomerCookie;
+  const refundFirstChargeback = await submitAddFundsChargebackFact({
+    eventId: `chargeback-refund-first:${randomUUID()}`,
+    providerOperationId: pendingChargebackOperationId,
+    addFundsAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+    originalExternalPaymentId: refundFirstPaymentId,
+    externalChargebackId: `mock-chargeback-refund-first-${randomUUID()}`,
+    amountMinor: "5175",
+    currency: "USD",
+    occurredAt: new Date(refundFirstPaymentAt.getTime() + 1_000).toISOString(),
+  });
+  assert.equal(refundFirstChargeback.status, 202);
+  assert.equal(refundFirstChargeback.body.status, "manual");
+} finally {
+  await dropRefundStartDelay();
+}
+assert.ok(refundFirst);
+const refundFirstFreeze = await corePool.query<{
+  refund_status: string;
+  operation_status: string;
+  job_status: string;
+  effects: string;
+  holds: string;
+  capacity_frozen: boolean;
+  available_minor: string;
+}>(
+  `SELECT
+     refund.status AS refund_status,
+     operation.status AS operation_status,
+     job.status AS job_status,
+     (SELECT count(*)::text FROM add_funds_unclaimed_chargeback_effects effect
+       WHERE effect.fund_receipt_id = refund.source_fund_receipt_id) AS effects,
+     (SELECT count(*)::text
+        FROM add_funds_chargeback_holds hold_record
+        JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.add_funds_attempt_id = $2
+         AND fact.original_external_payment_id = $3) AS holds,
+     capacity.capacity_frozen,
+     capacity.available_minor::text
+   FROM refunds refund
+   JOIN provider_operations operation
+     ON operation.subject_type = 'refund'
+    AND operation.subject_id = refund.id
+    AND operation.kind = 'refund_create'
+   JOIN durable_jobs job
+     ON job.job_type = 'refund.start'
+    AND job.payload->>'refundId' = refund.id::text
+   JOIN unclaimed_fund_refund_capacity capacity
+     ON capacity.fund_receipt_id = refund.source_fund_receipt_id
+   WHERE refund.id = $1`,
+  [
+    refundFirst.refundId,
+    pendingChargebackAddFunds.command.addFundsAttemptId,
+    refundFirstPaymentId,
+  ],
+);
+assert.deepEqual(refundFirstFreeze.rows[0], {
+  refund_status: "failed",
+  operation_status: "failed",
+  job_status: "completed",
+  effects: "0",
+  holds: "1",
+  capacity_frozen: true,
+  available_minor: "0",
+});
+cookie = pendingCustomerCookie;
+
+const pendingUnclaimedOperation = await corePool.query<{
+  id: string;
+  client_account_id: string;
+}>(
+  `UPDATE provider_operations operation
+   SET status = 'running', attempt_count = 1, updated_at = now()
+   FROM add_funds_attempts attempt
+   WHERE operation.subject_type = 'add_funds'
+     AND operation.subject_id = $1
+     AND operation.kind = 'payment_create'
+     AND attempt.id = operation.subject_id
+   RETURNING operation.id, attempt.client_account_id`,
+  [unclaimedPendingChargebackAddFunds.command.addFundsAttemptId],
+);
+const pendingUnclaimedOperationRow = pendingUnclaimedOperation.rows[0];
+assert.ok(pendingUnclaimedOperationRow);
+const pendingUnclaimedPaymentId = `mock-pay-pending-unclaimed-${randomUUID()}`;
+const pendingUnclaimedPaymentAt = new Date();
+const pendingUnclaimedChargebackFact = await submitAddFundsChargebackFact({
+  eventId: `chargeback-pending-unclaimed:${randomUUID()}`,
+  providerOperationId: pendingUnclaimedOperationRow.id,
+  addFundsAttemptId: unclaimedPendingChargebackAddFunds.command.addFundsAttemptId,
+  originalExternalPaymentId: pendingUnclaimedPaymentId,
+  externalChargebackId: `mock-chargeback-pending-unclaimed-${randomUUID()}`,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date(pendingUnclaimedPaymentAt.getTime() + 1_000).toISOString(),
+});
+assert.equal(pendingUnclaimedChargebackFact.status, 202);
+assert.equal(pendingUnclaimedChargebackFact.body.status, "pending_source");
+await corePool.query(
+  `UPDATE client_accounts SET restricted_at = now() WHERE id = $1`,
+  [pendingUnclaimedOperationRow.client_account_id],
+);
+const pendingThenUnclaimedPayment = await submitPaymentFact({
+  eventId: `add-funds-pending-unclaimed:${randomUUID()}`,
+  providerOperationId: pendingUnclaimedOperationRow.id,
+  paymentAttemptId: unclaimedPendingChargebackAddFunds.command.addFundsAttemptId,
+  externalPaymentId: pendingUnclaimedPaymentId,
+  status: "succeeded",
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: pendingUnclaimedPaymentAt.toISOString(),
+});
+assert.equal(pendingThenUnclaimedPayment.status, 202);
+assert.equal(pendingThenUnclaimedPayment.body.status, "unclaimed");
+const pendingThenUnclaimedState = await corePool.query<{
+  effects: string;
+  holds: string;
+  disposition: string;
+  capacity_frozen: boolean;
+  available_minor: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM add_funds_unclaimed_chargeback_effects effect
+       WHERE effect.fund_receipt_id = receipt.id) AS effects,
+     (SELECT count(*)::text
+        FROM add_funds_chargeback_holds hold_record
+        JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.add_funds_attempt_id = $2) AS holds,
+     receipt.disposition,
+     capacity.capacity_frozen,
+     capacity.available_minor::text
+   FROM fund_receipts receipt
+   JOIN unclaimed_fund_refund_capacity capacity
+     ON capacity.fund_receipt_id = receipt.id
+   WHERE receipt.external_payment_id = $1`,
+  [
+    pendingUnclaimedPaymentId,
+    unclaimedPendingChargebackAddFunds.command.addFundsAttemptId,
+  ],
+);
+assert.deepEqual(pendingThenUnclaimedState.rows[0], {
+  effects: "1",
+  holds: "0",
+  disposition: "charged_back",
+  capacity_frozen: true,
+  available_minor: "0",
+});
+await corePool.query(
+  `UPDATE client_accounts SET restricted_at = NULL WHERE id = $1`,
+  [pendingUnclaimedOperationRow.client_account_id],
+);
+
+cookie = "";
+const chargebackEmail = `chargeback-${randomUUID()}@example.invalid`;
+await request(
+  "/api/v1/auth/register",
+  {
+    method: "POST",
+    body: JSON.stringify({
+      email: chargebackEmail,
+      password,
+      clientName: "Synthetic Chargeback Client",
+      locale: "en",
+    }),
+  },
+  201,
+);
+await corePool.query(
+  "UPDATE users SET email_verified_at = now() WHERE email = $1",
+  [chargebackEmail],
+);
+await request(
+  "/api/v1/auth/login",
+  { method: "POST", body: JSON.stringify({ email: chargebackEmail, password }) },
+  200,
+);
+const chargebackMe = await request<{ id: string; clientAccountId: string }>(
+  "/api/v1/auth/me",
+);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const activeReauthBeforeChargeback = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM reauth_grants
+   WHERE user_id = $1 AND invalidated_at IS NULL AND expires_at > now()`,
+  [chargebackMe.id],
+);
+assert.equal(activeReauthBeforeChargeback.rows[0]?.count, "1");
+
+const chargebackQuote = await createAddFundsQuote("5000", "card");
+const chargebackAddFunds = await startAddFunds(chargebackQuote.quoteId, "success");
+const chargebackAddFundsSettled = await waitForAddFunds(
+  chargebackAddFunds.command.commandId,
+  "succeeded",
+);
+assert.equal(chargebackAddFundsSettled.principalMinor, "5000");
+assert.equal(chargebackAddFundsSettled.feeMinor, "175");
+assert.equal(chargebackAddFundsSettled.externalDueMinor, "5175");
+const originalChargebackSource = await corePool.query<{
+  external_payment_id: string;
+  receipt_id: string;
+  settlement_id: string;
+}>(
+  `SELECT attempt.external_payment_id, receipt.id AS receipt_id,
+          settlement.id AS settlement_id
+   FROM add_funds_attempts attempt
+   JOIN add_funds_settlements settlement
+     ON settlement.add_funds_attempt_id = attempt.id
+   JOIN fund_receipts receipt ON receipt.id = settlement.fund_receipt_id
+   WHERE attempt.id = $1`,
+  [chargebackAddFundsSettled.addFundsAttemptId],
+);
+const chargebackSource = originalChargebackSource.rows[0];
+assert.ok(chargebackSource?.external_payment_id);
+
+const chargebackCreditOrder = await createOrder(automaticPrice.id, legal);
+const chargebackCreditQuote = await createPaymentQuote(
+  chargebackCreditOrder.invoice.id,
+  "usdt",
+  true,
+);
+assert.equal(chargebackCreditQuote.creditToApplyMinor, "500");
+assert.equal(chargebackCreditQuote.externalDueMinor, "0");
+await request<PaymentCommand>(
+  `/api/v1/invoices/${chargebackCreditOrder.invoice.id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: chargebackCreditQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  200,
+);
+const paidBeforeChargeback = await request<OrderDetail>(
+  `/api/v1/orders/${chargebackCreditOrder.order.id}`,
+);
+assert.equal(paidBeforeChargeback.invoice.status, "paid");
+assert.equal(paidBeforeChargeback.invoice.creditAppliedMinor, "500");
+await corePool.query(
+  `UPDATE client_memberships
+   SET removed_at = now()
+   WHERE user_id = $1 AND client_account_id = $2`,
+  [chargebackMe.id, chargebackMe.clientAccountId],
+);
+
+const mockChargebackRequestId = randomUUID();
+const mockChargebackResponse = await fetch(
+  new URL(
+    `/v1/payments/${chargebackAddFundsSettled.providerOperationId}/chargebacks`,
+    providerUrl,
+  ),
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${paymentProviderToken}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": mockChargebackRequestId,
+    },
+    body: JSON.stringify({
+      requestId: mockChargebackRequestId,
+      scenario: "duplicate",
+    }),
+  },
+);
+assert.equal(mockChargebackResponse.status, 202);
+const replayedMockChargebackResponse = await fetch(
+  new URL(
+    `/v1/payments/${chargebackAddFundsSettled.providerOperationId}/chargebacks`,
+    providerUrl,
+  ),
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${paymentProviderToken}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": mockChargebackRequestId,
+    },
+    body: JSON.stringify({
+      requestId: mockChargebackRequestId,
+      scenario: "duplicate",
+    }),
+  },
+);
+assert.equal(replayedMockChargebackResponse.status, 202);
+assert.equal(
+  ((await replayedMockChargebackResponse.json()) as { replayed: boolean }).replayed,
+  true,
+);
+const replayedMockChargebackCalls = await providerPool.query<{ create_calls: number }>(
+  `SELECT create_calls
+   FROM mock_chargeback_operations
+   WHERE request_id = $1`,
+  [mockChargebackRequestId],
+);
+assert.equal(replayedMockChargebackCalls.rows[0]?.create_calls, 2);
+await waitFor(
+  "settled Add Funds Chargeback while the originating member is removed",
+  () =>
+    corePool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM add_funds_chargeback_effects
+       WHERE add_funds_settlement_id = $1`,
+      [chargebackSource.settlement_id],
+    ),
+  (result) => result.rows[0]?.count === "1",
+  30_000,
+);
+await corePool.query(
+  `UPDATE client_memberships
+   SET removed_at = NULL
+   WHERE user_id = $1 AND client_account_id = $2`,
+  [chargebackMe.id, chargebackMe.clientAccountId],
+);
+const customerChargebackStatus = await waitFor(
+  "settled Add Funds Chargeback customer status",
+  () => request<ChargebackStatus>("/api/v1/billing/chargeback-status"),
+  (status) => status.chargebacks.length === 1,
+  30_000,
+);
+assert.equal(customerChargebackStatus.restricted, true);
+assert.equal(customerChargebackStatus.creditBalanceMinor, "0");
+assert.equal(customerChargebackStatus.debtBalanceMinor, "500");
+assert.deepEqual(
+  {
+    externalAmountMinor: customerChargebackStatus.chargebacks[0]?.externalAmountMinor,
+    creditRecoveredMinor: customerChargebackStatus.chargebacks[0]?.creditRecoveredMinor,
+    debtMinor: customerChargebackStatus.chargebacks[0]?.debtMinor,
+    restrictionActive: customerChargebackStatus.chargebacks[0]?.restrictionActive,
+  },
+  {
+    externalAmountMinor: "5175",
+    creditRecoveredMinor: "4500",
+    debtMinor: "500",
+    restrictionActive: true,
+  },
+);
+await new Promise((resolve) => setTimeout(resolve, 200));
+const restrictedBilling = await rawCoreRequest("/api/v1/billing/summary", { method: "GET" });
+assert.equal(restrictedBilling.status, 403);
+assert.equal(restrictedBilling.body.code, "ACCOUNT_RESTRICTED");
+
+const chargebackEffects = await corePool.query<{
+  effects: string;
+  facts: string;
+  replays: string;
+  holds: string;
+  credit_debits: string;
+  debt_debits: string;
+  restrictions: string;
+  journals: string;
+  active_reauth: string;
+  invoice_status: string;
+  invoice_credit_minor: string;
+  receipt_disposition: string;
+  add_funds_status: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM add_funds_chargeback_effects
+       WHERE add_funds_settlement_id = $1) AS effects,
+     (SELECT count(*)::text FROM add_funds_chargeback_facts
+       WHERE add_funds_attempt_id = $2) AS facts,
+     (SELECT count(*)::text FROM add_funds_chargeback_replay_dispositions replay
+       JOIN add_funds_chargeback_facts fact ON fact.id = replay.fact_id
+       WHERE fact.add_funds_attempt_id = $2) AS replays,
+     (SELECT count(*)::text FROM add_funds_chargeback_holds hold_record
+       JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.add_funds_attempt_id = $2) AS holds,
+     (SELECT count(*)::text FROM credit_transactions
+       WHERE kind = 'chargeback' AND source_type = 'add_funds_chargeback_effect'
+         AND source_id IN (SELECT id FROM add_funds_chargeback_effects
+           WHERE add_funds_settlement_id = $1)) AS credit_debits,
+     (SELECT count(*)::text FROM client_account_debt_transactions
+       WHERE kind = 'chargeback' AND source_type = 'add_funds_chargeback_effect'
+         AND source_id IN (SELECT id FROM add_funds_chargeback_effects
+           WHERE add_funds_settlement_id = $1)) AS debt_debits,
+     (SELECT count(*)::text FROM client_account_restrictions
+       WHERE kind = 'financial_chargeback'
+         AND source_id IN (SELECT id FROM add_funds_chargeback_effects
+           WHERE add_funds_settlement_id = $1)) AS restrictions,
+     (SELECT count(*)::text FROM ledger_journals
+       WHERE source_type = 'add_funds_chargeback_effect'
+         AND source_id IN (SELECT id FROM add_funds_chargeback_effects
+           WHERE add_funds_settlement_id = $1)) AS journals,
+     (SELECT count(*)::text FROM reauth_grants
+       WHERE user_id = $3 AND invalidated_at IS NULL AND expires_at > now()) AS active_reauth,
+     (SELECT CASE
+        WHEN allocation.allocated_minor = 0 THEN 'open'
+        WHEN allocation.allocated_minor < invoice.total_minor THEN 'partially_paid'
+        ELSE 'paid'
+      END
+      FROM invoices invoice
+      JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+      WHERE invoice.id = $4) AS invoice_status,
+     (SELECT credit_minor::text FROM invoice_allocation_totals WHERE invoice_id = $4)
+       AS invoice_credit_minor,
+     (SELECT disposition FROM fund_receipts WHERE id = $5) AS receipt_disposition,
+     (SELECT status FROM add_funds_attempts WHERE id = $2) AS add_funds_status`,
+  [
+    chargebackSource.settlement_id,
+    chargebackAddFundsSettled.addFundsAttemptId,
+    chargebackMe.id,
+    chargebackCreditOrder.invoice.id,
+    chargebackSource.receipt_id,
+  ],
+);
+assert.deepEqual(chargebackEffects.rows[0], {
+  effects: "1",
+  facts: "2",
+  replays: "1",
+  holds: "0",
+  credit_debits: "1",
+  debt_debits: "1",
+  restrictions: "1",
+  journals: "1",
+  active_reauth: "0",
+  invoice_status: "paid",
+  invoice_credit_minor: "500",
+  receipt_disposition: "allocated",
+  add_funds_status: "succeeded",
+});
+const chargebackJournal = await corePool.query<{
+  account_code: string;
+  debit_minor: string;
+  credit_minor: string;
+}>(
+  `SELECT line.account_code, line.debit_minor::text, line.credit_minor::text
+   FROM ledger_lines line
+   JOIN ledger_journals journal ON journal.id = line.journal_id
+   JOIN add_funds_chargeback_effects effect ON effect.id = journal.source_id
+   WHERE journal.source_type = 'add_funds_chargeback_effect'
+     AND effect.add_funds_settlement_id = $1
+   ORDER BY line.account_code`,
+  [chargebackSource.settlement_id],
+);
+assert.deepEqual(chargebackJournal.rows, [
+  { account_code: "chargeback_receivable", debit_minor: "500", credit_minor: "0" },
+  { account_code: "client_credit_liability", debit_minor: "4500", credit_minor: "0" },
+  { account_code: "mock_cash", debit_minor: "0", credit_minor: "5175" },
+  { account_code: "payment_fee_revenue", debit_minor: "175", credit_minor: "0" },
+]);
+
+const wrongAmountRequestId = randomUUID();
+const wrongAmountResponse = await fetch(
+  new URL(
+    `/v1/payments/${chargebackAddFundsSettled.providerOperationId}/chargebacks`,
+    providerUrl,
+  ),
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${paymentProviderToken}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": wrongAmountRequestId,
+    },
+    body: JSON.stringify({ requestId: wrongAmountRequestId, scenario: "wrong_amount" }),
+  },
+);
+assert.equal(wrongAmountResponse.status, 202);
+const heldWrongAmount = await waitFor(
+  "wrong-amount Chargeback manual hold",
+  () => request<ChargebackStatus>("/api/v1/billing/chargeback-status"),
+  (status) => status.manualHolds.length === 1,
+);
+assert.match(heldWrongAmount.manualHolds[0]?.reason ?? "", /conflicts|amount/i);
+const afterWrongAmount = await corePool.query<{ effects: string; journals: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM add_funds_chargeback_effects
+       WHERE add_funds_settlement_id = $1) AS effects,
+     (SELECT count(*)::text FROM ledger_journals
+       WHERE source_type = 'add_funds_chargeback_effect'
+         AND source_id IN (SELECT id FROM add_funds_chargeback_effects
+           WHERE add_funds_settlement_id = $1)) AS journals`,
+  [chargebackSource.settlement_id],
+);
+assert.deepEqual(afterWrongAmount.rows[0], { effects: "1", journals: "1" });
+
+const canonicalChargebackFact = await corePool.query<{
+  provider_operation_id: string;
+  add_funds_attempt_id: string;
+  original_external_payment_id: string;
+  external_chargeback_id: string;
+  amount_minor: string;
+  currency: string;
+  occurred_at: Date;
+}>(
+  `SELECT
+     fact.provider_operation_id,
+     fact.add_funds_attempt_id,
+     fact.original_external_payment_id,
+     fact.external_chargeback_id,
+     fact.amount_minor::text,
+     fact.currency,
+     fact.occurred_at
+   FROM add_funds_chargeback_effects effect
+   JOIN add_funds_chargeback_facts fact ON fact.id = effect.fact_id
+   WHERE effect.add_funds_settlement_id = $1`,
+  [chargebackSource.settlement_id],
+);
+const canonicalChargeback = canonicalChargebackFact.rows[0];
+assert.ok(canonicalChargeback);
+const changedOccurrenceReplay = await submitAddFundsChargebackFact({
+  eventId: `chargeback-changed-occurrence:${randomUUID()}`,
+  providerOperationId: canonicalChargeback.provider_operation_id,
+  addFundsAttemptId: canonicalChargeback.add_funds_attempt_id,
+  originalExternalPaymentId: canonicalChargeback.original_external_payment_id,
+  externalChargebackId: canonicalChargeback.external_chargeback_id,
+  amountMinor: canonicalChargeback.amount_minor,
+  currency: canonicalChargeback.currency,
+  occurredAt: new Date(canonicalChargeback.occurred_at.getTime() + 1_000).toISOString(),
+});
+assert.equal(changedOccurrenceReplay.status, 202);
+assert.equal(changedOccurrenceReplay.body.status, "manual");
+const changedOccurrenceDisposition = await corePool.query<{
+  facts: string;
+  effects: string;
+  replays: string;
+  holds: string;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM add_funds_chargeback_facts fact
+       WHERE fact.external_chargeback_id = $1) AS facts,
+     (SELECT count(*)::text FROM add_funds_chargeback_effects effect
+       WHERE effect.external_chargeback_id = $1) AS effects,
+     (SELECT count(*)::text FROM add_funds_chargeback_replay_dispositions replay
+       JOIN add_funds_chargeback_facts fact ON fact.id = replay.fact_id
+       WHERE fact.external_chargeback_id = $1) AS replays,
+     (SELECT count(*)::text FROM add_funds_chargeback_holds hold_record
+       JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+       WHERE fact.external_chargeback_id = $1) AS holds`,
+  [canonicalChargeback.external_chargeback_id],
+);
+assert.deepEqual(changedOccurrenceDisposition.rows[0], {
+  facts: "3",
+  effects: "1",
+  replays: "1",
+  holds: "1",
+});
+
+const crossAccountAttemptEvent = `chargeback-cross-account:${randomUUID()}`;
+const crossAccountAttempt = await submitAddFundsChargebackFact({
+  eventId: crossAccountAttemptEvent,
+  providerOperationId: chargebackAddFundsSettled.providerOperationId,
+  addFundsAttemptId: pendingChargebackAddFunds.command.addFundsAttemptId,
+  originalExternalPaymentId: chargebackSource.external_payment_id,
+  externalChargebackId: `mock-chargeback-cross-account-${randomUUID()}`,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date().toISOString(),
+});
+assert.equal(crossAccountAttempt.status, 202);
+assert.equal(crossAccountAttempt.body.status, "manual");
+assert.match(String(crossAccountAttempt.body.reason), /attempt identity/i);
+const crossAccountHold = await corePool.query<{
+  client_account_id: string | null;
+  pending_account_holds: string;
+}>(
+  `SELECT hold_record.client_account_id,
+          (SELECT count(*)::text
+            FROM add_funds_chargeback_holds pending_hold
+            JOIN add_funds_chargeback_facts pending_fact
+              ON pending_fact.id = pending_hold.fact_id
+           WHERE pending_fact.add_funds_attempt_id = $2
+             AND pending_fact.external_event_id = $1
+             AND pending_hold.client_account_id = (
+               SELECT client_account_id
+               FROM add_funds_attempts
+               WHERE id = $2
+             )) AS pending_account_holds
+   FROM add_funds_chargeback_holds hold_record
+   JOIN add_funds_chargeback_facts fact ON fact.id = hold_record.fact_id
+   WHERE fact.external_event_id = $1`,
+  [crossAccountAttemptEvent, pendingChargebackAddFunds.command.addFundsAttemptId],
+);
+assert.equal(crossAccountHold.rows[0]?.client_account_id, chargebackMe.clientAccountId);
+assert.equal(crossAccountHold.rows[0]?.pending_account_holds, "0");
+
+const invalidCapabilityEvent = `chargeback-invalid-capability:${randomUUID()}`;
+const invalidCapability = await submitAddFundsChargebackFact({
+  eventId: invalidCapabilityEvent,
+  providerOperationId: chargebackAddFundsSettled.providerOperationId,
+  addFundsAttemptId: chargebackAddFundsSettled.addFundsAttemptId,
+  originalExternalPaymentId: chargebackSource.external_payment_id,
+  externalChargebackId: `mock-chargeback-invalid-capability-${randomUUID()}`,
+  amountMinor: "5175",
+  currency: "USD",
+  occurredAt: new Date().toISOString(),
+  callbackCapability: "A".repeat(43),
+});
+assert.equal(invalidCapability.status, 202);
+assert.equal(invalidCapability.body.rejected, true);
+assert.equal(invalidCapability.body.reason, "invalid_operation_capability");
+const invalidCapabilityPersistence = await corePool.query<{ inbox: string; facts: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM provider_inbox WHERE external_event_id = $1) AS inbox,
+     (SELECT count(*)::text FROM add_funds_chargeback_facts
+       WHERE external_event_id = $1) AS facts`,
+  [invalidCapabilityEvent],
+);
+assert.deepEqual(invalidCapabilityPersistence.rows[0], { inbox: "0", facts: "0" });
+
+const rejectedSignatureEvent = `chargeback-bad-signature:${randomUUID()}`;
+const rejectedSignature = await submitAddFundsChargebackFact(
+  {
+    eventId: rejectedSignatureEvent,
+    providerOperationId: chargebackAddFundsSettled.providerOperationId,
+    addFundsAttemptId: chargebackAddFundsSettled.addFundsAttemptId,
+    originalExternalPaymentId: chargebackSource.external_payment_id,
+    externalChargebackId: `mock-chargeback-${randomUUID()}`,
+    amountMinor: "5175",
+    currency: "USD",
+    occurredAt: new Date().toISOString(),
+  },
+  "synthetic-wrong-webhook-secret-000000000000",
+);
+assert.equal(rejectedSignature.status, 401);
+const rejectedSignatureInbox = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM provider_inbox
+   WHERE external_event_id = $1`,
+  [rejectedSignatureEvent],
+);
+assert.equal(rejectedSignatureInbox.rows[0]?.count, "0");
+const unredactedChargebackCapabilities = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM provider_inbox
+   WHERE event_type = 'add_funds.chargeback'
+     AND payload->>'callbackCapability' <> '[REDACTED]'`,
+);
+assert.equal(unredactedChargebackCapabilities.rows[0]?.count, "0");
+
+cookie = staffCookie;
+const adminChargebacks = await request<{
+  items: Array<{ clientAccountId: string; debtMinor: string }>;
+  unclaimedChargebacks: Array<{
+    clientAccountId: string;
+    fundReceiptId: string;
+    externalAmountMinor: string;
+  }>;
+  manualHolds: Array<{ clientAccountId: string | null }>;
+}>("/api/v1/admin/add-funds-chargebacks");
+assert.equal(
+  adminChargebacks.items.some(
+    (item) => item.clientAccountId === chargebackMe.clientAccountId && item.debtMinor === "500",
+  ),
+  true,
+);
+assert.equal(
+  adminChargebacks.manualHolds.some(
+    (hold) => hold.clientAccountId === chargebackMe.clientAccountId,
+  ),
+  true,
+);
+assert.equal(
+  adminChargebacks.unclaimedChargebacks.some(
+    (effect) =>
+      effect.fundReceiptId ===
+        secondUnclaimedCustomerStatus.unclaimedChargebacks[0]?.fundReceiptId &&
+      effect.externalAmountMinor === "5175",
+  ),
+  true,
+);
+
+const directAttackClient = await corePool.connect();
+let rejectedUnboundChargebackDebit = false;
+try {
+  await directAttackClient.query("BEGIN");
+  const creditAccount = await directAttackClient.query<{ id: string }>(
+    `SELECT id FROM credit_accounts
+     WHERE client_account_id = $1 AND currency = 'USD'`,
+    [chargebackMe.clientAccountId],
+  );
+  await directAttackClient.query(
+    `INSERT INTO credit_transactions(
+       credit_account_id, kind, credit_minor, debit_minor,
+       source_type, source_id, actor_type, reason,
+       idempotency_key, request_fingerprint
+     ) VALUES ($1, 'chargeback', 0, 1, 'forged', $2, 'provider',
+               'forged Chargeback debit', $3, $4)`,
+    [creditAccount.rows[0]?.id, randomUUID(), randomUUID(), randomUUID()],
+  );
+  await directAttackClient.query("COMMIT");
+} catch {
+  rejectedUnboundChargebackDebit = true;
+  await directAttackClient.query("ROLLBACK");
+} finally {
+  directAttackClient.release();
+}
+assert.equal(rejectedUnboundChargebackDebit, true);
+
+const directRestrictionClient = await corePool.connect();
+let rejectedRestrictionClear = false;
+try {
+  await directRestrictionClient.query("BEGIN");
+  await directRestrictionClient.query(
+    `UPDATE client_accounts SET restricted_at = NULL WHERE id = $1`,
+    [chargebackMe.clientAccountId],
+  );
+  await directRestrictionClient.query("COMMIT");
+} catch {
+  rejectedRestrictionClear = true;
+  await directRestrictionClient.query("ROLLBACK");
+} finally {
+  directRestrictionClient.release();
+}
+assert.equal(rejectedRestrictionClear, true);
+
+const directDebtClient = await corePool.connect();
+let rejectedForgedDebtRecovery = false;
+try {
+  await directDebtClient.query("BEGIN");
+  const debtAccount = await directDebtClient.query<{ id: string }>(
+    `SELECT id FROM client_account_debt_accounts
+     WHERE client_account_id = $1 AND currency = 'USD'`,
+    [chargebackMe.clientAccountId],
+  );
+  await directDebtClient.query(
+    `INSERT INTO client_account_debt_transactions(
+       debt_account_id, kind, debit_minor, credit_minor,
+       source_type, source_id, actor_type, reason, idempotency_key
+     ) VALUES ($1, 'recovery', 0, 1, 'forged', $2, 'system',
+               'forged debt recovery', $3)`,
+    [debtAccount.rows[0]?.id, randomUUID(), randomUUID()],
+  );
+  await directDebtClient.query("COMMIT");
+} catch {
+  rejectedForgedDebtRecovery = true;
+  await directDebtClient.query("ROLLBACK");
+} finally {
+  directDebtClient.release();
+}
+assert.equal(rejectedForgedDebtRecovery, true);
+
+const sealedJournalClient = await corePool.connect();
+let rejectedSealedJournalLines = false;
+try {
+  await sealedJournalClient.query("BEGIN");
+  const chargebackJournalId = await sealedJournalClient.query<{ id: string }>(
+    `SELECT journal.id
+     FROM ledger_journals journal
+     JOIN add_funds_chargeback_effects effect ON effect.id = journal.source_id
+     WHERE journal.source_type = 'add_funds_chargeback_effect'
+       AND effect.add_funds_settlement_id = $1`,
+    [chargebackSource.settlement_id],
+  );
+  await sealedJournalClient.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'chargeback_receivable', 999, 0),
+       ($1, 'mock_cash', 0, 999)`,
+    [chargebackJournalId.rows[0]?.id],
+  );
+  await sealedJournalClient.query("COMMIT");
+} catch {
+  rejectedSealedJournalLines = true;
+  await sealedJournalClient.query("ROLLBACK");
+} finally {
+  sealedJournalClient.release();
+}
+assert.equal(rejectedSealedJournalLines, true);
+
+const chargedBackReceiptClient = await corePool.connect();
+let rejectedChargedBackReceiptMutation = false;
+try {
+  await chargedBackReceiptClient.query("BEGIN");
+  await chargedBackReceiptClient.query(
+    `UPDATE fund_receipts
+     SET disposition = 'unclaimed', reason = 'forged reopening', updated_at = now()
+     WHERE external_payment_id = $1`,
+    [secondUnclaimedPaymentId],
+  );
+  await chargedBackReceiptClient.query("COMMIT");
+} catch {
+  rejectedChargedBackReceiptMutation = true;
+  await chargedBackReceiptClient.query("ROLLBACK");
+} finally {
+  chargedBackReceiptClient.release();
+}
+assert.equal(rejectedChargedBackReceiptMutation, true);
+
+const mismatchedFactClient = await corePool.connect();
+let rejectedMismatchedFactSource = false;
+try {
+  await mismatchedFactClient.query("BEGIN");
+  await mismatchedFactClient.query(
+    `INSERT INTO add_funds_chargeback_facts(
+       provider_installation_id, provider_operation_id, add_funds_attempt_id,
+       external_event_id, original_external_payment_id, external_chargeback_id,
+       status, amount_minor, currency, occurred_at, fact_fingerprint
+     ) VALUES ('mock-payment-v1', $1, $2, $3, $4, $5,
+               'succeeded', 1, 'USD', now(), $6)`,
+    [
+      chargebackAddFundsSettled.providerOperationId,
+      pendingChargebackAddFunds.command.addFundsAttemptId,
+      `forged-event-${randomUUID()}`,
+      chargebackSource.external_payment_id,
+      `forged-chargeback-${randomUUID()}`,
+      randomUUID(),
+    ],
+  );
+  await mismatchedFactClient.query("COMMIT");
+} catch {
+  rejectedMismatchedFactSource = true;
+  await mismatchedFactClient.query("ROLLBACK");
+} finally {
+  mismatchedFactClient.release();
+}
+assert.equal(rejectedMismatchedFactSource, true);
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count

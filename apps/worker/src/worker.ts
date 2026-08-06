@@ -41,7 +41,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "010_stage_b_unclaimed_refunds";
+const REQUIRED_SCHEMA_VERSION = "011_stage_b_add_funds_chargebacks";
 
 type Job = {
   id: string;
@@ -3298,6 +3298,7 @@ async function startAddFunds(job: Job): Promise<void> {
           scenario: preflight.value.scenario,
         }),
       },
+      preflight.value.scenario === "delayed_definitive_reject" ? 30_000 : config.PROVIDER_TIMEOUT_MS,
     );
     if (!response.ok) {
       if (

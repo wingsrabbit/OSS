@@ -31,6 +31,10 @@ The first runnable vertical slice is implemented:
 - a customer can combine Credit with an external payment, see the configured
   payment fee, add synthetic funds, and keep late or mismatched money isolated
   for staff review;
+- when a settled Mock Add Funds payment is charged back, Core preserves the
+  original receipt and paid invoices, recovers only available Credit, records
+  consumed principal as explicit Client Account debt, restricts only that
+  Client Account, and gives both customer and staff a page-level breakdown;
 - an administrator can re-confirm their password, resolve unclaimed funds,
   adjust Credit, and make a full, partial, Credit, original-payment, or explicit
   no-refund decision from the web interface;
@@ -108,3 +112,6 @@ Core, Web, Worker, and core administration tools are licensed under
 `AGPL-3.0-or-later`. Provider contracts, SDK material, conformance assets, and
 Mock Providers use `Apache-2.0` as described in
 [LICENSES/README.md](LICENSES/README.md).
+
+Operators handling synthetic Add Funds losses should read
+[docs/operators/add-funds-chargebacks.md](docs/operators/add-funds-chargebacks.md).

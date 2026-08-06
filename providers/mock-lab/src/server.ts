@@ -33,6 +33,8 @@ const paymentCreateSchema = z.object({
     "timeout_success",
     "duplicate_out_of_order",
     "definitive_reject",
+    "delayed_definitive_reject",
+    "reconcile_manual",
     "success_then_reject",
     "partial_then_reject",
     "partial_then_timeout",
@@ -51,6 +53,17 @@ const refundCreateSchema = z.object({
   amountMinor: z.string().regex(/^[1-9]\d*$/),
   currency: z.string().regex(/^[A-Z]{3}$/),
   scenario: z.enum(["success", "failed", "timeout_success", "duplicate_out_of_order"]),
+});
+
+const chargebackCreateSchema = z.object({
+  requestId: z.uuid(),
+  scenario: z.enum([
+    "success",
+    "duplicate",
+    "wrong_amount",
+    "wrong_currency",
+    "wrong_external_payment",
+  ]),
 });
 
 const resourceCreateSchema = z.object({
@@ -121,6 +134,21 @@ await pool.query(`
     create_calls integer NOT NULL DEFAULT 1 CHECK (create_calls > 0),
     request_fingerprint text NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS mock_chargeback_operations (
+    request_id uuid PRIMARY KEY,
+    original_operation_id uuid NOT NULL
+      REFERENCES mock_payment_operations(operation_id),
+    external_chargeback_id text NOT NULL UNIQUE,
+    scenario text NOT NULL CHECK (
+      scenario IN (
+        'success', 'duplicate', 'wrong_amount', 'wrong_currency',
+        'wrong_external_payment'
+      )
+    ),
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    create_calls integer NOT NULL DEFAULT 1 CHECK (create_calls > 0),
+    request_fingerprint text NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS mock_resource_operations (
     operation_id uuid PRIMARY KEY,
     service_id uuid NOT NULL,
@@ -136,6 +164,11 @@ await pool.query(`
   CREATE TABLE IF NOT EXISTS mock_resource_faults (
     operation_id uuid PRIMARY KEY,
     behavior text NOT NULL CHECK (behavior IN ('callback_success_then_reject'))
+  );
+  CREATE TABLE IF NOT EXISTS mock_payment_fault_gates (
+    operation_id uuid PRIMARY KEY,
+    behavior text NOT NULL CHECK (behavior IN ('delayed_definitive_reject')),
+    released_at timestamptz
   );
   CREATE TABLE IF NOT EXISTS mock_mail_messages (
     operation_id uuid PRIMARY KEY,
@@ -187,6 +220,8 @@ await pool.query(`
     ALTER COLUMN request_fingerprint SET NOT NULL;
   CREATE INDEX IF NOT EXISTS mock_refund_operations_original_status_idx
     ON mock_refund_operations (original_external_payment_id, status);
+  CREATE INDEX IF NOT EXISTS mock_chargeback_operations_original_idx
+    ON mock_chargeback_operations (original_operation_id, occurred_at);
   CREATE OR REPLACE FUNCTION opensales_guard_mock_refund_operation_mutation()
   RETURNS trigger
   LANGUAGE plpgsql
@@ -215,6 +250,30 @@ await pool.query(`
   CREATE TRIGGER mock_refund_operations_append_only
   BEFORE UPDATE OR DELETE ON mock_refund_operations
   FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_refund_operation_mutation();
+  CREATE OR REPLACE FUNCTION opensales_guard_mock_chargeback_operation_mutation()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF TG_OP = 'DELETE'
+       OR NEW.request_id IS DISTINCT FROM OLD.request_id
+       OR NEW.original_operation_id IS DISTINCT FROM OLD.original_operation_id
+       OR NEW.external_chargeback_id IS DISTINCT FROM OLD.external_chargeback_id
+       OR NEW.scenario IS DISTINCT FROM OLD.scenario
+       OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+       OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
+       OR NEW.create_calls <> OLD.create_calls + 1 THEN
+      RAISE EXCEPTION
+        'Mock chargeback operations are append-only except for idempotent create call counting';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS mock_chargeback_operations_append_only
+    ON mock_chargeback_operations;
+  CREATE TRIGGER mock_chargeback_operations_append_only
+  BEFORE UPDATE OR DELETE ON mock_chargeback_operations
+  FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_chargeback_operation_mutation();
 `);
 
 const app = Fastify({
@@ -330,6 +389,28 @@ app.post("/v1/payments", async (request, reply) => {
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
+  if (body.scenario === "delayed_definitive_reject") {
+    await pool.query(
+      `INSERT INTO mock_payment_fault_gates(operation_id, behavior)
+       VALUES ($1, 'delayed_definitive_reject')
+       ON CONFLICT (operation_id) DO NOTHING`,
+      [body.operationId],
+    );
+    const deadline = Date.now() + 25_000;
+    while (Date.now() < deadline) {
+      const gate = await pool.query<{ released: boolean }>(
+        `SELECT released_at IS NOT NULL AS released
+         FROM mock_payment_fault_gates
+         WHERE operation_id = $1`,
+        [body.operationId],
+      );
+      if (gate.rows[0]?.released) {
+        return reply.code(400).send({ error: "synthetic delayed definitive payment rejection" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return reply.code(503).send({ error: "synthetic definitive rejection gate timed out" });
+  }
   if (body.scenario === "definitive_reject") {
     return reply.code(400).send({ error: "synthetic definitive payment rejection" });
   }
@@ -436,6 +517,10 @@ app.post("/v1/payments", async (request, reply) => {
   } else if (body.scenario === "partial_then_timeout") {
     await callback("/api/v1/provider-events/payment", event, callbackSecret);
     await new Promise((resolve) => setTimeout(resolve, 3_000));
+  } else if (body.scenario === "reconcile_manual") {
+    return reply.code(503).send({
+      error: "synthetic ambiguous create followed by manual reconciliation",
+    });
   } else {
     scheduleCallback(
       "/api/v1/provider-events/payment",
@@ -473,6 +558,9 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
   );
   const row = result.rows[0];
   if (!row) return reply.code(404).send({ error: "operation not found" });
+  if (row.scenario === "reconcile_manual") {
+    return reply.code(422).send({ error: "synthetic reconciliation requires an operator" });
+  }
   return {
     callbackCapability: row.callback_capability,
     externalPaymentId: row.external_payment_id,
@@ -489,6 +577,127 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
         ? new Date(row.occurred_at.getTime() + 31 * 60 * 1_000).toISOString()
         : row.occurred_at.toISOString(),
   };
+});
+
+app.post("/v1/payments/:operationId/chargebacks", async (request, reply) => {
+  const params = z.object({ operationId: z.uuid() }).parse(request.params);
+  const body = chargebackCreateSchema.parse(request.body);
+  const callbackSecret = config.MOCK_PAYMENT_WEBHOOK_SECRET;
+  if (!callbackSecret) {
+    return reply.code(503).send({ error: "chargeback callback is not configured" });
+  }
+  if (request.headers["idempotency-key"] !== body.requestId) {
+    return reply.code(400).send({ error: "stable idempotency key is required" });
+  }
+
+  type ChargebackOperation = {
+    request_id: string;
+    external_chargeback_id: string;
+    scenario: z.infer<typeof chargebackCreateSchema>["scenario"];
+    occurred_at: Date;
+    payment_attempt_id: string;
+    external_payment_id: string;
+    amount_minor: string;
+    currency: string;
+    callback_capability: string;
+    create_calls: number;
+  };
+  const fingerprint = requestFingerprint("chargeback.create:v1", {
+    originalOperationId: params.operationId,
+    ...body,
+  });
+  const externalChargebackId = `mock-chargeback-${body.requestId}`;
+  const inserted = await pool.query<ChargebackOperation>(
+    `INSERT INTO mock_chargeback_operations(
+       request_id, original_operation_id, external_chargeback_id,
+       scenario, request_fingerprint
+     )
+     SELECT $1, payment.operation_id, $2, $3, $4
+     FROM mock_payment_operations payment
+     WHERE payment.operation_id = $5
+       AND payment.status = 'succeeded'
+     ON CONFLICT (request_id) DO UPDATE
+       SET create_calls = mock_chargeback_operations.create_calls + 1
+       WHERE mock_chargeback_operations.request_fingerprint = EXCLUDED.request_fingerprint
+     RETURNING
+       request_id,
+       external_chargeback_id,
+       scenario,
+       occurred_at,
+       (SELECT payment_attempt_id
+          FROM mock_payment_operations
+         WHERE operation_id = original_operation_id),
+       (SELECT external_payment_id
+          FROM mock_payment_operations
+         WHERE operation_id = original_operation_id),
+       (SELECT amount_minor::text
+          FROM mock_payment_operations
+         WHERE operation_id = original_operation_id),
+       (SELECT currency
+          FROM mock_payment_operations
+         WHERE operation_id = original_operation_id),
+       (SELECT callback_capability
+          FROM mock_payment_operations
+         WHERE operation_id = original_operation_id),
+       create_calls`,
+    [
+      body.requestId,
+      externalChargebackId,
+      body.scenario,
+      fingerprint,
+      params.operationId,
+    ],
+  );
+  const operation = inserted.rows[0];
+  if (!operation) {
+    const original = await pool.query(
+      `SELECT status
+       FROM mock_payment_operations
+       WHERE operation_id = $1`,
+      [params.operationId],
+    );
+    if (!original.rows[0]) {
+      return reply.code(404).send({ error: "original payment operation not found" });
+    }
+    if (original.rows[0].status !== "succeeded") {
+      return reply.code(409).send({ error: "only a settled payment can be charged back" });
+    }
+    return reply.code(409).send({ error: "idempotency key was reused with a different chargeback" });
+  }
+
+  const event = {
+    eventId: `chargeback:${operation.request_id}:succeeded`,
+    providerOperationId: params.operationId,
+    addFundsAttemptId: operation.payment_attempt_id,
+    callbackCapability: operation.callback_capability,
+    originalExternalPaymentId:
+      operation.scenario === "wrong_external_payment"
+        ? `wrong-${operation.external_payment_id}`
+        : operation.external_payment_id,
+    externalChargebackId: operation.external_chargeback_id,
+    status: "succeeded",
+    amountMinor:
+      operation.scenario === "wrong_amount"
+        ? (BigInt(operation.amount_minor) + 1n).toString()
+        : operation.amount_minor,
+    currency: operation.scenario === "wrong_currency" ? "EUR" : operation.currency,
+    occurredAt: operation.occurred_at.toISOString(),
+  };
+  scheduleCallback("/api/v1/provider-events/add-funds-chargeback", event, 20, callbackSecret);
+  if (operation.scenario === "duplicate") {
+    scheduleCallback(
+      "/api/v1/provider-events/add-funds-chargeback",
+      { ...event, eventId: `${event.eventId}:duplicate` },
+      40,
+      callbackSecret,
+    );
+  }
+  return reply.code(202).send({
+    requestId: operation.request_id,
+    externalChargebackId: operation.external_chargeback_id,
+    status: "succeeded",
+    replayed: operation.create_calls > 1,
+  });
 });
 
 app.post("/v1/refunds", async (request, reply) => {

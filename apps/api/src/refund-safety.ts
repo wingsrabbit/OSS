@@ -2,6 +2,107 @@
 
 import type { DatabaseClient } from "./database.js";
 
+export async function freezeRefundsForChargebackHold(
+  client: DatabaseClient,
+  input: { factId: string; reason: string },
+): Promise<string[]> {
+  const receiptResult = await client.query<{ id: string }>(
+    `SELECT receipt.id
+     FROM add_funds_chargeback_facts fact
+     JOIN fund_receipts receipt
+       ON receipt.reported_add_funds_attempt_id = fact.add_funds_attempt_id
+      AND receipt.external_payment_id = fact.original_external_payment_id
+     WHERE fact.id = $1
+     FOR UPDATE OF receipt`,
+    [input.factId],
+  );
+  const receiptId = receiptResult.rows[0]?.id;
+  if (!receiptId) return [];
+
+  const candidates = await client.query<{
+    id: string;
+    status: string;
+    operation_id: string | null;
+    operation_status: string | null;
+    attempt_count: number | null;
+  }>(
+    `SELECT
+       refund.id,
+       refund.status,
+       operation.id AS operation_id,
+       operation.status AS operation_status,
+       operation.attempt_count
+     FROM refunds refund
+     LEFT JOIN provider_operations operation
+       ON operation.subject_type = 'refund'
+      AND operation.subject_id = refund.id
+      AND operation.kind = 'refund_create'
+     WHERE refund.source_fund_receipt_id = $1
+       AND refund.status IN ('queued', 'processing', 'unknown')
+     ORDER BY refund.id
+     FOR UPDATE OF refund`,
+    [receiptId],
+  );
+  const frozenIds: string[] = [];
+  for (const refund of candidates.rows) {
+    const knownUnsent =
+      refund.status === "queued" &&
+      refund.operation_id !== null &&
+      refund.operation_status === "queued" &&
+      refund.attempt_count === 0;
+    const nextStatus = knownUnsent ? "failed" : "manual";
+    await client.query(
+      `UPDATE refunds
+       SET status = $2,
+           security_hold = false,
+           last_error = $3,
+           result = result || $4::jsonb,
+           updated_at = now(),
+           version = version + 1
+       WHERE id = $1`,
+      [
+        refund.id,
+        nextStatus,
+        input.reason,
+        JSON.stringify({ frozenByChargebackFactId: input.factId, knownUnsent }),
+      ],
+    );
+    if (refund.operation_id) {
+      await client.query(
+        `UPDATE provider_operations
+         SET status = $2, last_error = $3, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [refund.operation_id, knownUnsent ? "failed" : "unknown", input.reason],
+      );
+    }
+    await client.query(
+      `UPDATE durable_jobs
+       SET status = $2,
+           locked_at = NULL,
+           locked_by = NULL,
+           last_error = $3,
+           updated_at = now()
+       WHERE payload->>'refundId' = $1
+         AND job_type IN ('refund.start', 'refund.reconcile')
+         AND status NOT IN ('completed', 'manual')`,
+      [refund.id, knownUnsent ? "completed" : "manual", input.reason],
+    );
+    await client.query(
+      `INSERT INTO refund_events(
+         refund_id, event_type, actor_type, actor_id, reason, metadata
+       ) VALUES ($1, $2, 'system', 'chargeback-hold-freeze', $3, $4)`,
+      [
+        refund.id,
+        nextStatus,
+        input.reason,
+        { chargebackFactId: input.factId, knownUnsent },
+      ],
+    );
+    frozenIds.push(refund.id);
+  }
+  return frozenIds;
+}
+
 export async function freezeCompetingRefunds(
   client: DatabaseClient,
   input: {

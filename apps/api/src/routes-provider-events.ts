@@ -20,6 +20,10 @@ import {
   handleAddFundsPaymentEvent,
   type AddFundsPaymentEvent,
 } from "./add-funds-settlement.js";
+import {
+  handleAddFundsChargebackEvent,
+  type AddFundsChargebackEvent,
+} from "./add-funds-chargeback.js";
 
 const paymentEventSchema = z.object({
   eventId: z.string().min(1).max(160),
@@ -50,6 +54,19 @@ const refundEventSchema = z.object({
   callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   externalRefundId: z.string().min(1).max(160),
   status: z.enum(["succeeded", "failed"]),
+  amountMinor: z.string().regex(/^[1-9]\d*$/),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  occurredAt: z.iso.datetime(),
+});
+
+const addFundsChargebackEventSchema = z.object({
+  eventId: z.string().min(1).max(160),
+  providerOperationId: z.uuid(),
+  addFundsAttemptId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  originalExternalPaymentId: z.string().min(1).max(160),
+  externalChargebackId: z.string().min(1).max(160),
+  status: z.literal("succeeded"),
   amountMinor: z.string().regex(/^[1-9]\d*$/),
   currency: z.string().regex(/^[A-Z]{3}$/),
   occurredAt: z.iso.datetime(),
@@ -1033,6 +1050,19 @@ export async function registerProviderEventRoutes(
         orderStatus: settlement.orderStatus,
       };
     });
+    return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
+  });
+
+  app.post("/api/v1/provider-events/add-funds-chargeback", async (request, reply) => {
+    const body = addFundsChargebackEventSchema.parse(request.body);
+    assertProviderSignature(request, config.MOCK_PAYMENT_WEBHOOK_SECRET, body);
+    const outcome = await transaction(pool, (client) =>
+      handleAddFundsChargebackEvent(
+        client,
+        config,
+        body as AddFundsChargebackEvent,
+      ),
+    );
     return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
   });
 

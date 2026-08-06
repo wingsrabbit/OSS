@@ -295,6 +295,58 @@ type AddFundsCommand = {
   externalDueMinor: string;
   result: Record<string, unknown> | null;
 };
+type AddFundsChargeback = {
+  chargebackEffectId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  providerInstallationId: string;
+  originalExternalPaymentId: string;
+  externalChargebackId: string;
+  principalMinor: string;
+  feeMinor: string;
+  externalAmountMinor: string;
+  creditRecoveredMinor: string;
+  debtMinor: string;
+  currency: string;
+  occurredAt: string;
+  restrictedAt: string | null;
+  restrictionActive: boolean;
+  semanticReplayCount: string;
+};
+type AddFundsUnclaimedChargeback = {
+  unclaimedChargebackEffectId: string;
+  fundReceiptId: string;
+  clientAccountId: string;
+  clientAccountName: string;
+  providerInstallationId: string;
+  originalExternalPaymentId: string;
+  externalChargebackId: string;
+  externalAmountMinor: string;
+  currency: string;
+  occurredAt: string;
+  semanticReplayCount: string;
+};
+type AddFundsChargebackHold = {
+  holdId: string;
+  clientAccountId?: string | null;
+  clientAccountName?: string | null;
+  externalChargebackId?: string;
+  originalExternalPaymentId?: string;
+  amountMinor?: string;
+  currency?: string;
+  reason: string;
+  occurredAt?: string;
+  createdAt: string;
+};
+type ChargebackStatus = {
+  clientAccountId: string;
+  restricted: boolean;
+  creditBalanceMinor: string;
+  debtBalanceMinor: string;
+  chargebacks: AddFundsChargeback[];
+  unclaimedChargebacks: AddFundsUnclaimedChargeback[];
+  manualHolds: AddFundsChargebackHold[];
+};
 
 const words = {
   en: {
@@ -389,6 +441,14 @@ export function App() {
   const [addFundsScenario, setAddFundsScenario] = useState("success");
   const [addFundsQuote, setAddFundsQuote] = useState<AddFundsQuote | null>(null);
   const [addFundsCommand, setAddFundsCommand] = useState<AddFundsCommand | null>(null);
+  const [chargebackStatus, setChargebackStatus] = useState<ChargebackStatus | null>(null);
+  const [adminChargebacks, setAdminChargebacks] = useState<AddFundsChargeback[]>([]);
+  const [adminUnclaimedChargebacks, setAdminUnclaimedChargebacks] = useState<
+    AddFundsUnclaimedChargeback[]
+  >([]);
+  const [adminChargebackHolds, setAdminChargebackHolds] = useState<
+    AddFundsChargebackHold[]
+  >([]);
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
@@ -464,6 +524,16 @@ export function App() {
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
   }, [me]);
 
+  const refreshChargebackStatus = useCallback(async () => {
+    if (!me) {
+      setChargebackStatus(null);
+      return;
+    }
+    setChargebackStatus(
+      await api<ChargebackStatus>("/api/v1/billing/chargeback-status"),
+    );
+  }, [me]);
+
   useEffect(() => {
     void Promise.all([
       api<{ products: Product[] }>(`/api/v1/catalog?locale=${locale}`).then((data) =>
@@ -479,6 +549,10 @@ export function App() {
   useEffect(() => {
     void refreshBilling().catch(() => undefined);
   }, [refreshBilling]);
+
+  useEffect(() => {
+    void refreshChargebackStatus().catch(() => undefined);
+  }, [refreshChargebackStatus]);
 
   useEffect(() => {
     const allowedMethods =
@@ -683,6 +757,23 @@ export function App() {
     setRefundReceiptCapacityIncidents(result.items);
   }, [me?.staff]);
 
+  const refreshAdminChargebacks = useCallback(async () => {
+    if (!me?.staff) {
+      setAdminChargebacks([]);
+      setAdminUnclaimedChargebacks([]);
+      setAdminChargebackHolds([]);
+      return;
+    }
+    const result = await api<{
+      items: AddFundsChargeback[];
+      unclaimedChargebacks: AddFundsUnclaimedChargeback[];
+      manualHolds: AddFundsChargebackHold[];
+    }>("/api/v1/admin/add-funds-chargebacks");
+    setAdminChargebacks(result.items);
+    setAdminUnclaimedChargebacks(result.unclaimedChargebacks);
+    setAdminChargebackHolds(result.manualHolds);
+  }, [me?.staff]);
+
   useEffect(() => {
     void Promise.all([
       refreshManualItems(),
@@ -692,6 +783,7 @@ export function App() {
       refreshRefundSecurityHolds(),
       refreshRefundDismissalCorrections(),
       refreshRefundReceiptCapacityIncidents(),
+      refreshAdminChargebacks(),
     ]).catch(() => undefined);
   }, [
     refreshManualItems,
@@ -700,6 +792,7 @@ export function App() {
     refreshRefundSecurityHolds,
     refreshRefundDismissalCorrections,
     refreshRefundReceiptCapacityIncidents,
+    refreshAdminChargebacks,
     refreshUnclaimedFunds,
   ]);
 
@@ -1595,6 +1688,84 @@ export function App() {
           </div>
         </section>
 
+        {me &&
+          chargebackStatus &&
+          (chargebackStatus.chargebacks.length > 0 ||
+            chargebackStatus.unclaimedChargebacks.length > 0 ||
+            chargebackStatus.manualHolds.length > 0) && (
+            <section className="order-panel" aria-label="Chargeback account status">
+              <div>
+                <p className="eyebrow">Customer billing · Mock Chargeback</p>
+                <h2>
+                  {chargebackStatus.restricted
+                    ? "Client Account restricted after Chargeback"
+                    : "Chargeback history"}
+                </h2>
+                <p>
+                  Available Credit <strong>{usd(chargebackStatus.creditBalanceMinor)}</strong> ·
+                  outstanding Chargeback debt {" "}
+                  <strong>{usd(chargebackStatus.debtBalanceMinor)}</strong>. Original payments,
+                  paid invoices, allocations and delivered services remain historical facts.
+                </p>
+              </div>
+              <div data-testid="customer-chargeback-list">
+                {chargebackStatus.chargebacks.map((chargeback) => (
+                  <article
+                    className="manual-item security-hold-item"
+                    data-testid="customer-chargeback"
+                    key={chargeback.chargebackEffectId}
+                  >
+                    <div>
+                      <strong>
+                        External loss {usd(chargeback.externalAmountMinor)} · debt {" "}
+                        {usd(chargeback.debtMinor)}
+                      </strong>
+                      <span>
+                        Credit recovered {usd(chargeback.creditRecoveredMinor)} · original fee
+                        reversed {usd(chargeback.feeMinor)}
+                      </span>
+                      <span>
+                        Account restriction: {chargeback.restrictionActive ? "active" : "not active"}
+                      </span>
+                      <span className="mono">
+                        {chargeback.originalExternalPaymentId} · {chargeback.externalChargebackId}
+                      </span>
+                    </div>
+                  </article>
+                ))}
+                {chargebackStatus.unclaimedChargebacks.map((chargeback) => (
+                  <article
+                    className="manual-item security-hold-item"
+                    data-testid="customer-unclaimed-chargeback"
+                    key={chargeback.unclaimedChargebackEffectId}
+                  >
+                    <div>
+                      <strong>
+                        Unclaimed payment reversed {usd(chargeback.externalAmountMinor)}
+                      </strong>
+                      <span>No Credit or debt was created from these returned funds.</span>
+                      <span className="mono">
+                        {chargeback.originalExternalPaymentId} · {chargeback.externalChargebackId}
+                      </span>
+                    </div>
+                  </article>
+                ))}
+                {chargebackStatus.manualHolds.map((hold) => (
+                  <article
+                    className="manual-item security-hold-item"
+                    data-testid="customer-chargeback-hold"
+                    key={hold.holdId}
+                  >
+                    <div>
+                      <strong>Chargeback fact requires staff review</strong>
+                      <span>{hold.reason}</span>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+
         {me?.eligible && billing?.addFunds.enabled && (
           <section className="order-panel" aria-label="Add Funds">
             <div>
@@ -1788,6 +1959,102 @@ export function App() {
             <p>
               Current customer Credit: <strong>{usd(billing?.creditBalanceMinor ?? "0")}</strong>
             </p>
+            <div className="admin-subsection" aria-label="Add Funds Chargebacks">
+              <div>
+                <p className="eyebrow">Immutable external loss and customer debt</p>
+                <h3>Add Funds Chargebacks</h3>
+                <p>
+                  Original payment identity and amount facts remain immutable. An unclaimed
+                  receipt moves to charged_back; an allocated receipt and paid invoice remain
+                  historical. Remaining Credit is recovered first, and consumed principal becomes
+                  an explicit receivable for only the affected Client Account.
+                </p>
+              </div>
+              <button onClick={() => void refreshAdminChargebacks()}>
+                Refresh Chargebacks
+              </button>
+              {adminChargebacks.length === 0 &&
+              adminUnclaimedChargebacks.length === 0 &&
+              adminChargebackHolds.length === 0 ? (
+                <p className="muted">No Add Funds Chargeback is currently recorded.</p>
+              ) : (
+                <div data-testid="admin-chargeback-list">
+                  {adminChargebacks.map((chargeback) => (
+                    <article
+                      className="manual-item security-hold-item"
+                      data-testid="admin-chargeback"
+                      key={chargeback.chargebackEffectId}
+                    >
+                      <div>
+                        <strong>
+                          {chargeback.clientAccountName} · external loss {" "}
+                          {usd(chargeback.externalAmountMinor)}
+                        </strong>
+                        <span>
+                          Credit recovered {usd(chargeback.creditRecoveredMinor)} · debt {" "}
+                          {usd(chargeback.debtMinor)} · fee reversal {usd(chargeback.feeMinor)}
+                        </span>
+                        <span>
+                          Client Account restriction: {" "}
+                          {chargeback.restrictionActive ? "active" : "not active"}
+                        </span>
+                        <span className="mono">
+                          {chargeback.originalExternalPaymentId} · {chargeback.externalChargebackId}
+                        </span>
+                      </div>
+                    </article>
+                  ))}
+                  {adminUnclaimedChargebacks.map((chargeback) => (
+                    <article
+                      className="manual-item security-hold-item"
+                      data-testid="admin-unclaimed-chargeback"
+                      key={chargeback.unclaimedChargebackEffectId}
+                    >
+                      <div>
+                        <strong>
+                          {chargeback.clientAccountName} · unclaimed receipt reversed {" "}
+                          {usd(chargeback.externalAmountMinor)}
+                        </strong>
+                        <span>
+                          No customer Credit or debt was created; unclaimed liability and Mock cash
+                          were reversed together.
+                        </span>
+                        <span className="mono">
+                          receipt {chargeback.fundReceiptId} · {" "}
+                          {chargeback.originalExternalPaymentId} · {" "}
+                          {chargeback.externalChargebackId}
+                        </span>
+                      </div>
+                    </article>
+                  ))}
+                  {adminChargebackHolds.map((hold) => (
+                    <article
+                      className="manual-item security-hold-item"
+                      data-testid="admin-chargeback-hold"
+                      key={hold.holdId}
+                    >
+                      <div>
+                        <strong>
+                          {hold.clientAccountName ?? "Unresolved Client Account"} · manual hold
+                        </strong>
+                        <span>{hold.reason}</span>
+                        {hold.amountMinor && hold.currency && (
+                          <span>
+                            Provider reported {usd(hold.amountMinor)} {hold.currency}
+                          </span>
+                        )}
+                        {(hold.originalExternalPaymentId || hold.externalChargebackId) && (
+                          <span className="mono">
+                            {hold.originalExternalPaymentId ?? "unknown payment"} · {" "}
+                            {hold.externalChargebackId ?? "unknown Chargeback"}
+                          </span>
+                        )}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
             {manualItems.length === 0 ? (
               <p className="muted">No paid manual services are waiting.</p>
             ) : (

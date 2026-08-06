@@ -5,6 +5,7 @@ import { canTransitionPayment, type PaymentStatus } from "@opensales/core";
 import { providerOperationCapabilityMatches } from "@opensales/core/provider-capability";
 import type { Config } from "./config.js";
 import type { DatabaseClient } from "./database.js";
+import { settlePendingAddFundsChargebacks } from "./add-funds-chargeback.js";
 
 export type AddFundsPaymentEvent = {
   eventId: string;
@@ -64,6 +65,12 @@ export async function handleAddFundsPaymentEvent(
   config: Config,
   body: AddFundsPaymentEvent,
 ): Promise<Record<string, unknown>> {
+  // Worker preflight and Chargeback callbacks use this same operation-scoped
+  // lock before taking Add Funds rows. Keeping payment settlement in that
+  // order prevents an operation/attempt lock inversion during callback races.
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    `provider-operation:${body.providerOperationId}`,
+  ]);
   const lockPointer = await client.query<{
     submitted_by_user_id: string;
     client_account_id: string;
@@ -326,6 +333,9 @@ export async function handleAddFundsPaymentEvent(
         { paymentStatus: body.status },
       ],
     );
+    if (body.status !== "processing") {
+      await settlePendingAddFundsChargebacks(client, attempt.id);
+    }
     return { accepted: true, status: body.status };
   }
 
@@ -495,6 +505,7 @@ export async function handleAddFundsPaymentEvent(
         receivedCurrency: body.currency,
       },
     );
+    await settlePendingAddFundsChargebacks(client, attempt.id);
     return { accepted: true, status: "unclaimed", receiptId };
   }
 
@@ -606,5 +617,6 @@ export async function handleAddFundsPaymentEvent(
     "Mock Add Funds principal credited after verified settlement",
     result,
   );
+  await settlePendingAddFundsChargebacks(client, attempt.id);
   return { accepted: true, status: "succeeded", ...result };
 }
