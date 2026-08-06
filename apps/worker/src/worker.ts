@@ -2167,6 +2167,44 @@ async function preflightRefund(
       await manualJobWithClient(client, job.id, "refund job references a missing refund");
       return { kind: "halted" };
     }
+    let authorizationValid = true;
+    if (mode === "start") {
+      const authorization = await client.query(
+        `SELECT 1
+         FROM users user_record
+         JOIN staff_members staff ON staff.user_id = user_record.id
+         JOIN sessions session_record
+           ON session_record.id = $2
+          AND session_record.user_id = user_record.id
+         JOIN client_memberships membership
+           ON membership.user_id = user_record.id
+          AND membership.client_account_id = $3
+          AND membership.removed_at IS NULL
+         JOIN client_accounts account
+           ON account.id = membership.client_account_id
+         JOIN reauth_grants reauth
+           ON reauth.user_id = user_record.id
+          AND reauth.session_id = session_record.id
+          AND reauth.invalidated_at IS NULL
+          AND reauth.expires_at > now()
+         WHERE user_record.id = $1
+           AND user_record.email_verified_at IS NOT NULL
+           AND user_record.restricted_at IS NULL
+           AND account.restricted_at IS NULL
+           AND staff.active
+           AND (staff.permissions ? '*' OR staff.permissions ? 'billing.refund_manage')
+           AND session_record.revoked_at IS NULL
+           AND session_record.expires_at > now()
+         LIMIT 1
+         FOR UPDATE OF user_record, staff, session_record, membership, account, reauth`,
+        [
+          initial.requested_by_user_id,
+          initial.requested_session_id,
+          initial.requested_client_account_id,
+        ],
+      );
+      authorizationValid = authorization.rowCount === 1;
+    }
     const receiptId = initial.source_fund_receipt_id;
     await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [receiptId]);
     const result = await client.query<{
@@ -2359,41 +2397,6 @@ async function preflightRefund(
       );
       return { kind: "halted" };
     }
-    const authorization = await client.query(
-      `SELECT 1
-       FROM users user_record
-       JOIN staff_members staff ON staff.user_id = user_record.id
-       JOIN sessions session_record
-         ON session_record.id = $2
-        AND session_record.user_id = user_record.id
-       JOIN client_memberships membership
-         ON membership.user_id = user_record.id
-        AND membership.client_account_id = $3
-        AND membership.removed_at IS NULL
-       JOIN client_accounts account
-         ON account.id = membership.client_account_id
-       JOIN reauth_grants reauth
-         ON reauth.user_id = user_record.id
-        AND reauth.session_id = session_record.id
-        AND reauth.invalidated_at IS NULL
-        AND reauth.expires_at > now()
-       WHERE user_record.id = $1
-         AND user_record.email_verified_at IS NOT NULL
-         AND user_record.restricted_at IS NULL
-         AND account.restricted_at IS NULL
-         AND staff.active
-         AND (staff.permissions ? '*' OR staff.permissions ? 'billing.refund_manage')
-         AND session_record.revoked_at IS NULL
-         AND session_record.expires_at > now()
-       LIMIT 1
-       FOR UPDATE OF user_record, staff, session_record, membership, account, reauth`,
-      [
-        initial.requested_by_user_id,
-        initial.requested_session_id,
-        initial.requested_client_account_id,
-      ],
-    );
-    const authorizationValid = authorization.rowCount === 1;
     if (!authorizationValid) {
       await failKnownUnsentRefund(
         client,

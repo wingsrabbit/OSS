@@ -832,6 +832,7 @@ export async function registerRefundRoutes(
           return { adjudication: semanticReplay, replayed: true };
         }
 
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         const pointer = await client.query<{
           refund_id: string;
           source_fund_receipt_id: string;
@@ -869,7 +870,6 @@ export async function registerRefundRoutes(
             code: "REFUND_HOLD_ALREADY_ADJUDICATED",
           });
         }
-        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         if (hold.refund_version !== body.expectedRefundVersion) {
           throw Object.assign(
             new Error("The refund changed after the hold impact was displayed; refresh first"),
@@ -1349,6 +1349,7 @@ export async function registerRefundRoutes(
           return { row: semantic, replayed: true };
         }
 
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         const pointer = await client.query<{
           refund_id: string;
           receipt_id: string;
@@ -1438,7 +1439,6 @@ export async function registerRefundRoutes(
         if (!state) {
           throw Object.assign(new Error("Refund adjudication disappeared"), { statusCode: 409 });
         }
-        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         if (state.refund_version !== body.expectedRefundVersion) {
           throw Object.assign(new Error("The refund changed; refresh before correcting"), {
             statusCode: 409,
@@ -1954,6 +1954,7 @@ export async function registerRefundRoutes(
         return { row: replay, replayed: true };
       }
 
+      await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `refund:${params.refundId}`,
       ]);
@@ -2006,7 +2007,6 @@ export async function registerRefundRoutes(
       if (!state) {
         throw Object.assign(new Error("Refund Provider operation not found"), { statusCode: 409 });
       }
-      await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
       if (state.refund_version !== body.expectedRefundVersion) {
         throw Object.assign(new Error("The refund changed; refresh before deciding"), {
           statusCode: 409,
