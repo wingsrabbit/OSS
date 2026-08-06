@@ -832,7 +832,6 @@ export async function registerRefundRoutes(
           return { adjudication: semanticReplay, replayed: true };
         }
 
-        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         const pointer = await client.query<{
           refund_id: string;
           source_fund_receipt_id: string;
@@ -860,6 +859,7 @@ export async function registerRefundRoutes(
             lock,
           ]);
         }
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
           target.source_fund_receipt_id,
         ]);
@@ -1349,7 +1349,6 @@ export async function registerRefundRoutes(
           return { row: semantic, replayed: true };
         }
 
-        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         const pointer = await client.query<{
           refund_id: string;
           receipt_id: string;
@@ -1382,6 +1381,7 @@ export async function registerRefundRoutes(
             lock,
           ]);
         }
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
           target.receipt_id,
         ]);
@@ -1954,10 +1954,10 @@ export async function registerRefundRoutes(
         return { row: replay, replayed: true };
       }
 
-      await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `refund:${params.refundId}`,
       ]);
+      await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
       const pointer = await client.query<{ source_fund_receipt_id: string }>(
         "SELECT source_fund_receipt_id FROM refunds WHERE id = $1",
         [params.refundId],
