@@ -8,6 +8,16 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Administrators can return all or part of a still-unclaimed Fund Receipt to
+  its immutable original Mock Payment destination from the web queue. The flow
+  requires both funds and refund permissions, fixed-window password
+  confirmation, a reason, a displayed-capacity snapshot, and supports failure,
+  timeout reconciliation, duplicate/out-of-order callbacks, and reloadable
+  history without fabricating an invoice.
+- Unclaimed-funds returns use the shared refund Provider state machine with an
+  explicit source context and liability-aware journals. Failed requests release
+  capacity, while unknown results and receipt security holds freeze allocation
+  and further returns until reconciliation or human adjudication.
 - Administrator manual refunds for fully allocated invoice receipts, including
   full/partial amounts, original-payment or Credit destinations, an explicit
   no-refund decision, and a reference-only remaining-service calculation.
@@ -47,6 +57,15 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Security
 
+- Fund allocation and original-payment return serialize on the same receipt
+  lock. If funds are allocated after a failed or dismissed return and a real
+  Provider outflow is later confirmed, Core preserves both facts and creates a
+  visible cumulative recovery incident from allocated amount plus confirmed
+  outflows. PostgreSQL derives the triggering source context and rejects an
+  understated incident snapshot.
+- API and Worker both enforce `billing.unclaimed_manage` plus
+  `billing.refund_manage`; revocation before the first Provider request fails
+  known-unsent work without an external call and releases its reservation.
 - Refund capacity serializes on the immutable Fund Receipt; queued, processing,
   unknown, manual, and succeeded refunds reserve capacity, while only a
   definitive Provider failure releases it. The Worker rechecks aggregate

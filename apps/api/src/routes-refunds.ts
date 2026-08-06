@@ -93,6 +93,33 @@ const refundRequestSchema = z
     }
   });
 
+const unclaimedRefundRequestSchema = z
+  .object({
+    amountMode: z.enum(["full", "partial"]),
+    amountMinor: positiveMinor.nullable().default(null),
+    expectedAvailableMinor: positiveMinor,
+    scenario: z.enum(["success", "failed", "timeout_success", "duplicate_out_of_order"]),
+    reason: z.string().trim().min(10).max(1_000),
+    idempotencyKey: z.string().min(8).max(128),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.amountMode === "partial" && value.amountMinor === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["amountMinor"],
+        message: "A partial return requires an amount",
+      });
+    }
+    if (value.amountMode === "full" && value.amountMinor !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["amountMinor"],
+        message: "A full return uses the current server-calculated available amount",
+      });
+    }
+  });
+
 const refundHoldAdjudicationSchema = z
   .object({
     decision: z.enum([
@@ -136,9 +163,11 @@ type RefundSecurityHoldRow = {
   hold_id: string;
   receipt_id: string;
   receipt_amount_minor: string;
+  receipt_allocated_minor: string;
   confirmed_settlement_minor: string;
   refund_id: string;
-  invoice_id: string;
+  invoice_id: string | null;
+  source_context: "allocated_invoice" | "unclaimed_funds";
   client_account_id: string;
   client_account_name: string;
   refund_status: string;
@@ -217,9 +246,11 @@ type RefundReceiptCapacityIncidentRow = {
   correction_id: string | null;
   adjudication_id: string | null;
   refund_id: string;
-  invoice_id: string;
+  invoice_id: string | null;
+  source_context: "allocated_invoice" | "unclaimed_funds";
   client_account_id: string;
   client_account_name: string;
+  receipt_allocated_minor: string;
   confirmed_compensation_minor: string;
   receipt_amount_minor: string;
   overage_minor: string;
@@ -245,7 +276,7 @@ type RefundDismissalCorrectionRow = {
   hold_id: string;
   refund_id: string;
   refund_version: number;
-  invoice_id: string;
+  invoice_id: string | null;
   client_account_id: string;
   client_account_name: string;
   receipt_id: string;
@@ -263,7 +294,8 @@ type RefundDismissalCorrectionRow = {
 
 type RefundRow = {
   id: string;
-  invoice_id: string;
+  invoice_id: string | null;
+  source_context: "allocated_invoice" | "unclaimed_funds";
   client_account_id: string;
   source_fund_receipt_id: string;
   provider_installation_id: string | null;
@@ -295,6 +327,7 @@ function refundResponse(row: RefundRow, replayed: boolean): Record<string, unkno
     warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
     refundId: row.id,
     invoiceId: row.invoice_id,
+    sourceContext: row.source_context,
     receiptId: row.source_fund_receipt_id,
     clientAccountId: row.client_account_id,
     destination: row.destination,
@@ -320,6 +353,9 @@ function refundResponse(row: RefundRow, replayed: boolean): Record<string, unkno
 }
 
 function refundSecurityHoldResponse(row: RefundSecurityHoldRow): Record<string, unknown> {
+  const consumedBeforeHeldRefund =
+    BigInt(row.confirmed_settlement_minor) +
+    (row.source_context === "unclaimed_funds" ? BigInt(row.receipt_allocated_minor) : 0n);
   const exactAuthorizedDiscrepancy =
     row.discrepancy_id !== null &&
     row.discrepancy_external_refund_id !== null &&
@@ -327,15 +363,18 @@ function refundSecurityHoldResponse(row: RefundSecurityHoldRow): Record<string, 
     row.discrepancy_amount_minor === row.refund_amount_minor &&
     row.discrepancy_currency === row.refund_currency &&
     row.existing_settlement_id === null &&
-    BigInt(row.confirmed_settlement_minor) + BigInt(row.refund_amount_minor) <=
-      BigInt(row.receipt_amount_minor);
+    consumedBeforeHeldRefund + BigInt(row.refund_amount_minor) <= BigInt(row.receipt_amount_minor);
+  const recordableUnexpectedOutflow =
+    row.provider_fact_status === "succeeded";
   return {
     holdId: row.hold_id,
     receiptId: row.receipt_id,
     receiptAmountMinor: row.receipt_amount_minor,
+    receiptAllocatedMinor: row.receipt_allocated_minor,
     confirmedSettlementMinor: row.confirmed_settlement_minor,
     refundId: row.refund_id,
     invoiceId: row.invoice_id,
+    sourceContext: row.source_context,
     clientAccountId: row.client_account_id,
     clientAccountName: row.client_account_name,
     refundStatus: row.refund_status,
@@ -375,20 +414,22 @@ function refundSecurityHoldResponse(row: RefundSecurityHoldRow): Record<string, 
       ...(exactAuthorizedDiscrepancy && row.refund_status === "manual"
         ? ["accept_authorized_outflow"]
         : []),
-      ...(row.provider_fact_status === "succeeded" ? ["record_unexpected_outflow"] : []),
+      ...(recordableUnexpectedOutflow ? ["record_unexpected_outflow"] : []),
       "dismiss_provider_claim",
     ],
     impact: exactAuthorizedDiscrepancy
       ? {
           acceptAuthorizedOutflow:
-            "Reclassifies discrepancy suspense to sales refunds; mock cash is not reduced again.",
+            row.source_context === "unclaimed_funds"
+              ? "Reclassifies discrepancy suspense to unclaimed funds liability; mock cash is not reduced again."
+              : "Reclassifies discrepancy suspense to sales refunds; mock cash is not reduced again.",
           recordUnexpectedOutflow:
             "Keeps the verified cash outflow in discrepancy suspense without settling the refund.",
           dismissProviderClaim:
             "Posts a compensating cash/suspense journal and does not settle the refund.",
         }
       : {
-          ...(row.provider_fact_status === "succeeded"
+          ...(recordableUnexpectedOutflow
             ? {
                 recordUnexpectedOutflow:
                   "Records the verified cash reduction in discrepancy suspense without settling the refund.",
@@ -421,6 +462,10 @@ function refundCapacityIncidentResponse(
   row: RefundReceiptCapacityIncidentRow,
 ): Record<string, unknown> {
   const isCurrentSnapshot = row.is_current_snapshot;
+  const allocatedContributionMinor =
+    row.source_context === "unclaimed_funds" ? BigInt(row.receipt_allocated_minor) : 0n;
+  const confirmedProviderOutflowMinor =
+    BigInt(row.confirmed_compensation_minor) - allocatedContributionMinor;
   return {
     warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
     incidentId: row.incident_id,
@@ -431,8 +476,13 @@ function refundCapacityIncidentResponse(
       : { type: "unexpected_outflow_adjudication", adjudicationId: row.adjudication_id },
     refundId: row.refund_id,
     invoiceId: row.invoice_id,
+    sourceContext: row.source_context,
     clientAccountId: row.client_account_id,
     clientAccountName: row.client_account_name,
+    receiptAllocatedMinor: row.receipt_allocated_minor,
+    allocatedContributionMinor: allocatedContributionMinor.toString(),
+    confirmedProviderOutflowMinor: confirmedProviderOutflowMinor.toString(),
+    confirmedDispositionMinor: row.confirmed_compensation_minor,
     confirmedCompensationMinor: row.confirmed_compensation_minor,
     receiptAmountMinor: row.receipt_amount_minor,
     overageMinor: row.overage_minor,
@@ -482,34 +532,44 @@ async function readConfirmedReceiptCompensation(
   client: DatabaseClient,
   receiptId: string,
   currency: string,
+  sourceContext: "allocated_invoice" | "unclaimed_funds",
 ): Promise<bigint> {
   const result = await client.query<{ amount_minor: string }>(
-    `SELECT COALESCE(sum(confirmed.amount_minor), 0)::text AS amount_minor
-     FROM (
-       SELECT settlement.amount_minor
-       FROM refunds related_refund
-       JOIN refund_settlements settlement ON settlement.refund_id = related_refund.id
-       WHERE related_refund.source_fund_receipt_id = $1
-         AND settlement.currency = $2
-       UNION ALL
-       SELECT discrepancy.amount_minor
-       FROM refunds related_refund
-       JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = related_refund.id
-       JOIN refund_security_hold_adjudications adjudication
-         ON adjudication.discrepancy_settlement_id = discrepancy.id
-        AND adjudication.decision = 'record_unexpected_outflow'
-       WHERE related_refund.source_fund_receipt_id = $1
-         AND discrepancy.currency = $2
-       UNION ALL
-       SELECT discrepancy.amount_minor
-       FROM refunds related_refund
-       JOIN refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = related_refund.id
-       JOIN refund_adjudication_corrections correction
-         ON correction.discrepancy_settlement_id = discrepancy.id
-       WHERE related_refund.source_fund_receipt_id = $1
-         AND discrepancy.currency = $2
-     ) confirmed`,
-    [receiptId, currency],
+    `SELECT (
+       COALESCE((
+         SELECT sum(confirmed.amount_minor)
+         FROM (
+           SELECT settlement.amount_minor
+           FROM refunds related_refund
+           JOIN refund_settlements settlement ON settlement.refund_id = related_refund.id
+           WHERE related_refund.source_fund_receipt_id = receipt.id
+             AND settlement.currency = receipt.currency
+           UNION ALL
+           SELECT discrepancy.amount_minor
+           FROM refunds related_refund
+           JOIN refund_discrepancy_settlements discrepancy
+             ON discrepancy.refund_id = related_refund.id
+           JOIN refund_security_hold_adjudications adjudication
+             ON adjudication.discrepancy_settlement_id = discrepancy.id
+            AND adjudication.decision = 'record_unexpected_outflow'
+           WHERE related_refund.source_fund_receipt_id = receipt.id
+             AND discrepancy.currency = receipt.currency
+           UNION ALL
+           SELECT discrepancy.amount_minor
+           FROM refunds related_refund
+           JOIN refund_discrepancy_settlements discrepancy
+             ON discrepancy.refund_id = related_refund.id
+           JOIN refund_adjudication_corrections correction
+             ON correction.discrepancy_settlement_id = discrepancy.id
+           WHERE related_refund.source_fund_receipt_id = receipt.id
+             AND discrepancy.currency = receipt.currency
+         ) confirmed
+       ), 0)
+       + CASE WHEN $3 = 'unclaimed_funds' THEN receipt.allocated_minor ELSE 0 END
+     )::text AS amount_minor
+     FROM fund_receipts receipt
+     WHERE receipt.id = $1 AND receipt.currency = $2`,
+    [receiptId, currency, sourceContext],
   );
   return BigInt(result.rows[0]?.amount_minor ?? "0");
 }
@@ -520,6 +580,7 @@ async function createRefundCapacityIncident(
     receiptId: string;
     receiptAmountMinor: string;
     currency: string;
+    sourceContext: "allocated_invoice" | "unclaimed_funds";
     correctionId?: string;
     adjudicationId?: string;
     reason: string;
@@ -529,6 +590,7 @@ async function createRefundCapacityIncident(
     client,
     input.receiptId,
     input.currency,
+    input.sourceContext,
   );
   const receiptAmountMinor = BigInt(input.receiptAmountMinor);
   if (confirmedCompensationMinor <= receiptAmountMinor) return null;
@@ -662,6 +724,7 @@ async function readActiveRefundSecurityHold(
        security_hold.id AS hold_id,
        security_hold.source_fund_receipt_id AS receipt_id,
        receipt.amount_minor::text AS receipt_amount_minor,
+       receipt.allocated_minor::text AS receipt_allocated_minor,
        COALESCE((
          SELECT sum(confirmed.amount_minor)
          FROM (
@@ -692,6 +755,7 @@ async function readActiveRefundSecurityHold(
        ), 0)::text AS confirmed_settlement_minor,
        security_hold.refund_id,
        refund.invoice_id,
+       refund.source_context,
        refund.client_account_id,
        account.name AS client_account_name,
        refund.status AS refund_status,
@@ -797,8 +861,10 @@ export async function registerRefundRoutes(
          incident.triggering_adjudication_id AS adjudication_id,
          COALESCE(correction.refund_id, source_adjudication.refund_id) AS refund_id,
          refund.invoice_id,
+         refund.source_context,
          refund.client_account_id,
          account.name AS client_account_name,
+         receipt.allocated_minor::text AS receipt_allocated_minor,
          incident.confirmed_compensation_minor::text AS confirmed_compensation_minor,
          incident.receipt_amount_minor::text AS receipt_amount_minor,
          incident.overage_minor::text AS overage_minor,
@@ -822,6 +888,7 @@ export async function registerRefundRoutes(
        JOIN refunds refund
          ON refund.id = COALESCE(correction.refund_id, source_adjudication.refund_id)
        JOIN client_accounts account ON account.id = refund.client_account_id
+       JOIN fund_receipts receipt ON receipt.id = incident.source_fund_receipt_id
        LEFT JOIN refund_receipt_capacity_acknowledgements acknowledgement
          ON acknowledgement.incident_id = incident.id
        ORDER BY incident.created_at, incident.id`,
@@ -934,8 +1001,10 @@ export async function registerRefundRoutes(
              incident.triggering_adjudication_id AS adjudication_id,
              COALESCE(correction.refund_id, source_adjudication.refund_id) AS refund_id,
              refund.invoice_id,
+             refund.source_context,
              refund.client_account_id,
              account.name AS client_account_name,
+             receipt.allocated_minor::text AS receipt_allocated_minor,
              incident.confirmed_compensation_minor::text AS confirmed_compensation_minor,
              incident.receipt_amount_minor::text AS receipt_amount_minor,
              incident.overage_minor::text AS overage_minor,
@@ -954,6 +1023,7 @@ export async function registerRefundRoutes(
            JOIN refunds refund
              ON refund.id = COALESCE(correction.refund_id, source_adjudication.refund_id)
            JOIN client_accounts account ON account.id = refund.client_account_id
+           JOIN fund_receipts receipt ON receipt.id = incident.source_fund_receipt_id
            WHERE incident.id = $1
              AND NOT EXISTS (
                SELECT 1
@@ -984,6 +1054,7 @@ export async function registerRefundRoutes(
           client,
           incident.receipt_id,
           incident.currency,
+          incident.source_context,
         );
         if (
           currentConfirmedCompensationMinor.toString() !==
@@ -1085,6 +1156,7 @@ export async function registerRefundRoutes(
          security_hold.id AS hold_id,
          security_hold.source_fund_receipt_id AS receipt_id,
          receipt.amount_minor::text AS receipt_amount_minor,
+         receipt.allocated_minor::text AS receipt_allocated_minor,
          COALESCE((
            SELECT sum(confirmed.amount_minor)
            FROM (
@@ -1115,6 +1187,7 @@ export async function registerRefundRoutes(
          ), 0)::text AS confirmed_settlement_minor,
          security_hold.refund_id,
          refund.invoice_id,
+         refund.source_context,
          refund.client_account_id,
          account.name AS client_account_name,
          refund.status AS refund_status,
@@ -1364,7 +1437,11 @@ export async function registerRefundRoutes(
           hold.discrepancy_amount_minor === hold.refund_amount_minor &&
           hold.discrepancy_currency === hold.refund_currency &&
           hold.existing_settlement_id === null &&
-          BigInt(hold.confirmed_settlement_minor) + BigInt(hold.refund_amount_minor) <=
+          BigInt(hold.confirmed_settlement_minor) +
+              (hold.source_context === "unclaimed_funds"
+                ? BigInt(hold.receipt_allocated_minor)
+                : 0n) +
+              BigInt(hold.refund_amount_minor) <=
             BigInt(hold.receipt_amount_minor) &&
           hold.refund_status === "manual" &&
           hold.refund_security_hold;
@@ -1535,9 +1612,15 @@ export async function registerRefundRoutes(
           await client.query(
             `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
              VALUES
-               ($1, 'sales_refunds_and_allowances', $2, 0),
+               ($1, $3, $2, 0),
                ($1, 'refund_discrepancy_suspense', 0, $2)`,
-            [journalId, hold.refund_amount_minor],
+            [
+              journalId,
+              hold.refund_amount_minor,
+              hold.source_context === "unclaimed_funds"
+                ? "unclaimed_funds_liability"
+                : "sales_refunds_and_allowances",
+            ],
           );
           await client.query(
             `UPDATE durable_jobs
@@ -1597,6 +1680,7 @@ export async function registerRefundRoutes(
               receiptId: hold.receipt_id,
               receiptAmountMinor: hold.receipt_amount_minor,
               currency: hold.refund_currency,
+              sourceContext: hold.source_context,
               adjudicationId: adjudication.id,
               reason:
                 "Confirmed refund compensation exceeds the immutable source receipt after an unexpected Provider outflow was recorded; manual recovery remains outstanding",
@@ -1899,6 +1983,7 @@ export async function registerRefundRoutes(
           decision: string;
           refund_id: string;
           refund_version: number;
+          source_context: "allocated_invoice" | "unclaimed_funds";
           provider_fact_id: string;
           provider_fact_status: string;
           provider_amount_minor: string;
@@ -1914,6 +1999,7 @@ export async function registerRefundRoutes(
              adjudication.decision,
              refund.id AS refund_id,
              refund.version AS refund_version,
+             refund.source_context,
              fact.id AS provider_fact_id,
              fact.status AS provider_fact_status,
              fact.amount_minor::text AS provider_amount_minor,
@@ -2088,6 +2174,7 @@ export async function registerRefundRoutes(
                 receiptId: target.receipt_id,
                 receiptAmountMinor: receipt.amount_minor,
                 currency: receipt.currency,
+                sourceContext: state.source_context,
                 correctionId: correction.id,
                 reason:
                   "Confirmed refund compensation exceeds the immutable source receipt after a dismissed Provider outflow correction; manual financial recovery remains outstanding",
@@ -2101,6 +2188,7 @@ export async function registerRefundRoutes(
               client,
               target.receipt_id,
               receipt.currency,
+              state.source_context,
             )
           ).toString();
         const changedRefund = await client.query(
@@ -2191,6 +2279,257 @@ export async function registerRefundRoutes(
       });
     },
   );
+
+  app.post("/api/v1/admin/funds/:receiptId/refunds", async (request, reply) => {
+    const user = await requireUser(request, pool, config);
+    await requireStaffPermission(pool, user, "billing.unclaimed_manage");
+    await requireStaffPermission(pool, user, "billing.refund_manage");
+    await requireRecentReauth(pool, user);
+    const params = z.object({ receiptId: canonicalUuid }).parse(request.params);
+    const body = unclaimedRefundRequestSchema.parse(request.body);
+    const fingerprint = requestFingerprint("admin.unclaimed-fund-refund:v1", {
+      receiptId: params.receiptId,
+      amountMode: body.amountMode,
+      amountMinor: body.amountMinor,
+      expectedAvailableMinor: body.expectedAvailableMinor,
+      scenario: body.scenario,
+      reason: body.reason,
+    });
+
+    const outcome = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `refund:idempotency:${body.idempotencyKey}`,
+      ]);
+      const replayResult = await client.query<RefundRow>(
+        `SELECT refund.*
+         FROM refund_request_aliases alias
+         JOIN refunds refund ON refund.id = alias.refund_id
+         WHERE alias.idempotency_key = $1`,
+        [body.idempotencyKey],
+      );
+      const replay = replayResult.rows[0];
+      if (replay) {
+        if (
+          replay.source_context !== "unclaimed_funds" ||
+          replay.invoice_id !== null ||
+          replay.source_fund_receipt_id !== params.receiptId ||
+          replay.request_fingerprint !== fingerprint
+        ) {
+          throw Object.assign(
+            new Error("The idempotency key was used for another funds return"),
+            { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
+          );
+        }
+        await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+        await requireStaffActionLocked(client, user, "billing.refund_manage");
+        await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
+          replay.source_fund_receipt_id,
+        ]);
+        await client.query("SELECT id FROM refunds WHERE id = $1 FOR UPDATE", [replay.id]);
+        return { row: await readRefund(client, replay.id), replayed: true };
+      }
+
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `refund:fingerprint:${fingerprint}`,
+      ]);
+      const semanticReplayResult = await client.query<RefundRow>(
+        `SELECT *
+         FROM refunds
+         WHERE request_fingerprint = $1`,
+        [fingerprint],
+      );
+      const semanticReplay = semanticReplayResult.rows[0];
+      if (semanticReplay) {
+        if (
+          semanticReplay.source_context !== "unclaimed_funds" ||
+          semanticReplay.invoice_id !== null ||
+          semanticReplay.source_fund_receipt_id !== params.receiptId
+        ) {
+          throw Object.assign(new Error("The fund return identity conflicts with another refund"), {
+            statusCode: 409,
+            code: "REFUND_IDENTITY_CONFLICT",
+          });
+        }
+        await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+        await requireStaffActionLocked(client, user, "billing.refund_manage");
+        await client.query("SELECT id FROM fund_receipts WHERE id = $1 FOR UPDATE", [
+          semanticReplay.source_fund_receipt_id,
+        ]);
+        await client.query("SELECT id FROM refunds WHERE id = $1 FOR UPDATE", [
+          semanticReplay.id,
+        ]);
+        await client.query(
+          `INSERT INTO refund_request_aliases(
+             idempotency_key, refund_id, request_fingerprint
+           ) VALUES ($1, $2, $3)`,
+          [body.idempotencyKey, semanticReplay.id, fingerprint],
+        );
+        return { row: await readRefund(client, semanticReplay.id), replayed: true };
+      }
+
+      await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+      await requireStaffActionLocked(client, user, "billing.refund_manage");
+      const receiptResult = await client.query<{
+        id: string;
+        client_account_id: string;
+        provider_installation_id: string;
+        external_payment_id: string;
+        amount_minor: string;
+        allocated_minor: string;
+        currency: string;
+      }>(
+        `SELECT id, client_account_id, provider_installation_id, external_payment_id,
+                amount_minor::text, allocated_minor::text, currency
+         FROM fund_receipts
+         WHERE id = $1
+         FOR UPDATE`,
+        [params.receiptId],
+      );
+      const receipt = receiptResult.rows[0];
+      if (!receipt) {
+        throw Object.assign(new Error("Fund receipt not found"), { statusCode: 404 });
+      }
+      const capacityResult = await client.query<{
+        reserved_refund_minor: string;
+        confirmed_outflow_minor: string;
+        capacity_frozen: boolean;
+        available_minor: string;
+      }>(
+        `SELECT
+           capacity.reserved_refund_minor::text,
+           capacity.confirmed_outflow_minor::text,
+           capacity.capacity_frozen,
+           capacity.available_minor::text
+         FROM unclaimed_fund_refund_capacity capacity
+         WHERE capacity.fund_receipt_id = $1`,
+        [params.receiptId],
+      );
+      const capacity = capacityResult.rows[0];
+      if (!capacity) throw new Error("Fund receipt capacity is unavailable");
+      if (receipt.provider_installation_id !== "mock-payment-v1") {
+        throw Object.assign(new Error("The original Payment Provider is not available"), {
+          statusCode: 422,
+          code: "REFUND_PROVIDER_NOT_AVAILABLE",
+        });
+      }
+      if (capacity.capacity_frozen) {
+        throw Object.assign(
+          new Error("The receipt has an unknown or security-held outflow; reconcile it first"),
+          { statusCode: 409, code: "UNCLAIMED_FUNDS_CAPACITY_FROZEN" },
+        );
+      }
+      if (capacity.available_minor !== body.expectedAvailableMinor) {
+        throw Object.assign(
+          new Error("The available funds changed after display; refresh and confirm again"),
+          { statusCode: 409, code: "UNCLAIMED_FUNDS_AVAILABLE_CHANGED" },
+        );
+      }
+      const availableMinor = BigInt(capacity.available_minor);
+      const amountMinor =
+        body.amountMode === "full" ? availableMinor : BigInt(body.amountMinor ?? "0");
+      if (amountMinor <= 0n || amountMinor > availableMinor) {
+        throw Object.assign(new Error("Return amount exceeds the currently available funds"), {
+          statusCode: 409,
+          code: "UNCLAIMED_FUNDS_RETURN_EXCEEDS_AVAILABLE",
+        });
+      }
+
+      const refundId = randomUUID();
+      await client.query(
+        `INSERT INTO refunds(
+           id, invoice_id, source_context, client_account_id, source_fund_receipt_id,
+           provider_installation_id, original_external_payment_id,
+           destination, amount_mode, amount_minor, currency, status, scenario,
+           requested_by_user_id, requested_session_id, requested_client_account_id,
+           reason, idempotency_key, request_fingerprint, result
+         ) VALUES (
+           $1, NULL, 'unclaimed_funds', $2, $3, $4, $5,
+           'original_payment', $6, $7, $8, 'queued', $9,
+           $10, $11, $12, $13, $14, $15, $16
+         )`,
+        [
+          refundId,
+          receipt.client_account_id,
+          receipt.id,
+          receipt.provider_installation_id,
+          receipt.external_payment_id,
+          body.amountMode,
+          amountMinor.toString(),
+          receipt.currency,
+          body.scenario,
+          user.userId,
+          user.sessionId,
+          user.clientAccountId,
+          body.reason,
+          body.idempotencyKey,
+          fingerprint,
+          {
+            sourceContext: "unclaimed_funds",
+            reservedMinor: amountMinor.toString(),
+            displayedAvailableMinor: body.expectedAvailableMinor,
+          },
+        ],
+      );
+      await client.query(
+        `INSERT INTO refund_events(
+           refund_id, event_type, actor_type, actor_id, reason, metadata
+         ) VALUES ($1, 'requested', 'staff', $2, $3, $4)`,
+        [
+          refundId,
+          user.userId,
+          body.reason,
+          {
+            sourceContext: "unclaimed_funds",
+            amountMinor: amountMinor.toString(),
+            receiptId: receipt.id,
+          },
+        ],
+      );
+      await client.query(
+        `INSERT INTO refund_request_aliases(
+           idempotency_key, refund_id, request_fingerprint
+         ) VALUES ($1, $2, $3)`,
+        [body.idempotencyKey, refundId, fingerprint],
+      );
+      const operation = await client.query<{ id: string }>(
+        `INSERT INTO provider_operations(
+           provider_installation_id, kind, subject_type, subject_id, stable_key, status
+         ) VALUES ($1, 'refund_create', 'refund', $2, $3, 'queued')
+         RETURNING id`,
+        [receipt.provider_installation_id, refundId, `refund:${refundId}`],
+      );
+      const providerOperationId = operation.rows[0]?.id;
+      if (!providerOperationId) throw new Error("Unable to create funds return Provider operation");
+      await client.query(
+        `INSERT INTO durable_jobs(job_type, unique_key, payload)
+         VALUES ('refund.start', $1, $2)`,
+        [`refund:${refundId}`, { refundId, providerOperationId }],
+      );
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('staff', $1, 'billing.unclaimed_funds_refund_requested',
+                   'fund_receipt', $2, $3, $4)`,
+        [
+          user.userId,
+          receipt.id,
+          body.reason,
+          {
+            refundId,
+            providerOperationId,
+            amountMinor: amountMinor.toString(),
+            currency: receipt.currency,
+            sourceContext: "unclaimed_funds",
+          },
+        ],
+      );
+      return { row: await readRefund(client, refundId), replayed: false };
+    });
+
+    return reply
+      .code(outcome.replayed ? 200 : 202)
+      .send(refundResponse(outcome.row, outcome.replayed));
+  });
 
   app.get("/api/v1/admin/refund-candidates", async (request) => {
     const user = await requireUser(request, pool, config);
@@ -2747,6 +3086,16 @@ export async function registerRefundRoutes(
       );
       const semanticReplay = semanticReplayResult.rows[0];
       if (semanticReplay) {
+        if (
+          semanticReplay.source_context !== "allocated_invoice" ||
+          semanticReplay.invoice_id !== params.invoiceId ||
+          semanticReplay.source_fund_receipt_id !== body.receiptId
+        ) {
+          throw Object.assign(new Error("The refund identity conflicts with another refund"), {
+            statusCode: 409,
+            code: "REFUND_IDENTITY_CONFLICT",
+          });
+        }
         await lockInvoice(client, semanticReplay.invoice_id);
         await requireStaffActionLocked(client, user, "billing.refund_manage");
         await client.query("SELECT id FROM refunds WHERE id = $1 FOR UPDATE", [

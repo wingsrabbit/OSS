@@ -85,6 +85,10 @@ type UnclaimedFundItem = {
   amountMinor: string;
   allocatedMinor: string;
   remainingMinor: string;
+  reservedRefundMinor: string;
+  confirmedOutflowMinor: string;
+  availableMinor: string;
+  capacityFrozen: boolean;
   currency: string;
   occurredAt: string;
   disposition: string;
@@ -110,7 +114,8 @@ type RefundCandidate = {
 };
 type RefundRecord = {
   refundId: string;
-  invoiceId: string;
+  invoiceId: string | null;
+  sourceContext: "allocated_invoice" | "unclaimed_funds";
   receiptId: string;
   destination: "original_payment" | "credit" | "none";
   amountMode: "full" | "partial" | "none";
@@ -130,9 +135,11 @@ type RefundSecurityHold = {
   holdId: string;
   receiptId: string;
   receiptAmountMinor: string;
+  receiptAllocatedMinor: string;
   confirmedSettlementMinor: string;
   refundId: string;
-  invoiceId: string;
+  invoiceId: string | null;
+  sourceContext: "allocated_invoice" | "unclaimed_funds";
   clientAccountId: string;
   clientAccountName: string;
   refundStatus: string;
@@ -184,7 +191,7 @@ type RefundDismissalCorrection = {
   holdId: string;
   refundId: string;
   refundVersion: number;
-  invoiceId: string;
+  invoiceId: string | null;
   clientAccountId: string;
   clientAccountName: string;
   receiptId: string;
@@ -210,9 +217,14 @@ type RefundReceiptCapacityIncident = {
     | { type: "dismissal_correction"; correctionId: string }
     | { type: "unexpected_outflow_adjudication"; adjudicationId: string };
   refundId: string;
-  invoiceId: string;
+  invoiceId: string | null;
+  sourceContext: "allocated_invoice" | "unclaimed_funds";
   clientAccountId: string;
   clientAccountName: string;
+  receiptAllocatedMinor: string;
+  allocatedContributionMinor: string;
+  confirmedProviderOutflowMinor: string;
+  confirmedDispositionMinor: string;
   confirmedCompensationMinor: string;
   receiptAmountMinor: string;
   overageMinor: string;
@@ -423,6 +435,12 @@ export function App() {
   const [fundResolutionMinor, setFundResolutionMinor] = useState("");
   const [fundResolutionInvoiceId, setFundResolutionInvoiceId] = useState("");
   const [fundResolutionReason, setFundResolutionReason] = useState("");
+  const [fundReturnAmountMode, setFundReturnAmountMode] = useState<"full" | "partial">("full");
+  const [fundReturnAmountMinor, setFundReturnAmountMinor] = useState("");
+  const [fundReturnReason, setFundReturnReason] = useState("");
+  const [fundReturnScenario, setFundReturnScenario] = useState<
+    "success" | "failed" | "timeout_success" | "duplicate_out_of_order"
+  >("success");
   const fundResolutionInFlight = useRef(new Set<string>());
   const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
     ReadonlySet<string>
@@ -698,11 +716,22 @@ export function App() {
           }),
         ),
       )
-        .then(() => Promise.all([refreshRefundCandidates(), refreshRefundSecurityHolds()]))
+        .then(() =>
+          Promise.all([
+            refreshRefundCandidates(),
+            refreshRefundSecurityHolds(),
+            refreshUnclaimedFunds(),
+          ]),
+        )
         .catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(timer);
-  }, [refundRecords, refreshRefundCandidates, refreshRefundSecurityHolds]);
+  }, [
+    refundRecords,
+    refreshRefundCandidates,
+    refreshRefundSecurityHolds,
+    refreshUnclaimedFunds,
+  ]);
 
   const groups = useMemo(() => {
     const result = new Map<string, Product[]>();
@@ -912,7 +941,12 @@ export function App() {
     action: "convert_to_credit" | "allocate_invoice",
   ) {
     if (!me?.staff) return;
-    if (fundResolutionInFlight.current.has(item.receiptId)) return;
+    if (
+      fundResolutionInFlight.current.has(item.receiptId) ||
+      refundInFlight.current.has(item.receiptId)
+    ) {
+      return;
+    }
     const invoiceId =
       action === "allocate_invoice"
         ? fundResolutionInvoiceId || item.suggestedInvoiceId
@@ -973,6 +1007,90 @@ export function App() {
     } finally {
       fundResolutionInFlight.current.delete(item.receiptId);
       setFundResolutionPendingReceiptIds((current) => {
+        const next = new Set(current);
+        next.delete(item.receiptId);
+        return next;
+      });
+    }
+  }
+
+  async function returnUnclaimedFunds(item: UnclaimedFundItem) {
+    if (
+      !me?.staff ||
+      refundInFlight.current.has(item.receiptId) ||
+      fundResolutionInFlight.current.has(item.receiptId)
+    ) {
+      return;
+    }
+    const amountMinor = fundReturnAmountMode === "partial" ? fundReturnAmountMinor : null;
+    const reason = fundReturnReason.trim();
+    const identity = JSON.stringify({
+      sourceContext: "unclaimed_funds",
+      receiptId: item.receiptId,
+      amountMode: fundReturnAmountMode,
+      amountMinor,
+      expectedAvailableMinor: item.availableMinor,
+      scenario: fundReturnScenario,
+      reason,
+    });
+    refundInFlight.current.add(item.receiptId);
+    setRefundPendingReceiptIds((current) => new Set(current).add(item.receiptId));
+    setError("");
+    try {
+      const storageKey = await refundIntentStorageKey(identity);
+      let storedKey: string | null = null;
+      try {
+        storedKey = window.localStorage.getItem(storageKey);
+      } catch {
+        storedKey = null;
+      }
+      const idempotencyKey =
+        refundIntentKeys.current.get(identity) ?? storedKey ?? crypto.randomUUID();
+      refundIntentKeys.current.set(identity, idempotencyKey);
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The in-memory key still makes repeated clicks replay the same request.
+      }
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const refund = await api<RefundRecord>(
+        `/api/v1/admin/funds/${item.receiptId}/refunds`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            amountMode: fundReturnAmountMode,
+            amountMinor,
+            expectedAvailableMinor: item.availableMinor,
+            scenario: fundReturnScenario,
+            reason,
+            idempotencyKey,
+          }),
+        },
+      );
+      refundIntentKeys.current.delete(identity);
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A retained key is safe: a later retry replays instead of returning funds twice.
+      }
+      setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
+      setNotice(
+        refund.replayed
+          ? "The same unclaimed-funds return was replayed; no second Provider request was created."
+          : "Return to the original payment requested. Funds remain reserved until the Provider result is known.",
+      );
+      setFundReturnAmountMinor("");
+      setFundReturnReason("");
+      await Promise.all([refreshUnclaimedFunds(), refreshRefundRecords()]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unclaimed-funds return failed");
+    } finally {
+      refundInFlight.current.delete(item.receiptId);
+      setRefundPendingReceiptIds((current) => {
         const next = new Set(current);
         next.delete(item.receiptId);
         return next;
@@ -1734,6 +1852,54 @@ export function App() {
                   placeholder="Resolution reason (10+ characters)"
                 />
               </div>
+              <div className="inline-form admin-confirm refund-controls">
+                <select
+                  aria-label="Unclaimed funds return amount mode"
+                  value={fundReturnAmountMode}
+                  onChange={(event) =>
+                    setFundReturnAmountMode(event.target.value as "full" | "partial")
+                  }
+                >
+                  <option value="full">Return all currently available funds</option>
+                  <option value="partial">Return a partial amount</option>
+                </select>
+                <input
+                  aria-label="Unclaimed funds return amount in cents"
+                  inputMode="numeric"
+                  value={fundReturnAmountMinor}
+                  onChange={(event) => setFundReturnAmountMinor(event.target.value)}
+                  disabled={fundReturnAmountMode === "full"}
+                  placeholder={
+                    fundReturnAmountMode === "full"
+                      ? "Uses the displayed actionable amount"
+                      : "Return amount in cents"
+                  }
+                />
+                <select
+                  aria-label="Unclaimed funds refund Provider scenario"
+                  value={fundReturnScenario}
+                  onChange={(event) =>
+                    setFundReturnScenario(
+                      event.target.value as
+                        | "success"
+                        | "failed"
+                        | "timeout_success"
+                        | "duplicate_out_of_order",
+                    )
+                  }
+                >
+                  <option value="success">Provider success</option>
+                  <option value="failed">Provider failure</option>
+                  <option value="timeout_success">Timeout, then reconcile success</option>
+                  <option value="duplicate_out_of_order">Duplicate/out-of-order callbacks</option>
+                </select>
+                <input
+                  aria-label="Unclaimed funds return reason"
+                  value={fundReturnReason}
+                  onChange={(event) => setFundReturnReason(event.target.value)}
+                  placeholder="Original-payment return reason (10+ characters)"
+                />
+              </div>
               {unclaimedFunds.length === 0 ? (
                 <p className="muted">No unclaimed funds are waiting.</p>
               ) : (
@@ -1742,23 +1908,37 @@ export function App() {
                     <article
                       className="manual-item"
                       data-testid="unclaimed-fund-item"
+                      data-receipt-id={item.receiptId}
                       key={item.receiptId}
                     >
                       <div>
                         <strong>
-                          {item.clientAccountName} · remaining {usd(item.remainingMinor)}
+                          {item.clientAccountName} · actionable {usd(item.availableMinor)}
                         </strong>
                         <span>
                           Received {usd(item.amountMinor)} via {item.providerInstallationId}
                         </span>
+                        <span>
+                          Allocated {usd(item.allocatedMinor)} · pending return{" "}
+                          {usd(item.reservedRefundMinor)} · confirmed returned{" "}
+                          {usd(item.confirmedOutflowMinor)}
+                        </span>
                         <span className="mono">{item.externalPaymentId}</span>
                         <span>{item.reason ?? "Awaiting operator classification"}</span>
+                        {item.capacityFrozen && (
+                          <span>
+                            Reconciliation required — allocation and new returns are blocked.
+                          </span>
+                        )}
                       </div>
                       <div className="fund-actions">
                         <button
                           className="primary"
                           disabled={
                             fundResolutionPendingReceiptIds.has(item.receiptId) ||
+                            refundPendingReceiptIds.has(item.receiptId) ||
+                            item.capacityFrozen ||
+                            BigInt(item.availableMinor) <= 0n ||
                             adminPassword.length === 0 ||
                             !/^[1-9]\d*$/.test(fundResolutionMinor) ||
                             fundResolutionReason.trim().length < 10
@@ -1770,6 +1950,9 @@ export function App() {
                         <button
                           disabled={
                             fundResolutionPendingReceiptIds.has(item.receiptId) ||
+                            refundPendingReceiptIds.has(item.receiptId) ||
+                            item.capacityFrozen ||
+                            BigInt(item.availableMinor) <= 0n ||
                             adminPassword.length === 0 ||
                             !/^[1-9]\d*$/.test(fundResolutionMinor) ||
                             fundResolutionReason.trim().length < 10 ||
@@ -1778,6 +1961,22 @@ export function App() {
                           onClick={() => resolveUnclaimedFunds(item, "allocate_invoice")}
                         >
                           Allocate amount to invoice
+                        </button>
+                        <button
+                          data-testid="return-unclaimed-funds"
+                          disabled={
+                            fundResolutionPendingReceiptIds.has(item.receiptId) ||
+                            refundPendingReceiptIds.has(item.receiptId) ||
+                            item.capacityFrozen ||
+                            BigInt(item.availableMinor) <= 0n ||
+                            adminPassword.length === 0 ||
+                            fundReturnReason.trim().length < 10 ||
+                            (fundReturnAmountMode === "partial" &&
+                              !/^[1-9]\d*$/.test(fundReturnAmountMinor))
+                          }
+                          onClick={() => returnUnclaimedFunds(item)}
+                        >
+                          Return to original payment
                         </button>
                       </div>
                     </article>
@@ -1791,8 +1990,9 @@ export function App() {
                 <h3>Manual refunds</h3>
                 <p>
                   The reference amount is advisory. A refund does not silently cancel service,
-                  reopen the paid invoice, or rewrite the original payment. Add Funds and
-                  unclaimed receipts are excluded from this safe scope.
+                  reopen the paid invoice, or rewrite the original payment. This section covers
+                  allocated invoice receipts; unclaimed original-payment returns are handled in
+                  the funds queue above.
                 </p>
               </div>
               <button
@@ -1950,9 +2150,13 @@ export function App() {
                           </strong>
                           <span>{incident.reason}</span>
                           <span>
-                            Immutable receipt {usd(incident.receiptAmountMinor)} · confirmed
-                            compensation {usd(incident.confirmedCompensationMinor)} · overage {" "}
-                            {usd(incident.overageMinor)} {incident.currency}
+                            Immutable receipt {usd(incident.receiptAmountMinor)} · confirmed total
+                            disposition {usd(incident.confirmedDispositionMinor)} · Provider outflow {" "}
+                            {usd(incident.confirmedProviderOutflowMinor)}
+                            {incident.sourceContext === "unclaimed_funds"
+                              ? ` · allocated/Credit contribution ${usd(incident.allocatedContributionMinor)}`
+                              : ""}
+                            {" · "}overage {usd(incident.overageMinor)} {incident.currency}
                           </span>
                           <span>{incident.impact}</span>
                           <span>
@@ -2000,6 +2204,12 @@ export function App() {
                   </p>
                   {refundSecurityHolds.map((hold) => {
                     const pending = refundAdjudicationPendingIds.has(hold.holdId);
+                    const allocatedContributionMinor =
+                      hold.sourceContext === "unclaimed_funds"
+                        ? BigInt(hold.receiptAllocatedMinor)
+                        : 0n;
+                    const consumedBeforeHeldFactMinor =
+                      BigInt(hold.confirmedSettlementMinor) + allocatedContributionMinor;
                     const disabled =
                       pending || adminPassword.length === 0 || refundReason.trim().length < 10;
                     return (
@@ -2023,10 +2233,22 @@ export function App() {
                             {hold.providerFact.eventId}
                           </span>
                           <span>
-                            Receipt {usd(hold.receiptAmountMinor)} · already confirmed{" "}
-                            {usd(hold.confirmedSettlementMinor)} · {hold.providerFacts.length}{" "}
+                            Receipt {usd(hold.receiptAmountMinor)} · consumed before this fact{" "}
+                            {usd(consumedBeforeHeldFactMinor.toString())}
+                            {hold.sourceContext === "unclaimed_funds"
+                              ? ` (allocated/Credit ${usd(allocatedContributionMinor.toString())}, Provider outflow ${usd(hold.confirmedSettlementMinor)})`
+                              : ` (confirmed refund outflow ${usd(hold.confirmedSettlementMinor)})`}
+                            {" · "}{hold.providerFacts.length}{" "}
                             immutable Provider fact{hold.providerFacts.length === 1 ? "" : "s"}
                           </span>
+                          {hold.sourceContext === "unclaimed_funds" &&
+                            hold.allowedDecisions.includes("record_unexpected_outflow") && (
+                              <span>
+                                Recording this outflow preserves the cash fact; if allocation plus
+                                confirmed Provider outflow exceeds the receipt, Core opens a manual
+                                recovery incident instead of hiding the double disposition.
+                              </span>
+                            )}
                           {hold.providerFacts.map((fact) => (
                             <span className="mono" key={fact.factId}>
                               {fact.status} · {fact.amountMinor} {fact.currency} ·{" "}
@@ -2144,6 +2366,11 @@ export function App() {
                         <span>
                           Refund {refund.status} · Provider{" "}
                           {refund.providerOperationStatus ?? "not used"}
+                        </span>
+                        <span>
+                          {refund.sourceContext === "unclaimed_funds"
+                            ? `Unclaimed receipt ${refund.receiptId}`
+                            : `Invoice ${refund.invoiceId ?? "unavailable"}`}
                         </span>
                         {refund.securityHold && (
                           <span>

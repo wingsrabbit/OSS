@@ -130,6 +130,66 @@ test("staff records a manual refund decision and reloads its history", async ({ 
   await expect(persistedNoRefundDecisions).toHaveCount(noRefundCountBefore + 1);
 });
 
+test("staff returns unclaimed funds to the immutable original payment", async ({ page }) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const receipt = admin
+    .getByTestId("unclaimed-fund-item")
+    .filter({ hasText: "Synthetic browser return-ready unclaimed receipt" });
+  await expect(receipt).toHaveCount(1);
+  const receiptId = await receipt.getAttribute("data-receipt-id");
+  expect(receiptId).toMatch(/^[0-9a-f-]{36}$/);
+  await expect(receipt).toContainText("Received $");
+  await expect(receipt).toContainText("Allocated $");
+  await expect(receipt).toContainText("pending return $");
+  await expect(receipt).toContainText("confirmed returned $");
+  await expect(receipt).toContainText("actionable $");
+
+  await admin.getByLabel("Unclaimed funds return amount mode").selectOption("full");
+  await admin.getByLabel("Unclaimed funds refund Provider scenario").selectOption("success");
+  await admin
+    .getByLabel("Unclaimed funds return reason")
+    .fill("Synthetic browser operator returns all actionable liability to its original payment");
+  await admin
+    .getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill(staffPassword);
+  await receipt.getByRole("button", { name: "Return to original payment" }).click();
+  await expect(
+    page.getByText(
+      "Return to the original payment requested. Funds remain reserved until the Provider result is known.",
+    ),
+  ).toBeVisible();
+
+  const history = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: `Unclaimed receipt ${receiptId}` })
+    .first();
+  await expect(history).toContainText("Refund succeeded", { timeout: 35_000 });
+  await expect(history).toContainText("Provider succeeded");
+  await expect(receipt).toHaveCount(0);
+
+  await page.reload();
+  const persistedHistory = page
+    .locator("section.admin-panel")
+    .getByTestId("refund-status")
+    .filter({ hasText: `Unclaimed receipt ${receiptId}` })
+    .first();
+  await expect(persistedHistory).toContainText("Refund succeeded");
+  await expect(
+    page
+      .locator("section.admin-panel")
+      .getByTestId("unclaimed-fund-item")
+      .filter({ hasText: "Synthetic browser return-ready unclaimed receipt" }),
+  ).toHaveCount(0);
+});
+
 test("staff completes partial failure, full original, and Credit refund page journeys", async ({
   page,
 }) => {
@@ -143,9 +203,9 @@ test("staff completes partial failure, full original, and Credit refund page jou
   const admin = page.locator("section.admin-panel");
   const passwordInput = admin.getByPlaceholder("Re-enter password (15-minute fixed window)");
   const reasonInput = admin.getByLabel("Refund reason");
-  await admin.getByLabel("Refund amount mode").selectOption("partial");
-  await admin.getByLabel("Refund amount in cents").fill("11");
-  await admin.getByLabel("Refund Provider scenario").selectOption("failed");
+  await admin.getByLabel("Refund amount mode", { exact: true }).selectOption("partial");
+  await admin.getByLabel("Refund amount in cents", { exact: true }).fill("11");
+  await admin.getByLabel("Refund Provider scenario", { exact: true }).selectOption("failed");
   await passwordInput.fill(staffPassword);
   await reasonInput.fill("Synthetic browser verifies a partial original-payment refund failure");
   await admin
@@ -160,8 +220,8 @@ test("staff completes partial failure, full original, and Credit refund page jou
     .first();
   await expect(failedRefund).toContainText("Refund failed", { timeout: 35_000 });
 
-  await admin.getByLabel("Refund amount mode").selectOption("full");
-  await admin.getByLabel("Refund Provider scenario").selectOption("success");
+  await admin.getByLabel("Refund amount mode", { exact: true }).selectOption("full");
+  await admin.getByLabel("Refund Provider scenario", { exact: true }).selectOption("success");
   await passwordInput.fill(staffPassword);
   await reasonInput.fill("Synthetic browser verifies a full original-payment refund success");
   const fullCandidate = admin.getByTestId("refund-candidate").first();
@@ -295,6 +355,14 @@ test("staff owns a callback-first receipt overage without hiding recovery", asyn
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
   const admin = page.locator("section.admin-panel");
+  const allocatedLateIncident = admin
+    .getByTestId("refund-receipt-capacity-incident")
+    .filter({ hasText: "allocated/Credit contribution" })
+    .last();
+  await expect(allocatedLateIncident).toBeVisible();
+  await expect(allocatedLateIncident).toContainText("confirmed total disposition");
+  await expect(allocatedLateIncident).toContainText("Provider outflow");
+  await expect(allocatedLateIncident).toContainText("manual recovery");
   const historicalIncident = admin
     .getByTestId("refund-receipt-capacity-incident")
     .filter({ hasText: "receipt overage $0.25" });
@@ -313,7 +381,7 @@ test("staff owns a callback-first receipt overage without hiding recovery", asyn
     .filter({ hasText: "receipt overage $0.32" });
   await expect(incident).toBeVisible();
   await expect(incident).toContainText("receipt overage $0.32");
-  await expect(incident).toContainText("confirmed compensation");
+  await expect(incident).toContainText("confirmed total disposition");
   await expect(incident).toContainText(
     "current cumulative receipt overage",
   );

@@ -9,7 +9,7 @@ import type { Config } from "./config.js";
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = "009_stage_b_refund_capacity_incidents";
+export const REQUIRED_SCHEMA_VERSION = "010_stage_b_unclaimed_refunds";
 
 export function createPool(config: Config): DatabasePool {
   return new Pool({

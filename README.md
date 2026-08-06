@@ -34,6 +34,9 @@ The first runnable vertical slice is implemented:
 - an administrator can re-confirm their password, resolve unclaimed funds,
   adjust Credit, and make a full, partial, Credit, original-payment, or explicit
   no-refund decision from the web interface;
+- a still-unclaimed receipt can be returned to its immutable original Mock
+  Payment destination without inventing an invoice; failure releases capacity,
+  while unknown or security-held results block competing allocation and returns;
 - confirmed refunds are separate append-only facts: they do not rewrite the
   original payment, paid invoice, order, service, or service term;
 - refund confirmation binds the displayed refundable balance, and replaying the
