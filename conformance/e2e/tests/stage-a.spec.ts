@@ -107,6 +107,11 @@ test("staff records a manual refund decision and reloads its history", async ({ 
     `Synthetic browser operator selected no refund for decision ${decisionIdentity}`,
   );
 
+  const noRefundDecisions = admin
+    .getByTestId("refund-status")
+    .filter({ hasText: "none · $0.00" })
+    .filter({ hasText: "Refund declined" });
+  const noRefundCountBefore = await noRefundDecisions.count();
   const candidate = admin.getByTestId("refund-candidate").first();
   await expect(candidate).toBeVisible();
   await candidate.getByRole("button", { name: "Record no refund" }).click();
@@ -114,18 +119,15 @@ test("staff records a manual refund decision and reloads its history", async ({ 
     page.getByText("The audited no-refund decision was recorded without moving money."),
   ).toBeVisible();
 
-  const latestBeforeReload = admin.getByTestId("refund-status-list").locator("article").first();
-  await expect(latestBeforeReload).toContainText("none · $0.00");
-  await expect(latestBeforeReload).toContainText("Refund declined");
+  await expect.poll(() => noRefundDecisions.count()).toBe(noRefundCountBefore + 1);
 
   await page.reload();
-  const latestAfterReload = page
+  const persistedNoRefundDecisions = page
     .locator("section.admin-panel")
-    .getByTestId("refund-status-list")
-    .locator("article")
-    .first();
-  await expect(latestAfterReload).toContainText("none · $0.00");
-  await expect(latestAfterReload).toContainText("Refund declined");
+    .getByTestId("refund-status")
+    .filter({ hasText: "none · $0.00" })
+    .filter({ hasText: "Refund declined" });
+  await expect(persistedNoRefundDecisions).toHaveCount(noRefundCountBefore + 1);
 });
 
 test("staff completes partial failure, full original, and Credit refund page journeys", async ({
@@ -244,8 +246,10 @@ test("staff dismisses then corrects a later-confirmed Provider outflow", async (
   const admin = page.locator("section.admin-panel");
   const passwordInput = admin.getByPlaceholder("Re-enter password (15-minute fixed window)");
   const reasonInput = admin.getByLabel("Refund reason");
+  const dismissalFactMarker = "mock-refund-browser-dismissal-correction:";
   const exactHold = admin
     .getByTestId("refund-security-hold")
+    .filter({ hasText: dismissalFactMarker })
     .filter({ has: page.getByRole("button", { name: "Accept authorized outflow" }) })
     .first();
   await expect(exactHold).toBeVisible();
@@ -255,7 +259,9 @@ test("staff dismisses then corrects a later-confirmed Provider outflow", async (
   await expect(page.getByText(/Provider claim dismissed; immutable evidence remains/)).toBeVisible();
   await expect(passwordInput).toHaveValue("");
 
-  const correction = admin.getByTestId("refund-dismissal-correction").first();
+  const correction = admin
+    .getByTestId("refund-dismissal-correction")
+    .filter({ hasText: dismissalFactMarker });
   await expect(correction).toBeVisible();
   await passwordInput.fill(staffPassword);
   await reasonInput.fill("Synthetic browser later confirms the dismissed Provider cash outflow");
@@ -266,7 +272,9 @@ test("staff dismisses then corrects a later-confirmed Provider outflow", async (
     page.getByText(/later-confirmed Provider outflow was restored to discrepancy suspense/),
   ).toBeVisible();
   await expect(passwordInput).toHaveValue("");
-  await expect(admin.getByTestId("refund-dismissal-correction")).toHaveCount(0);
+  await expect(
+    admin.getByTestId("refund-dismissal-correction").filter({ hasText: dismissalFactMarker }),
+  ).toHaveCount(0);
 });
 
 test("staff records a verified unexpected Provider outflow without settling the refund", async ({
