@@ -8,6 +8,21 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Settled Mock Add Funds Chargebacks now arrive as immutable Provider facts.
+  Core recovers the remaining Credit, records already consumed principal as
+  explicit Client Account debt, reverses the original fee revenue, books one
+  balanced compensating journal, preserves immutable payment facts, and marks
+  reversed unclaimed receipts `charged_back` without rewriting amount or identity,
+  settlement, paid invoice, order, or service.
+- Customers retain read-only access to a Chargeback status page after their
+  affected Client Account is restricted. Staff have a permission-checked queue
+  showing the external loss, Credit recovery, debt, fee reversal, restriction,
+  and mismatched facts that require manual review.
+- The Mock Payment Provider can emit successful, duplicate, wrong-amount,
+  wrong-currency, and wrong-original-payment Chargebacks through a stable,
+  idempotent endpoint. A Chargeback that reaches Core before its source
+  settlement remains pending and is resolved atomically when that settlement
+  arrives.
 - Administrators can return all or part of a still-unclaimed Fund Receipt to
   its immutable original Mock Payment destination from the web queue. The flow
   requires both funds and refund permissions, fixed-window password
@@ -57,6 +72,20 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Security
 
+- Add Funds Chargeback callbacks require the Provider HMAC, the exact started
+  Provider Operation and its operation-scoped capability. Core derives the
+  Client Account from the immutable operation chain; callback account and
+  attempt claims cannot redirect the loss. Capabilities are redacted before
+  Inbox persistence.
+- Operation, attempt, Client Account, Fund Receipt, and Credit Account locks
+  serialize Chargeback settlement with Provider callbacks and Credit spending.
+  Duplicate or reordered facts cannot debit Credit, create debt, restrict an
+  account, or post the compensating journal twice. Wrong facts remain immutable
+  and visible on manual Hold without automatic financial effect.
+- Client Account restriction invalidates fixed-window reauthentication grants
+  for every associated member, including a member removed during callback
+  processing. A legitimate external loss is still recorded if customer
+  eligibility or membership has changed since the original settlement.
 - Fund allocation and original-payment return serialize on the same receipt
   lock. If funds are allocated after a failed or dismissed return and a real
   Provider outflow is later confirmed, Core preserves both facts and creates a
@@ -125,8 +154,9 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Still planned
 
-- Chargeback, renewal, suspension/recovery, cancellation/termination, saved
-  payment methods, customer operations, plugin, and two-VPS laboratory stages.
+- Chargeback debt recovery and audited restriction release, renewal,
+  suspension/recovery, cancellation/termination, saved payment methods,
+  customer operations, plugin, and two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 

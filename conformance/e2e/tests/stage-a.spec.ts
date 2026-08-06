@@ -2,7 +2,10 @@
 
 import { expect, test } from "@playwright/test";
 
-test("unverified customer verifies, pays, and reaches Ready for Service", async ({ page }) => {
+test("unverified customer verifies, pays, reaches Ready for Service, and sees Add Funds Chargeback debt", async ({
+  page,
+  request,
+}) => {
   const unique = crypto.randomUUID();
   const email = `browser-${unique}@example.invalid`;
   const password = `Synthetic-${unique}-Password!`;
@@ -76,7 +79,18 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   await expect(addFunds.getByText("Principal added to Credit: $50.00")).toBeVisible();
   await expect(addFunds.getByText("Payment fee: $1.75", { exact: true })).toBeVisible();
   await expect(addFunds.getByText("External amount due: $51.75", { exact: true })).toBeVisible();
+  const addFundsStart = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/v1/billing/add-funds") &&
+      response.request().method() === "POST",
+  );
   await addFunds.getByRole("button", { name: "Start Mock Add Funds" }).click();
+  const addFundsStartResponse = await addFundsStart;
+  expect(addFundsStartResponse.status()).toBe(202);
+  const addFundsStartBody = (await addFundsStartResponse.json()) as {
+    providerOperationId?: string;
+  };
+  expect(addFundsStartBody.providerOperationId).toMatch(/^[0-9a-f-]{36}$/);
   const addFundsStatus = addFunds.getByTestId("add-funds-status");
   const addFundsCommandStatus = addFundsStatus.getByTestId("status-add-funds");
   await expect(addFundsCommandStatus.getByText("succeeded", { exact: true })).toBeVisible({
@@ -84,6 +98,100 @@ test("unverified customer verifies, pays, and reaches Ready for Service", async 
   });
   await expect(addFundsStatus.getByText("credited $50.00", { exact: true })).toBeVisible();
   await expect(addFunds.getByText(/Current Credit/)).toContainText("$50.00");
+
+  await product.getByRole("button", { name: /monthly/i }).click();
+  await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
+  await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
+  await expect(journey.getByText("Credit this payment: $5.00", { exact: true })).toBeVisible();
+  await expect(journey.getByText("External amount due: $0.00", { exact: true })).toBeVisible();
+  await journey.getByRole("button", { name: "Start mock payment" }).click();
+  await expect(journey.getByText("paid", { exact: true })).toBeVisible();
+  await expect(journey.getByText("active", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(addFunds.getByText(/Current Credit/)).toContainText("$45.00");
+
+  const providerUrl = process.env.MOCK_PAYMENT_PROVIDER_URL ?? "http://127.0.0.1:4000";
+  const providerToken = process.env.MOCK_PAYMENT_PROVIDER_TOKEN;
+  expect(providerToken, "The browser Chargeback journey requires the synthetic Provider token")
+    .toBeTruthy();
+  const chargebackRequestId = crypto.randomUUID();
+  const chargebackResponse = await request.post(
+    new URL(
+      `/v1/payments/${addFundsStartBody.providerOperationId}/chargebacks`,
+      providerUrl,
+    ).toString(),
+    {
+      headers: {
+        Authorization: `Bearer ${providerToken}`,
+        "Idempotency-Key": chargebackRequestId,
+      },
+      data: { requestId: chargebackRequestId, scenario: "duplicate" },
+    },
+  );
+  expect(chargebackResponse.status(), await chargebackResponse.text()).toBe(202);
+
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(async () => {
+          const response = await fetch("/api/v1/billing/chargeback-status");
+          if (!response.ok) return null;
+          return response.json() as Promise<{
+            restricted: boolean;
+            creditBalanceMinor: string;
+            debtBalanceMinor: string;
+            chargebacks: unknown[];
+          }>;
+        }),
+      { timeout: 30_000 },
+    )
+    .toMatchObject({
+      restricted: true,
+      creditBalanceMinor: "0",
+      debtBalanceMinor: "500",
+      chargebacks: [{}],
+    });
+
+  await page.reload();
+  const chargebackStatus = page.locator('section[aria-label="Chargeback account status"]');
+  await expect(
+    chargebackStatus.getByRole("heading", {
+      name: "Client Account restricted after Chargeback",
+    }),
+  ).toBeVisible();
+  await expect(chargebackStatus).toContainText("Available Credit $0.00");
+  await expect(chargebackStatus).toContainText("outstanding Chargeback debt $5.00");
+  const chargeback = chargebackStatus.getByTestId("customer-chargeback");
+  await expect(chargeback).toHaveCount(1);
+  await expect(chargeback).toContainText("External loss $51.75 · debt $5.00");
+  await expect(chargeback).toContainText("Credit recovered $45.00 · original fee reversed $1.75");
+  await expect(chargeback).toContainText("Account restriction: active");
+});
+
+test("staff sees the affected Client Account Chargeback and its exact recovery split", async ({
+  page,
+}) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const chargebackPanel = admin.locator('div[aria-label="Add Funds Chargebacks"]');
+  await expect(chargebackPanel.getByRole("heading", { name: "Add Funds Chargebacks" }))
+    .toBeVisible();
+  await chargebackPanel.getByRole("button", { name: "Refresh Chargebacks" }).click();
+  const chargeback = chargebackPanel
+    .getByTestId("admin-chargeback")
+    .filter({ hasText: "Synthetic Browser Client" })
+    .last();
+  await expect(chargeback).toContainText("external loss $51.75");
+  await expect(chargeback).toContainText(
+    "Credit recovered $45.00 · debt $5.00 · fee reversal $1.75",
+  );
+  await expect(chargeback).toContainText("Client Account restriction: active");
 });
 
 test("staff records a manual refund decision and reloads its history", async ({ page }) => {

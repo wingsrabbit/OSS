@@ -112,3 +112,18 @@ export function assertEligible(user: AuthenticatedUser): void {
     });
   }
 }
+
+export function assertFinancialReadEligible(user: AuthenticatedUser): void {
+  if (!user.emailVerifiedAt) {
+    throw Object.assign(new Error("Email verification is required"), {
+      statusCode: 403,
+      code: "EMAIL_VERIFICATION_REQUIRED",
+    });
+  }
+  if (user.userRestrictedAt) {
+    throw Object.assign(new Error("User is restricted"), {
+      statusCode: 403,
+      code: "ACCOUNT_RESTRICTED",
+    });
+  }
+}
