@@ -8,6 +8,7 @@ import {
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
+import { attemptJobClaim } from "./job-claim.js";
 
 const config = z
   .object({
@@ -6039,7 +6040,15 @@ while (!stopping) {
     nextRecoveryAt =
       Date.now() + Math.max(5_000, Math.floor((config.JOB_LOCK_TIMEOUT_SECONDS * 1_000) / 2));
   }
-  const job = await claimJob();
+  const claim = await attemptJobClaim(claimJob);
+  if (claim.kind === "failed") {
+    console.error("durable job claim failed", {
+      error: claim.error instanceof Error ? claim.error.message : "unknown",
+    });
+    await new Promise((resolve) => setTimeout(resolve, config.WORKER_POLL_MS));
+    continue;
+  }
+  const job = claim.job;
   if (!job) {
     await new Promise((resolve) => setTimeout(resolve, config.WORKER_POLL_MS));
     continue;
@@ -6060,7 +6069,18 @@ while (!stopping) {
       jobType: job.job_type,
       error: error instanceof Error ? error.message : "unknown",
     });
-    await failJob(job, error);
+    try {
+      await failJob(job, error);
+    } catch (persistenceError) {
+      console.error(
+        "failed to persist durable job failure; stale-job recovery will reconcile it",
+        {
+          jobId: job.id,
+          jobType: job.job_type,
+          error: persistenceError instanceof Error ? persistenceError.message : "unknown",
+        },
+      );
+    }
   }
 }
 await pool.end();
