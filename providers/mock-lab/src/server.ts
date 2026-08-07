@@ -182,8 +182,12 @@ await pool.query(`
     status text NOT NULL CHECK (status IN ('succeeded', 'failed')),
     occurred_at timestamptz NOT NULL DEFAULT now(),
     action_calls integer NOT NULL DEFAULT 1 CHECK (action_calls > 0),
+    query_calls integer NOT NULL DEFAULT 0 CHECK (query_calls >= 0),
     request_fingerprint text NOT NULL
   );
+  ALTER TABLE mock_resource_action_operations
+    ADD COLUMN IF NOT EXISTS query_calls integer NOT NULL DEFAULT 0
+      CHECK (query_calls >= 0);
   CREATE TABLE IF NOT EXISTS mock_resource_faults (
     operation_id uuid PRIMARY KEY,
     behavior text NOT NULL CHECK (behavior IN ('callback_success_then_reject'))
@@ -321,9 +325,13 @@ await pool.query(`
        OR NEW.status IS DISTINCT FROM OLD.status
        OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
        OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
-       OR NEW.action_calls <> OLD.action_calls + 1 THEN
+       OR NOT (
+         (NEW.action_calls = OLD.action_calls + 1 AND NEW.query_calls = OLD.query_calls)
+         OR
+         (NEW.action_calls = OLD.action_calls AND NEW.query_calls = OLD.query_calls + 1)
+       ) THEN
       RAISE EXCEPTION
-        'Mock resource actions are append-only except for idempotent call counting';
+        'Mock resource actions are append-only except for request call counting';
     END IF;
     RETURN NEW;
   END;
@@ -1191,7 +1199,10 @@ app.post("/v1/resource-actions", async (request, reply) => {
     status: operation.status,
     occurredAt: operation.occurred_at.toISOString(),
   };
-  const delayMs = body.scenario === "timeout_success" ? 3_500 : 20;
+  // The timeout-success callback deliberately arrives after the first normal
+  // reconcile opportunity. This proves that Core learns the external result
+  // through the Provider query rather than a conveniently early callback.
+  const delayMs = body.scenario === "timeout_success" ? 8_000 : 20;
   scheduleCallback("/api/v1/provider-events/resource-action", event, delayMs, callbackSecret);
   if (body.scenario === "duplicate_out_of_order") {
     scheduleCallback("/api/v1/provider-events/resource-action", event, 40, callbackSecret);
@@ -1227,10 +1238,11 @@ app.get("/v1/resource-actions/:operationId", async (request, reply) => {
     status: "succeeded" | "failed";
     occurred_at: Date;
   }>(
-    `SELECT callback_capability, service_id, external_resource_id,
-            action, status, occurred_at
-     FROM mock_resource_action_operations
-     WHERE operation_id = $1`,
+    `UPDATE mock_resource_action_operations
+     SET query_calls = query_calls + 1
+     WHERE operation_id = $1
+     RETURNING callback_capability, service_id, external_resource_id,
+               action, status, occurred_at`,
     [params.operationId],
   );
   const row = result.rows[0];

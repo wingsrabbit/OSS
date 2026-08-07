@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
+import { digestToken, passwordHash } from "./auth.js";
+import { buildApp } from "./app.js";
+import type { Config } from "./config.js";
 import { assertSchemaCompatible, runMigrations, type DatabaseClient } from "./database.js";
 import { scheduleResumeAfterRenewalSettlement } from "./delinquency-lifecycle.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { providerSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -282,6 +287,80 @@ async function recordFixturePayment(
   return attemptId;
 }
 
+async function recordFixturePaymentWithFee(
+  client: DatabaseClient,
+  input: {
+    clientAccountId: string;
+    invoiceId: string;
+    principalMinor: bigint;
+    feeMinor: bigint;
+    feeBasisPoints: number;
+    paymentMethodCode: string;
+  },
+): Promise<string> {
+  const attemptId = await recordFixturePayment(client, {
+    clientAccountId: input.clientAccountId,
+    invoiceId: input.invoiceId,
+    amountMinor: input.principalMinor + input.feeMinor,
+  });
+  await client.query(
+    `UPDATE payment_attempts
+     SET payment_method_code = $2, principal_minor = $3,
+         fee_basis_points = $4, fee_minor = $5
+     WHERE id = $1`,
+    [
+      attemptId,
+      input.paymentMethodCode,
+      input.principalMinor.toString(),
+      input.feeBasisPoints,
+      input.feeMinor.toString(),
+    ],
+  );
+  const feeLine = await client.query<{ id: string }>(
+    `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+     VALUES ($1, 'payment_fee', 'Synthetic external payment fee', $2)
+     RETURNING id`,
+    [input.invoiceId, input.feeMinor.toString()],
+  );
+  const feeLineId = feeLine.rows[0]?.id;
+  assert.ok(feeLineId);
+  await client.query(
+    `INSERT INTO invoice_fee_charges(
+       invoice_id, payment_attempt_id, invoice_line_id, payment_method_code,
+       basis_minor, basis_points, amount_minor
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      input.invoiceId,
+      attemptId,
+      feeLineId,
+      input.paymentMethodCode,
+      input.principalMinor.toString(),
+      input.feeBasisPoints,
+      input.feeMinor.toString(),
+    ],
+  );
+  await client.query(
+    `UPDATE invoices SET total_minor = total_minor + $2 WHERE id = $1`,
+    [input.invoiceId, input.feeMinor.toString()],
+  );
+  const feeJournal = await client.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES ('invoice_payment_fee', $1, 'USD', 'Synthetic external payment fee')
+     RETURNING id`,
+    [feeLineId],
+  );
+  const feeJournalId = feeJournal.rows[0]?.id;
+  assert.ok(feeJournalId);
+  await client.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'accounts_receivable', $2, 0),
+       ($1, 'payment_fee_revenue', 0, $2)`,
+    [feeJournalId, input.feeMinor.toString()],
+  );
+  return attemptId;
+}
+
 async function loadRenewal(client: DatabaseClient, serviceId: string): Promise<RenewalRow> {
   const result = await client.query<RenewalRow>(
     `SELECT renewal.id, renewal.invoice_id, renewal.recurring_minor::text,
@@ -551,6 +630,14 @@ async function proveDelinquencyLifecycle(client: DatabaseClient): Promise<{
      VALUES ($1, 9997, '{"en":"Delinquency Integration"}'::jsonb)`,
     [groupId],
   );
+  await client.query(
+    `INSERT INTO payment_methods(
+       code, display_name, provider_installation_id, fee_basis_points
+     ) VALUES (
+       'renewal_fee_card', '{"en":"Synthetic renewal fee card"}'::jsonb,
+       'renewal-integration-payment', 350
+     )`,
+  );
   for (const providerInstallationId of [
     providerAutomatic,
     providerAlternate,
@@ -712,10 +799,13 @@ async function proveDelinquencyLifecycle(client: DatabaseClient): Promise<{
   );
   const policyMismatchRenewal = await loadRenewal(client, policyMismatchService.serviceId);
   assert.equal(automaticRenewal.allocated_minor, "300");
-  await recordFixturePayment(client, {
+  await recordFixturePaymentWithFee(client, {
     clientAccountId: automaticAccount.clientAccountId,
     invoiceId: automaticRenewal.invoice_id,
-    amountMinor: 200n,
+    principalMinor: 200n,
+    feeMinor: 7n,
+    feeBasisPoints: 350,
+    paymentMethodCode: "renewal_fee_card",
   });
 
   const pendingAttemptIds: string[] = [];
@@ -829,7 +919,7 @@ async function proveDelinquencyLifecycle(client: DatabaseClient): Promise<{
     basis_points: 1000,
     amount_minor: "50",
     disposition: "charged",
-    invoice_total_minor: "1050",
+    invoice_total_minor: "1057",
     fee_lines: "1",
     journal_currency: "USD",
     journal_debits: "50",
@@ -1081,6 +1171,24 @@ async function proveDelinquencyLifecycle(client: DatabaseClient): Promise<{
     jobs: "1",
   });
 
+  const mismatchedInvoices = await client.query<{
+    id: string;
+    total_minor: string;
+    line_total_minor: string;
+  }>(
+    `SELECT invoice.id, invoice.total_minor::text,
+            COALESCE(sum(line.amount_minor), 0)::bigint::text AS line_total_minor
+     FROM invoices invoice
+     LEFT JOIN invoice_lines line ON line.invoice_id = invoice.id
+     GROUP BY invoice.id
+     HAVING invoice.total_minor <> COALESCE(sum(line.amount_minor), 0)::bigint
+     ORDER BY invoice.id`,
+  );
+  assert.deepEqual(
+    mismatchedInvoices.rows,
+    [],
+    "every invoice total must remain reconstructable from immutable invoice lines",
+  );
   await client.query("SET CONSTRAINTS ALL IMMEDIATE");
   const unbalanced = await client.query<{ id: string }>(
     `SELECT journal.id
@@ -1103,6 +1211,745 @@ async function proveDelinquencyLifecycle(client: DatabaseClient): Promise<{
     deferralStatuses,
     resumeStatus,
   };
+}
+
+async function proveManualSuspensionApi(pool: pg.Pool): Promise<void> {
+  const setup = await pool.connect();
+  const namespace = randomUUID();
+  const groupId = `manual-action-group-${namespace}`;
+  const manualProductId = `manual-action-colocation-${namespace}`;
+  const automaticProductId = `manual-action-vps-${namespace}`;
+  // The signed resource-action route is scoped to the configured laboratory
+  // Provider installation, so this journey must exercise that exact ownership
+  // boundary rather than a fixture-only alias.
+  const providerInstallationId = "mock-provisioning-v1";
+  const password = "Synthetic-manual-action-password-2026";
+  const sessionToken = randomBytes(32).toString("base64url");
+  let manualAccount!: FixtureAccount;
+  let automaticAccount!: FixtureAccount;
+  let staffAccount!: FixtureAccount;
+  let manualService!: FixtureService;
+  let automaticService!: FixtureService;
+  let manualRenewal!: RenewalRow;
+  let automaticRenewal!: RenewalRow;
+  let manualCaseId = "";
+  let automaticCaseId = "";
+  let sessionId = "";
+  try {
+    await setup.query("BEGIN");
+    await setup.query(
+      `UPDATE billing_automation_policies
+       SET late_fee_enabled = true, late_fee_days = 5, late_fee_basis_points = 1000,
+           overdue_suspension_enabled = true, overdue_suspension_days = 5,
+           updated_at = now()
+       WHERE id = 'default'`,
+    );
+    await setup.query(
+      `INSERT INTO product_groups(id, sort_order, names)
+       VALUES ($1, 9996, '{"en":"Manual Action API"}'::jsonb)`,
+      [groupId],
+    );
+    await setup.query(
+      `INSERT INTO provider_installation_capabilities(
+         provider_installation_id, provider_type, enabled, capabilities
+       ) VALUES (
+         $1, 'provisioning', true,
+         '["resource_create","resource_reconcile","resource_suspend","resource_resume"]'::jsonb
+       )`,
+      [providerInstallationId],
+    );
+    await createFixtureProduct(setup, {
+      groupId,
+      productId: manualProductId,
+      label: "Colocation Manual Suspension API",
+      overdueAction: "manual",
+      delayMode: "exact_hours",
+      delayValue: 72,
+    });
+    await createFixtureProduct(setup, {
+      groupId,
+      productId: automaticProductId,
+      label: "Automatic VPS Manual Takeover API",
+      overdueAction: "automatic",
+      providerInstallationId,
+    });
+    manualAccount = await createFixtureAccount(setup, "manual-action-colocation");
+    automaticAccount = await createFixtureAccount(setup, "manual-action-automatic");
+    staffAccount = await createFixtureAccount(setup, "manual-action-staff");
+    const termStart = new Date("2004-01-01T15:00:00.000Z");
+    const termEnd = new Date("2004-02-01T15:00:00.000Z");
+    manualService = await createFixtureService(setup, manualAccount, {
+      label: "Colocation Manual Suspension API",
+      productId: manualProductId,
+      recurringMinor: 1200n,
+      termStart,
+      termEnd,
+    });
+    automaticService = await createFixtureService(setup, automaticAccount, {
+      label: "Automatic VPS Manual Takeover API",
+      productId: automaticProductId,
+      recurringMinor: 1000n,
+      termStart,
+      termEnd,
+    });
+    await bindFixtureService(setup, automaticService.serviceId, { providerInstallationId });
+    await setup.query(
+      `UPDATE services SET external_resource_id = $2 WHERE id = $1`,
+      [automaticService.serviceId, `manual-action-resource-${automaticService.serviceId}`],
+    );
+    await runBillingDay(
+      setup,
+      staffAccount.userId,
+      new Date("2004-01-18T15:00:00.000Z"),
+      "manual-action-create",
+    );
+    manualRenewal = await loadRenewal(setup, manualService.serviceId);
+    automaticRenewal = await loadRenewal(setup, automaticService.serviceId);
+    await runBillingDay(
+      setup,
+      staffAccount.userId,
+      new Date("2004-02-04T16:00:00.000Z"),
+      "manual-action-colocation-after-72-hours",
+    );
+    await runBillingDay(
+      setup,
+      staffAccount.userId,
+      new Date("2004-02-05T16:00:00.000Z"),
+      "manual-action-day-five",
+    );
+    const cases = await setup.query<{
+      id: string;
+      service_id: string;
+      status: string;
+      version: number;
+    }>(
+      `SELECT id, service_id, status, version
+       FROM service_suspension_cases
+       WHERE service_id = ANY($1::uuid[])`,
+      [[manualService.serviceId, automaticService.serviceId]],
+    );
+    const manualCase = cases.rows.find((row) => row.service_id === manualService.serviceId);
+    const automaticCase = cases.rows.find((row) => row.service_id === automaticService.serviceId);
+    assert.equal(manualCase?.status, "manual");
+    assert.equal(automaticCase?.status, "suspend_queued");
+    manualCaseId = manualCase?.id ?? "";
+    automaticCaseId = automaticCase?.id ?? "";
+    assert.ok(manualCaseId);
+    assert.ok(automaticCaseId);
+    const providerOccurredAt = new Date("2004-02-05T16:05:00.000Z");
+    await setup.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', attempt_count = 1, provider_occurred_at = $2,
+           last_error = 'Synthetic reconciliation exhaustion', updated_at = now()
+       WHERE subject_type = 'service_suspension_case'
+         AND subject_id = $1 AND kind = 'resource_suspend'`,
+      [automaticCaseId, providerOccurredAt],
+    );
+    await setup.query(
+      `UPDATE service_suspension_cases
+       SET status = 'manual', provider_occurred_at = $2,
+           last_error = 'Synthetic reconciliation exhaustion',
+           updated_at = now(), version = version + 1
+       WHERE id = $1`,
+      [automaticCaseId, providerOccurredAt],
+    );
+
+    const passwordDigest = await passwordHash(password);
+    await setup.query("UPDATE users SET password_hash = $2 WHERE id = $1", [
+      staffAccount.userId,
+      passwordDigest,
+    ]);
+    await setup.query(
+      `INSERT INTO staff_members(user_id, roles, permissions)
+       VALUES ($1, ARRAY['billing'], '["billing.automation_manage"]'::jsonb)`,
+      [staffAccount.userId],
+    );
+    const session = await setup.query<{ id: string }>(
+      `INSERT INTO sessions(user_id, token_digest, expires_at)
+       VALUES ($1, $2, now() + interval '1 hour')
+       RETURNING id`,
+      [staffAccount.userId, digestToken(sessionToken)],
+    );
+    sessionId = session.rows[0]?.id ?? "";
+    assert.ok(sessionId);
+    await setup.query("COMMIT");
+  } catch (error) {
+    await setup.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    setup.release();
+  }
+
+  const config: Config = {
+    DATABASE_URL: databaseUrl!,
+    OSS_ENV: "test",
+    OSS_PUBLIC_URL: "http://127.0.0.1:3000",
+    API_HOST: "127.0.0.1",
+    API_PORT: 3000,
+    GLOBAL_RATE_LIMIT_MAX: 10_000,
+    SESSION_COOKIE_NAME: "oss_manual_action_session",
+    SESSION_TTL_HOURS: 24,
+    VERIFICATION_TTL_MINUTES: 30,
+    WEB_ORIGIN: "http://127.0.0.1:5173",
+    MOCK_MAILBOX_URL: "http://127.0.0.1:4000",
+    LAB_MAILBOX_TOKEN: "manual-action-mailbox-token-0000000000000000",
+    PROVIDER_OPERATION_CAPABILITY_SECRET:
+      "manual-action-capability-secret-0000000000000000",
+    MOCK_PAYMENT_WEBHOOK_SECRET: "manual-action-payment-secret-000000000000000000",
+    MOCK_PROVISIONING_WEBHOOK_SECRET:
+      "manual-action-provisioning-secret-0000000000000000",
+    LAB_MAILBOX_ENABLED: false,
+  };
+  const { app } = await buildApp(config, pool);
+  await app.ready();
+  const request = async (
+    path: string,
+    input: { method?: string; body?: Record<string, unknown> } = {},
+  ) => {
+    const response = await app.inject({
+      method: input.method ?? "GET",
+      url: path,
+      headers: { cookie: `${config.SESSION_COOKIE_NAME}=${sessionToken}` },
+      ...(input.body ? { payload: input.body } : {}),
+    });
+    return {
+      statusCode: response.statusCode,
+      body: response.json() as Record<string, unknown>,
+    };
+  };
+  const actionBody = (
+    action: "confirm_suspended" | "confirm_restored",
+    reason: string,
+    expectedVersion: number,
+    idempotencyKey = randomUUID(),
+  ) => ({ action, reason, expectedVersion, idempotencyKey });
+
+  try {
+    const firstReauth = await request("/api/v1/auth/reauth", {
+      method: "POST",
+      body: { password },
+    });
+    assert.equal(firstReauth.statusCode, 200);
+    assert.equal(firstReauth.body.fixedWindowMinutes, 15);
+    const billingDiscovery = await request("/api/v1/admin/billing/renewals");
+    assert.equal(
+      billingDiscovery.statusCode,
+      200,
+      "Billing staff can discover renewal cases but cannot mutate service state",
+    );
+    const forbidden = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: actionBody(
+          "confirm_suspended",
+          "Permission negative test for manual suspension",
+          1,
+        ),
+      },
+    );
+    assert.equal(forbidden.statusCode, 403);
+
+    await pool.query(
+      `UPDATE staff_members
+       SET permissions = '["services.suspension_manage"]'::jsonb,
+           updated_at = now()
+       WHERE user_id = $1`,
+      [staffAccount.userId],
+    );
+    const invalidatedReauth = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: actionBody(
+          "confirm_suspended",
+          "Permission change must invalidate password confirmation",
+          1,
+        ),
+      },
+    );
+    assert.equal(invalidatedReauth.statusCode, 403);
+    assert.equal(invalidatedReauth.body.code, "REAUTH_REQUIRED");
+    const reauth = await request("/api/v1/auth/reauth", {
+      method: "POST",
+      body: { password },
+    });
+    assert.equal(reauth.statusCode, 200);
+    assert.equal(reauth.body.fixedWindowMinutes, 15);
+
+    const adminList = await request("/api/v1/admin/billing/renewals");
+    assert.equal(adminList.statusCode, 200);
+    const listItems = adminList.body.items as Array<{
+      serviceId: string;
+      delinquency: {
+        version: number;
+        manualControl: { allowedActions: string[]; impact: Record<string, string> } | null;
+      } | null;
+    }>;
+    const listedManual = listItems.find((item) => item.serviceId === manualService.serviceId);
+    const listedAutomatic = listItems.find((item) => item.serviceId === automaticService.serviceId);
+    assert.deepEqual(listedManual?.delinquency?.manualControl?.allowedActions, [
+      "confirm_suspended",
+    ]);
+    assert.deepEqual(listedAutomatic?.delinquency?.manualControl?.allowedActions, [
+      "confirm_suspended",
+    ]);
+    assert.match(
+      listedManual?.delinquency?.manualControl?.impact.confirmSuspended ?? "",
+      /No Provider request is sent/i,
+    );
+
+    const manualSuspendKey = randomUUID();
+    const manualSuspendBody = actionBody(
+      "confirm_suspended",
+      "Colocation operator confirmed network and power suspension",
+      listedManual?.delinquency?.version ?? 0,
+      manualSuspendKey,
+    );
+    const manualSuspended = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      { method: "POST", body: manualSuspendBody },
+    );
+    assert.equal(manualSuspended.statusCode, 201);
+    assert.equal(manualSuspended.body.serviceStatus, "suspended");
+    assert.equal(manualSuspended.body.providerCalled, false);
+    const manualSuspendReplay = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      { method: "POST", body: manualSuspendBody },
+    );
+    assert.equal(manualSuspendReplay.statusCode, 200);
+    assert.equal(manualSuspendReplay.body.manualActionId, manualSuspended.body.manualActionId);
+    assert.equal(manualSuspendReplay.body.recordedAt, manualSuspended.body.recordedAt);
+    assert.equal(manualSuspendReplay.body.replayed, true);
+    const manualSuspendConflict = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: { ...manualSuspendBody, reason: "A materially different operator decision reason" },
+      },
+    );
+    assert.equal(manualSuspendConflict.statusCode, 409);
+    assert.equal(manualSuspendConflict.body.code, "IDEMPOTENCY_CONFLICT");
+    const staleManualSuspend = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: actionBody(
+          "confirm_suspended",
+          "A stale second confirmation must not overwrite the first",
+          listedManual?.delinquency?.version ?? 0,
+        ),
+      },
+    );
+    assert.equal(staleManualSuspend.statusCode, 409);
+    assert.equal(staleManualSuspend.body.code, "VERSION_CONFLICT");
+
+    const automaticVersion = listedAutomatic?.delinquency?.version ?? 0;
+    const workerBarrier = await pool.connect();
+    let blockedTakeoverPromise:
+      | Promise<{ statusCode: number; body: Record<string, unknown> }>
+      | null = null;
+    try {
+      await workerBarrier.query("BEGIN");
+      const runningJob = await workerBarrier.query<{ id: string }>(
+        `UPDATE durable_jobs job
+         SET status = 'running', updated_at = now()
+         FROM provider_operations operation
+         WHERE operation.subject_type = 'service_suspension_case'
+           AND operation.subject_id = $1
+           AND operation.kind = 'resource_suspend'
+           AND job.job_type = 'service.suspend.start'
+           AND job.unique_key = operation.stable_key
+           AND job.status = 'pending'
+         RETURNING job.id`,
+        [automaticCaseId],
+      );
+      assert.equal(runningJob.rowCount, 1);
+      blockedTakeoverPromise = request(
+        `/api/v1/admin/billing/delinquency-cases/${automaticCaseId}/manual-actions`,
+        {
+          method: "POST",
+          body: actionBody(
+            "confirm_suspended",
+            "Concurrent Worker claim must block manual takeover",
+            automaticVersion,
+          ),
+        },
+      );
+      let requestSettled = false;
+      void blockedTakeoverPromise.finally(() => {
+        requestSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(requestSettled, false, "manual takeover must wait on the Worker job lock");
+      await workerBarrier.query("COMMIT");
+      const blockedTakeover = await blockedTakeoverPromise;
+      assert.equal(blockedTakeover.statusCode, 409);
+      assert.equal(blockedTakeover.body.code, "PROVIDER_JOB_RUNNING");
+    } catch (error) {
+      await workerBarrier.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      workerBarrier.release();
+    }
+    await pool.query(
+      `UPDATE durable_jobs job
+       SET status = 'pending', updated_at = now()
+       FROM provider_operations operation
+       WHERE operation.subject_type = 'service_suspension_case'
+         AND operation.subject_id = $1
+         AND operation.kind = 'resource_suspend'
+         AND job.job_type = 'service.suspend.start'
+         AND job.unique_key = operation.stable_key
+         AND job.status = 'running'`,
+      [automaticCaseId],
+    );
+    const automaticSuspendBody = actionBody(
+      "confirm_suspended",
+      "Operator confirmed the timed-out Provider left the resource suspended",
+      automaticVersion,
+    );
+    const automaticSuspended = await request(
+      `/api/v1/admin/billing/delinquency-cases/${automaticCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: automaticSuspendBody,
+      },
+    );
+    assert.equal(automaticSuspended.statusCode, 201);
+    assert.equal(automaticSuspended.body.providerCalled, false);
+    assert.equal(automaticSuspended.body.stoppedProviderJobCount, 1);
+    const automaticEvidence = automaticSuspended.body.providerOperationEvidence as {
+      status: string;
+      attemptCount: number;
+    };
+    assert.equal(automaticEvidence.status, "unknown");
+    assert.equal(automaticEvidence.attemptCount, 1);
+    const providerTimeAfterTakeover = await pool.query<{
+      provider_occurred_at: Date;
+      job_status: string;
+    }>(
+      `SELECT suspension_case.provider_occurred_at,
+              job.status AS job_status
+       FROM service_suspension_cases suspension_case
+       JOIN provider_operations operation
+         ON operation.subject_type = 'service_suspension_case'
+        AND operation.subject_id = suspension_case.id
+        AND operation.kind = 'resource_suspend'
+       JOIN durable_jobs job
+         ON job.job_type = 'service.suspend.start'
+        AND job.unique_key = operation.stable_key
+       WHERE suspension_case.id = $1`,
+      [automaticCaseId],
+    );
+    assert.equal(
+      providerTimeAfterTakeover.rows[0]?.provider_occurred_at.toISOString(),
+      "2004-02-05T16:05:00.000Z",
+    );
+    assert.equal(providerTimeAfterTakeover.rows[0]?.job_status, "manual");
+
+    const settle = await pool.connect();
+    try {
+      await settle.query("BEGIN");
+      for (const input of [
+        { account: manualAccount, renewal: manualRenewal },
+        { account: automaticAccount, renewal: automaticRenewal },
+      ]) {
+        const total = await settle.query<{ due_minor: string }>(
+          `SELECT (invoice.total_minor - allocation.allocated_minor)::text AS due_minor
+           FROM invoices invoice
+           JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+           WHERE invoice.id = $1`,
+          [input.renewal.invoice_id],
+        );
+        await recordFixturePayment(settle, {
+          clientAccountId: input.account.clientAccountId,
+          invoiceId: input.renewal.invoice_id,
+          amountMinor: BigInt(total.rows[0]?.due_minor ?? "0"),
+        });
+        const settlement = await advancePaidInvoice(settle, input.renewal.invoice_id, {
+          kind: "user_command",
+          userId: input.account.userId,
+        });
+        assert.equal(settlement.renewalStatus, "paid");
+      }
+      await settle.query("COMMIT");
+    } catch (error) {
+      await settle.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      settle.release();
+    }
+
+    await pool.query("UPDATE client_accounts SET restricted_at = now() WHERE id = $1", [
+      manualAccount.clientAccountId,
+    ]);
+    const manualRestoreVersion = Number(manualSuspended.body.version);
+    const restrictedRestore = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: actionBody(
+          "confirm_restored",
+          "Restricted Client Account must block manual restoration",
+          manualRestoreVersion,
+        ),
+      },
+    );
+    assert.equal(restrictedRestore.statusCode, 409);
+    assert.equal(restrictedRestore.body.code, "MANUAL_RESTORATION_BLOCKED");
+    await pool.query("UPDATE client_accounts SET restricted_at = NULL WHERE id = $1", [
+      manualAccount.clientAccountId,
+    ]);
+    const manualRestored = await request(
+      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: actionBody(
+          "confirm_restored",
+          "Colocation operator confirmed network and power restoration",
+          manualRestoreVersion,
+        ),
+      },
+    );
+    assert.equal(manualRestored.statusCode, 201);
+    assert.equal(manualRestored.body.serviceStatus, "active");
+    assert.equal(manualRestored.body.caseStatus, "resolved");
+
+    const automaticResume = await pool.query<{
+      operation_id: string;
+      case_version: number;
+    }>(
+      `SELECT operation.id AS operation_id, suspension_case.version AS case_version
+       FROM service_suspension_cases suspension_case
+       JOIN provider_operations operation
+         ON operation.subject_type = 'service_suspension_case'
+        AND operation.subject_id = suspension_case.id
+        AND operation.kind = 'resource_resume'
+       WHERE suspension_case.id = $1`,
+      [automaticCaseId],
+    );
+    const automaticResumeRow = automaticResume.rows[0];
+    assert.ok(automaticResumeRow);
+    const resumeJobBeforeReplay = await pool.query<{ status: string }>(
+      `SELECT job.status
+       FROM durable_jobs job
+       JOIN provider_operations operation ON operation.stable_key = job.unique_key
+       WHERE operation.id = $1 AND job.job_type = 'service.resume.start'`,
+      [automaticResumeRow.operation_id],
+    );
+    assert.equal(resumeJobBeforeReplay.rows[0]?.status, "pending");
+    const oldSuspendReplayAfterSettlement = await request(
+      `/api/v1/admin/billing/delinquency-cases/${automaticCaseId}/manual-actions`,
+      { method: "POST", body: automaticSuspendBody },
+    );
+    assert.equal(oldSuspendReplayAfterSettlement.statusCode, 200);
+    assert.equal(oldSuspendReplayAfterSettlement.body.replayed, true);
+    const resumeJobAfterReplay = await pool.query<{ status: string }>(
+      `SELECT job.status
+       FROM durable_jobs job
+       JOIN provider_operations operation ON operation.stable_key = job.unique_key
+       WHERE operation.id = $1 AND job.job_type = 'service.resume.start'`,
+      [automaticResumeRow.operation_id],
+    );
+    assert.equal(
+      resumeJobAfterReplay.rows[0]?.status,
+      "pending",
+      "an old suspension replay must not stop the later resume job",
+    );
+    const resumeOccurredAt = new Date(Date.now() + 1_000);
+    await pool.query("UPDATE client_accounts SET restricted_at = now() WHERE id = $1", [
+      automaticAccount.clientAccountId,
+    ]);
+    const startedResumeOperation = await pool.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = 1, updated_at = now()
+       WHERE id = $1 AND status = 'queued'`,
+      [automaticResumeRow.operation_id],
+    );
+    assert.equal(startedResumeOperation.rowCount, 1);
+    const runningResumeJob = await pool.query(
+      `UPDATE durable_jobs job
+       SET status = 'running', attempts = attempts + 1,
+           locked_at = now(), locked_by = 'integration-resource-action-callback',
+           updated_at = now()
+       FROM provider_operations operation
+       WHERE operation.id = $1
+         AND job.job_type = 'service.resume.start'
+         AND job.unique_key = operation.stable_key
+         AND job.status = 'pending'`,
+      [automaticResumeRow.operation_id],
+    );
+    assert.equal(runningResumeJob.rowCount, 1);
+    const externalResourceId = `manual-action-resource-${automaticService.serviceId}`;
+    const resumeCallbackBody = {
+      eventId: `resume-restricted-${automaticCaseId}`,
+      providerOperationId: automaticResumeRow.operation_id,
+      callbackCapability: providerOperationCapability(
+        config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+        "mock-provisioning-v1",
+        automaticResumeRow.operation_id,
+      ),
+      serviceId: automaticService.serviceId,
+      externalResourceId,
+      action: "resume",
+      status: "succeeded",
+      occurredAt: resumeOccurredAt.toISOString(),
+    };
+    const resumeCallbackTimestamp = Date.now().toString();
+    const resumeCallback = await app.inject({
+      method: "POST",
+      url: "/api/v1/provider-events/resource-action",
+      headers: {
+        "x-oss-timestamp": resumeCallbackTimestamp,
+        "x-oss-signature": providerSignature(
+          config.MOCK_PROVISIONING_WEBHOOK_SECRET,
+          resumeCallbackTimestamp,
+          resumeCallbackBody,
+        ),
+      },
+      payload: resumeCallbackBody,
+    });
+    assert.equal(resumeCallback.statusCode, 202);
+    assert.deepEqual(resumeCallback.json(), {
+      accepted: true,
+      status: "manual",
+      eligibilityHold: true,
+    });
+    const completedResumeJob = await pool.query(
+      `UPDATE durable_jobs job
+       SET status = 'completed', locked_at = NULL, locked_by = NULL, updated_at = now()
+       FROM provider_operations operation
+       WHERE operation.id = $1
+         AND job.job_type = 'service.resume.start'
+         AND job.unique_key = operation.stable_key
+         AND job.status = 'running'`,
+      [automaticResumeRow.operation_id],
+    );
+    assert.equal(completedResumeJob.rowCount, 1);
+    const automaticManualVersion = automaticResumeRow.case_version + 1;
+    const blockedEligibilityHoldList = await request("/api/v1/admin/billing/renewals");
+    assert.equal(blockedEligibilityHoldList.statusCode, 200);
+    const blockedEligibilityHoldItems = blockedEligibilityHoldList.body.items as typeof listItems;
+    const blockedEligibilityHold = blockedEligibilityHoldItems.find(
+      (item) => item.serviceId === automaticService.serviceId,
+    );
+    assert.deepEqual(blockedEligibilityHold?.delinquency?.manualControl?.allowedActions, []);
+    const restrictedEligibilityRestore = await request(
+      `/api/v1/admin/billing/delinquency-cases/${automaticCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: actionBody(
+          "confirm_restored",
+          "Restricted account must keep the Provider-restored service on hold",
+          automaticManualVersion,
+        ),
+      },
+    );
+    assert.equal(restrictedEligibilityRestore.statusCode, 409);
+    assert.equal(restrictedEligibilityRestore.body.code, "MANUAL_RESTORATION_BLOCKED");
+    await pool.query("UPDATE client_accounts SET restricted_at = NULL WHERE id = $1", [
+      automaticAccount.clientAccountId,
+    ]);
+    const eligibleHoldList = await request("/api/v1/admin/billing/renewals");
+    assert.equal(eligibleHoldList.statusCode, 200);
+    const eligibleHoldItems = eligibleHoldList.body.items as typeof listItems;
+    const eligibleHold = eligibleHoldItems.find(
+      (item) => item.serviceId === automaticService.serviceId,
+    );
+    assert.deepEqual(eligibleHold?.delinquency?.manualControl?.allowedActions, [
+      "confirm_restored",
+    ]);
+    const automaticRestoreBody = actionBody(
+      "confirm_restored",
+      "Operator confirmed the Provider-restored eligibility Hold is safe to release",
+      automaticManualVersion,
+    );
+    const automaticRestored = await request(
+      `/api/v1/admin/billing/delinquency-cases/${automaticCaseId}/manual-actions`,
+      {
+        method: "POST",
+        body: automaticRestoreBody,
+      },
+    );
+    assert.equal(automaticRestored.statusCode, 201);
+    assert.equal(automaticRestored.body.serviceStatus, "active");
+    assert.equal(automaticRestored.body.providerCalled, false);
+    const resumeEvidence = automaticRestored.body.providerOperationEvidence as {
+      kind: string;
+      status: string;
+    };
+    assert.deepEqual(resumeEvidence, {
+      ...resumeEvidence,
+      kind: "resource_resume",
+      status: "succeeded",
+    });
+    const restoredEligibilityFacts = await pool.query<{
+      provider_occurred_at: Date;
+      previous_service_status: string;
+      provider_operation_status: string;
+      result_evidence_status: string;
+    }>(
+      `SELECT suspension_case.provider_occurred_at,
+              manual_action.previous_service_status,
+              manual_action.provider_operation_status,
+              manual_action.result->'providerOperationEvidence'->>'status'
+                AS result_evidence_status
+       FROM service_suspension_cases suspension_case
+       JOIN service_suspension_manual_actions manual_action
+         ON manual_action.service_suspension_case_id = suspension_case.id
+        AND manual_action.action = 'confirm_restored'
+       WHERE suspension_case.id = $1`,
+      [automaticCaseId],
+    );
+    assert.equal(
+      restoredEligibilityFacts.rows[0]?.provider_occurred_at.toISOString(),
+      resumeOccurredAt.toISOString(),
+    );
+    assert.equal(restoredEligibilityFacts.rows[0]?.previous_service_status, "provisioned_hold");
+    assert.equal(restoredEligibilityFacts.rows[0]?.provider_operation_status, "succeeded");
+    assert.equal(restoredEligibilityFacts.rows[0]?.result_evidence_status, "succeeded");
+    const automaticRestoreReplay = await request(
+      `/api/v1/admin/billing/delinquency-cases/${automaticCaseId}/manual-actions`,
+      { method: "POST", body: automaticRestoreBody },
+    );
+    assert.equal(automaticRestoreReplay.statusCode, 200);
+    assert.equal(automaticRestoreReplay.body.replayed, true);
+    assert.equal(automaticRestoreReplay.body.providerCalled, false);
+    assert.equal(automaticRestoreReplay.body.manualActionId, automaticRestored.body.manualActionId);
+
+    const actionFacts = await pool.query<{
+      count: string;
+      audits: string;
+      provider_called: string;
+    }>(
+      `SELECT
+         count(*)::text AS count,
+         (SELECT count(*)::text FROM audit_events audit
+          WHERE audit.target_type = 'service_suspension_case'
+            AND audit.target_id = ANY($1::text[])
+            AND audit.action IN (
+              'service.manual_suspension_confirmed',
+              'service.manual_restoration_confirmed'
+            )) AS audits,
+         count(*) FILTER (WHERE result->>'providerCalled' <> 'false')::text AS provider_called
+       FROM service_suspension_manual_actions
+       WHERE service_suspension_case_id::text = ANY($1::text[])`,
+      [[manualCaseId, automaticCaseId]],
+    );
+    assert.deepEqual(actionFacts.rows[0], { count: "4", audits: "4", provider_called: "0" });
+    await assert.rejects(
+      pool.query(
+        `UPDATE service_suspension_manual_actions
+         SET reason = 'forged mutable operator record'
+         WHERE service_suspension_case_id = $1`,
+        [manualCaseId],
+      ),
+      /immutable|append-only|financial facts/i,
+    );
+  } finally {
+    await app.close();
+  }
 }
 
 async function proveConcurrentBillingDay(pool: pg.Pool): Promise<{ runId: string }> {
@@ -1442,6 +2289,11 @@ try {
      VALUES ($1, $2, NULL, 'USD', 1234, $3)`,
     [overlappingInvoiceId, mainAccount.clientAccountId, TERM_END],
   );
+  await client.query(
+    `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+     VALUES ($1, 'recurring', 'Synthetic overlapping renewal guard', 1234)`,
+    [overlappingInvoiceId],
+  );
   await expectDatabaseRejection(client, "renewal_overlap", /overlap/i, () =>
     client.query(
       `INSERT INTO service_renewals(
@@ -1465,6 +2317,11 @@ try {
      VALUES ($1, $2, NULL, 'USD', 555, $3)`,
     [wrongOwnerInvoiceId, partialAccount.clientAccountId, NEXT_TERM_END],
   );
+  await client.query(
+    `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+     VALUES ($1, 'recurring', 'Synthetic cross-account renewal guard', 555)`,
+    [wrongOwnerInvoiceId],
+  );
   await expectDatabaseRejection(client, "renewal_cross_account", /inconsistent/i, () =>
     client.query(
       `INSERT INTO service_renewals(
@@ -1487,6 +2344,11 @@ try {
     `INSERT INTO invoices(id, client_account_id, order_id, currency, total_minor, due_at)
      VALUES ($1, $2, NULL, 'USD', 555, $3)`,
     [wrongPeriodInvoiceId, guardAccount.clientAccountId, NEXT_TERM_END],
+  );
+  await client.query(
+    `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+     VALUES ($1, 'recurring', 'Synthetic billing-cycle renewal guard', 555)`,
+    [wrongPeriodInvoiceId],
   );
   await expectDatabaseRejection(client, "renewal_wrong_cycle", /billing cycle/i, () =>
     client.query(
@@ -1816,6 +2678,19 @@ try {
     ),
   );
   await client.query("ROLLBACK");
+  await proveManualSuspensionApi(pool);
+  console.log(
+    JSON.stringify(
+      {
+        result: "manual suspension and restoration API journey passed",
+        colocation: "manual suspend and restore",
+        automaticProviderTakeover: "terminal or unknown evidence retained without Provider POST",
+        authorization: "permission, fixed-window reauth, version and idempotency enforced",
+      },
+      null,
+      2,
+    ),
+  );
   const scheduledProof = await proveScheduledBillingDay(pool);
   console.log(
     JSON.stringify(

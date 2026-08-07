@@ -7,6 +7,7 @@ import {
 } from "@opensales/core/provider-capability";
 import pg from "pg";
 import { z } from "zod";
+import { ensureScheduledBillingJob } from "./billing-scheduler.js";
 
 const config = z
   .object({
@@ -1733,6 +1734,7 @@ type ServiceActionState = {
   operation_provider_installation_id: string;
   operation_stable_key: string;
   other_unpaid_case: boolean;
+  pending_payment_result: boolean;
 };
 
 function capabilityList(value: unknown): string[] {
@@ -1889,6 +1891,12 @@ async function lockServiceActionState(
        operation.attempt_count AS operation_attempt_count,
        operation.provider_installation_id AS operation_provider_installation_id,
        operation.stable_key AS operation_stable_key,
+       EXISTS (
+         SELECT 1
+         FROM payment_attempts pending_payment
+         WHERE pending_payment.invoice_id = invoice.id
+           AND pending_payment.status IN ('created', 'processing', 'unknown')
+       ) AS pending_payment_result,
        EXISTS (
          SELECT 1
          FROM service_suspension_cases other_case
@@ -2068,6 +2076,35 @@ async function preflightServiceAction(
     }
 
     const settled = BigInt(state.allocated_minor) >= BigInt(state.invoice_total_minor);
+    if (mode === "start" && action === "suspend" && state.pending_payment_result) {
+      const reason =
+        "suspension deferred while an external payment result is unresolved";
+      await client.query(
+        `UPDATE provider_operations
+         SET last_error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+        [providerOperationId, reason],
+      );
+      await client.query(
+        `UPDATE service_suspension_cases
+         SET last_error = $2, updated_at = now(), version = version + 1
+         WHERE id = $1 AND status = 'suspend_queued'`,
+        [caseId, reason],
+      );
+      const deferred = await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending', available_at = now() + interval '30 seconds',
+             locked_at = NULL, locked_by = NULL, last_error = $2, updated_at = now()
+         WHERE id = $1
+           AND status = 'running'
+           AND locked_by = $3
+           AND attempts = $4
+         RETURNING id`,
+        [job.id, reason, config.WORKER_ID, job.attempts],
+      );
+      if (deferred.rowCount !== 1) throw new LostJobLeaseError(job.id);
+      return { kind: "halted" };
+    }
     if (mode === "start" && action === "suspend" && settled) {
       const knownUnsent =
         state.operation_status === "queued" &&
@@ -5890,42 +5927,6 @@ async function sendNotification(job: Job): Promise<void> {
   await completeJob(job);
 }
 
-async function ensureScheduledBillingJob(): Promise<number> {
-  const result = await pool.query(
-    `WITH due_policy AS (
-       SELECT
-         policy.id,
-         (now() AT TIME ZONE policy.timezone)::date::text AS business_date,
-         now() AS effective_at
-       FROM billing_automation_policies policy
-       WHERE policy.enabled
-         AND (now() AT TIME ZONE policy.timezone)::time >= policy.run_local_time
-         AND NOT EXISTS (
-           SELECT 1
-           FROM billing_automation_runs run
-           WHERE run.policy_id = policy.id
-             AND run.business_date =
-               (now() AT TIME ZONE policy.timezone)::date
-         )
-       FOR UPDATE OF policy SKIP LOCKED
-     )
-     INSERT INTO durable_jobs(job_type, unique_key, payload)
-     SELECT
-       'billing.automation.scheduled',
-       'billing-automation:' || due_policy.id || ':' || due_policy.business_date,
-       jsonb_build_object(
-         'policyId', due_policy.id,
-         'businessDate', due_policy.business_date,
-         'effectiveAt', to_char(due_policy.effective_at AT TIME ZONE 'UTC',
-           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
-       )
-     FROM due_policy
-     ON CONFLICT (job_type, unique_key) DO NOTHING
-     RETURNING id`,
-  );
-  return result.rowCount ?? 0;
-}
-
 async function runScheduledBillingAutomation(job: Job): Promise<void> {
   const body = z
     .object({
@@ -6010,7 +6011,7 @@ let nextBillingScheduleAt = 0;
 while (!stopping) {
   if (Date.now() >= nextBillingScheduleAt) {
     try {
-      const scheduled = await ensureScheduledBillingJob();
+      const scheduled = await ensureScheduledBillingJob(pool);
       if (scheduled > 0) {
         console.log("scheduled durable billing automation", { count: scheduled });
       }

@@ -146,6 +146,46 @@ CREATE TRIGGER service_provider_bindings_immutable
 BEFORE UPDATE OR DELETE ON service_provider_bindings
 FOR EACH ROW EXECUTE FUNCTION opensales_reject_service_period_mutation();
 
+-- Invoice settlement remains based on the full invoice total, including an
+-- attempt-specific payment fee. Delinquency uses only the portion that reduced
+-- eligible service/tax charges so that it never charges a Late Fee on an older
+-- payment fee or treats that paid fee as extra principal.
+CREATE OR REPLACE VIEW invoice_delinquency_allocation_totals AS
+SELECT
+  invoice.id AS invoice_id,
+  (
+    COALESCE(payment.principal_minor, 0)
+    + COALESCE(unclaimed.amount_minor, 0)
+  )::bigint AS payment_minor,
+  COALESCE(credit.amount_minor, 0)::bigint AS credit_minor,
+  (
+    COALESCE(payment.principal_minor, 0)
+    + COALESCE(unclaimed.amount_minor, 0)
+    + COALESCE(credit.amount_minor, 0)
+  )::bigint AS allocated_minor,
+  COALESCE(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
+FROM invoices invoice
+LEFT JOIN LATERAL (
+  SELECT sum(
+    GREATEST(allocation.amount_minor - COALESCE(fee.amount_minor, 0), 0)
+  ) AS principal_minor
+  FROM payment_allocations allocation
+  LEFT JOIN invoice_fee_charges fee
+    ON fee.payment_attempt_id = allocation.payment_attempt_id
+   AND fee.invoice_id = allocation.invoice_id
+  WHERE allocation.invoice_id = invoice.id
+) payment ON true
+LEFT JOIN LATERAL (
+  SELECT sum(allocation.amount_minor) AS amount_minor
+  FROM fund_receipt_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) unclaimed ON true
+LEFT JOIN LATERAL (
+  SELECT sum(allocation.amount_minor) AS amount_minor
+  FROM credit_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) credit ON true;
+
 CREATE TABLE IF NOT EXISTS invoice_late_fee_assessments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   invoice_id uuid NOT NULL UNIQUE REFERENCES invoices(id),
@@ -240,7 +280,7 @@ BEGIN
 
   SELECT allocation.payment_minor, allocation.credit_minor
   INTO payment_minor, credit_minor
-  FROM invoice_allocation_totals allocation
+  FROM invoice_delinquency_allocation_totals allocation
   WHERE allocation.invoice_id = NEW.invoice_id;
 
   expected_basis := GREATEST(eligible_minor - (payment_minor + credit_minor), 0);
@@ -316,7 +356,183 @@ CREATE TRIGGER invoice_late_fee_assessments_immutable
 BEFORE UPDATE OR DELETE ON invoice_late_fee_assessments
 FOR EACH ROW EXECUTE FUNCTION opensales_reject_service_period_mutation();
 
-CREATE OR REPLACE FUNCTION opensales_guard_assessed_late_fee_line()
+CREATE OR REPLACE FUNCTION opensales_guard_invoice_line_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.kind <> 'payment_fee' AND EXISTS (
+      SELECT 1
+      FROM invoice_late_fee_assessments assessment
+      WHERE assessment.invoice_id = NEW.invoice_id
+    ) THEN
+      RAISE EXCEPTION 'non-payment-fee invoice facts cannot be added after Late Fee assessment';
+    END IF;
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'invoice lines are immutable; post a new compensating fact';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS invoice_lines_assessed_late_fee_immutable ON invoice_lines;
+DROP TRIGGER IF EXISTS invoice_lines_immutable_after_insert ON invoice_lines;
+CREATE TRIGGER invoice_lines_immutable_after_insert
+BEFORE INSERT OR UPDATE OR DELETE ON invoice_lines
+FOR EACH ROW EXECUTE FUNCTION opensales_guard_invoice_line_mutation();
+
+CREATE OR REPLACE FUNCTION opensales_validate_invoice_total()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  target_invoice_id uuid;
+  recorded_total bigint;
+  line_total bigint;
+BEGIN
+  IF TG_TABLE_NAME = 'invoices' THEN
+    target_invoice_id := NEW.id;
+  ELSIF TG_OP = 'DELETE' THEN
+    target_invoice_id := OLD.invoice_id;
+  ELSE
+    target_invoice_id := NEW.invoice_id;
+  END IF;
+
+  SELECT invoice.total_minor,
+         COALESCE(sum(line.amount_minor), 0)::bigint
+  INTO recorded_total, line_total
+  FROM invoices invoice
+  LEFT JOIN invoice_lines line ON line.invoice_id = invoice.id
+  WHERE invoice.id = target_invoice_id
+  GROUP BY invoice.id;
+  IF recorded_total IS NOT NULL AND recorded_total <> line_total THEN
+    RAISE EXCEPTION 'invoice total must equal the sum of immutable invoice lines';
+  END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS invoices_total_matches_lines ON invoices;
+CREATE CONSTRAINT TRIGGER invoices_total_matches_lines
+AFTER INSERT OR UPDATE OF total_minor ON invoices
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_invoice_total();
+
+DROP TRIGGER IF EXISTS invoice_lines_total_matches_invoice ON invoice_lines;
+CREATE CONSTRAINT TRIGGER invoice_lines_total_matches_invoice
+AFTER INSERT OR UPDATE OR DELETE ON invoice_lines
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_invoice_total();
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM invoices invoice
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(sum(line.amount_minor), 0)::bigint AS line_total
+      FROM invoice_lines line
+      WHERE line.invoice_id = invoice.id
+    ) lines ON true
+    WHERE invoice.total_minor <> lines.line_total
+  ) THEN
+    RAISE EXCEPTION 'existing invoice total does not match immutable invoice lines';
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION opensales_validate_payment_fee_fact()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  target_line_id uuid;
+  source_row record;
+BEGIN
+  IF TG_TABLE_NAME = 'invoice_lines' THEN
+    IF NEW.kind <> 'payment_fee' THEN RETURN NEW; END IF;
+    target_line_id := NEW.id;
+  ELSE
+    target_line_id := NEW.invoice_line_id;
+  END IF;
+
+  SELECT
+    line.invoice_id AS line_invoice_id,
+    line.kind AS line_kind,
+    line.amount_minor AS line_amount_minor,
+    charge.invoice_id AS charge_invoice_id,
+    charge.amount_minor AS charge_amount_minor,
+    charge.basis_minor AS charge_basis_minor,
+    charge.basis_points AS charge_basis_points,
+    charge.payment_method_code AS charge_payment_method_code,
+    attempt.invoice_id AS attempt_invoice_id,
+    attempt.status AS attempt_status,
+    attempt.principal_minor AS attempt_principal_minor,
+    attempt.fee_minor AS attempt_fee_minor,
+    attempt.fee_basis_points AS attempt_fee_basis_points,
+    attempt.payment_method_code AS attempt_payment_method_code
+  INTO source_row
+  FROM invoice_lines line
+  LEFT JOIN invoice_fee_charges charge ON charge.invoice_line_id = line.id
+  LEFT JOIN payment_attempts attempt ON attempt.id = charge.payment_attempt_id
+  WHERE line.id = target_line_id;
+
+  IF source_row IS NULL
+     OR source_row.line_kind <> 'payment_fee'
+     OR source_row.charge_invoice_id IS NULL
+     OR source_row.line_invoice_id <> source_row.charge_invoice_id
+     OR source_row.line_invoice_id <> source_row.attempt_invoice_id
+     OR source_row.line_amount_minor <> source_row.charge_amount_minor
+     OR source_row.line_amount_minor <> source_row.attempt_fee_minor
+     OR source_row.charge_basis_minor <> source_row.attempt_principal_minor
+     OR source_row.charge_basis_points <> source_row.attempt_fee_basis_points
+     OR source_row.charge_payment_method_code <> source_row.attempt_payment_method_code
+     OR source_row.attempt_status <> 'succeeded' THEN
+    RAISE EXCEPTION 'payment fee line must match one settled payment attempt and fee charge';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS invoice_lines_payment_fee_fact_guard ON invoice_lines;
+CREATE CONSTRAINT TRIGGER invoice_lines_payment_fee_fact_guard
+AFTER INSERT ON invoice_lines
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_payment_fee_fact();
+
+DROP TRIGGER IF EXISTS invoice_fee_charges_fact_guard ON invoice_fee_charges;
+CREATE CONSTRAINT TRIGGER invoice_fee_charges_fact_guard
+AFTER INSERT ON invoice_fee_charges
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_payment_fee_fact();
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM invoice_lines line
+    LEFT JOIN invoice_fee_charges charge ON charge.invoice_line_id = line.id
+    LEFT JOIN payment_attempts attempt ON attempt.id = charge.payment_attempt_id
+    WHERE line.kind = 'payment_fee'
+      AND (
+        charge.id IS NULL
+        OR line.invoice_id <> charge.invoice_id
+        OR line.invoice_id <> attempt.invoice_id
+        OR line.amount_minor <> charge.amount_minor
+        OR line.amount_minor <> attempt.fee_minor
+        OR charge.basis_minor <> attempt.principal_minor
+        OR charge.basis_points <> attempt.fee_basis_points
+        OR charge.payment_method_code <> attempt.payment_method_code
+        OR attempt.status <> 'succeeded'
+      )
+  ) THEN
+    RAISE EXCEPTION 'existing payment fee facts are inconsistent';
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION opensales_guard_assessed_late_fee_journal_line()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -324,19 +540,18 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM invoice_late_fee_assessments assessment
-    WHERE assessment.invoice_line_id = OLD.id
+    WHERE assessment.ledger_journal_id = NEW.journal_id
   ) THEN
-    RAISE EXCEPTION 'an assessed late fee line is immutable';
+    RAISE EXCEPTION 'an assessed Late Fee journal cannot receive more lines';
   END IF;
-  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
   RETURN NEW;
 END;
 $$;
 
-DROP TRIGGER IF EXISTS invoice_lines_assessed_late_fee_immutable ON invoice_lines;
-CREATE TRIGGER invoice_lines_assessed_late_fee_immutable
-BEFORE UPDATE OR DELETE ON invoice_lines
-FOR EACH ROW EXECUTE FUNCTION opensales_guard_assessed_late_fee_line();
+DROP TRIGGER IF EXISTS assessed_late_fee_journal_line_guard ON ledger_lines;
+CREATE TRIGGER assessed_late_fee_journal_line_guard
+BEFORE INSERT ON ledger_lines
+FOR EACH ROW EXECUTE FUNCTION opensales_guard_assessed_late_fee_journal_line();
 
 -- An unresolved external payment result blocks new delinquency side effects.
 -- The immutable snapshot makes the operational hold visible without claiming
@@ -640,7 +855,7 @@ BEGIN
     )
     WHEN 'suspend_processing' THEN NEW.status IN ('suspend_unknown', 'suspended', 'manual')
     WHEN 'suspend_unknown' THEN NEW.status IN ('suspended', 'resolved', 'manual')
-    WHEN 'suspended' THEN NEW.status IN ('resume_queued', 'manual')
+    WHEN 'suspended' THEN NEW.status IN ('resume_queued', 'resolved', 'manual')
     WHEN 'resume_queued' THEN NEW.status IN (
       'resume_processing', 'resume_unknown', 'resolved', 'manual'
     )
@@ -695,3 +910,191 @@ CREATE INDEX IF NOT EXISTS provider_operations_suspension_case_idx
   ON provider_operations(subject_id, kind, created_at)
   WHERE subject_type = 'service_suspension_case'
     AND kind IN ('resource_suspend', 'resource_resume');
+
+-- Manual overdue actions are explicit Staff facts. They never masquerade as
+-- Provider outcomes and cannot be edited after the state transition commits.
+CREATE TABLE IF NOT EXISTS service_suspension_manual_actions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  service_suspension_case_id uuid NOT NULL REFERENCES service_suspension_cases(id),
+  service_id uuid NOT NULL REFERENCES services(id),
+  service_renewal_id uuid NOT NULL REFERENCES service_renewals(id),
+  invoice_id uuid NOT NULL REFERENCES invoices(id),
+  staff_user_id uuid NOT NULL REFERENCES staff_members(user_id),
+  staff_session_id uuid NOT NULL REFERENCES sessions(id),
+  case_action_snapshot text NOT NULL CHECK (case_action_snapshot IN ('automatic', 'manual')),
+  provider_operation_id uuid REFERENCES provider_operations(id),
+  provider_operation_kind text CHECK (provider_operation_kind IN ('resource_suspend', 'resource_resume')),
+  provider_operation_status text CHECK (provider_operation_status IN ('unknown', 'succeeded', 'failed')),
+  provider_operation_attempt_count integer CHECK (provider_operation_attempt_count > 0),
+  provider_operation_evidence jsonb CHECK (
+    provider_operation_evidence IS NULL OR jsonb_typeof(provider_operation_evidence) = 'object'
+  ),
+  action text NOT NULL CHECK (action IN ('confirm_suspended', 'confirm_restored')),
+  reason text NOT NULL CHECK (char_length(btrim(reason)) BETWEEN 10 AND 1000),
+  expected_case_version integer NOT NULL CHECK (expected_case_version > 0),
+  previous_case_status text NOT NULL CHECK (previous_case_status IN ('manual', 'suspended')),
+  resulting_case_status text NOT NULL CHECK (resulting_case_status IN ('suspended', 'resolved')),
+  previous_service_status text NOT NULL
+    CHECK (previous_service_status IN ('active', 'suspended', 'provisioned_hold')),
+  resulting_service_status text NOT NULL CHECK (resulting_service_status IN ('suspended', 'active')),
+  idempotency_key text NOT NULL CHECK (char_length(idempotency_key) BETWEEN 8 AND 128),
+  request_fingerprint text NOT NULL CHECK (char_length(request_fingerprint) > 0),
+  result jsonb NOT NULL CHECK (jsonb_typeof(result) = 'object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (staff_user_id, idempotency_key),
+  CHECK (
+    (
+      case_action_snapshot = 'manual'
+      AND provider_operation_id IS NULL
+      AND provider_operation_kind IS NULL
+      AND provider_operation_status IS NULL
+      AND provider_operation_attempt_count IS NULL
+      AND provider_operation_evidence IS NULL
+    )
+    OR
+    (
+      case_action_snapshot = 'automatic'
+      AND provider_operation_id IS NOT NULL
+      AND provider_operation_kind IS NOT NULL
+      AND provider_operation_status IS NOT NULL
+      AND provider_operation_attempt_count IS NOT NULL
+      AND provider_operation_evidence IS NOT NULL
+    )
+  ),
+  CHECK (
+    (
+      action = 'confirm_suspended'
+      AND previous_case_status = 'manual'
+      AND resulting_case_status = 'suspended'
+      AND previous_service_status = 'active'
+      AND resulting_service_status = 'suspended'
+    )
+    OR
+    (
+      action = 'confirm_restored'
+      AND (
+        (
+          case_action_snapshot = 'manual'
+          AND previous_case_status = 'suspended'
+          AND previous_service_status = 'suspended'
+        )
+        OR
+        (
+          case_action_snapshot = 'automatic'
+          AND previous_case_status = 'manual'
+          AND (
+            previous_service_status = 'suspended'
+            OR (
+              previous_service_status = 'provisioned_hold'
+              AND provider_operation_kind = 'resource_resume'
+              AND provider_operation_status = 'succeeded'
+            )
+          )
+        )
+      )
+      AND resulting_case_status = 'resolved'
+      AND resulting_service_status = 'active'
+    )
+  )
+);
+
+CREATE OR REPLACE FUNCTION opensales_validate_service_suspension_manual_action()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_row record;
+  operation_row record;
+BEGIN
+  SELECT
+    suspension_case.action AS case_action,
+    suspension_case.status AS case_status,
+    suspension_case.version AS case_version,
+    suspension_case.service_id,
+    suspension_case.service_renewal_id,
+    suspension_case.invoice_id,
+    service.status AS service_status,
+    staff_session.user_id AS session_user_id
+  INTO source_row
+  FROM service_suspension_cases suspension_case
+  JOIN services service ON service.id = suspension_case.service_id
+  JOIN sessions staff_session ON staff_session.id = NEW.staff_session_id
+  WHERE suspension_case.id = NEW.service_suspension_case_id;
+
+  IF source_row IS NULL
+     OR source_row.case_action <> NEW.case_action_snapshot
+     OR source_row.service_id <> NEW.service_id
+     OR source_row.service_renewal_id <> NEW.service_renewal_id
+     OR source_row.invoice_id <> NEW.invoice_id
+     OR source_row.session_user_id <> NEW.staff_user_id
+     OR source_row.case_version <> NEW.expected_case_version + 1
+     OR source_row.case_status <> NEW.resulting_case_status
+     OR source_row.service_status <> NEW.resulting_service_status
+     OR NEW.result->>'caseId' IS DISTINCT FROM NEW.service_suspension_case_id::text
+     OR NEW.result->>'serviceId' IS DISTINCT FROM NEW.service_id::text
+     OR NEW.result->>'renewalId' IS DISTINCT FROM NEW.service_renewal_id::text
+     OR NEW.result->>'invoiceId' IS DISTINCT FROM NEW.invoice_id::text
+     OR NEW.result->>'action' IS DISTINCT FROM NEW.action
+     OR NEW.result->>'caseAction' IS DISTINCT FROM NEW.case_action_snapshot
+     OR NEW.result->>'caseStatus' IS DISTINCT FROM NEW.resulting_case_status
+     OR NEW.result->>'serviceStatus' IS DISTINCT FROM NEW.resulting_service_status
+     OR NEW.result->>'version' IS DISTINCT FROM source_row.case_version::text
+     OR NEW.result->>'providerCalled' IS DISTINCT FROM 'false' THEN
+    RAISE EXCEPTION 'manual service suspension action does not match the resulting Core state';
+  END IF;
+  IF NEW.case_action_snapshot = 'automatic' THEN
+    SELECT operation.kind, operation.status, operation.attempt_count
+    INTO operation_row
+    FROM provider_operations operation
+    WHERE operation.id = NEW.provider_operation_id
+      AND operation.subject_type = 'service_suspension_case'
+      AND operation.subject_id = NEW.service_suspension_case_id;
+    IF operation_row IS NULL
+       OR operation_row.kind <> NEW.provider_operation_kind
+       OR operation_row.status <> NEW.provider_operation_status
+       OR operation_row.attempt_count <> NEW.provider_operation_attempt_count
+       OR operation_row.status NOT IN ('unknown', 'succeeded', 'failed')
+       OR operation_row.attempt_count <= 0
+       OR NEW.provider_operation_evidence->>'providerOperationId'
+            IS DISTINCT FROM NEW.provider_operation_id::text
+       OR NEW.provider_operation_evidence->>'kind'
+            IS DISTINCT FROM NEW.provider_operation_kind
+       OR NEW.provider_operation_evidence->>'status'
+            IS DISTINCT FROM NEW.provider_operation_status
+       OR NEW.provider_operation_evidence->>'attemptCount'
+            IS DISTINCT FROM NEW.provider_operation_attempt_count::text THEN
+      RAISE EXCEPTION 'automatic manual takeover lacks terminal Provider operation evidence';
+    END IF;
+    IF NEW.result->'providerOperationEvidence'
+         IS DISTINCT FROM NEW.provider_operation_evidence THEN
+      RAISE EXCEPTION 'automatic manual takeover result lost Provider operation evidence';
+    END IF;
+    IF NEW.action = 'confirm_restored'
+       AND NEW.previous_service_status = 'provisioned_hold'
+       AND (
+         NEW.provider_operation_kind <> 'resource_resume'
+         OR NEW.provider_operation_status <> 'succeeded'
+       ) THEN
+      RAISE EXCEPTION 'a provisioned Hold can only be released from a succeeded Provider resume fact';
+    END IF;
+  ELSIF NEW.result->'providerOperationEvidence' IS DISTINCT FROM 'null'::jsonb THEN
+    RAISE EXCEPTION 'manual product action cannot claim Provider operation evidence';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS service_suspension_manual_actions_insert_guard
+  ON service_suspension_manual_actions;
+CREATE TRIGGER service_suspension_manual_actions_insert_guard
+BEFORE INSERT ON service_suspension_manual_actions
+FOR EACH ROW EXECUTE FUNCTION opensales_validate_service_suspension_manual_action();
+
+DROP TRIGGER IF EXISTS service_suspension_manual_actions_immutable
+  ON service_suspension_manual_actions;
+CREATE TRIGGER service_suspension_manual_actions_immutable
+BEFORE UPDATE OR DELETE ON service_suspension_manual_actions
+FOR EACH ROW EXECUTE FUNCTION opensales_reject_service_period_mutation();
+
+CREATE INDEX IF NOT EXISTS service_suspension_manual_actions_case_created_idx
+  ON service_suspension_manual_actions(service_suspension_case_id, created_at, id);

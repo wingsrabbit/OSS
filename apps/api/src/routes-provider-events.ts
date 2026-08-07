@@ -1902,6 +1902,7 @@ export async function registerProviderEventRoutes(
         external_resource_id: string | null;
         renewal_status: string;
         account_restricted_at: Date | null;
+        other_unpaid_case: boolean;
       }>(
         `SELECT
            operation.id AS operation_id,
@@ -1922,7 +1923,17 @@ export async function registerProviderEventRoutes(
            service.status AS service_status,
            service.external_resource_id,
            renewal.status AS renewal_status,
-           account.restricted_at AS account_restricted_at
+           account.restricted_at AS account_restricted_at,
+           EXISTS (
+             SELECT 1
+             FROM service_suspension_cases other_case
+             JOIN service_renewals other_renewal
+               ON other_renewal.id = other_case.service_renewal_id
+             WHERE other_case.service_id = service.id
+               AND other_case.id <> suspension_case.id
+               AND other_case.status <> 'resolved'
+               AND other_renewal.status <> 'paid'
+           ) AS other_unpaid_case
          FROM provider_operations operation
          JOIN service_suspension_cases suspension_case
            ON operation.subject_type = 'service_suspension_case'
@@ -2181,7 +2192,10 @@ export async function registerProviderEventRoutes(
         );
         return { ignored: true, reason: "stale_provider_fact" };
       }
-      if (state.account_restricted_at) {
+      if (state.account_restricted_at || state.other_unpaid_case) {
+        const eligibilityReason = state.account_restricted_at
+          ? "Provider resumed the resource while the Client Account was restricted"
+          : "Provider resumed the resource while another unpaid delinquency case remained";
         await client.query(
           `UPDATE services
            SET status = 'provisioned_hold', updated_at = now(), version = version + 1
@@ -2192,10 +2206,10 @@ export async function registerProviderEventRoutes(
           `UPDATE service_suspension_cases
            SET status = 'manual', resume_required = false,
                provider_occurred_at = $2,
-               last_error = 'Provider resumed the resource while the Client Account was restricted',
+               last_error = $4,
                updated_at = now(), version = version + 1
            WHERE id = $1 AND version = $3`,
-          [state.case_id, occurredAt, state.case_version],
+          [state.case_id, occurredAt, state.case_version, eligibilityReason],
         );
         await auditProvider(
           client,
@@ -2203,10 +2217,15 @@ export async function registerProviderEventRoutes(
           "service.resource_resume_restricted_hold",
           "service_suspension_case",
           state.case_id,
-          "Provider resume fact was recorded, but Core kept the service on restricted hold",
-          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+          "Provider resume fact was recorded, but Core kept the service on an eligibility hold",
+          {
+            eventId: body.eventId,
+            providerOperationId: body.providerOperationId,
+            accountRestricted: Boolean(state.account_restricted_at),
+            otherUnpaidCase: state.other_unpaid_case,
+          },
         );
-        return { accepted: true, status: "manual", restrictedHold: true };
+        return { accepted: true, status: "manual", eligibilityHold: true };
       }
       const serviceUpdate = await client.query(
         `UPDATE services

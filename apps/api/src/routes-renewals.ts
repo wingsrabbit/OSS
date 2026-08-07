@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertFinancialReadEligible, requireUser } from "./auth.js";
+import { assertFinancialReadEligible, requireUser, type AuthenticatedUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -16,6 +17,41 @@ import {
 } from "./routes-admin.js";
 
 const LAB_WARNING = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY";
+
+const suspensionManualActionSchema = z
+  .object({
+    action: z.enum(["confirm_suspended", "confirm_restored"]),
+    reason: z.string().trim().min(10).max(1_000),
+    expectedVersion: z.number().int().positive(),
+    idempotencyKey: z.string().min(8).max(128),
+  })
+  .strict();
+
+async function requireRenewalAdminReadPermission(
+  pool: DatabasePool,
+  user: AuthenticatedUser,
+): Promise<void> {
+  if (user.userRestrictedAt || user.clientAccountRestrictedAt || !user.emailVerifiedAt) {
+    throw Object.assign(new Error("Staff account is not eligible"), { statusCode: 403 });
+  }
+  const result = await pool.query<{ permissions: unknown }>(
+    `SELECT permissions
+     FROM staff_members
+     WHERE user_id = $1 AND active`,
+    [user.userId],
+  );
+  const permissions = result.rows[0]?.permissions;
+  if (
+    !Array.isArray(permissions) ||
+    !permissions.some((permission) =>
+      ["*", "billing.automation_manage", "services.suspension_manage"].includes(permission),
+    )
+  ) {
+    throw Object.assign(new Error("Billing or service suspension permission is required"), {
+      statusCode: 403,
+    });
+  }
+}
 
 type RenewalListRow = {
   renewal_id: string;
@@ -63,6 +99,11 @@ type RenewalListRow = {
   suspend_operation_attempts: number | null;
   resume_operation_status: string | null;
   resume_operation_attempts: number | null;
+  account_restricted_at: Date | null;
+  all_service_renewals_settled: boolean;
+  all_service_renewal_periods_granted: boolean;
+  suspension_manual_action_count: string;
+  latest_suspension_manual_action_at: Date | null;
   pending_payment_result: boolean;
   delinquency_deferral_count: string;
   latest_delinquency_deferral_at: Date | null;
@@ -116,6 +157,30 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
        suspend_operation.attempt_count AS suspend_operation_attempts,
        resume_operation.status AS resume_operation_status,
        resume_operation.attempt_count AS resume_operation_attempts,
+       account.restricted_at AS account_restricted_at,
+       NOT EXISTS (
+         SELECT 1
+         FROM service_renewals other_renewal
+         JOIN invoices other_invoice ON other_invoice.id = other_renewal.invoice_id
+         JOIN invoice_allocation_totals other_allocation
+           ON other_allocation.invoice_id = other_invoice.id
+         WHERE other_renewal.service_id = service.id
+           AND other_allocation.allocated_minor < other_invoice.total_minor
+       ) AS all_service_renewals_settled,
+       NOT EXISTS (
+         SELECT 1
+         FROM service_renewals other_renewal
+         WHERE other_renewal.service_id = service.id
+           AND other_renewal.status <> 'paid'
+       ) AS all_service_renewal_periods_granted,
+       (SELECT count(*)::text
+        FROM service_suspension_manual_actions manual_action
+        WHERE manual_action.service_suspension_case_id = suspension_case.id)
+         AS suspension_manual_action_count,
+       (SELECT max(manual_action.created_at)
+        FROM service_suspension_manual_actions manual_action
+        WHERE manual_action.service_suspension_case_id = suspension_case.id)
+         AS latest_suspension_manual_action_at,
        EXISTS (
          SELECT 1
          FROM payment_attempts attempt
@@ -216,6 +281,17 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
         version: number;
         suspendOperation: { status: string; attempts: number } | null;
         resumeOperation: { status: string; attempts: number } | null;
+        manualControl: {
+          allowedActions: Array<"confirm_suspended" | "confirm_restored">;
+          requiresReauthentication: true;
+          actionCount: string;
+          latestActionAt: string | null;
+          blockedReason: string | null;
+          impact: {
+            confirmSuspended: string;
+            confirmRestored: string;
+          };
+        } | null;
       } | null;
       paymentReconciliationHold: {
         active: boolean;
@@ -230,6 +306,83 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
       const total = BigInt(row.total_minor);
       const allocated = BigInt(row.allocated_minor);
       const due = total > allocated ? total - allocated : 0n;
+      const providerOutcomeIsManualTakeoverSafe = (status: string | null, attempts: number | null) =>
+        Boolean(
+          status &&
+            ["unknown", "succeeded", "failed"].includes(status) &&
+            (attempts ?? 0) > 0,
+        );
+      const automaticSuspendTakeover =
+        row.suspension_action === "automatic" &&
+        row.suspension_status === "manual" &&
+        providerOutcomeIsManualTakeoverSafe(
+          row.suspend_operation_status,
+          row.suspend_operation_attempts,
+        );
+      const automaticRestoreTakeover =
+        row.suspension_action === "automatic" &&
+        row.suspension_status === "manual" &&
+        (providerOutcomeIsManualTakeoverSafe(
+          row.resume_operation_status,
+          row.resume_operation_attempts,
+        ) ||
+          providerOutcomeIsManualTakeoverSafe(
+            row.suspend_operation_status,
+            row.suspend_operation_attempts,
+          ));
+      const automaticProvisionedHoldRestore =
+        row.suspension_action === "automatic" &&
+        row.suspension_status === "manual" &&
+        row.service_status === "provisioned_hold" &&
+        row.resume_operation_status === "succeeded" &&
+        providerOutcomeIsManualTakeoverSafe(
+          row.resume_operation_status,
+          row.resume_operation_attempts,
+        );
+      const allowedManualActions: Array<"confirm_suspended" | "confirm_restored"> = [];
+      if (
+        (row.suspension_action === "manual" || automaticSuspendTakeover) &&
+        row.suspension_status === "manual" &&
+        row.service_status === "active" &&
+        due > 0n
+      ) {
+        allowedManualActions.push("confirm_suspended");
+      }
+      if (
+        (
+          (
+            row.suspension_action === "manual" &&
+            row.suspension_status === "suspended" &&
+            row.service_status === "suspended"
+          ) ||
+          (
+            automaticRestoreTakeover && row.service_status === "suspended"
+          ) ||
+          (
+            automaticProvisionedHoldRestore
+          )
+        ) &&
+        row.all_service_renewals_settled &&
+        row.all_service_renewal_periods_granted &&
+        !row.account_restricted_at
+      ) {
+        allowedManualActions.push("confirm_restored");
+      }
+      const exposesManualControl =
+        row.suspension_action === "manual" ||
+        (row.suspension_action === "automatic" && row.suspension_status === "manual");
+      const manualBlockedReason = !exposesManualControl
+        ? null
+        : allowedManualActions.length > 0
+          ? null
+          : row.account_restricted_at
+            ? "Client Account is restricted; manual restoration is blocked."
+            : row.suspension_status === "suspended" && !row.all_service_renewals_settled
+              ? "At least one renewal invoice for this service is still unpaid."
+              : row.suspension_status === "suspended" &&
+                  !row.all_service_renewal_periods_granted
+                ? "A funded renewal still needs its exact service period granted."
+              : "The current service and delinquency states do not allow a manual transition.";
       const fundingStatus =
         allocated === 0n ? "open" : allocated < total ? "partially_paid" : "paid";
       item = {
@@ -298,6 +451,23 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
                       attempts: row.resume_operation_attempts ?? 0,
                     }
                   : null,
+                manualControl:
+                  exposesManualControl
+                    ? {
+                        allowedActions: allowedManualActions,
+                        requiresReauthentication: true,
+                        actionCount: row.suspension_manual_action_count,
+                        latestActionAt:
+                          row.latest_suspension_manual_action_at?.toISOString() ?? null,
+                        blockedReason: manualBlockedReason,
+                        impact: {
+                          confirmSuspended:
+                            "Immediately mark this active Core service suspended for its unpaid renewal. Automatic takeovers require a prior terminal or unknown Provider operation fact. No Provider request is sent.",
+                          confirmRestored:
+                            "Restore a suspended service, or an automatic Provider-resumed eligibility Hold, only after every renewal invoice and period is settled and the Client Account is unrestricted. Automatic takeovers retain the prior Provider operation evidence. No Provider request is sent.",
+                        },
+                      }
+                    : null,
               }
             : null,
         paymentReconciliationHold: {
@@ -354,7 +524,7 @@ export async function registerRenewalRoutes(
 
   app.get("/api/v1/admin/billing/renewals", async (request) => {
     const user = await requireUser(request, pool, config);
-    await requireStaffPermission(pool, user, "billing.automation_manage");
+    await requireRenewalAdminReadPermission(pool, user);
     return { warning: LAB_WARNING, items: await listRenewals(pool) };
   });
 
@@ -413,6 +583,535 @@ export async function registerRenewalRoutes(
     });
     return reply.code(outcome.replayed ? 200 : 201).send(outcome);
   });
+
+  app.post(
+    "/api/v1/admin/billing/delinquency-cases/:caseId/manual-actions",
+    async (request, reply) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "services.suspension_manage");
+      await requireRecentReauth(pool, user);
+      const params = z.object({ caseId: z.uuid() }).strict().parse(request.params);
+      const body = suspensionManualActionSchema.parse(request.body);
+      const fingerprint = requestFingerprint("admin.service-suspension-manual-action:v1", {
+        caseId: params.caseId,
+        action: body.action,
+        reason: body.reason,
+        expectedVersion: body.expectedVersion,
+      });
+      const outcome = await transaction(pool, async (client) => {
+        const pointerResult = await client.query<{
+          service_id: string;
+          service_renewal_id: string;
+          invoice_id: string;
+          order_item_id: string;
+          order_id: string;
+          client_account_id: string;
+          renewal_invoice_ids: string[];
+        }>(
+          `SELECT suspension_case.service_id,
+                  suspension_case.service_renewal_id,
+                  suspension_case.invoice_id,
+                  service.order_item_id,
+                  item.order_id,
+                  service.client_account_id,
+                  ARRAY(
+                    SELECT renewal_invoice.id
+                    FROM service_renewals service_renewal
+                    JOIN invoices renewal_invoice
+                      ON renewal_invoice.id = service_renewal.invoice_id
+                    WHERE service_renewal.service_id = service.id
+                    ORDER BY renewal_invoice.id
+                  ) AS renewal_invoice_ids
+           FROM service_suspension_cases suspension_case
+           JOIN services service ON service.id = suspension_case.service_id
+           JOIN order_items item ON item.id = service.order_item_id
+           WHERE suspension_case.id = $1`,
+          [params.caseId],
+        );
+        const pointer = pointerResult.rows[0];
+        if (!pointer) {
+          throw Object.assign(new Error("Manual delinquency case not found"), {
+            statusCode: 404,
+          });
+        }
+        await requireStaffActionLocked(client, user, "services.suspension_manage");
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `service-suspension-manual-action:${user.userId}:${body.idempotencyKey}`,
+        ]);
+        const previous = await client.query<{
+          request_fingerprint: string;
+          result: Record<string, unknown>;
+        }>(
+          `SELECT request_fingerprint, result
+           FROM service_suspension_manual_actions
+           WHERE staff_user_id = $1 AND idempotency_key = $2
+           FOR UPDATE`,
+          [user.userId, body.idempotencyKey],
+        );
+        const replay = previous.rows[0];
+        if (replay) {
+          if (replay.request_fingerprint !== fingerprint) {
+            throw Object.assign(
+              new Error("The idempotency key was used for a different manual service action"),
+              { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
+            );
+          }
+          return { ...replay.result, replayed: true };
+        }
+
+        // Durable jobs are the first mutable ownership boundary. Atomically
+        // stop every still-pending job before taking business-row locks, then
+        // lock the whole matching job set. A Worker that already claimed one
+        // wins; Staff must wait for its result instead of racing a Provider POST.
+        const stoppedJobs = await client.query<{ id: string }>(
+          `UPDATE durable_jobs job
+           SET status = 'manual',
+               last_error = 'Staff requested manual service-state takeover; Provider delivery is stopped',
+               updated_at = now()
+           FROM provider_operations operation
+           WHERE job.unique_key LIKE operation.stable_key || '%'
+             AND operation.subject_type = 'service_suspension_case'
+             AND operation.subject_id = $1
+             AND job.status = 'pending'
+           RETURNING job.id`,
+          [params.caseId],
+        );
+        const lockedJobs = await client.query<{ id: string; status: string }>(
+          `SELECT job.id, job.status
+           FROM durable_jobs job
+           JOIN provider_operations operation
+             ON job.unique_key LIKE operation.stable_key || '%'
+           WHERE operation.subject_type = 'service_suspension_case'
+             AND operation.subject_id = $1
+           ORDER BY job.id
+           FOR UPDATE OF job`,
+          [params.caseId],
+        );
+        if (lockedJobs.rows.some((job) => job.status === "running")) {
+          throw Object.assign(
+            new Error("A Provider job is already running; wait for reconciliation before takeover"),
+            { statusCode: 409, code: "PROVIDER_JOB_RUNNING" },
+          );
+        }
+
+        // Invoice is the common financial root used by payment settlement. Lock
+        // every renewal invoice for this service before the service/case rows so
+        // restoration cannot race another allocation or a new billing period.
+        await client.query(
+          `SELECT id
+           FROM invoices
+           WHERE id = ANY($1::uuid[])
+           ORDER BY id
+           FOR UPDATE`,
+          [pointer.renewal_invoice_ids],
+        );
+        await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [pointer.order_id]);
+        await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+          pointer.order_item_id,
+        ]);
+        await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+          pointer.service_id,
+        ]);
+        await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+          pointer.client_account_id,
+        ]);
+        await client.query(
+          `SELECT id
+           FROM service_renewals
+           WHERE service_id = $1
+           ORDER BY id
+           FOR UPDATE`,
+          [pointer.service_id],
+        );
+        await client.query("SELECT id FROM service_suspension_cases WHERE id = $1 FOR UPDATE", [
+          params.caseId,
+        ]);
+        await client.query(
+          `SELECT id
+           FROM provider_operations
+           WHERE subject_type = 'service_suspension_case' AND subject_id = $1
+           ORDER BY id
+           FOR UPDATE`,
+          [params.caseId],
+        );
+        const stateResult = await client.query<{
+          case_action: "automatic" | "manual" | "none";
+          case_status: string;
+          case_version: number;
+          service_status: string;
+          renewal_status: string;
+          invoice_total_minor: string;
+          invoice_allocated_minor: string;
+          account_restricted_at: Date | null;
+          has_pending_payment_result: boolean;
+          all_service_renewals_settled: boolean;
+          all_service_renewal_periods_granted: boolean;
+          operation_id: string | null;
+          operation_kind: "resource_suspend" | "resource_resume" | null;
+          operation_status: string | null;
+          operation_attempt_count: number | null;
+          operation_last_error: string | null;
+          operation_external_reference: string | null;
+          operation_provider_occurred_at: Date | null;
+          operation_job_status: string | null;
+          operation_stable_key: string | null;
+          operation_has_running_job: boolean;
+        }>(
+          `SELECT suspension_case.action AS case_action,
+                  suspension_case.status AS case_status,
+                  suspension_case.version AS case_version,
+                  service.status AS service_status,
+                  renewal.status AS renewal_status,
+                  invoice.total_minor::text AS invoice_total_minor,
+                  allocation.allocated_minor::text AS invoice_allocated_minor,
+                  account.restricted_at AS account_restricted_at,
+                  EXISTS (
+                    SELECT 1
+                    FROM payment_attempts attempt
+                    WHERE attempt.invoice_id = invoice.id
+                      AND attempt.status IN ('created', 'processing', 'unknown')
+                  ) AS has_pending_payment_result,
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM service_renewals other_renewal
+                    JOIN invoices other_invoice ON other_invoice.id = other_renewal.invoice_id
+                    JOIN invoice_allocation_totals other_allocation
+                      ON other_allocation.invoice_id = other_invoice.id
+                    WHERE other_renewal.service_id = service.id
+                      AND other_allocation.allocated_minor < other_invoice.total_minor
+                  ) AS all_service_renewals_settled,
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM service_renewals other_renewal
+                    WHERE other_renewal.service_id = service.id
+                      AND other_renewal.status <> 'paid'
+                  ) AS all_service_renewal_periods_granted,
+                  operation.id AS operation_id,
+                  operation.kind AS operation_kind,
+                  operation.status AS operation_status,
+                  operation.attempt_count AS operation_attempt_count,
+                  operation.last_error AS operation_last_error,
+                  operation.external_reference AS operation_external_reference,
+                  operation.provider_occurred_at AS operation_provider_occurred_at,
+                  operation.job_status AS operation_job_status,
+                  operation.stable_key AS operation_stable_key,
+                  COALESCE(operation.has_running_job, false) AS operation_has_running_job
+           FROM service_suspension_cases suspension_case
+           JOIN services service ON service.id = suspension_case.service_id
+           JOIN client_accounts account ON account.id = service.client_account_id
+           JOIN service_renewals renewal ON renewal.id = suspension_case.service_renewal_id
+           JOIN invoices invoice ON invoice.id = suspension_case.invoice_id
+           JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+           LEFT JOIN LATERAL (
+             SELECT provider_operation.*,
+                    (
+                      SELECT job.status
+                      FROM durable_jobs job
+                      WHERE job.unique_key LIKE provider_operation.stable_key || '%'
+                        AND job.job_type IN (
+                          'service.suspend.start', 'service.suspend.reconcile',
+                          'service.resume.start', 'service.resume.reconcile'
+                        )
+                      ORDER BY job.created_at DESC, job.id DESC
+                      LIMIT 1
+                    ) AS job_status
+                    ,EXISTS (
+                      SELECT 1
+                      FROM durable_jobs running_job
+                      WHERE running_job.unique_key LIKE provider_operation.stable_key || '%'
+                        AND running_job.status = 'running'
+                    ) AS has_running_job
+             FROM provider_operations provider_operation
+             WHERE provider_operation.subject_type = 'service_suspension_case'
+               AND provider_operation.subject_id = suspension_case.id
+               AND (
+                 provider_operation.kind = CASE
+                   WHEN $2 = 'confirm_suspended' THEN 'resource_suspend'
+                   ELSE 'resource_resume'
+                 END
+                 OR ($2 = 'confirm_restored' AND provider_operation.kind = 'resource_suspend')
+               )
+             ORDER BY
+               CASE
+                 WHEN provider_operation.kind = CASE
+                   WHEN $2 = 'confirm_suspended' THEN 'resource_suspend'
+                   ELSE 'resource_resume'
+                 END THEN 0
+                 ELSE 1
+               END,
+               provider_operation.created_at DESC,
+               provider_operation.id DESC
+             LIMIT 1
+           ) operation ON true
+           WHERE suspension_case.id = $1`,
+          [params.caseId, body.action],
+        );
+        const state = stateResult.rows[0];
+        if (!state) throw new Error("Locked delinquency case disappeared");
+        if (state.case_version !== body.expectedVersion) {
+          throw Object.assign(
+            new Error("Delinquency case changed; refresh the impact and confirm again"),
+            { statusCode: 409, code: "VERSION_CONFLICT" },
+          );
+        }
+        const providerOperationEvidence = state.operation_id
+          ? {
+              providerOperationId: state.operation_id,
+              kind: state.operation_kind,
+              status: state.operation_status,
+              attemptCount: state.operation_attempt_count,
+              lastError: state.operation_last_error,
+              externalReference: state.operation_external_reference,
+              providerOccurredAt: state.operation_provider_occurred_at?.toISOString() ?? null,
+              jobStatus: state.operation_job_status,
+            }
+          : null;
+        const terminalProviderEvidence = Boolean(
+          providerOperationEvidence &&
+            providerOperationEvidence.kind &&
+            providerOperationEvidence.status &&
+            ["unknown", "succeeded", "failed"].includes(providerOperationEvidence.status) &&
+            (providerOperationEvidence.attemptCount ?? 0) > 0,
+        );
+        if (state.case_action === "none") {
+          throw Object.assign(new Error("This product policy explicitly disallows suspension"), {
+            statusCode: 409,
+            code: "MANUAL_ACTION_NOT_ALLOWED",
+          });
+        }
+        if (state.case_action === "manual" && providerOperationEvidence) {
+          throw Object.assign(
+            new Error("An explicit manual product unexpectedly has Provider operation evidence"),
+            { statusCode: 409, code: "PROVIDER_EVIDENCE_CONFLICT" },
+          );
+        }
+        if (
+          state.case_action === "automatic" &&
+          (!terminalProviderEvidence ||
+            state.case_status !== "manual" ||
+            state.operation_has_running_job)
+        ) {
+          throw Object.assign(
+            new Error(
+              "Automatic takeover requires a terminal or unknown attempted Provider operation and a manual case",
+            ),
+            { statusCode: 409, code: "PROVIDER_RECONCILIATION_REQUIRED" },
+          );
+        }
+        const stoppedProviderJobCount = stoppedJobs.rowCount ?? 0;
+        if (
+          state.case_action === "automatic" &&
+          body.action === "confirm_suspended" &&
+          providerOperationEvidence?.kind !== "resource_suspend"
+        ) {
+          throw Object.assign(new Error("Manual suspension lacks a prior suspend operation fact"), {
+            statusCode: 409,
+            code: "PROVIDER_EVIDENCE_CONFLICT",
+          });
+        }
+
+        const previousCaseStatus = state.case_status;
+        const previousServiceStatus = state.service_status;
+        let resultingCaseStatus: "suspended" | "resolved";
+        let resultingServiceStatus: "suspended" | "active";
+        if (body.action === "confirm_suspended") {
+          if (
+            state.case_status !== "manual" ||
+            state.service_status !== "active" ||
+            state.renewal_status === "paid" ||
+            BigInt(state.invoice_allocated_minor) >= BigInt(state.invoice_total_minor) ||
+            state.has_pending_payment_result
+          ) {
+            throw Object.assign(
+              new Error(
+                state.has_pending_payment_result
+                  ? "A payment result is still being reconciled; manual suspension is blocked"
+                  : "The manual case no longer has an active service with an unpaid renewal",
+              ),
+              { statusCode: 409, code: "MANUAL_SUSPENSION_BLOCKED" },
+            );
+          }
+          const suspendedService = await client.query(
+            `UPDATE services
+             SET status = 'suspended', updated_at = now(), version = version + 1
+             WHERE id = $1 AND status = 'active'
+             RETURNING id`,
+            [pointer.service_id],
+          );
+          const suspendedCase = await client.query(
+            `UPDATE service_suspension_cases
+             SET status = 'suspended', resume_required = false,
+                 updated_at = now(), version = version + 1
+             WHERE id = $1 AND action = $3 AND status = 'manual' AND version = $2
+             RETURNING version`,
+            [params.caseId, body.expectedVersion, state.case_action],
+          );
+          if (suspendedService.rowCount !== 1 || suspendedCase.rowCount !== 1) {
+            throw Object.assign(new Error("Service state changed; refresh and confirm again"), {
+              statusCode: 409,
+              code: "VERSION_CONFLICT",
+            });
+          }
+          resultingCaseStatus = "suspended";
+          resultingServiceStatus = "suspended";
+        } else {
+          if (
+            !(
+              (
+                state.case_action === "manual" &&
+                state.case_status === "suspended" &&
+                state.service_status === "suspended"
+              ) ||
+              (
+                state.case_action === "automatic" &&
+                state.case_status === "manual" &&
+                ["suspended", "provisioned_hold"].includes(state.service_status) &&
+                state.operation_kind === "resource_resume" &&
+                state.operation_status === "succeeded"
+              ) ||
+              (
+                state.case_action === "automatic" &&
+                state.case_status === "manual" &&
+                state.service_status === "suspended"
+              )
+            ) ||
+            !state.all_service_renewals_settled ||
+            !state.all_service_renewal_periods_granted ||
+            state.account_restricted_at
+          ) {
+            throw Object.assign(
+              new Error(
+                state.account_restricted_at
+                  ? "The Client Account is restricted; manual restoration is blocked"
+                  : "Every renewal invoice and exact service period must be settled before restoration",
+              ),
+              { statusCode: 409, code: "MANUAL_RESTORATION_BLOCKED" },
+            );
+          }
+          const restoredService = await client.query(
+            `UPDATE services
+             SET status = 'active', updated_at = now(), version = version + 1
+             WHERE id = $1 AND status IN ('suspended', 'provisioned_hold')
+             RETURNING id`,
+            [pointer.service_id],
+          );
+          const restoredCase = await client.query(
+            `UPDATE service_suspension_cases
+             SET status = 'resolved', resume_required = false, resolved_at = now(),
+                 updated_at = now(), version = version + 1
+             WHERE id = $1 AND action = $3 AND status = $4 AND version = $2
+             RETURNING version`,
+            [params.caseId, body.expectedVersion, state.case_action, state.case_status],
+          );
+          if (restoredService.rowCount !== 1 || restoredCase.rowCount !== 1) {
+            throw Object.assign(new Error("Service state changed; refresh and confirm again"), {
+              statusCode: 409,
+              code: "VERSION_CONFLICT",
+            });
+          }
+          resultingCaseStatus = "resolved";
+          resultingServiceStatus = "active";
+        }
+
+        const manualActionId = randomUUID();
+        const recordedAt = new Date();
+        const result = {
+          caseId: params.caseId,
+          serviceId: pointer.service_id,
+          renewalId: pointer.service_renewal_id,
+          invoiceId: pointer.invoice_id,
+          action: body.action,
+          caseAction: state.case_action,
+          caseStatus: resultingCaseStatus,
+          serviceStatus: resultingServiceStatus,
+          version: body.expectedVersion + 1,
+          providerCalled: false,
+          providerOperationEvidence,
+          stoppedProviderJobCount,
+          manualActionId,
+          recordedAt: recordedAt.toISOString(),
+        };
+        const manualAction = await client.query<{ id: string }>(
+          `INSERT INTO service_suspension_manual_actions(
+             id, service_suspension_case_id, service_id, service_renewal_id, invoice_id,
+             staff_user_id, staff_session_id, case_action_snapshot,
+             provider_operation_id, provider_operation_kind, provider_operation_status,
+             provider_operation_attempt_count, provider_operation_evidence,
+             action, reason, expected_case_version,
+             previous_case_status, resulting_case_status,
+             previous_service_status, resulting_service_status,
+             idempotency_key, request_fingerprint, result, created_at
+           ) VALUES (
+             $1, $2, $3, $4, $5,
+             $6, $7, $8,
+             $9, $10, $11, $12, $13,
+             $14, $15, $16,
+             $17, $18, $19, $20,
+             $21, $22, $23, $24
+           )
+           RETURNING id`,
+          [
+            manualActionId,
+            params.caseId,
+            pointer.service_id,
+            pointer.service_renewal_id,
+            pointer.invoice_id,
+            user.userId,
+            user.sessionId,
+            state.case_action,
+            state.case_action === "automatic" ? state.operation_id : null,
+            state.case_action === "automatic" ? state.operation_kind : null,
+            state.case_action === "automatic" ? state.operation_status : null,
+            state.case_action === "automatic" ? state.operation_attempt_count : null,
+            state.case_action === "automatic" ? providerOperationEvidence : null,
+            body.action,
+            body.reason,
+            body.expectedVersion,
+            previousCaseStatus,
+            resultingCaseStatus,
+            previousServiceStatus,
+            resultingServiceStatus,
+            body.idempotencyKey,
+            fingerprint,
+            result,
+            recordedAt,
+          ],
+        );
+        const actionRecord = manualAction.rows[0];
+        if (!actionRecord) throw new Error("Unable to record manual service action");
+        await client.query(
+          `INSERT INTO audit_events(
+             actor_type, actor_id, action, target_type, target_id, reason, metadata
+           ) VALUES ('staff', $1, $2, 'service_suspension_case', $3, $4, $5)`,
+          [
+            user.userId,
+            body.action === "confirm_suspended"
+              ? "service.manual_suspension_confirmed"
+              : "service.manual_restoration_confirmed",
+            params.caseId,
+            body.reason,
+            {
+              manualActionId: actionRecord.id,
+              serviceId: pointer.service_id,
+              renewalId: pointer.service_renewal_id,
+              invoiceId: pointer.invoice_id,
+              previousCaseStatus,
+              resultingCaseStatus,
+              previousServiceStatus,
+              resultingServiceStatus,
+              expectedVersion: body.expectedVersion,
+              caseAction: state.case_action,
+              providerOperationEvidence,
+              stoppedProviderJobCount,
+              providerCalled: false,
+            },
+          ],
+        );
+        return { ...result, replayed: false };
+      });
+      return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+    },
+  );
 
   app.post(
     "/api/v1/admin/billing/renewals/:renewalId/resolve-hold",

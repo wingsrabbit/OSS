@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url";
 import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
 import { assertSchemaCompatible, runMigrations } from "./database.js";
+import { advancePaidInvoice } from "./invoice-settlement.js";
 import { providerSignature } from "./provider-signature.js";
+import { runRenewalAutomation } from "./renewal-lifecycle.js";
 
 const coreUrl = process.env.CORE_TEST_URL ?? "http://127.0.0.1:3000";
 const databaseUrl = process.env.DATABASE_URL;
@@ -608,6 +610,64 @@ async function submitProvisionFact(
     headers: {
       "X-OSS-Timestamp": timestamp,
       "X-OSS-Signature": providerSignature(secret, timestamp, signedBody),
+    },
+    body: JSON.stringify(signedBody),
+  });
+}
+
+async function submitResourceActionFact(
+  body: {
+    eventId: string;
+    providerOperationId: string;
+    serviceId: string;
+    externalResourceId: string;
+    action: "suspend" | "resume";
+    status: "succeeded" | "failed";
+    occurredAt: string;
+  },
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const signedBody = {
+    ...body,
+    callbackCapability: providerOperationCapability(
+      providerCapabilitySecret!,
+      "mock-provisioning-v1",
+      body.providerOperationId,
+    ),
+  };
+  const timestamp = Date.now().toString();
+  return rawCoreRequest("/api/v1/provider-events/resource-action", {
+    method: "POST",
+    headers: {
+      "X-OSS-Timestamp": timestamp,
+      "X-OSS-Signature": providerSignature(
+        provisioningWebhookSecret!,
+        timestamp,
+        signedBody,
+      ),
+    },
+    body: JSON.stringify(signedBody),
+  });
+}
+
+async function runSignedBillingDay(input: {
+  businessDate: string;
+  effectiveAt: string;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const signedBody = {
+    policyId: "default" as const,
+    businessDate: input.businessDate,
+    effectiveAt: input.effectiveAt,
+  };
+  const timestamp = Date.now().toString();
+  return rawCoreRequest("/api/v1/internal/billing/automation/run", {
+    method: "POST",
+    headers: {
+      "X-OSS-Timestamp": timestamp,
+      "X-OSS-Signature": providerSignature(
+        providerCapabilitySecret!,
+        timestamp,
+        signedBody,
+      ),
     },
     body: JSON.stringify(signedBody),
   });
@@ -10965,6 +11025,673 @@ try {
   mismatchedFactClient.release();
 }
 assert.equal(rejectedMismatchedFactSource, true);
+
+// Exercise the real Worker -> Mock Provider -> Core resource-action boundary.
+// The fixture uses historical synthetic dates so the two signed billing runs
+// cannot create renewals for the other Stage A services.
+const resourceLifecycleNamespace = randomUUID();
+const resourceLifecycleUserId = randomUUID();
+const resourceLifecycleAccountId = randomUUID();
+const resourceLifecycleOrderId = randomUUID();
+const resourceLifecycleOrderItemId = randomUUID();
+const resourceLifecycleInitialInvoiceId = randomUUID();
+const resourceLifecycleServiceId = randomUUID();
+const resourceLifecycleCreateOperationId = randomUUID();
+const resourceLifecycleExternalId = `mock-resource-${resourceLifecycleCreateOperationId}`;
+const resourceLifecycleTermStart = new Date("2006-01-01T01:00:00.000Z");
+const resourceLifecycleTermEnd = new Date("2006-02-01T01:00:00.000Z");
+const resourceLifecycleSnapshot = {
+  currency: "USD",
+  billingCycle: "monthly",
+  productId: "hkbgp-vps",
+  productName: "Synthetic Worker Resource Lifecycle VPS",
+  fulfillmentMode: "automatic",
+  components: [
+    {
+      code: "base",
+      label: "Synthetic Worker Resource Lifecycle VPS",
+      quantity: 1,
+      oneTimeMinor: "0",
+      recurringMinor: "300",
+    },
+  ],
+  oneTimeSubtotalMinor: "0",
+  setupMinor: "0",
+  recurringSubtotalMinor: "300",
+  invoiceTotalMinor: "300",
+};
+const resourceLifecycleSetup = await corePool.connect();
+try {
+  await resourceLifecycleSetup.query("BEGIN");
+  const policy = await resourceLifecycleSetup.query<{
+    late_fee_enabled: boolean;
+    overdue_suspension_enabled: boolean;
+  }>(
+    `SELECT late_fee_enabled, overdue_suspension_enabled
+     FROM billing_automation_policies WHERE id = 'default' FOR UPDATE`,
+  );
+  assert.deepEqual(policy.rows[0], {
+    late_fee_enabled: true,
+    overdue_suspension_enabled: true,
+  });
+  await resourceLifecycleSetup.query(
+    `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+     VALUES ($1, $2, 'synthetic-runtime-only-hash', 'en', $3)`,
+    [
+      resourceLifecycleUserId,
+      `resource-lifecycle-${resourceLifecycleNamespace}@example.invalid`,
+      resourceLifecycleTermStart,
+    ],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO client_accounts(id, name, owner_user_id)
+     VALUES ($1, 'Synthetic Worker Resource Lifecycle', $2)`,
+    [resourceLifecycleAccountId, resourceLifecycleUserId],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+     VALUES ($1, $2, 'owner', '["*"]'::jsonb)`,
+    [resourceLifecycleAccountId, resourceLifecycleUserId],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO orders(
+       id, client_account_id, submitted_by_user_id, status, currency, price_snapshot,
+       one_time_minor, setup_minor, recurring_minor, total_minor,
+       idempotency_key, request_fingerprint, submitted_at, updated_at
+     ) VALUES (
+       $1, $2, $3, 'completed', 'USD', $4,
+       0, 0, 300, 300, $5, $6, $7, $7
+     )`,
+    [
+      resourceLifecycleOrderId,
+      resourceLifecycleAccountId,
+      resourceLifecycleUserId,
+      resourceLifecycleSnapshot,
+      `resource-lifecycle-order:${resourceLifecycleNamespace}`,
+      `resource-lifecycle-order-fingerprint:${resourceLifecycleNamespace}`,
+      resourceLifecycleTermStart,
+    ],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO order_items(
+       id, order_id, product_id, product_name, fulfillment_mode,
+       billing_cycle, configuration, price_snapshot
+     ) VALUES (
+       $1, $2, 'hkbgp-vps', 'Synthetic Worker Resource Lifecycle VPS',
+       'automatic', 'monthly', '{}'::jsonb, $3
+     )`,
+    [resourceLifecycleOrderItemId, resourceLifecycleOrderId, resourceLifecycleSnapshot],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO invoices(id, client_account_id, order_id, currency, total_minor, due_at)
+     VALUES ($1, $2, $3, 'USD', 0, $4)`,
+    [
+      resourceLifecycleInitialInvoiceId,
+      resourceLifecycleAccountId,
+      resourceLifecycleOrderId,
+      resourceLifecycleTermStart,
+    ],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO services(
+       id, client_account_id, order_item_id, status, billing_cycle,
+       activated_at, term_start, term_end, external_resource_id
+     ) VALUES ($1, $2, $3, 'active', 'monthly', $4, $4, $5, $6)`,
+    [
+      resourceLifecycleServiceId,
+      resourceLifecycleAccountId,
+      resourceLifecycleOrderItemId,
+      resourceLifecycleTermStart,
+      resourceLifecycleTermEnd,
+      resourceLifecycleExternalId,
+    ],
+  );
+  await resourceLifecycleSetup.query(
+    `INSERT INTO service_periods(
+       service_id, invoice_id, period_kind, period_start, period_end, granted_at
+     ) VALUES ($1, $2, 'initial', $3, $4, $3)`,
+    [
+      resourceLifecycleServiceId,
+      resourceLifecycleInitialInvoiceId,
+      resourceLifecycleTermStart,
+      resourceLifecycleTermEnd,
+    ],
+  );
+  const binding = await resourceLifecycleSetup.query(
+    `INSERT INTO service_provider_bindings(
+       service_id, provider_installation_id, overdue_action_snapshot,
+       capability_snapshot, product_policy_version
+     )
+     SELECT $1, policy.provider_installation_id, policy.overdue_action,
+            provider.capabilities, policy.version
+     FROM product_service_automation_policies policy
+     JOIN provider_installation_capabilities provider
+       ON provider.provider_installation_id = policy.provider_installation_id
+     WHERE policy.product_id = 'hkbgp-vps'
+       AND policy.overdue_action = 'automatic'
+       AND provider.enabled
+     RETURNING service_id`,
+    [resourceLifecycleServiceId],
+  );
+  assert.equal(binding.rowCount, 1);
+  await resourceLifecycleSetup.query("COMMIT");
+} catch (error) {
+  await resourceLifecycleSetup.query("ROLLBACK");
+  throw error;
+} finally {
+  resourceLifecycleSetup.release();
+}
+await providerPool.query(
+  `INSERT INTO mock_resource_operations(
+     operation_id, service_id, external_resource_id, callback_capability,
+     scenario, status, ready_at, request_fingerprint, resource_state
+   ) VALUES ($1, $2, $3, $4, 'success', 'succeeded', now(), $5, 'active')`,
+  [
+    resourceLifecycleCreateOperationId,
+    resourceLifecycleServiceId,
+    resourceLifecycleExternalId,
+    "A".repeat(43),
+    `resource-lifecycle-fixture:${resourceLifecycleNamespace}`,
+  ],
+);
+
+const renewalCreationRun = await runSignedBillingDay({
+  businessDate: "2006-01-18",
+  effectiveAt: "2006-01-18T01:00:00.000Z",
+});
+assert.equal(renewalCreationRun.status, 201);
+const runtimeRenewal = await corePool.query<{
+  id: string;
+  invoice_id: string;
+}>(
+  `SELECT id, invoice_id FROM service_renewals WHERE service_id = $1`,
+  [resourceLifecycleServiceId],
+);
+const runtimeRenewalRow = runtimeRenewal.rows[0];
+assert.ok(runtimeRenewalRow);
+const suspensionRun = await runSignedBillingDay({
+  businessDate: "2006-02-06",
+  effectiveAt: "2006-02-06T01:00:00.000Z",
+});
+assert.equal(suspensionRun.status, 201);
+
+type ResourceLifecycleState = {
+  service_status: string;
+  case_id: string;
+  case_status: string;
+  operation_id: string;
+  operation_status: string;
+  operation_attempt_count: number;
+  provider_occurred_at: Date | null;
+};
+const readResourceLifecycle = async (
+  operationKind: "resource_suspend" | "resource_resume",
+): Promise<ResourceLifecycleState | null> => {
+  const state = await corePool.query<ResourceLifecycleState>(
+    `SELECT service.status AS service_status,
+            suspension_case.id AS case_id,
+            suspension_case.status AS case_status,
+            operation.id AS operation_id,
+            operation.status AS operation_status,
+            operation.attempt_count AS operation_attempt_count,
+            operation.provider_occurred_at
+     FROM services service
+     JOIN service_suspension_cases suspension_case
+       ON suspension_case.service_id = service.id
+     JOIN provider_operations operation
+       ON operation.subject_type = 'service_suspension_case'
+      AND operation.subject_id = suspension_case.id
+      AND operation.kind = $2
+     WHERE service.id = $1`,
+    [resourceLifecycleServiceId, operationKind],
+  );
+  return state.rows[0] ?? null;
+};
+const suspendedRuntime = await waitFor(
+  "Worker timeout/reconcile suspension to reach the Core terminal state",
+  () => readResourceLifecycle("resource_suspend"),
+  (state) =>
+    state?.service_status === "suspended" &&
+    state.case_status === "suspended" &&
+    state.operation_status === "succeeded",
+  45_000,
+);
+assert.ok(suspendedRuntime);
+assert.equal(suspendedRuntime.operation_attempt_count, 1);
+const runtimeInvoice = await corePool.query<{
+  total_minor: string;
+  late_fees: string;
+}>(
+  `SELECT invoice.total_minor::text,
+          count(assessment.id)::text AS late_fees
+   FROM invoices invoice
+   LEFT JOIN invoice_late_fee_assessments assessment
+     ON assessment.invoice_id = invoice.id
+   WHERE invoice.id = $1
+   GROUP BY invoice.id`,
+  [runtimeRenewalRow.invoice_id],
+);
+assert.deepEqual(runtimeInvoice.rows[0], { total_minor: "330", late_fees: "1" });
+
+const runtimePayment = await corePool.connect();
+try {
+  await runtimePayment.query("BEGIN");
+  const paymentAttemptId = randomUUID();
+  const receiptId = randomUUID();
+  const externalPaymentId = `resource-lifecycle-payment:${paymentAttemptId}`;
+  await runtimePayment.query(
+    `INSERT INTO payment_attempts(
+       id, client_account_id, invoice_id, provider_installation_id,
+       external_payment_id, status, amount_minor, currency, scenario,
+       idempotency_key, request_fingerprint
+     ) VALUES (
+       $1, $2, $3, 'runtime-integration-payment', $4,
+       'succeeded', 330, 'USD', 'success', $5, $6
+     )`,
+    [
+      paymentAttemptId,
+      resourceLifecycleAccountId,
+      runtimeRenewalRow.invoice_id,
+      externalPaymentId,
+      `resource-lifecycle-payment:${resourceLifecycleNamespace}`,
+      `resource-lifecycle-payment-fingerprint:${resourceLifecycleNamespace}`,
+    ],
+  );
+  await runtimePayment.query(
+    `INSERT INTO fund_receipts(
+       id, provider_installation_id, external_payment_id,
+       reported_payment_attempt_id, client_account_id,
+       amount_minor, allocated_minor, currency, occurred_at, disposition
+     ) VALUES (
+       $1, 'runtime-integration-payment', $2, $3, $4,
+       330, 330, 'USD', now(), 'allocated'
+     )`,
+    [receiptId, externalPaymentId, paymentAttemptId, resourceLifecycleAccountId],
+  );
+  await runtimePayment.query(
+    `INSERT INTO payment_allocations(payment_attempt_id, invoice_id, amount_minor)
+     VALUES ($1, $2, 330)`,
+    [paymentAttemptId, runtimeRenewalRow.invoice_id],
+  );
+  const paymentJournal = await runtimePayment.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES ('fund_receipt', $1, 'USD', 'Synthetic resource lifecycle payment')
+     RETURNING id`,
+    [receiptId],
+  );
+  await runtimePayment.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'mock_cash', 330, 0),
+       ($1, 'accounts_receivable', 0, 330)`,
+    [paymentJournal.rows[0]?.id],
+  );
+  const settlement = await advancePaidInvoice(runtimePayment, runtimeRenewalRow.invoice_id, {
+    kind: "user_command",
+    userId: resourceLifecycleUserId,
+  });
+  assert.equal(settlement.renewalStatus, "paid");
+  assert.equal(settlement.resumeSchedule, "resume_queued");
+  await runtimePayment.query("COMMIT");
+} catch (error) {
+  await runtimePayment.query("ROLLBACK");
+  throw error;
+} finally {
+  runtimePayment.release();
+}
+
+const resumedRuntime = await waitFor(
+  "Worker timeout/reconcile resume to reach the Core terminal state",
+  () => readResourceLifecycle("resource_resume"),
+  (state) =>
+    state?.service_status === "active" &&
+    state.case_status === "resolved" &&
+    state.operation_status === "succeeded",
+  45_000,
+);
+assert.ok(resumedRuntime);
+assert.equal(resumedRuntime.operation_attempt_count, 1);
+assert.ok(resumedRuntime.provider_occurred_at);
+const expectedResourceActionScenario = process.env.EXPECT_RESOURCE_ACTION_SCENARIO;
+const expectedResourceActionQueryCalls =
+  expectedResourceActionScenario === "timeout_success" ? 1 : 0;
+const providerResourceActions = await providerPool.query<{
+  action: "suspend" | "resume";
+  scenario: string;
+  status: string;
+  action_calls: number;
+  query_calls: number;
+}>(
+  `SELECT action, scenario, status, action_calls, query_calls
+   FROM mock_resource_action_operations
+   WHERE service_id = $1
+   ORDER BY occurred_at, operation_id`,
+  [resourceLifecycleServiceId],
+);
+assert.deepEqual(
+  providerResourceActions.rows.map((row) => ({
+    action: row.action,
+    status: row.status,
+    actionCalls: row.action_calls,
+    queryCalls: row.query_calls,
+  })),
+  [
+    {
+      action: "suspend",
+      status: "succeeded",
+      actionCalls: 1,
+      queryCalls: expectedResourceActionQueryCalls,
+    },
+    {
+      action: "resume",
+      status: "succeeded",
+      actionCalls: 1,
+      queryCalls: expectedResourceActionQueryCalls,
+    },
+  ],
+);
+if (expectedResourceActionScenario) {
+  assert.ok(
+    providerResourceActions.rows.every(
+      (row) => row.scenario === expectedResourceActionScenario,
+    ),
+    `Worker must request the expected resource action scenario ${expectedResourceActionScenario}`,
+  );
+}
+if (expectedResourceActionScenario === "timeout_success") {
+  const reconcileJobs = await corePool.query<{ job_type: string; status: string }>(
+    `SELECT job_type, status
+     FROM durable_jobs
+     WHERE unique_key IN ($1, $2)
+       AND job_type IN ('service.suspend.reconcile', 'service.resume.reconcile')
+     ORDER BY job_type`,
+    [
+      `service-suspension-case:${resumedRuntime.case_id}:suspend`,
+      `service-suspension-case:${resumedRuntime.case_id}:resume`,
+    ],
+  );
+  assert.deepEqual(reconcileJobs.rows, [
+    { job_type: "service.resume.reconcile", status: "completed" },
+    { job_type: "service.suspend.reconcile", status: "completed" },
+  ]);
+}
+
+const duplicateResumeFact = await submitResourceActionFact({
+  eventId: `resource-lifecycle-resume-duplicate:${resourceLifecycleNamespace}`,
+  providerOperationId: resumedRuntime.operation_id,
+  serviceId: resourceLifecycleServiceId,
+  externalResourceId: resourceLifecycleExternalId,
+  action: "resume",
+  status: "succeeded",
+  occurredAt: resumedRuntime.provider_occurred_at.toISOString(),
+});
+assert.equal(duplicateResumeFact.status, 202);
+const staleResumeFailure = await submitResourceActionFact({
+  eventId: `resource-lifecycle-resume-stale:${resourceLifecycleNamespace}`,
+  providerOperationId: resumedRuntime.operation_id,
+  serviceId: resourceLifecycleServiceId,
+  externalResourceId: resourceLifecycleExternalId,
+  action: "resume",
+  status: "failed",
+  occurredAt: new Date(
+    resumedRuntime.provider_occurred_at.getTime() - 1_000,
+  ).toISOString(),
+});
+assert.equal(staleResumeFailure.status, 202);
+const finalResourceLifecycle = await corePool.query<{
+  service_status: string;
+  case_status: string;
+  cases: string;
+  operations: string;
+}>(
+  `SELECT service.status AS service_status,
+          suspension_case.status AS case_status,
+          (SELECT count(*)::text FROM service_suspension_cases counted_case
+           WHERE counted_case.service_id = service.id) AS cases,
+          (SELECT count(*)::text FROM provider_operations operation
+           WHERE operation.subject_type = 'service_suspension_case'
+             AND operation.subject_id = suspension_case.id
+             AND operation.kind IN ('resource_suspend', 'resource_resume')) AS operations
+   FROM services service
+   JOIN service_suspension_cases suspension_case
+     ON suspension_case.service_id = service.id
+   WHERE service.id = $1`,
+  [resourceLifecycleServiceId],
+);
+assert.deepEqual(finalResourceLifecycle.rows[0], {
+  service_status: "active",
+  case_status: "resolved",
+  cases: "1",
+  operations: "2",
+});
+
+// Reuse the now-active service for the exact payment race: billing commits a
+// queued suspension, an external result becomes unknown before the Worker can
+// dispatch it, and settlement later wins without any Provider POST.
+const secondRenewalCreation = await runSignedBillingDay({
+  businessDate: "2006-02-15",
+  effectiveAt: "2006-02-15T01:00:00.000Z",
+});
+assert.equal(secondRenewalCreation.status, 201);
+const secondRuntimeRenewal = await corePool.query<{ id: string; invoice_id: string }>(
+  `SELECT id, invoice_id
+   FROM service_renewals
+   WHERE service_id = $1 AND status = 'invoiced'
+   ORDER BY created_at DESC
+   LIMIT 1`,
+  [resourceLifecycleServiceId],
+);
+const secondRuntimeRenewalRow = secondRuntimeRenewal.rows[0];
+assert.ok(secondRuntimeRenewalRow);
+const pendingRaceAttemptId = randomUUID();
+const pendingRaceExternalPaymentId = `resource-lifecycle-pending:${pendingRaceAttemptId}`;
+const pendingRace = await corePool.connect();
+try {
+  await pendingRace.query("BEGIN");
+  const secondDelinquencyRun = await runRenewalAutomation(pendingRace, {
+    requestedByUserId: null,
+    reason: "Scheduled Asia/Shanghai billing automation",
+    scheduledBusinessDate: "2006-03-06",
+    effectiveAt: new Date("2006-03-06T01:00:00.000Z"),
+  });
+  assert.equal(secondDelinquencyRun.suspensionCasesCreated, 1);
+  await pendingRace.query(
+    `INSERT INTO payment_attempts(
+       id, client_account_id, invoice_id, provider_installation_id,
+       external_payment_id, status, amount_minor, currency, scenario,
+       idempotency_key, request_fingerprint
+     ) VALUES (
+       $1, $2, $3, 'runtime-integration-payment', $4,
+       'unknown', 330, 'USD', 'timeout_success', $5, $6
+     )`,
+    [
+      pendingRaceAttemptId,
+      resourceLifecycleAccountId,
+      secondRuntimeRenewalRow.invoice_id,
+      pendingRaceExternalPaymentId,
+      `resource-lifecycle-pending:${resourceLifecycleNamespace}`,
+      `resource-lifecycle-pending-fingerprint:${resourceLifecycleNamespace}`,
+    ],
+  );
+  await pendingRace.query("COMMIT");
+} catch (error) {
+  await pendingRace.query("ROLLBACK");
+  throw error;
+} finally {
+  pendingRace.release();
+}
+const pendingRaceState = await waitFor(
+  "Worker suspension preflight to defer an unresolved payment without Provider POST",
+  async () => {
+    const state = await corePool.query<{
+      case_id: string;
+      case_status: string;
+      operation_id: string;
+      operation_status: string;
+      operation_attempt_count: number;
+      job_status: string;
+      job_last_error: string | null;
+      provider_action_count: string;
+    }>(
+      `SELECT suspension_case.id AS case_id,
+              suspension_case.status AS case_status,
+              operation.id AS operation_id,
+              operation.status AS operation_status,
+              operation.attempt_count AS operation_attempt_count,
+              job.status AS job_status,
+              job.last_error AS job_last_error,
+              (SELECT count(*)::text
+               FROM provider_operations sent_operation
+               WHERE sent_operation.subject_type = 'service_suspension_case'
+                 AND sent_operation.subject_id = suspension_case.id
+                 AND sent_operation.attempt_count > 0) AS provider_action_count
+       FROM service_suspension_cases suspension_case
+       JOIN provider_operations operation
+         ON operation.subject_type = 'service_suspension_case'
+        AND operation.subject_id = suspension_case.id
+        AND operation.kind = 'resource_suspend'
+       JOIN durable_jobs job
+         ON job.job_type = 'service.suspend.start'
+        AND job.unique_key = operation.stable_key
+       WHERE suspension_case.service_renewal_id = $1`,
+      [secondRuntimeRenewalRow.id],
+    );
+    return state.rows[0] ?? null;
+  },
+  (state) =>
+    state?.case_status === "suspend_queued" &&
+    state.operation_status === "queued" &&
+    state.operation_attempt_count === 0 &&
+    state.job_status === "pending" &&
+    state.job_last_error?.includes("external payment result is unresolved") === true,
+  15_000,
+);
+assert.ok(pendingRaceState);
+assert.equal(pendingRaceState.provider_action_count, "0");
+const actionsBeforePendingSettlement = await providerPool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM mock_resource_action_operations
+   WHERE service_id = $1`,
+  [resourceLifecycleServiceId],
+);
+assert.equal(actionsBeforePendingSettlement.rows[0]?.count, "2");
+
+const settlePendingRace = await corePool.connect();
+try {
+  await settlePendingRace.query("BEGIN");
+  await settlePendingRace.query(
+    `UPDATE payment_attempts
+     SET status = 'succeeded', provider_occurred_at = now(),
+         updated_at = now(), version = version + 1
+     WHERE id = $1 AND status = 'unknown'`,
+    [pendingRaceAttemptId],
+  );
+  const pendingReceiptId = randomUUID();
+  await settlePendingRace.query(
+    `INSERT INTO fund_receipts(
+       id, provider_installation_id, external_payment_id,
+       reported_payment_attempt_id, client_account_id,
+       amount_minor, allocated_minor, currency, occurred_at, disposition
+     ) VALUES (
+       $1, 'runtime-integration-payment', $2, $3, $4,
+       330, 330, 'USD', now(), 'allocated'
+     )`,
+    [
+      pendingReceiptId,
+      pendingRaceExternalPaymentId,
+      pendingRaceAttemptId,
+      resourceLifecycleAccountId,
+    ],
+  );
+  await settlePendingRace.query(
+    `INSERT INTO payment_allocations(payment_attempt_id, invoice_id, amount_minor)
+     VALUES ($1, $2, 330)`,
+    [pendingRaceAttemptId, secondRuntimeRenewalRow.invoice_id],
+  );
+  const pendingJournal = await settlePendingRace.query<{ id: string }>(
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES ('fund_receipt', $1, 'USD', 'Synthetic pending-race payment')
+     RETURNING id`,
+    [pendingReceiptId],
+  );
+  await settlePendingRace.query(
+    `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+     VALUES
+       ($1, 'mock_cash', 330, 0),
+       ($1, 'accounts_receivable', 0, 330)`,
+    [pendingJournal.rows[0]?.id],
+  );
+  const pendingSettlement = await advancePaidInvoice(
+    settlePendingRace,
+    secondRuntimeRenewalRow.invoice_id,
+    { kind: "user_command", userId: resourceLifecycleUserId },
+  );
+  assert.equal(pendingSettlement.renewalStatus, "paid");
+  await settlePendingRace.query("COMMIT");
+} catch (error) {
+  await settlePendingRace.query("ROLLBACK");
+  throw error;
+} finally {
+  settlePendingRace.release();
+}
+await corePool.query(
+  `UPDATE durable_jobs
+   SET available_at = now(), updated_at = now()
+   WHERE job_type = 'service.suspend.start'
+     AND unique_key = $1
+     AND status = 'pending'`,
+  [`service-suspension-case:${pendingRaceState.case_id}:suspend`],
+);
+const resolvedPendingRace = await waitFor(
+  "settlement to cancel the known-unsent suspension",
+  async () => {
+    const state = await corePool.query<{
+      service_status: string;
+      case_status: string;
+      operation_status: string;
+      operation_attempt_count: number;
+      job_status: string;
+    }>(
+      `SELECT service.status AS service_status,
+              suspension_case.status AS case_status,
+              operation.status AS operation_status,
+              operation.attempt_count AS operation_attempt_count,
+              job.status AS job_status
+       FROM services service
+       JOIN service_suspension_cases suspension_case
+         ON suspension_case.service_id = service.id
+       JOIN provider_operations operation
+         ON operation.subject_type = 'service_suspension_case'
+        AND operation.subject_id = suspension_case.id
+        AND operation.kind = 'resource_suspend'
+       JOIN durable_jobs job
+         ON job.job_type = 'service.suspend.start'
+        AND job.unique_key = operation.stable_key
+       WHERE suspension_case.id = $1`,
+      [pendingRaceState.case_id],
+    );
+    return state.rows[0] ?? null;
+  },
+  (state) =>
+    state?.service_status === "active" &&
+    state.case_status === "resolved" &&
+    state.operation_status === "failed" &&
+    state.operation_attempt_count === 0 &&
+    state.job_status === "completed",
+  15_000,
+);
+assert.ok(resolvedPendingRace);
+const actionsAfterPendingSettlement = await providerPool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM mock_resource_action_operations
+   WHERE service_id = $1`,
+  [resourceLifecycleServiceId],
+);
+assert.equal(
+  actionsAfterPendingSettlement.rows[0]?.count,
+  "2",
+  "pending payment settlement must not dispatch a late suspension",
+);
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count

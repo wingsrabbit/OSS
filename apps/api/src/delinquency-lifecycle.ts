@@ -293,7 +293,8 @@ async function assessLateFees(
        FROM service_renewals renewal
        JOIN invoices invoice ON invoice.id = renewal.invoice_id
        JOIN services service ON service.id = renewal.service_id
-       JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+       JOIN invoice_delinquency_allocation_totals allocation
+         ON allocation.invoice_id = invoice.id
        WHERE renewal.invoice_id = $1
          AND renewal.status IN ('invoiced', 'manual_hold')
          AND ($3::timestamptz AT TIME ZONE $2)::date >=

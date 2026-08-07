@@ -319,6 +319,17 @@ type RenewalItem = {
     version: number;
     suspendOperation: { status: string; attempts: number } | null;
     resumeOperation: { status: string; attempts: number } | null;
+    manualControl: {
+      allowedActions: Array<"confirm_suspended" | "confirm_restored">;
+      requiresReauthentication: true;
+      actionCount: string;
+      latestActionAt: string | null;
+      blockedReason: string | null;
+      impact: {
+        confirmSuspended: string;
+        confirmRestored: string;
+      };
+    } | null;
   } | null;
   paymentReconciliationHold: {
     active: boolean;
@@ -515,6 +526,9 @@ export function App() {
   const [automationReason, setAutomationReason] = useState("");
   const [renewalHoldReason, setRenewalHoldReason] = useState("");
   const [renewalHoldPendingId, setRenewalHoldPendingId] = useState<string | null>(null);
+  const [manualSuspensionReason, setManualSuspensionReason] = useState("");
+  const [manualSuspensionPendingId, setManualSuspensionPendingId] = useState<string | null>(null);
+  const manualSuspensionIntentKeys = useRef(new Map<string, string>());
   const [paymentQuote, setPaymentQuote] = useState<PaymentQuote | null>(null);
   const [addFundsPrincipalMinor, setAddFundsPrincipalMinor] = useState("5000");
   const [addFundsMethod, setAddFundsMethod] = useState("card");
@@ -1144,6 +1158,70 @@ export function App() {
       setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
     } finally {
       setRenewalHoldPendingId(null);
+    }
+  }
+
+  async function performManualSuspensionAction(
+    renewal: AdminRenewalItem,
+    action: "confirm_suspended" | "confirm_restored",
+  ) {
+    const delinquency = renewal.delinquency;
+    if (
+      !me?.staff ||
+      !delinquency?.manualControl?.allowedActions.includes(action) ||
+      manualSuspensionReason.trim().length < 10 ||
+      manualSuspensionPendingId
+    ) {
+      return;
+    }
+    const requestIdentity = JSON.stringify({
+      caseId: delinquency.caseId,
+      action,
+      expectedVersion: delinquency.version,
+      reason: manualSuspensionReason.trim(),
+    });
+    let idempotencyKey = manualSuspensionIntentKeys.current.get(requestIdentity);
+    if (!idempotencyKey) {
+      idempotencyKey = crypto.randomUUID();
+      manualSuspensionIntentKeys.current.set(requestIdentity, idempotencyKey);
+    }
+    setError("");
+    setManualSuspensionPendingId(delinquency.caseId);
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const outcome = await api<{
+        caseStatus: string;
+        serviceStatus: string;
+        providerCalled: false;
+        replayed: boolean;
+      }>(
+        `/api/v1/admin/billing/delinquency-cases/${delinquency.caseId}/manual-actions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            reason: manualSuspensionReason.trim(),
+            expectedVersion: delinquency.version,
+            idempotencyKey,
+          }),
+        },
+      );
+      manualSuspensionIntentKeys.current.delete(requestIdentity);
+      setManualSuspensionReason("");
+      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      setNotice(
+        action === "confirm_suspended"
+          ? `Manual suspension recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`
+          : `Manual restoration recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Manual service action failed");
+    } finally {
+      setManualSuspensionPendingId(null);
     }
   }
 
@@ -2360,6 +2438,12 @@ export function App() {
                   onChange={(event) => setRenewalHoldReason(event.target.value)}
                   placeholder="Funded Hold review reason (10+ characters)"
                 />
+                <input
+                  aria-label="Manual suspension or restoration reason"
+                  value={manualSuspensionReason}
+                  onChange={(event) => setManualSuspensionReason(event.target.value)}
+                  placeholder="Manual service state reason (10+ characters)"
+                />
               </div>
               {adminRenewals.length === 0 ? (
                 <p className="muted">No generated renewal invoice is currently visible.</p>
@@ -2404,21 +2488,36 @@ export function App() {
                           </span>
                         )}
                         {renewal.delinquency && (
-                          <span data-testid="admin-renewal-delinquency-status">
-                            Action {renewal.delinquency.action} · case {renewal.delinquency.status}
-                            {renewal.delinquency.providerInstallationId
-                              ? ` · Provider ${renewal.delinquency.providerInstallationId}`
-                              : " · no Provider mutation"}
-                            {renewal.delinquency.suspendOperation
-                              ? ` · suspend ${renewal.delinquency.suspendOperation.status}/${renewal.delinquency.suspendOperation.attempts}`
-                              : ""}
-                            {renewal.delinquency.resumeOperation
-                              ? ` · resume ${renewal.delinquency.resumeOperation.status}/${renewal.delinquency.resumeOperation.attempts}`
-                              : ""}
-                            {renewal.delinquency.lastError
-                              ? ` · ${renewal.delinquency.lastError}`
-                              : ""}
-                          </span>
+                          <>
+                            <span data-testid="admin-renewal-delinquency-status">
+                              Action {renewal.delinquency.action} · case {renewal.delinquency.status}
+                              {renewal.delinquency.providerInstallationId
+                                ? ` · Provider ${renewal.delinquency.providerInstallationId}`
+                                : " · no Provider mutation"}
+                              {renewal.delinquency.suspendOperation
+                                ? ` · suspend ${renewal.delinquency.suspendOperation.status}/${renewal.delinquency.suspendOperation.attempts}`
+                                : ""}
+                              {renewal.delinquency.resumeOperation
+                                ? ` · resume ${renewal.delinquency.resumeOperation.status}/${renewal.delinquency.resumeOperation.attempts}`
+                                : ""}
+                              {renewal.delinquency.lastError
+                                ? ` · ${renewal.delinquency.lastError}`
+                                : ""}
+                            </span>
+                            {renewal.delinquency.manualControl && (
+                              <span data-testid="admin-renewal-manual-control">
+                                Manual records {renewal.delinquency.manualControl.actionCount}
+                                {renewal.delinquency.manualControl.latestActionAt
+                                  ? ` · latest ${new Date(
+                                      renewal.delinquency.manualControl.latestActionAt,
+                                    ).toLocaleString()}`
+                                  : ""}
+                                {renewal.delinquency.manualControl.blockedReason
+                                  ? ` · blocked: ${renewal.delinquency.manualControl.blockedReason}`
+                                  : " · password confirmation and a 10+ character reason are required"}
+                              </span>
+                            )}
+                          </>
                         )}
                         <span>
                           Notification delivery: {" "}
@@ -2429,6 +2528,50 @@ export function App() {
                                 .join(", ")}
                         </span>
                       </div>
+                      {renewal.delinquency?.manualControl?.allowedActions.includes(
+                        "confirm_suspended",
+                      ) && (
+                        <div className="fund-actions" data-testid="manual-suspension-control">
+                          <span>{renewal.delinquency.manualControl.impact.confirmSuspended}</span>
+                          <button
+                            className="primary"
+                            disabled={
+                              manualSuspensionPendingId !== null ||
+                              adminPassword.length === 0 ||
+                              manualSuspensionReason.trim().length < 10
+                            }
+                            onClick={() =>
+                              void performManualSuspensionAction(renewal, "confirm_suspended")
+                            }
+                          >
+                            {manualSuspensionPendingId === renewal.delinquency.caseId
+                              ? "Recording suspension…"
+                              : "Confirm service suspended"}
+                          </button>
+                        </div>
+                      )}
+                      {renewal.delinquency?.manualControl?.allowedActions.includes(
+                        "confirm_restored",
+                      ) && (
+                        <div className="fund-actions" data-testid="manual-restoration-control">
+                          <span>{renewal.delinquency.manualControl.impact.confirmRestored}</span>
+                          <button
+                            className="primary"
+                            disabled={
+                              manualSuspensionPendingId !== null ||
+                              adminPassword.length === 0 ||
+                              manualSuspensionReason.trim().length < 10
+                            }
+                            onClick={() =>
+                              void performManualSuspensionAction(renewal, "confirm_restored")
+                            }
+                          >
+                            {manualSuspensionPendingId === renewal.delinquency.caseId
+                              ? "Recording restoration…"
+                              : "Confirm service restored"}
+                          </button>
+                        </div>
+                      )}
                       {renewal.renewalStatus === "manual_hold" && (
                         <button
                           className="primary"
