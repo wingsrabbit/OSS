@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DatabaseClient } from "./database.js";
+import type { RenewalResumeScheduleOutcome } from "./delinquency-lifecycle.js";
 import { settleRenewalInvoice } from "./renewal-lifecycle.js";
 
 export type PaidInvoiceOutcome = {
@@ -8,6 +9,7 @@ export type PaidInvoiceOutcome = {
   orderStatus?: string;
   renewalStatus?: "paid" | "manual_hold";
   serviceStatus?: string;
+  resumeSchedule?: RenewalResumeScheduleOutcome;
 };
 
 export type InvoiceSettlementContext =
@@ -53,6 +55,7 @@ export async function advancePaidInvoice(
       invoiceStatus: "paid",
       renewalStatus: renewal.renewalStatus,
       serviceStatus: renewal.serviceStatus,
+      ...(renewal.resumeSchedule ? { resumeSchedule: renewal.resumeSchedule } : {}),
     };
   }
 

@@ -301,6 +301,30 @@ type RenewalItem = {
   settledAt: string | null;
   version: number;
   reminders: RenewalReminder[];
+  lateFee: {
+    disposition: "charged" | "skipped_zero";
+    basisMinor: string;
+    basisPoints: number;
+    amountMinor: string;
+    businessDate: string;
+  } | null;
+  delinquency: {
+    caseId: string;
+    action: "automatic" | "manual" | "none";
+    decisionReason: string;
+    status: string;
+    resumeRequired: boolean;
+    providerInstallationId: string | null;
+    lastError: string | null;
+    version: number;
+    suspendOperation: { status: string; attempts: number } | null;
+    resumeOperation: { status: string; attempts: number } | null;
+  } | null;
+  paymentReconciliationHold: {
+    active: boolean;
+    deferralCount: string;
+    latestDeferredAt: string | null;
+  };
 };
 type AdminRenewalItem = RenewalItem & {
   clientAccountId: string;
@@ -1065,6 +1089,7 @@ export function App() {
         businessDate: string;
         invoicesCreated: number;
         remindersCreated: number;
+        delinquencyDeferralsCreated: number;
         replayed: boolean;
       }>("/api/v1/admin/billing/automation/run", {
         method: "POST",
@@ -1079,7 +1104,7 @@ export function App() {
       setAutomationReason("");
       await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
       setNotice(
-        `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s).`,
+        `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s), ${result.delinquencyDeferralsCreated} payment reconciliation hold(s).`,
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Billing automation failed");
@@ -2008,6 +2033,29 @@ export function App() {
                         was not extended.
                       </span>
                     )}
+                    {renewal.lateFee && (
+                      <span data-testid="renewal-late-fee">
+                        Late Fee {renewal.lateFee.disposition}: {usd(renewal.lateFee.amountMinor)}
+                        {" "}on eligible unpaid basis {usd(renewal.lateFee.basisMinor)} at {" "}
+                        {(renewal.lateFee.basisPoints / 100).toFixed(2)}% · assessed {" "}
+                        {renewal.lateFee.businessDate}
+                      </span>
+                    )}
+                    {renewal.paymentReconciliationHold.active && (
+                      <span className="notice" data-testid="renewal-payment-reconciliation-hold">
+                        Payment result is still being reconciled. No new Late Fee or suspension is
+                        applied while the result remains unknown.
+                      </span>
+                    )}
+                    {renewal.delinquency && (
+                      <span data-testid="renewal-delinquency-status">
+                        Overdue action {renewal.delinquency.action} · {renewal.delinquency.status}
+                        {renewal.delinquency.resumeRequired ? " · restore required after reconciliation" : ""}
+                        {renewal.delinquency.lastError
+                          ? ` · staff attention: ${renewal.delinquency.lastError}`
+                          : ""}
+                      </span>
+                    )}
                     <span>
                       Reminders: {" "}
                       {renewal.reminders.length === 0
@@ -2273,12 +2321,15 @@ export function App() {
             <div className="admin-subsection" aria-label="Renewal billing automation">
               <div>
                 <p className="eyebrow">Manual laboratory billing run · Asia/Shanghai</p>
-                <h3>Renewal generation and reminders</h3>
+                <h3>Renewal, Late Fee and service state automation</h3>
                 <p>
                   This run creates the next non-overlapping invoice 14 days before paid-through and
-                  queues the configured pre-due and first overdue reminders. The laboratory time
-                  override is synthetic acceptance control, not a production clock setting. The
-                  unattended 09:00 scheduler is not enabled in this laboratory slice yet.
+                  queues the configured reminders. On Shanghai calendar day 5 it assesses one 10%
+                  Late Fee only on eligible unpaid charges, then queues suspension only when both
+                  the product policy and Provider explicitly allow suspend and resume. The laboratory
+                  time override is synthetic acceptance control, not a production clock setting. The
+                  durable Worker runs the policy once at or after 09:00 Asia/Shanghai and catches up
+                  safely after a restart; repeated scheduling returns the existing business-day run.
                 </p>
               </div>
               <div className="inline-form admin-confirm">
@@ -2339,6 +2390,36 @@ export function App() {
                             ? " — funds recorded; staff disposition required"
                             : ""}
                         </span>
+                        {renewal.lateFee && (
+                          <span data-testid="admin-renewal-late-fee">
+                            Late Fee {renewal.lateFee.disposition} · basis {usd(renewal.lateFee.basisMinor)}
+                            {" "}· {(renewal.lateFee.basisPoints / 100).toFixed(2)}% = {" "}
+                            {usd(renewal.lateFee.amountMinor)}
+                          </span>
+                        )}
+                        {renewal.paymentReconciliationHold.active && (
+                          <span data-testid="admin-renewal-payment-reconciliation-hold">
+                            Delinquency deferred for unresolved payment result · recorded holds {" "}
+                            {renewal.paymentReconciliationHold.deferralCount}
+                          </span>
+                        )}
+                        {renewal.delinquency && (
+                          <span data-testid="admin-renewal-delinquency-status">
+                            Action {renewal.delinquency.action} · case {renewal.delinquency.status}
+                            {renewal.delinquency.providerInstallationId
+                              ? ` · Provider ${renewal.delinquency.providerInstallationId}`
+                              : " · no Provider mutation"}
+                            {renewal.delinquency.suspendOperation
+                              ? ` · suspend ${renewal.delinquency.suspendOperation.status}/${renewal.delinquency.suspendOperation.attempts}`
+                              : ""}
+                            {renewal.delinquency.resumeOperation
+                              ? ` · resume ${renewal.delinquency.resumeOperation.status}/${renewal.delinquency.resumeOperation.attempts}`
+                              : ""}
+                            {renewal.delinquency.lastError
+                              ? ` · ${renewal.delinquency.lastError}`
+                              : ""}
+                          </span>
+                        )}
                         <span>
                           Notification delivery: {" "}
                           {renewal.reminders.length === 0

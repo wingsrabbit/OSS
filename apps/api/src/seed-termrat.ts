@@ -9,6 +9,10 @@ type SeedProduct = {
   en: string;
   zh: string;
   fulfillment: "automatic" | "review" | "manual" | "quote";
+  overdueAction: "automatic" | "manual" | "none";
+  overdueDelayMode?: "policy_calendar_days" | "exact_hours";
+  overdueDelayValue?: number;
+  providerInstallationId?: string;
   repeatable?: boolean;
   hidden?: boolean;
   monthlyMinor?: number;
@@ -32,6 +36,8 @@ const products: SeedProduct[] = [
     en: "HKBGP VPS",
     zh: "HKBGP VPS",
     fulfillment: "automatic",
+    overdueAction: "automatic",
+    providerInstallationId: "mock-provisioning-v1",
     monthlyMinor: 300,
     setupMinor: 200,
   },
@@ -41,6 +47,8 @@ const products: SeedProduct[] = [
     en: "HKBGP-CN VPS",
     zh: "HKBGP-CN VPS",
     fulfillment: "automatic",
+    overdueAction: "automatic",
+    providerInstallationId: "mock-provisioning-v1",
     monthlyMinor: 2_000,
     setupMinor: 200,
   },
@@ -50,6 +58,7 @@ const products: SeedProduct[] = [
     en: "HK-R640 HKBGP Dedicated",
     zh: "HK-R640 HKBGP 独立服务器",
     fulfillment: "manual",
+    overdueAction: "manual",
     monthlyMinor: 28_000,
     setupMinor: 1_000,
   },
@@ -59,6 +68,7 @@ const products: SeedProduct[] = [
     en: "HK-R640 HKBGP-CN Dedicated",
     zh: "HK-R640 HKBGP-CN 独立服务器",
     fulfillment: "manual",
+    overdueAction: "manual",
     monthlyMinor: 125_000,
     setupMinor: 1_000,
   },
@@ -68,6 +78,7 @@ const products: SeedProduct[] = [
     en: "HKBGP IP Transit",
     zh: "HKBGP IP Transit",
     fulfillment: "manual",
+    overdueAction: "manual",
     monthlyMinor: 3_000,
   },
   {
@@ -76,6 +87,7 @@ const products: SeedProduct[] = [
     en: "HKBGP-CN IP Transit",
     zh: "HKBGP-CN IP Transit",
     fulfillment: "manual",
+    overdueAction: "manual",
     monthlyMinor: 100_000,
   },
   {
@@ -84,6 +96,9 @@ const products: SeedProduct[] = [
     en: "Equinix HK2 Colocation",
     zh: "Equinix HK2 机房托管",
     fulfillment: "quote",
+    overdueAction: "manual",
+    overdueDelayMode: "exact_hours",
+    overdueDelayValue: 72,
     monthlyMinor: 0,
     optionSchema: [
       {
@@ -113,6 +128,7 @@ const products: SeedProduct[] = [
     en: "Remote Hands",
     zh: "Remote Hands 现场协助",
     fulfillment: "manual",
+    overdueAction: "none",
     repeatable: true,
     hidden: true,
     oneTimeMinor: 10_000,
@@ -123,6 +139,7 @@ const products: SeedProduct[] = [
     en: "GSL Inbound",
     zh: "GSL Inbound",
     fulfillment: "manual",
+    overdueAction: "manual",
     monthlyMinor: 0,
     optionSchema: [
       {
@@ -196,6 +213,42 @@ await transaction(pool, async (client) => {
        updated_at = now()`,
   );
 
+  await client.query(
+    `INSERT INTO provider_installation_capabilities(
+       provider_installation_id, provider_type, enabled, capabilities
+     ) VALUES (
+       'mock-provisioning-v1', 'provisioning', true,
+       '["resource_create","resource_reconcile","resource_suspend","resource_resume"]'::jsonb
+     )
+     ON CONFLICT (provider_installation_id) DO UPDATE SET
+       provider_type = EXCLUDED.provider_type,
+       enabled = EXCLUDED.enabled,
+       capabilities = EXCLUDED.capabilities,
+       version = provider_installation_capabilities.version + 1,
+       updated_at = now()
+     WHERE provider_installation_capabilities.provider_type IS DISTINCT FROM EXCLUDED.provider_type
+        OR provider_installation_capabilities.enabled IS DISTINCT FROM EXCLUDED.enabled
+        OR provider_installation_capabilities.capabilities IS DISTINCT FROM EXCLUDED.capabilities`,
+  );
+
+  await client.query(
+    `UPDATE billing_automation_policies
+     SET late_fee_enabled = true,
+         late_fee_days = 5,
+         late_fee_basis_points = 1000,
+         overdue_suspension_enabled = true,
+         overdue_suspension_days = 5,
+         updated_at = now()
+     WHERE id = 'default'
+       AND (
+         NOT late_fee_enabled
+         OR late_fee_days <> 5
+         OR late_fee_basis_points <> 1000
+         OR NOT overdue_suspension_enabled
+         OR overdue_suspension_days <> 5
+       )`,
+  );
+
   for (const product of products) {
     await client.query(
       `INSERT INTO products(
@@ -222,6 +275,34 @@ await transaction(pool, async (client) => {
         product.repeatable ?? false,
         product.hidden ?? false,
         JSON.stringify(product.optionSchema ?? []),
+      ],
+    );
+
+    await client.query(
+      `INSERT INTO product_service_automation_policies(
+         product_id, overdue_action, provider_installation_id,
+         overdue_delay_mode, overdue_delay_value
+       ) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (product_id) DO UPDATE SET
+         overdue_action = EXCLUDED.overdue_action,
+         provider_installation_id = EXCLUDED.provider_installation_id,
+         overdue_delay_mode = EXCLUDED.overdue_delay_mode,
+         overdue_delay_value = EXCLUDED.overdue_delay_value,
+         version = product_service_automation_policies.version + 1,
+         updated_at = now()
+       WHERE product_service_automation_policies.overdue_action IS DISTINCT FROM EXCLUDED.overdue_action
+          OR product_service_automation_policies.provider_installation_id
+               IS DISTINCT FROM EXCLUDED.provider_installation_id
+          OR product_service_automation_policies.overdue_delay_mode
+               IS DISTINCT FROM EXCLUDED.overdue_delay_mode
+          OR product_service_automation_policies.overdue_delay_value
+               IS DISTINCT FROM EXCLUDED.overdue_delay_value`,
+      [
+        product.id,
+        product.overdueAction,
+        product.providerInstallationId ?? null,
+        product.overdueDelayMode ?? "policy_calendar_days",
+        product.overdueDelayValue ?? 5,
       ],
     );
 

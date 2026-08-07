@@ -15,6 +15,7 @@ import { transaction, type DatabaseClient, type DatabasePool } from "./database.
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { recordInitialServicePeriod } from "./renewal-lifecycle.js";
+import { scheduleResumeAfterRenewalSettlement } from "./delinquency-lifecycle.js";
 import { assertProviderSignature } from "./provider-signature.js";
 import { freezeCompetingRefunds } from "./refund-safety.js";
 import {
@@ -45,6 +46,17 @@ const provisioningEventSchema = z.object({
   status: z.enum(["succeeded", "failed"]),
   externalResourceId: z.string().min(1).max(200).optional(),
   readyAt: z.iso.datetime().optional(),
+  occurredAt: z.iso.datetime(),
+});
+
+const resourceActionEventSchema = z.object({
+  eventId: z.string().min(1).max(160),
+  providerOperationId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  serviceId: z.uuid(),
+  externalResourceId: z.string().min(1).max(200),
+  action: z.enum(["suspend", "resume"]),
+  status: z.enum(["succeeded", "failed"]),
   occurredAt: z.iso.datetime(),
 });
 
@@ -1816,6 +1828,417 @@ export async function registerProviderEventRoutes(
         ],
       );
       return { accepted: true, status: "succeeded" };
+    });
+    return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
+  });
+
+  app.post("/api/v1/provider-events/resource-action", async (request, reply) => {
+    const body = resourceActionEventSchema.parse(request.body);
+    assertProviderSignature(request, config.MOCK_PROVISIONING_WEBHOOK_SECRET, body);
+    const outcome = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `provider-operation:${body.providerOperationId}`,
+      ]);
+      const pointerResult = await client.query<{
+        case_id: string;
+        service_id: string;
+        renewal_id: string;
+        invoice_id: string;
+        order_id: string;
+        order_item_id: string;
+      }>(
+        `SELECT
+           suspension_case.id AS case_id,
+           suspension_case.service_id,
+           suspension_case.service_renewal_id AS renewal_id,
+           suspension_case.invoice_id,
+           customer_order.id AS order_id,
+           item.id AS order_item_id
+         FROM provider_operations operation
+         JOIN service_suspension_cases suspension_case
+           ON operation.subject_type = 'service_suspension_case'
+          AND operation.subject_id = suspension_case.id
+         JOIN services service ON service.id = suspension_case.service_id
+         JOIN order_items item ON item.id = service.order_item_id
+         JOIN orders customer_order ON customer_order.id = item.order_id
+         WHERE operation.id = $1`,
+        [body.providerOperationId],
+      );
+      const pointer = pointerResult.rows[0];
+      if (!pointer) return { rejected: true, reason: "unknown_provider_operation" };
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        pointer.invoice_id,
+      ]);
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [pointer.order_id]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        pointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        pointer.service_id,
+      ]);
+      await client.query("SELECT id FROM service_renewals WHERE id = $1 FOR UPDATE", [
+        pointer.renewal_id,
+      ]);
+      await client.query("SELECT id FROM service_suspension_cases WHERE id = $1 FOR UPDATE", [
+        pointer.case_id,
+      ]);
+      const stateResult = await client.query<{
+        operation_id: string;
+        operation_provider_installation_id: string;
+        operation_kind: "resource_suspend" | "resource_resume";
+        operation_status: string;
+        operation_stable_key: string;
+        attempt_count: number;
+        operation_created_at: Date;
+        operation_provider_occurred_at: Date | null;
+        case_id: string;
+        case_provider_installation_id: string | null;
+        case_status: string;
+        resume_required: boolean;
+        case_provider_occurred_at: Date | null;
+        case_version: number;
+        service_id: string;
+        service_status: string;
+        external_resource_id: string | null;
+        renewal_status: string;
+        account_restricted_at: Date | null;
+      }>(
+        `SELECT
+           operation.id AS operation_id,
+           operation.provider_installation_id AS operation_provider_installation_id,
+           operation.kind AS operation_kind,
+           operation.status AS operation_status,
+           operation.stable_key AS operation_stable_key,
+           operation.attempt_count,
+           operation.created_at AS operation_created_at,
+           operation.provider_occurred_at AS operation_provider_occurred_at,
+           suspension_case.id AS case_id,
+           suspension_case.provider_installation_id AS case_provider_installation_id,
+           suspension_case.status AS case_status,
+           suspension_case.resume_required,
+           suspension_case.provider_occurred_at AS case_provider_occurred_at,
+           suspension_case.version AS case_version,
+           service.id AS service_id,
+           service.status AS service_status,
+           service.external_resource_id,
+           renewal.status AS renewal_status,
+           account.restricted_at AS account_restricted_at
+         FROM provider_operations operation
+         JOIN service_suspension_cases suspension_case
+           ON operation.subject_type = 'service_suspension_case'
+          AND operation.subject_id = suspension_case.id
+         JOIN services service ON service.id = suspension_case.service_id
+         JOIN client_accounts account ON account.id = service.client_account_id
+         JOIN service_renewals renewal ON renewal.id = suspension_case.service_renewal_id
+         WHERE operation.id = $1
+         FOR UPDATE OF operation, account`,
+        [body.providerOperationId],
+      );
+      const state = stateResult.rows[0];
+      if (!state || state.case_id !== pointer.case_id || state.service_id !== pointer.service_id) {
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+      const expectedKind = body.action === "suspend" ? "resource_suspend" : "resource_resume";
+      if (
+        state.operation_provider_installation_id !== MOCK_PROVISIONING_INSTALLATION_ID ||
+        state.case_provider_installation_id !== MOCK_PROVISIONING_INSTALLATION_ID ||
+        state.operation_kind !== expectedKind ||
+        body.serviceId !== state.service_id ||
+        body.externalResourceId !== state.external_resource_id
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.resource_action_rejected",
+          "service_suspension_case",
+          state.case_id,
+          "Provider resource action does not match Core ownership or operation scope",
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+      if (
+        !providerOperationCapabilityMatches(
+          body.callbackCapability,
+          config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          state.operation_id,
+        )
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.resource_action_rejected",
+          "service_suspension_case",
+          state.case_id,
+          "Provider resource action callback capability is invalid",
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { rejected: true, reason: "invalid_operation_capability" };
+      }
+      if (state.attempt_count === 0) {
+        return { rejected: true, reason: "provider_operation_not_started" };
+      }
+
+      const inbox = await insertInbox(
+        client,
+        MOCK_PROVISIONING_INSTALLATION_ID,
+        body.eventId,
+        "resource.action",
+        body,
+      );
+      if (inbox === "duplicate") return { duplicate: true };
+      if (inbox === "conflict") {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.resource_action_rejected",
+          "service_suspension_case",
+          state.case_id,
+          "Provider reused an event id with a different resource action fact",
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { rejected: true, reason: "event_id_conflict" };
+      }
+
+      const occurredAt = new Date(body.occurredAt);
+      const requireQueryOnlyReconciliation = async (reason: string) => {
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'unknown', last_error = $2, updated_at = now()
+           WHERE id = $1 AND status <> 'succeeded'`,
+          [state.operation_id, reason],
+        );
+        if (state.case_status !== "resolved") {
+          await client.query(
+            `UPDATE service_suspension_cases
+             SET status = 'manual',
+                 resume_required = CASE
+                   WHEN $3 = 'resume' THEN true
+                   WHEN $3 = 'suspend' AND $4 = 'paid' THEN true
+                   ELSE resume_required
+                 END,
+                 last_error = $2, updated_at = now(), version = version + 1
+             WHERE id = $1 AND version = $5`,
+            [state.case_id, reason, body.action, state.renewal_status, state.case_version],
+          );
+        }
+        const reconcileJobType = body.action === "suspend"
+          ? "service.suspend.reconcile"
+          : "service.resume.reconcile";
+        await client.query(
+          `INSERT INTO durable_jobs(job_type, unique_key, payload)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (job_type, unique_key) DO NOTHING`,
+          [
+            reconcileJobType,
+            `${state.operation_stable_key}:provider-conflict:${body.eventId}`,
+            {
+              caseId: state.case_id,
+              serviceId: state.service_id,
+              providerOperationId: state.operation_id,
+            },
+          ],
+        );
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.resource_action_reconciliation_required",
+          "service_suspension_case",
+          state.case_id,
+          reason,
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+      };
+      if (occurredAt.getTime() > Date.now() + 5 * 60_000) {
+        const reason = "Provider resource action time is implausibly far in the future";
+        await requireQueryOnlyReconciliation(reason);
+        return { accepted: true, status: "manual", reconciliationRequired: true };
+      }
+      if (
+        occurredAt.getTime() < state.operation_created_at.getTime() ||
+        !isAfter(state.operation_provider_occurred_at, occurredAt)
+      ) {
+        return { ignored: true, reason: "stale_provider_fact" };
+      }
+      if (state.operation_status === "succeeded") {
+        return { ignored: true, reason: "already_succeeded" };
+      }
+      if (state.operation_status === "failed" && body.status === "succeeded") {
+        const reason = "Provider contradicted a definitive resource action failure";
+        await requireQueryOnlyReconciliation(reason);
+        return { accepted: true, status: "manual", reconciliationRequired: true };
+      }
+
+      if (body.status === "failed") {
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed', provider_occurred_at = $2,
+               last_error = $3, updated_at = now()
+           WHERE id = $1 AND status <> 'succeeded'`,
+          [state.operation_id, occurredAt, `${body.action} was rejected by the Provider`],
+        );
+        if (state.case_status !== "resolved") {
+          await client.query(
+            `UPDATE service_suspension_cases
+             SET status = 'manual', provider_occurred_at = $2,
+                 resume_required = CASE WHEN $5 = 'resume' THEN true ELSE resume_required END,
+                 last_error = $3, updated_at = now(), version = version + 1
+             WHERE id = $1 AND version = $4`,
+            [
+              state.case_id,
+              occurredAt,
+              `${body.action} was rejected by the Provider`,
+              state.case_version,
+              body.action,
+            ],
+          );
+        }
+        return { accepted: true, status: "manual" };
+      }
+
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'succeeded', provider_occurred_at = $2,
+             external_reference = $3, last_error = NULL, updated_at = now()
+         WHERE id = $1 AND status <> 'succeeded'`,
+        [state.operation_id, occurredAt, body.externalResourceId],
+      );
+
+      if (body.action === "suspend") {
+        if (
+          state.case_status === "resolved" ||
+          state.case_status.startsWith("resume_") ||
+          state.service_status === "terminated"
+        ) {
+          await auditProvider(
+            client,
+            MOCK_PROVISIONING_INSTALLATION_ID,
+            "service.resource_action_stale",
+            "service_suspension_case",
+            state.case_id,
+            "A late suspend fact was recorded without moving Core state backwards",
+            { eventId: body.eventId, caseStatus: state.case_status },
+          );
+          return { ignored: true, reason: "stale_provider_fact" };
+        }
+        const serviceUpdate = await client.query(
+          `UPDATE services
+           SET status = 'suspended', updated_at = now(), version = version + 1
+           WHERE id = $1 AND status IN ('active', 'suspended')
+           RETURNING id`,
+          [state.service_id],
+        );
+        if (serviceUpdate.rowCount !== 1) {
+          await client.query(
+            `UPDATE service_suspension_cases
+             SET status = 'manual', provider_occurred_at = $2,
+                 last_error = $3, updated_at = now(), version = version + 1
+             WHERE id = $1 AND version = $4`,
+            [
+              state.case_id,
+              occurredAt,
+              "Provider suspended the resource but Core service state conflicts",
+              state.case_version,
+            ],
+          );
+          return { accepted: true, status: "manual" };
+        }
+        const nextCaseStatus = "suspended";
+        const resumeRequired = state.resume_required || state.renewal_status === "paid";
+        await client.query(
+          `UPDATE service_suspension_cases
+           SET status = $2, resume_required = $5,
+               provider_occurred_at = $3, last_error = NULL,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND version = $4`,
+          [state.case_id, nextCaseStatus, occurredAt, state.case_version, resumeRequired],
+        );
+        let resumeSchedule: string | null = null;
+        if (resumeRequired) {
+          resumeSchedule = await scheduleResumeAfterRenewalSettlement(client, {
+            renewalId: pointer.renewal_id,
+            serviceId: pointer.service_id,
+          });
+        }
+        return { accepted: true, status: nextCaseStatus, resumeSchedule };
+      }
+
+      if (
+        state.case_status === "resolved" ||
+        state.service_status === "terminated" ||
+        state.renewal_status !== "paid" ||
+        (!state.case_status.startsWith("resume_") && state.case_status !== "manual")
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.resource_action_stale",
+          "service_suspension_case",
+          state.case_id,
+          "A late resume fact was recorded without overriding current Core eligibility",
+          { eventId: body.eventId, caseStatus: state.case_status },
+        );
+        return { ignored: true, reason: "stale_provider_fact" };
+      }
+      if (state.account_restricted_at) {
+        await client.query(
+          `UPDATE services
+           SET status = 'provisioned_hold', updated_at = now(), version = version + 1
+           WHERE id = $1 AND status IN ('active', 'suspended', 'provisioned_hold')`,
+          [state.service_id],
+        );
+        await client.query(
+          `UPDATE service_suspension_cases
+           SET status = 'manual', resume_required = false,
+               provider_occurred_at = $2,
+               last_error = 'Provider resumed the resource while the Client Account was restricted',
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND version = $3`,
+          [state.case_id, occurredAt, state.case_version],
+        );
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.resource_resume_restricted_hold",
+          "service_suspension_case",
+          state.case_id,
+          "Provider resume fact was recorded, but Core kept the service on restricted hold",
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { accepted: true, status: "manual", restrictedHold: true };
+      }
+      const serviceUpdate = await client.query(
+        `UPDATE services
+         SET status = 'active', updated_at = now(), version = version + 1
+         WHERE id = $1 AND status IN ('active', 'suspended')
+         RETURNING id`,
+        [state.service_id],
+      );
+      if (serviceUpdate.rowCount !== 1) {
+        await client.query(
+          `UPDATE service_suspension_cases
+           SET status = 'manual', provider_occurred_at = $2,
+               last_error = $3, updated_at = now(), version = version + 1
+           WHERE id = $1 AND version = $4`,
+          [
+            state.case_id,
+            occurredAt,
+            "Provider resumed the resource but Core service state conflicts",
+            state.case_version,
+          ],
+        );
+        return { accepted: true, status: "manual" };
+      }
+      await client.query(
+        `UPDATE service_suspension_cases
+         SET status = 'resolved', resume_required = false,
+             provider_occurred_at = $2, resolved_at = $2,
+             last_error = NULL, updated_at = now(), version = version + 1
+         WHERE id = $1 AND version = $3`,
+        [state.case_id, occurredAt, state.case_version],
+      );
+      return { accepted: true, status: "resolved" };
     });
     return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
   });

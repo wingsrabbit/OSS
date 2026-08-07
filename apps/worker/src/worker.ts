@@ -32,6 +32,9 @@ const config = z
     MOCK_PROVISION_SCENARIO: z
       .enum(["success", "failed", "timeout_existing"])
       .default("success"),
+    MOCK_RESOURCE_ACTION_SCENARIO: z
+      .enum(["success", "failed", "timeout_success", "duplicate_out_of_order"])
+      .default("success"),
   })
   .parse(process.env);
 
@@ -41,7 +44,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "012_stage_b_renewal_lifecycle";
+const REQUIRED_SCHEMA_VERSION = "013_stage_b_late_fee_suspension";
 
 type Job = {
   id: string;
@@ -142,7 +145,9 @@ async function enqueueReconcileWithClient(
     | "payment.reconcile"
     | "add_funds.reconcile"
     | "provision.reconcile"
-    | "refund.reconcile",
+    | "refund.reconcile"
+    | "service.suspend.reconcile"
+    | "service.resume.reconcile",
   uniqueKey: string,
   payload: Record<string, string>,
   delaySeconds: number,
@@ -366,7 +371,11 @@ async function recoverStaleJobs(): Promise<number> {
      FROM durable_jobs
      WHERE status = 'running'
        AND locked_at < now() - make_interval(secs => $1)
-       AND job_type NOT IN ('refund.start', 'refund.reconcile')
+       AND job_type NOT IN (
+         'refund.start', 'refund.reconcile',
+         'service.suspend.start', 'service.suspend.reconcile',
+         'service.resume.start', 'service.resume.reconcile'
+       )
      ORDER BY locked_at, created_at
      LIMIT 50`,
     [config.JOB_LOCK_TIMEOUT_SECONDS],
@@ -1686,6 +1695,521 @@ async function preflightProvision(
   });
 }
 
+type ServiceAction = "suspend" | "resume";
+
+type ServiceActionCall = {
+  externalResourceId: string;
+};
+
+type ServiceActionState = {
+  case_id: string;
+  case_status: string;
+  case_action: string;
+  case_provider_installation_id: string | null;
+  resume_required: boolean;
+  service_id: string;
+  service_status: string;
+  external_resource_id: string | null;
+  client_account_restricted_at: Date | null;
+  renewal_id: string;
+  renewal_status: string;
+  invoice_id: string;
+  invoice_total_minor: string;
+  allocated_minor: string;
+  product_action: string | null;
+  product_provider_installation_id: string | null;
+  required_suspend_capability: string | null;
+  required_resume_capability: string | null;
+  product_policy_version: number | null;
+  binding_action: string | null;
+  binding_provider_installation_id: string | null;
+  binding_capability_snapshot: unknown;
+  binding_product_policy_version: number | null;
+  provider_enabled: boolean | null;
+  current_provider_capabilities: unknown;
+  operation_status: string;
+  operation_kind: string;
+  operation_attempt_count: number;
+  operation_provider_installation_id: string;
+  operation_stable_key: string;
+  other_unpaid_case: boolean;
+};
+
+function capabilityList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
+}
+
+function serviceActionNames(action: ServiceAction): {
+  startStatus: string;
+  processingStatus: string;
+  unknownStatus: string;
+  terminalCaseStatus: string;
+  terminalServiceStatus: string;
+  operationKind: string;
+  capability: "resource_suspend" | "resource_resume";
+  reconcileType: "service.suspend.reconcile" | "service.resume.reconcile";
+} {
+  return action === "suspend"
+    ? {
+        startStatus: "suspend_queued",
+        processingStatus: "suspend_processing",
+        unknownStatus: "suspend_unknown",
+        terminalCaseStatus: "suspended",
+        terminalServiceStatus: "suspended",
+        operationKind: "resource_suspend",
+        capability: "resource_suspend",
+        reconcileType: "service.suspend.reconcile",
+      }
+    : {
+        startStatus: "resume_queued",
+        processingStatus: "resume_processing",
+        unknownStatus: "resume_unknown",
+        terminalCaseStatus: "resolved",
+        terminalServiceStatus: "active",
+        operationKind: "resource_resume",
+        capability: "resource_resume",
+        reconcileType: "service.resume.reconcile",
+      };
+}
+
+async function lockServiceActionState(
+  client: DatabaseClient,
+  job: Job,
+  action: ServiceAction,
+  caseId: string,
+  serviceId: string,
+  providerOperationId: string,
+): Promise<ServiceActionState | null> {
+  // Resolve the lock targets without taking row locks, then acquire business
+  // rows in the same order used by invoice settlement and Provider callbacks.
+  // The operation advisory lock serializes this exact external side effect but
+  // intentionally does not replace the shared row-lock order.
+  await lockProviderOperation(client, providerOperationId);
+  const pointer = await client.query<{
+    invoice_id: string;
+    renewal_id: string;
+    service_id: string;
+    order_item_id: string;
+    product_id: string;
+    client_account_id: string;
+  }>(
+    `SELECT suspension_case.invoice_id,
+            suspension_case.service_renewal_id AS renewal_id,
+            suspension_case.service_id,
+            service.order_item_id,
+            item.product_id,
+            service.client_account_id
+     FROM service_suspension_cases suspension_case
+     JOIN services service ON service.id = suspension_case.service_id
+     JOIN order_items item ON item.id = service.order_item_id
+     WHERE suspension_case.id = $1
+       AND suspension_case.service_id = $2`,
+    [caseId, serviceId],
+  );
+  const target = pointer.rows[0];
+  if (!target) {
+    await assertJobLeaseWithClient(client, job);
+    return null;
+  }
+  await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [target.invoice_id]);
+  await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+    target.order_item_id,
+  ]);
+  await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [target.service_id]);
+  await client.query("SELECT id FROM service_renewals WHERE id = $1 FOR UPDATE", [
+    target.renewal_id,
+  ]);
+  await client.query("SELECT id FROM service_suspension_cases WHERE id = $1 FOR UPDATE", [
+    caseId,
+  ]);
+  await client.query("SELECT id FROM provider_operations WHERE id = $1 FOR UPDATE", [
+    providerOperationId,
+  ]);
+  // These are the mutable authorization rows. Holding them until this
+  // transaction commits makes the commit the dispatch-ownership point: a
+  // concurrent account restriction, product-policy change, Provider pause, or
+  // capability revocation wins either before this final preflight or after the
+  // action has already been durably marked as dispatched. There is no separate
+  // provider_installations table in the current schema; the capability row is
+  // the authoritative installation/enabled record.
+  await client.query("SELECT id FROM products WHERE id = $1 FOR UPDATE", [target.product_id]);
+  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+    target.client_account_id,
+  ]);
+  const lockedPolicy = await client.query<{ provider_installation_id: string | null }>(
+    `SELECT provider_installation_id
+     FROM product_service_automation_policies
+     WHERE product_id = $1
+     FOR UPDATE`,
+    [target.product_id],
+  );
+  const lockedProviderInstallationId = lockedPolicy.rows[0]?.provider_installation_id;
+  if (lockedProviderInstallationId) {
+    await client.query(
+      `SELECT provider_installation_id
+       FROM provider_installation_capabilities
+       WHERE provider_installation_id = $1
+       FOR UPDATE`,
+      [lockedProviderInstallationId],
+    );
+  }
+  await assertJobLeaseWithClient(client, job);
+
+  const result = await client.query<ServiceActionState>(
+    `SELECT
+       suspension_case.id AS case_id,
+       suspension_case.status AS case_status,
+       suspension_case.action AS case_action,
+       suspension_case.provider_installation_id AS case_provider_installation_id,
+       suspension_case.resume_required,
+       service.id AS service_id,
+       service.status AS service_status,
+       service.external_resource_id,
+       client_account.restricted_at AS client_account_restricted_at,
+       renewal.id AS renewal_id,
+       renewal.status AS renewal_status,
+       invoice.id AS invoice_id,
+       invoice.total_minor::text AS invoice_total_minor,
+       allocation.allocated_minor::text,
+       product_policy.overdue_action AS product_action,
+       product_policy.provider_installation_id AS product_provider_installation_id,
+       product_policy.required_suspend_capability,
+       product_policy.required_resume_capability,
+       product_policy.version AS product_policy_version,
+       binding.overdue_action_snapshot AS binding_action,
+       binding.provider_installation_id AS binding_provider_installation_id,
+       binding.capability_snapshot AS binding_capability_snapshot,
+       binding.product_policy_version AS binding_product_policy_version,
+       provider.enabled AS provider_enabled,
+       provider.capabilities AS current_provider_capabilities,
+       operation.status AS operation_status,
+       operation.kind AS operation_kind,
+       operation.attempt_count AS operation_attempt_count,
+       operation.provider_installation_id AS operation_provider_installation_id,
+       operation.stable_key AS operation_stable_key,
+       EXISTS (
+         SELECT 1
+         FROM service_suspension_cases other_case
+         JOIN service_renewals other_renewal
+           ON other_renewal.id = other_case.service_renewal_id
+         WHERE other_case.service_id = service.id
+           AND other_case.id <> suspension_case.id
+           AND other_case.status <> 'resolved'
+           AND other_renewal.status <> 'paid'
+       ) AS other_unpaid_case
+     FROM service_suspension_cases suspension_case
+     JOIN services service ON service.id = suspension_case.service_id
+     JOIN client_accounts client_account ON client_account.id = service.client_account_id
+     JOIN service_renewals renewal ON renewal.id = suspension_case.service_renewal_id
+     JOIN invoices invoice ON invoice.id = suspension_case.invoice_id
+     JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+     JOIN order_items item ON item.id = service.order_item_id
+     LEFT JOIN product_service_automation_policies product_policy
+       ON product_policy.product_id = item.product_id
+     LEFT JOIN service_provider_bindings binding ON binding.service_id = service.id
+     LEFT JOIN provider_installation_capabilities provider
+       ON provider.provider_installation_id = binding.provider_installation_id
+     JOIN provider_operations operation
+       ON operation.id = $3
+      AND operation.subject_type = 'service_suspension_case'
+      AND operation.subject_id = suspension_case.id
+     WHERE suspension_case.id = $1
+       AND suspension_case.service_id = $2`,
+    [caseId, serviceId, providerOperationId],
+  );
+  const state = result.rows[0] ?? null;
+  if (state && state.operation_kind !== serviceActionNames(action).operationKind) return state;
+  return state;
+}
+
+async function setServiceActionManualWithClient(
+  client: DatabaseClient,
+  job: Job,
+  state: ServiceActionState,
+  providerOperationId: string,
+  action: ServiceAction,
+  reason: string,
+  definitivelyRejected = false,
+): Promise<void> {
+  const potentiallySent = state.operation_attempt_count > 0 ||
+    state.operation_status === "running" || state.operation_status === "unknown";
+  await client.query(
+    `UPDATE provider_operations
+     SET status = $2, last_error = $3, updated_at = now()
+     WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+    [
+      providerOperationId,
+      definitivelyRejected || !potentiallySent ? "failed" : "unknown",
+      reason.slice(0, 1_000),
+    ],
+  );
+  if (state.case_status !== "resolved") {
+    await client.query(
+      `UPDATE service_suspension_cases
+       SET status = 'manual',
+           resume_required = CASE WHEN $2 = 'resume' THEN true ELSE resume_required END,
+           last_error = $3, updated_at = now(), version = version + 1
+       WHERE id = $1 AND status <> 'resolved'`,
+      [state.case_id, action, reason.slice(0, 1_000)],
+    );
+  }
+  await client.query(
+    `INSERT INTO audit_events(
+       actor_type, actor_id, action, target_type, target_id, reason, metadata
+     ) VALUES ('system', $1, $2, 'service_suspension_case', $3, $4, $5)`,
+    [
+      config.WORKER_ID,
+      `service.${action}.manual`,
+      state.case_id,
+      reason.slice(0, 1_000),
+      {
+        providerOperationId,
+        serviceId: state.service_id,
+        potentiallySent,
+        definitivelyRejected,
+      },
+    ],
+  );
+  await manualJobWithClient(client, job, reason);
+}
+
+async function preflightServiceAction(
+  job: Job,
+  action: ServiceAction,
+  caseId: string,
+  serviceId: string,
+  providerOperationId: string,
+  mode: "start" | "reconcile",
+): Promise<PreflightResult<ServiceActionCall>> {
+  return transaction(async (client) => {
+    const state = await lockServiceActionState(
+      client,
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(
+        client,
+        job,
+        "service action job references missing or inconsistent Core records",
+      );
+      return { kind: "halted" };
+    }
+    const names = serviceActionNames(action);
+    const terminal =
+      state.operation_status === "succeeded" &&
+      state.case_status === names.terminalCaseStatus &&
+      state.service_status === names.terminalServiceStatus;
+    const failed = state.operation_status === "failed" && state.case_status === "manual";
+    if (terminal || failed) {
+      await completeJobWithClient(client, job);
+      return { kind: "halted" };
+    }
+    if (
+      state.case_status === "resolved" &&
+      (state.operation_status === "succeeded" || state.operation_status === "failed")
+    ) {
+      await completeJobWithClient(client, job);
+      return { kind: "halted" };
+    }
+
+    const bindingCapabilities = capabilityList(state.binding_capability_snapshot);
+    const currentCapabilities = capabilityList(state.current_provider_capabilities);
+    const requiredCapability = action === "suspend"
+      ? state.required_suspend_capability ?? names.capability
+      : state.required_resume_capability ?? names.capability;
+    const ownershipValid =
+      state.case_id === caseId &&
+      state.service_id === serviceId &&
+      state.operation_kind === names.operationKind &&
+      state.operation_stable_key === job.unique_key &&
+      state.case_provider_installation_id === "mock-provisioning-v1" &&
+      state.operation_provider_installation_id === "mock-provisioning-v1" &&
+      state.binding_provider_installation_id === "mock-provisioning-v1";
+    const currentlyAuthorized =
+      state.case_action === "automatic" &&
+      state.product_action === "automatic" &&
+      state.product_provider_installation_id === "mock-provisioning-v1" &&
+      state.binding_action === "automatic" &&
+      state.product_policy_version !== null &&
+      state.binding_product_policy_version === state.product_policy_version &&
+      state.provider_enabled === true &&
+      bindingCapabilities.includes(requiredCapability) &&
+      currentCapabilities.includes(requiredCapability) &&
+      (action !== "resume" || state.client_account_restricted_at === null);
+    if (!ownershipValid || (mode === "start" && !currentlyAuthorized)) {
+      await setServiceActionManualWithClient(
+        client,
+        job,
+        state,
+        providerOperationId,
+        action,
+        !ownershipValid
+          ? "service action Provider ownership or stable operation identity is inconsistent"
+          : "service action is no longer allowed by the current product, binding, or Provider capability policy",
+      );
+      return { kind: "halted" };
+    }
+    if (!state.external_resource_id) {
+      await setServiceActionManualWithClient(
+        client,
+        job,
+        state,
+        providerOperationId,
+        action,
+        "service action requires an existing external resource id",
+      );
+      return { kind: "halted" };
+    }
+
+    const settled = BigInt(state.allocated_minor) >= BigInt(state.invoice_total_minor);
+    if (mode === "start" && action === "suspend" && settled) {
+      const knownUnsent =
+        state.operation_status === "queued" &&
+        state.operation_attempt_count === 0 &&
+        state.case_status === names.startStatus;
+      if (knownUnsent) {
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed',
+               last_error = 'renewal settled before the suspension request was sent',
+               updated_at = now()
+           WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+          [providerOperationId],
+        );
+        await client.query(
+          `UPDATE service_suspension_cases
+           SET status = 'resolved', resume_required = false, resolved_at = now(),
+               last_error = NULL, updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'suspend_queued'`,
+          [caseId],
+        );
+      } else {
+        const reason =
+          "renewal settled after suspension may have been sent; query-only reconciliation required";
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'unknown', last_error = $2, updated_at = now()
+           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+          [providerOperationId, reason],
+        );
+        await client.query(
+          `UPDATE service_suspension_cases
+           SET status = $2, resume_required = true, last_error = $3,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND status IN ($4, $5, $2)`,
+          [caseId, names.unknownStatus, reason, names.startStatus, names.processingStatus],
+        );
+        await enqueueReconcileWithClient(
+          client,
+          names.reconcileType,
+          job.unique_key,
+          { caseId, serviceId, providerOperationId },
+          config.RECONCILE_BASE_DELAY_SECONDS,
+        );
+      }
+      await completeJobWithClient(client, job);
+      return { kind: "halted" };
+    }
+    const businessStateValid = action === "suspend"
+      ? state.renewal_status !== "paid" && !settled &&
+        (mode === "reconcile" || state.service_status === "active")
+      : state.renewal_status === "paid" && settled && !state.other_unpaid_case &&
+        (mode === "reconcile" || state.service_status === "suspended");
+    if (mode === "start" && !businessStateValid) {
+      await setServiceActionManualWithClient(
+        client,
+        job,
+        state,
+        providerOperationId,
+        action,
+        action === "suspend"
+          ? "suspension preflight found no eligible unpaid active renewal"
+          : "resume preflight requires a settled renewal, suspended service, and no other unpaid case",
+      );
+      return { kind: "halted" };
+    }
+
+    if (mode === "reconcile") {
+      const possiblySent = state.operation_attempt_count > 0 ||
+        state.operation_status === "running" || state.operation_status === "unknown";
+      if (!possiblySent) {
+        await setServiceActionManualWithClient(
+          client,
+          job,
+          state,
+          providerOperationId,
+          action,
+          "service action reconciliation has no evidence that the Provider request was sent",
+        );
+        return { kind: "halted" };
+      }
+      return { kind: "call", value: { externalResourceId: state.external_resource_id } };
+    }
+
+    const actionMayHaveRun =
+      state.case_status !== names.startStatus ||
+      state.operation_status !== "queued" ||
+      state.operation_attempt_count > 0;
+    if (actionMayHaveRun) {
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown',
+             last_error = 'resource action may already have been sent; reconciliation required',
+             updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId],
+      );
+      await client.query(
+        `UPDATE service_suspension_cases
+         SET status = $2, last_error = $3, updated_at = now(), version = version + 1
+         WHERE id = $1 AND status IN ($4, $5)`,
+        [
+          caseId,
+          names.unknownStatus,
+          "resource action may already have been sent; reconciliation required",
+          names.startStatus,
+          names.processingStatus,
+        ],
+      );
+      await enqueueReconcileWithClient(
+        client,
+        names.reconcileType,
+        job.unique_key,
+        { caseId, serviceId, providerOperationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeJobWithClient(client, job);
+      return { kind: "halted" };
+    }
+
+    const caseUpdated = await client.query(
+      `UPDATE service_suspension_cases
+       SET status = $2, last_error = NULL, updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = $3
+       RETURNING id`,
+      [caseId, names.processingStatus, names.startStatus],
+    );
+    const operationUpdated = await client.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = attempt_count + 1,
+           last_error = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'queued' AND attempt_count = 0
+       RETURNING id`,
+      [providerOperationId],
+    );
+    if (caseUpdated.rowCount !== 1 || operationUpdated.rowCount !== 1) {
+      throw new Error("service action state changed while beginning Provider delivery");
+    }
+    return { kind: "call", value: { externalResourceId: state.external_resource_id } };
+  });
+}
+
 async function finishStartWithWatchdog(
   job: Job,
   operationId: string,
@@ -1693,7 +2217,9 @@ async function finishStartWithWatchdog(
     | "payment.reconcile"
     | "add_funds.reconcile"
     | "provision.reconcile"
-    | "refund.reconcile",
+    | "refund.reconcile"
+    | "service.suspend.reconcile"
+    | "service.resume.reconcile",
 ): Promise<void> {
   await transaction(async (client) => {
     if (reconcileType === "refund.reconcile" && job.payload.refundId) {
@@ -1709,11 +2235,18 @@ async function finishStartWithWatchdog(
     );
     const status = operation.rows[0]?.status;
     if (status && status !== "succeeded" && status !== "failed") {
+      const reconcilePayload = reconcileType.startsWith("service.")
+        ? {
+            caseId: job.payload.caseId ?? "",
+            serviceId: job.payload.serviceId ?? "",
+            providerOperationId: operationId,
+          }
+        : { ...job.payload, operationId };
       await enqueueReconcileWithClient(
         client,
         reconcileType,
         job.unique_key,
-        { ...job.payload, operationId },
+        reconcilePayload,
         config.WATCHDOG_DELAY_SECONDS,
       );
     }
@@ -3562,6 +4095,681 @@ async function startProvision(job: Job): Promise<void> {
   }
 }
 
+async function markServiceActionUnknown(
+  job: Job,
+  action: ServiceAction,
+  caseId: string,
+  serviceId: string,
+  providerOperationId: string,
+  reason: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    const state = await lockServiceActionState(
+      client,
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(
+        client,
+        job,
+        "resource action became inconsistent after Provider delivery",
+      );
+      return;
+    }
+    const names = serviceActionNames(action);
+    if (
+      (state.operation_status === "succeeded" &&
+        state.case_status === names.terminalCaseStatus &&
+        state.service_status === names.terminalServiceStatus) ||
+      (state.operation_status === "failed" && state.case_status === "manual")
+    ) {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [providerOperationId, reason.slice(0, 1_000)],
+    );
+    await client.query(
+      `UPDATE service_suspension_cases
+       SET status = $2, last_error = $3, updated_at = now(), version = version + 1
+       WHERE id = $1 AND status IN ($4, $5)`,
+      [
+        caseId,
+        names.unknownStatus,
+        reason.slice(0, 1_000),
+        names.startStatus,
+        names.processingStatus,
+      ],
+    );
+    await enqueueReconcileWithClient(
+      client,
+      names.reconcileType,
+      job.unique_key,
+      { caseId, serviceId, providerOperationId },
+      config.RECONCILE_BASE_DELAY_SECONDS,
+    );
+    await completeJobWithClient(client, job);
+  });
+}
+
+async function rejectServiceActionStartManually(
+  job: Job,
+  action: ServiceAction,
+  caseId: string,
+  serviceId: string,
+  providerOperationId: string,
+  reason: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    const state = await lockServiceActionState(
+      client,
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(client, job, reason);
+      return;
+    }
+    const names = serviceActionNames(action);
+    if (
+      state.operation_status === "succeeded" &&
+      state.case_status === names.terminalCaseStatus &&
+      state.service_status === names.terminalServiceStatus
+    ) {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    await setServiceActionManualWithClient(
+      client,
+      job,
+      state,
+      providerOperationId,
+      action,
+      reason,
+      true,
+    );
+  });
+}
+
+async function delayServiceActionReconcile(
+  job: Job,
+  action: ServiceAction,
+  caseId: string,
+  serviceId: string,
+  providerOperationId: string,
+  reason: string,
+  forceManual = false,
+): Promise<void> {
+  await transaction(async (client) => {
+    const state = await lockServiceActionState(
+      client,
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(client, job, reason);
+      return;
+    }
+    const names = serviceActionNames(action);
+    if (
+      (state.operation_status === "succeeded" &&
+        state.case_status === names.terminalCaseStatus &&
+        state.service_status === names.terminalServiceStatus) ||
+      (state.operation_status === "failed" && state.case_status === "manual")
+    ) {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    const manual = forceManual || job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
+    if (manual) {
+      await setServiceActionManualWithClient(
+        client,
+        job,
+        state,
+        providerOperationId,
+        action,
+        reason,
+      );
+      return;
+    }
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [providerOperationId, reason.slice(0, 1_000)],
+    );
+    const updated = await client.query(
+      `UPDATE durable_jobs
+       SET status = 'pending',
+           available_at = now() + make_interval(secs => $2),
+           locked_at = NULL, locked_by = NULL, last_error = $3, updated_at = now()
+       WHERE id = $1 AND status = 'running' AND locked_by = $4 AND attempts = $5
+       RETURNING id`,
+      [
+        job.id,
+        reconcileDelaySeconds(job.attempts),
+        reason.slice(0, 1_000),
+        config.WORKER_ID,
+        job.attempts,
+      ],
+    );
+    if (updated.rowCount !== 1) throw new LostJobLeaseError(job.id);
+  });
+}
+
+async function startServiceAction(job: Job, action: ServiceAction): Promise<void> {
+  const caseId = job.payload.caseId;
+  const serviceId = job.payload.serviceId;
+  const providerOperationId = job.payload.providerOperationId;
+  if (!caseId || !serviceId || !providerOperationId) {
+    throw new Error(`Invalid service.${action}.start payload`);
+  }
+  const preflight = await preflightServiceAction(
+    job,
+    action,
+    caseId,
+    serviceId,
+    providerOperationId,
+    "start",
+  );
+  if (preflight.kind === "halted") return;
+  const callbackCapability = providerOperationCapability(
+    config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+    "mock-provisioning-v1",
+    providerOperationId,
+  );
+  try {
+    const response = await providerRequest(
+      config.MOCK_PROVISIONING_PROVIDER_URL,
+      config.MOCK_PROVISIONING_PROVIDER_TOKEN,
+      "/v1/resource-actions",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": providerOperationId },
+        body: JSON.stringify({
+          operationId: providerOperationId,
+          serviceId,
+          externalResourceId: preflight.value.externalResourceId,
+          callbackCapability,
+          action,
+          scenario: config.MOCK_RESOURCE_ACTION_SCENARIO,
+        }),
+      },
+    );
+    if (!response.ok) {
+      if (
+        response.status === 408 ||
+        response.status === 409 ||
+        response.status === 425 ||
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        await markServiceActionUnknown(
+          job,
+          action,
+          caseId,
+          serviceId,
+          providerOperationId,
+          `resource ${action} returned ambiguous HTTP ${response.status}; reconciliation required`,
+        );
+        return;
+      }
+      await rejectServiceActionStartManually(
+        job,
+        action,
+        caseId,
+        serviceId,
+        providerOperationId,
+        `resource ${action} was definitively rejected with HTTP ${response.status}`,
+      );
+      return;
+    }
+    await finishStartWithWatchdog(
+      job,
+      providerOperationId,
+      serviceActionNames(action).reconcileType,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await markServiceActionUnknown(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      `resource ${action} transport result is unknown (${message}); reconciliation required`,
+    );
+  }
+}
+
+async function reconcileServiceAction(job: Job, action: ServiceAction): Promise<void> {
+  const caseId = job.payload.caseId;
+  const serviceId = job.payload.serviceId;
+  const providerOperationId = job.payload.providerOperationId ?? job.payload.operationId;
+  if (!caseId || !serviceId || !providerOperationId) {
+    throw new Error(`Invalid service.${action}.reconcile payload`);
+  }
+  const preflight = await preflightServiceAction(
+    job,
+    action,
+    caseId,
+    serviceId,
+    providerOperationId,
+    "reconcile",
+  );
+  if (preflight.kind === "halted") return;
+
+  let response: Response;
+  try {
+    response = await providerRequest(
+      config.MOCK_PROVISIONING_PROVIDER_URL,
+      config.MOCK_PROVISIONING_PROVIDER_TOKEN,
+      `/v1/resource-actions/${encodeURIComponent(providerOperationId)}`,
+      { method: "GET" },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await delayServiceActionReconcile(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      `resource ${action} reconciliation transport failed: ${message}`,
+    );
+    return;
+  }
+  if (
+    response.status === 404 ||
+    response.status === 408 ||
+    response.status === 425 ||
+    response.status === 429 ||
+    response.status >= 500
+  ) {
+    await delayServiceActionReconcile(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      `resource ${action} is not yet reconcilable at the Provider (HTTP ${response.status})`,
+    );
+    return;
+  }
+  if (!response.ok) {
+    await delayServiceActionReconcile(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      `resource ${action} reconciliation requires manual intervention (HTTP ${response.status})`,
+      true,
+    );
+    return;
+  }
+
+  let fact: {
+    callbackCapability: string;
+    serviceId: string;
+    externalResourceId: string;
+    action: ServiceAction;
+    status: "succeeded" | "failed";
+    occurredAt: string;
+  };
+  try {
+    fact = z
+      .object({
+        callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+        serviceId: z.uuid(),
+        externalResourceId: z.string().min(1).max(200),
+        action: z.enum(["suspend", "resume"]),
+        status: z.enum(["succeeded", "failed"]),
+        occurredAt: z.iso.datetime({ offset: true }),
+      })
+      .parse(await response.json());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid Provider response";
+    await delayServiceActionReconcile(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      `resource ${action} reconciliation response is invalid: ${message}`,
+      true,
+    );
+    return;
+  }
+  if (
+    fact.action !== action ||
+    fact.serviceId !== serviceId ||
+    fact.externalResourceId !== preflight.value.externalResourceId ||
+    !providerOperationCapabilityMatches(
+      fact.callbackCapability,
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+      "mock-provisioning-v1",
+      providerOperationId,
+    )
+  ) {
+    await delayServiceActionReconcile(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      `resource ${action} reconciliation returned mismatched ownership or operation capability`,
+      true,
+    );
+    return;
+  }
+
+  const coreOutcome = await submitReconciledEvent(
+    "/api/v1/provider-events/resource-action",
+    {
+      eventId: `reconcile:resource-action:${providerOperationId}:${randomUUID()}`,
+      providerOperationId,
+      ...fact,
+    },
+    config.MOCK_PROVISIONING_WEBHOOK_SECRET,
+  );
+  if (coreOutcome.kind === "retry") {
+    await delayServiceActionReconcile(
+      job,
+      action,
+      caseId,
+      serviceId,
+      providerOperationId,
+      coreOutcome.reason,
+    );
+    return;
+  }
+  await completeJob(job);
+}
+
+async function recoverOneStaleServiceActionJob(candidate: Job): Promise<boolean> {
+  const action: ServiceAction | null = candidate.job_type.startsWith("service.suspend.")
+    ? "suspend"
+    : candidate.job_type.startsWith("service.resume.")
+      ? "resume"
+      : null;
+  if (!action) return false;
+  const start = candidate.job_type.endsWith(".start");
+  const caseId = candidate.payload.caseId;
+  const serviceId = candidate.payload.serviceId;
+  const providerOperationId =
+    candidate.payload.providerOperationId ?? candidate.payload.operationId;
+  if (!caseId || !serviceId || !providerOperationId) {
+    return transaction(async (client) => {
+      const job = await lockStaleJobWithClient(client, candidate);
+      if (!job) return false;
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale service action job has an invalid payload; manual inspection required",
+      );
+      return true;
+    });
+  }
+
+  return transaction(async (client) => {
+    await lockProviderOperation(client, providerOperationId);
+    const pointer = await client.query<{
+      invoice_id: string;
+      renewal_id: string;
+      service_id: string;
+      order_item_id: string;
+    }>(
+      `SELECT suspension_case.invoice_id,
+              suspension_case.service_renewal_id AS renewal_id,
+              suspension_case.service_id,
+              service.order_item_id
+       FROM service_suspension_cases suspension_case
+       JOIN services service ON service.id = suspension_case.service_id
+       WHERE suspension_case.id = $1`,
+      [caseId],
+    );
+    const target = pointer.rows[0];
+    if (target) {
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [target.invoice_id]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        target.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        target.service_id,
+      ]);
+      await client.query("SELECT id FROM service_renewals WHERE id = $1 FOR UPDATE", [
+        target.renewal_id,
+      ]);
+      await client.query("SELECT id FROM service_suspension_cases WHERE id = $1 FOR UPDATE", [
+        caseId,
+      ]);
+      await client.query("SELECT id FROM provider_operations WHERE id = $1 FOR UPDATE", [
+        providerOperationId,
+      ]);
+    }
+    const job = await lockStaleJobWithClient(client, candidate);
+    if (!job) return false;
+    if (!target) {
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale service action job references missing Core records",
+      );
+      return true;
+    }
+    const names = serviceActionNames(action);
+    const state = await client.query<{
+      case_status: string;
+      service_id: string;
+      service_status: string;
+      operation_status: string;
+      operation_attempt_count: number;
+      operation_kind: string;
+      operation_subject_id: string;
+    }>(
+      `SELECT suspension_case.status AS case_status,
+              service.id AS service_id,
+              service.status AS service_status,
+              operation.status AS operation_status,
+              operation.attempt_count AS operation_attempt_count,
+              operation.kind AS operation_kind,
+              operation.subject_id AS operation_subject_id
+       FROM service_suspension_cases suspension_case
+       JOIN services service ON service.id = suspension_case.service_id
+       JOIN provider_operations operation ON operation.id = $2
+       WHERE suspension_case.id = $1`,
+      [caseId, providerOperationId],
+    );
+    const current = state.rows[0];
+    if (
+      !current ||
+      current.service_id !== serviceId ||
+      current.operation_kind !== names.operationKind ||
+      current.operation_subject_id !== caseId
+    ) {
+      const reason =
+        "stale service action job references a missing or inconsistent Provider operation";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $3, updated_at = now()
+         WHERE id = $1
+           AND subject_type = 'service_suspension_case'
+           AND subject_id = $2
+           AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId, caseId, reason],
+      );
+      await client.query(
+        `UPDATE service_suspension_cases
+         SET status = 'manual',
+             resume_required = CASE WHEN $2 = 'resume' THEN true ELSE resume_required END,
+             last_error = $3, updated_at = now(), version = version + 1
+         WHERE id = $1 AND status <> 'resolved'`,
+        [caseId, action, reason],
+      );
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, reason, metadata
+         ) VALUES ('system', $1, 'service.action_stale_recovery_manual',
+                   'service_suspension_case', $2, $3, $4)`,
+        [
+          config.WORKER_ID,
+          caseId,
+          reason,
+          { providerOperationId, payloadServiceId: serviceId },
+        ],
+      );
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        reason,
+      );
+      return true;
+    }
+    if (
+      (current.operation_status === "succeeded" &&
+        current.case_status === names.terminalCaseStatus &&
+        current.service_status === names.terminalServiceStatus) ||
+      (current.operation_status === "failed" && current.case_status === "manual") ||
+      current.case_status === "resolved"
+    ) {
+      await completeRecoveredJobWithClient(client, job);
+      return true;
+    }
+
+    if (
+      start &&
+      current.operation_status === "queued" &&
+      current.operation_attempt_count === 0 &&
+      current.case_status === names.startStatus
+    ) {
+      if (job.attempts >= config.MAX_JOB_ATTEMPTS) {
+        const reason =
+          "known-unsent resource action repeatedly lost its worker lease; manual intervention required";
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed', last_error = $2, updated_at = now()
+           WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+          [providerOperationId, reason],
+        );
+        await client.query(
+          `UPDATE service_suspension_cases
+           SET status = 'manual',
+               resume_required = CASE WHEN $2 = 'resume' THEN true ELSE resume_required END,
+               last_error = $3, updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = $4`,
+          [caseId, action, reason, names.startStatus],
+        );
+        await manualRecoveredJobWithClient(client, job, reason);
+      } else {
+        await client.query(
+          `UPDATE durable_jobs
+           SET status = 'pending',
+               available_at = now() + make_interval(secs => $3),
+               locked_at = NULL, locked_by = NULL,
+               last_error = 'worker lock expired before the Provider action attempt began',
+               updated_at = now()
+           WHERE id = $1 AND status = 'running' AND attempts = $2`,
+          [job.id, job.attempts, reconcileDelaySeconds(job.attempts)],
+        );
+      }
+      return true;
+    }
+
+    if (start) {
+      const reason =
+        "worker lock expired after a resource action may have been sent; query-only reconciliation required";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId, reason],
+      );
+      await client.query(
+        `UPDATE service_suspension_cases
+         SET status = $2, last_error = $3, updated_at = now(), version = version + 1
+         WHERE id = $1 AND status IN ($4, $5)`,
+        [caseId, names.unknownStatus, reason, names.startStatus, names.processingStatus],
+      );
+      await enqueueReconcileWithClient(
+        client,
+        names.reconcileType,
+        job.unique_key,
+        { caseId, serviceId, providerOperationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeRecoveredJobWithClient(client, job);
+      return true;
+    }
+
+    const manual = job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
+    const reason = manual
+      ? "resource action reconciliation lease repeatedly expired; manual intervention required"
+      : "resource action reconciliation lease expired; retrying query only";
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [providerOperationId, reason],
+    );
+    if (manual && current.case_status !== "resolved") {
+      await client.query(
+        `UPDATE service_suspension_cases
+         SET status = 'manual',
+             resume_required = CASE WHEN $2 = 'resume' THEN true ELSE resume_required END,
+             last_error = $3, updated_at = now(), version = version + 1
+         WHERE id = $1 AND status <> 'resolved'`,
+        [caseId, action, reason],
+      );
+      await manualRecoveredJobWithClient(client, job, reason);
+    } else {
+      await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending',
+             available_at = now() + make_interval(secs => $3),
+             locked_at = NULL, locked_by = NULL, last_error = $4, updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2`,
+        [job.id, job.attempts, reconcileDelaySeconds(job.attempts), reason],
+      );
+    }
+    return true;
+  });
+}
+
+async function recoverStaleServiceActionJobs(): Promise<number> {
+  const candidates = await pool.query<Job>(
+    `SELECT id, job_type, unique_key, payload, attempts
+     FROM durable_jobs
+     WHERE status = 'running'
+       AND job_type IN (
+         'service.suspend.start', 'service.suspend.reconcile',
+         'service.resume.start', 'service.resume.reconcile'
+       )
+       AND locked_at < now() - make_interval(secs => $1)
+     ORDER BY locked_at, created_at
+     LIMIT 50`,
+    [config.JOB_LOCK_TIMEOUT_SECONDS],
+  );
+  let recovered = 0;
+  for (const candidate of candidates.rows) {
+    if (await recoverOneStaleServiceActionJob(candidate)) recovered += 1;
+  }
+  return recovered;
+}
+
 function coreSignature(timestamp: string, body: unknown, secret: string): string {
   return createHmac("sha256", secret)
     .update(`${timestamp}.${canonicalProviderJson(body)}`, "utf8")
@@ -4682,7 +5890,83 @@ async function sendNotification(job: Job): Promise<void> {
   await completeJob(job);
 }
 
+async function ensureScheduledBillingJob(): Promise<number> {
+  const result = await pool.query(
+    `WITH due_policy AS (
+       SELECT
+         policy.id,
+         (now() AT TIME ZONE policy.timezone)::date::text AS business_date,
+         now() AS effective_at
+       FROM billing_automation_policies policy
+       WHERE policy.enabled
+         AND (now() AT TIME ZONE policy.timezone)::time >= policy.run_local_time
+         AND NOT EXISTS (
+           SELECT 1
+           FROM billing_automation_runs run
+           WHERE run.policy_id = policy.id
+             AND run.business_date =
+               (now() AT TIME ZONE policy.timezone)::date
+         )
+       FOR UPDATE OF policy SKIP LOCKED
+     )
+     INSERT INTO durable_jobs(job_type, unique_key, payload)
+     SELECT
+       'billing.automation.scheduled',
+       'billing-automation:' || due_policy.id || ':' || due_policy.business_date,
+       jsonb_build_object(
+         'policyId', due_policy.id,
+         'businessDate', due_policy.business_date,
+         'effectiveAt', to_char(due_policy.effective_at AT TIME ZONE 'UTC',
+           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+       )
+     FROM due_policy
+     ON CONFLICT (job_type, unique_key) DO NOTHING
+     RETURNING id`,
+  );
+  return result.rowCount ?? 0;
+}
+
+async function runScheduledBillingAutomation(job: Job): Promise<void> {
+  const body = z
+    .object({
+      policyId: z.literal("default"),
+      businessDate: z.iso.date(),
+      effectiveAt: z.iso.datetime({ offset: true }),
+    })
+    .strict()
+    .parse(job.payload);
+  const timestamp = Date.now().toString();
+  const response = await fetch(
+    new URL("/api/v1/internal/billing/automation/run", config.CORE_INTERNAL_URL),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Timestamp": timestamp,
+        "X-OSS-Signature": coreSignature(
+          timestamp,
+          body,
+          config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+        ),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+      redirect: "error",
+    },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 500);
+    throw new Error(
+      `Core scheduled billing automation returned HTTP ${response.status}: ${detail}`,
+    );
+  }
+  await completeJob(job);
+}
+
 async function processJob(job: Job): Promise<void> {
+  if (job.job_type === "billing.automation.scheduled") {
+    return runScheduledBillingAutomation(job);
+  }
   if (job.job_type === "notification.send") return sendNotification(job);
   if (job.job_type === "refund.start") return startRefund(job);
   if (job.job_type === "refund.reconcile") return reconcileRefund(job);
@@ -4692,6 +5976,14 @@ async function processJob(job: Job): Promise<void> {
   if (job.job_type === "add_funds.reconcile") return reconcileAddFunds(job);
   if (job.job_type === "provision.start") return startProvision(job);
   if (job.job_type === "provision.reconcile") return reconcileProvision(job);
+  if (job.job_type === "service.suspend.start") return startServiceAction(job, "suspend");
+  if (job.job_type === "service.suspend.reconcile") {
+    return reconcileServiceAction(job, "suspend");
+  }
+  if (job.job_type === "service.resume.start") return startServiceAction(job, "resume");
+  if (job.job_type === "service.resume.reconcile") {
+    return reconcileServiceAction(job, "resume");
+  }
   throw new Error(`Unsupported job type: ${job.job_type}`);
 }
 
@@ -4714,10 +6006,27 @@ if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
 
 console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`);
 let nextRecoveryAt = 0;
+let nextBillingScheduleAt = 0;
 while (!stopping) {
+  if (Date.now() >= nextBillingScheduleAt) {
+    try {
+      const scheduled = await ensureScheduledBillingJob();
+      if (scheduled > 0) {
+        console.log("scheduled durable billing automation", { count: scheduled });
+      }
+    } catch (error) {
+      console.error("billing automation scheduling failed", {
+        error: error instanceof Error ? error.message : "unknown",
+      });
+    }
+    nextBillingScheduleAt = Date.now() + 60_000;
+  }
   if (Date.now() >= nextRecoveryAt) {
     try {
-      const recovered = (await recoverStaleJobs()) + (await recoverStaleRefundJobs());
+      const recovered =
+        (await recoverStaleJobs()) +
+        (await recoverStaleRefundJobs()) +
+        (await recoverStaleServiceActionJobs());
       if (recovered > 0) {
         console.warn("recovered stale durable jobs", { count: recovered });
       }

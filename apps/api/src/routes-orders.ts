@@ -429,6 +429,24 @@ export async function registerOrderRoutes(
       if (!serviceId) throw new Error("Unable to create service");
 
       await client.query(
+        `INSERT INTO service_provider_bindings(
+           service_id, provider_installation_id, overdue_action_snapshot,
+           capability_snapshot, product_policy_version
+         )
+         SELECT
+           $1,
+           policy.provider_installation_id,
+           policy.overdue_action,
+           COALESCE(provider.capabilities, '[]'::jsonb),
+           policy.version
+         FROM product_service_automation_policies policy
+         LEFT JOIN provider_installation_capabilities provider
+           ON provider.provider_installation_id = policy.provider_installation_id
+         WHERE policy.product_id = $2`,
+        [serviceId, snapshot.productId],
+      );
+
+      await client.query(
         `INSERT INTO outbox(event_type, unique_key, payload)
          VALUES ('order.submitted', $1, $2)`,
         [`order:${orderId}`, { orderId, invoiceId, clientAccountId: user.clientAccountId }],

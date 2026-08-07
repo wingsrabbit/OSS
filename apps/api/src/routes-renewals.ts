@@ -7,6 +7,7 @@ import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { assertProviderSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
 import {
   requireRecentReauth,
@@ -45,6 +46,26 @@ type RenewalListRow = {
   reminder_suppressed_at: Date | null;
   reminder_job_status: string | null;
   reminder_job_attempts: number | null;
+  late_fee_disposition: "charged" | "skipped_zero" | null;
+  late_fee_basis_minor: string | null;
+  late_fee_basis_points: number | null;
+  late_fee_amount_minor: string | null;
+  late_fee_business_date: string | null;
+  suspension_case_id: string | null;
+  suspension_action: "automatic" | "manual" | "none" | null;
+  suspension_decision_reason: string | null;
+  suspension_status: string | null;
+  suspension_resume_required: boolean | null;
+  suspension_provider_installation_id: string | null;
+  suspension_last_error: string | null;
+  suspension_version: number | null;
+  suspend_operation_status: string | null;
+  suspend_operation_attempts: number | null;
+  resume_operation_status: string | null;
+  resume_operation_attempts: number | null;
+  pending_payment_result: boolean;
+  delinquency_deferral_count: string;
+  latest_delinquency_deferral_at: Date | null;
 };
 
 async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
@@ -77,7 +98,36 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
        delivery.provider_occurred_at AS reminder_provider_occurred_at,
        suppression.created_at AS reminder_suppressed_at,
        job.status AS reminder_job_status,
-       job.attempts AS reminder_job_attempts
+       job.attempts AS reminder_job_attempts,
+       late_fee.disposition AS late_fee_disposition,
+       late_fee.basis_minor::text AS late_fee_basis_minor,
+       late_fee.basis_points AS late_fee_basis_points,
+       late_fee.amount_minor::text AS late_fee_amount_minor,
+       late_fee.business_date::text AS late_fee_business_date,
+       suspension_case.id AS suspension_case_id,
+       suspension_case.action AS suspension_action,
+       suspension_case.decision_reason AS suspension_decision_reason,
+       suspension_case.status AS suspension_status,
+       suspension_case.resume_required AS suspension_resume_required,
+       suspension_case.provider_installation_id AS suspension_provider_installation_id,
+       suspension_case.last_error AS suspension_last_error,
+       suspension_case.version AS suspension_version,
+       suspend_operation.status AS suspend_operation_status,
+       suspend_operation.attempt_count AS suspend_operation_attempts,
+       resume_operation.status AS resume_operation_status,
+       resume_operation.attempt_count AS resume_operation_attempts,
+       EXISTS (
+         SELECT 1
+         FROM payment_attempts attempt
+         WHERE attempt.invoice_id = invoice.id
+           AND attempt.status IN ('created', 'processing', 'unknown')
+       ) AS pending_payment_result,
+       (SELECT count(*)::text
+        FROM invoice_delinquency_deferrals deferral
+        WHERE deferral.invoice_id = invoice.id) AS delinquency_deferral_count,
+       (SELECT max(deferral.created_at)
+        FROM invoice_delinquency_deferrals deferral
+        WHERE deferral.invoice_id = invoice.id) AS latest_delinquency_deferral_at
      FROM service_renewals renewal
      JOIN services service ON service.id = renewal.service_id
      JOIN order_items item ON item.id = service.order_item_id
@@ -91,6 +141,18 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
      LEFT JOIN durable_jobs job
        ON job.job_type = 'notification.send'
       AND job.unique_key = 'outbox:' || outbox.id::text
+     LEFT JOIN invoice_late_fee_assessments late_fee
+       ON late_fee.invoice_id = invoice.id
+     LEFT JOIN service_suspension_cases suspension_case
+       ON suspension_case.service_renewal_id = renewal.id
+     LEFT JOIN provider_operations suspend_operation
+       ON suspend_operation.subject_type = 'service_suspension_case'
+      AND suspend_operation.subject_id = suspension_case.id
+      AND suspend_operation.kind = 'resource_suspend'
+     LEFT JOIN provider_operations resume_operation
+       ON resume_operation.subject_type = 'service_suspension_case'
+      AND resume_operation.subject_id = suspension_case.id
+      AND resume_operation.kind = 'resource_resume'
      WHERE ($1::uuid IS NULL OR account.id = $1::uuid)
      ORDER BY renewal.created_at DESC, renewal.id, reminder.created_at, reminder.id`,
     [clientAccountId ?? null],
@@ -136,6 +198,30 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
         deliveredAt: string | null;
         outcomeAt: string | null;
       }>;
+      lateFee: {
+        disposition: "charged" | "skipped_zero";
+        basisMinor: string;
+        basisPoints: number;
+        amountMinor: string;
+        businessDate: string;
+      } | null;
+      delinquency: {
+        caseId: string;
+        action: "automatic" | "manual" | "none";
+        decisionReason: string;
+        status: string;
+        resumeRequired: boolean;
+        providerInstallationId: string | null;
+        lastError: string | null;
+        version: number;
+        suspendOperation: { status: string; attempts: number } | null;
+        resumeOperation: { status: string; attempts: number } | null;
+      } | null;
+      paymentReconciliationHold: {
+        active: boolean;
+        deferralCount: string;
+        latestDeferredAt: string | null;
+      };
     }
   >();
   for (const row of result.rows) {
@@ -171,6 +257,54 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
         settledAt: row.settled_at?.toISOString() ?? null,
         version: row.renewal_version,
         reminders: [],
+        lateFee:
+          row.late_fee_disposition &&
+          row.late_fee_basis_minor !== null &&
+          row.late_fee_basis_points !== null &&
+          row.late_fee_amount_minor !== null &&
+          row.late_fee_business_date
+            ? {
+                disposition: row.late_fee_disposition,
+                basisMinor: row.late_fee_basis_minor,
+                basisPoints: row.late_fee_basis_points,
+                amountMinor: row.late_fee_amount_minor,
+                businessDate: row.late_fee_business_date,
+              }
+            : null,
+        delinquency:
+          row.suspension_case_id &&
+          row.suspension_action &&
+          row.suspension_decision_reason &&
+          row.suspension_status &&
+          row.suspension_version !== null
+            ? {
+                caseId: row.suspension_case_id,
+                action: row.suspension_action,
+                decisionReason: row.suspension_decision_reason,
+                status: row.suspension_status,
+                resumeRequired: row.suspension_resume_required ?? false,
+                providerInstallationId: row.suspension_provider_installation_id,
+                lastError: row.suspension_last_error,
+                version: row.suspension_version,
+                suspendOperation: row.suspend_operation_status
+                  ? {
+                      status: row.suspend_operation_status,
+                      attempts: row.suspend_operation_attempts ?? 0,
+                    }
+                  : null,
+                resumeOperation: row.resume_operation_status
+                  ? {
+                      status: row.resume_operation_status,
+                      attempts: row.resume_operation_attempts ?? 0,
+                    }
+                  : null,
+              }
+            : null,
+        paymentReconciliationHold: {
+          active: row.pending_payment_result,
+          deferralCount: row.delinquency_deferral_count,
+          latestDeferredAt: row.latest_delinquency_deferral_at?.toISOString() ?? null,
+        },
       };
       items.set(row.renewal_id, item);
     }
@@ -224,6 +358,27 @@ export async function registerRenewalRoutes(
     return { warning: LAB_WARNING, items: await listRenewals(pool) };
   });
 
+  app.post("/api/v1/internal/billing/automation/run", async (request, reply) => {
+    const body = z
+      .object({
+        policyId: z.literal("default"),
+        businessDate: z.iso.date(),
+        effectiveAt: z.iso.datetime({ offset: true }),
+      })
+      .strict()
+      .parse(request.body);
+    assertProviderSignature(request, config.PROVIDER_OPERATION_CAPABILITY_SECRET, body);
+    const outcome = await transaction(pool, (client) =>
+      runRenewalAutomation(client, {
+        requestedByUserId: null,
+        reason: "Scheduled Asia/Shanghai billing automation",
+        scheduledBusinessDate: body.businessDate,
+        effectiveAt: new Date(body.effectiveAt),
+      }),
+    );
+    return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+  });
+
   app.post("/api/v1/admin/billing/automation/run", async (request, reply) => {
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "billing.automation_manage");
@@ -235,8 +390,8 @@ export async function registerRenewalRoutes(
         effectiveAt: z.iso.datetime({ offset: true }).optional(),
       })
       .parse(request.body);
-    if (body.effectiveAt && config.OSS_ENV !== "laboratory") {
-      throw Object.assign(new Error("effectiveAt is available only in the laboratory"), {
+    if (body.effectiveAt && !["laboratory", "test"].includes(config.OSS_ENV)) {
+      throw Object.assign(new Error("effectiveAt is available only in laboratory or test mode"), {
         statusCode: 400,
         code: "LABORATORY_ONLY",
       });
