@@ -235,8 +235,8 @@ export async function registerRenewalRoutes(
         effectiveAt: z.iso.datetime({ offset: true }).optional(),
       })
       .parse(request.body);
-    if (body.effectiveAt && config.OSS_ENV !== "laboratory") {
-      throw Object.assign(new Error("effectiveAt is available only in the laboratory"), {
+    if (body.effectiveAt && !["laboratory", "test"].includes(config.OSS_ENV)) {
+      throw Object.assign(new Error("effectiveAt is available only in laboratory or test mode"), {
         statusCode: 400,
         code: "LABORATORY_ONLY",
       });
