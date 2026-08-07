@@ -124,6 +124,21 @@ jobs:
           await client.query('CREATE DATABASE provider');
           await client.end();"
 
+      - name: Create isolated renewal lifecycle database
+        shell: bash
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.ADMIN_DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE DATABASE renewal_lifecycle');
+          await client.end();"
+
+      - name: Run renewal lifecycle PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/renewal_lifecycle
+        run: pnpm --filter @opensales/api test:integration:renewal-lifecycle
+
       - name: Apply forward migrations and synthetic configuration
         shell: bash
         run: |
