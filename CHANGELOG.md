@@ -8,6 +8,19 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Daily billing automation now runs once at or after 09:00 in the configured
+  timezone through a signed Worker-to-Core durable job. Restart and duplicate
+  delivery reuse the existing business-day run, while early, mismatched-date,
+  unsigned, or disabled-policy requests fail closed.
+- Renewal invoices can receive one configured Late Fee on the eligible unpaid
+  service charge after real payment and Credit allocations. An unresolved
+  payment result creates an immutable reconciliation deferral instead of a fee
+  or suspension decision.
+- Product-specific delinquency policies distinguish automatic VPS suspension,
+  manual or non-suspendable products, and the TermRat Colocation 72-hour grace.
+  Provider suspend/resume operations use stable identities, finite query-only
+  reconciliation after unknown outcomes, and payment-triggered recovery.
+
 - Customer and staff renewal pages now show funding separately from service-term
   grant, paid-through dates, immutable next-period facts, current amount due,
   reminder delivery, and fully funded manual Holds. Authorized staff can resolve
@@ -84,6 +97,15 @@ All notable project changes will be documented here. Project release numbering a
   amount, with USDT-style zero-fee configuration in the TermRat laboratory seed.
 
 ### Security
+
+- Core rechecks the current Client Account restriction, service ownership,
+  product policy, immutable Provider binding, installation status, and approved
+  suspend/resume capabilities before each new service-side effect. Capability
+  revocation blocks new calls while already-unknown operations remain
+  query-only and available for manual takeover.
+- PostgreSQL rejects forged Late Fee amounts, currencies, invoice totals,
+  journals, suspension decisions, policy snapshots, invalid state transitions,
+  and mutation of original deferral or assessment facts.
 
 - Owner or Billing authority is enforced when creating payment Quotes and
   payments, inside the payment transaction, again before the Worker calls the
