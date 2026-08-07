@@ -9,6 +9,7 @@ import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
 import { attemptJobClaim } from "./job-claim.js";
+import { isPaymentBusinessStatePayable } from "./payment-business-state.js";
 
 const config = z
   .object({
@@ -1310,10 +1311,12 @@ async function preflightPayment(
         false,
       );
     }
-    const payableBusinessState =
-      payment.payment_context === "order"
-        ? payment.order_status === "waiting_payment"
-        : payment.renewal_status === "invoiced" && payment.service_status === "active";
+    const payableBusinessState = isPaymentBusinessStatePayable({
+      paymentContext: payment.payment_context,
+      orderStatus: payment.order_status,
+      renewalStatus: payment.renewal_status,
+      serviceStatus: payment.service_status,
+    });
     if (
       !payableBusinessState ||
       payment.order_currency !== payment.invoice_currency ||
