@@ -14,6 +14,7 @@ import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { recordInitialServicePeriod } from "./renewal-lifecycle.js";
 import { assertProviderSignature } from "./provider-signature.js";
 import { freezeCompetingRefunds } from "./refund-safety.js";
 import {
@@ -664,20 +665,46 @@ export async function registerProviderEventRoutes(
       const identityPointers = await client.query<{
         order_id: string;
         service_id: string;
-        submitted_by_user_id: string;
+        lock_user_id: string;
         client_account_id: string;
       }>(
-        `SELECT
-           o.id AS order_id,
-           s.id AS service_id,
-           o.submitted_by_user_id,
-           o.client_account_id
-         FROM invoices i
-         JOIN orders o ON o.id = i.order_id
-         JOIN order_items oi ON oi.order_id = o.id
-         JOIN services s ON s.order_item_id = oi.id
-         WHERE i.id = $1`,
-        [attempt.invoice_id],
+        `SELECT order_id, service_id, lock_user_id, client_account_id
+         FROM (
+           SELECT
+             original_order.id AS order_id,
+             service.id AS service_id,
+             command.initiated_by_user_id AS lock_user_id,
+             original_order.client_account_id
+           FROM invoices invoice
+           JOIN orders original_order ON original_order.id = invoice.order_id
+           JOIN order_items item ON item.order_id = original_order.id
+           JOIN services service ON service.order_item_id = item.id
+           JOIN invoice_payment_commands command
+             ON command.invoice_id = invoice.id
+            AND command.payment_attempt_id = $2
+            AND command.initiator_type = 'user'
+           WHERE invoice.id = $1
+
+           UNION ALL
+
+           SELECT
+             original_order.id AS order_id,
+             service.id AS service_id,
+             command.initiated_by_user_id AS lock_user_id,
+             service.client_account_id
+           FROM invoices invoice
+           JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+           JOIN services service ON service.id = renewal.service_id
+           JOIN order_items item ON item.id = service.order_item_id
+           JOIN orders original_order ON original_order.id = item.order_id
+           JOIN client_accounts account ON account.id = service.client_account_id
+           JOIN invoice_payment_commands command
+             ON command.invoice_id = invoice.id
+            AND command.payment_attempt_id = $2
+            AND command.initiator_type = 'user'
+           WHERE invoice.id = $1
+         ) identity`,
+        [attempt.invoice_id, attempt.id],
       );
       const identityPointer = identityPointers.rows[0];
       if (
@@ -702,7 +729,7 @@ export async function registerProviderEventRoutes(
         identityPointer.service_id,
       ]);
       await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-        identityPointer.submitted_by_user_id,
+        identityPointer.lock_user_id,
       ]);
       await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
         identityPointer.client_account_id,
@@ -712,7 +739,7 @@ export async function registerProviderEventRoutes(
          FROM client_memberships
          WHERE client_account_id = $1 AND user_id = $2
          FOR UPDATE`,
-        [identityPointer.client_account_id, identityPointer.submitted_by_user_id],
+        [identityPointer.client_account_id, identityPointer.lock_user_id],
       );
       const inboxOutcome = await insertInbox(
         client,
@@ -1028,7 +1055,10 @@ export async function registerProviderEventRoutes(
         [attempt.operation_id, body.externalPaymentId, occurredAt],
       );
 
-      const settlement = await advancePaidInvoice(client, attempt.invoice_id);
+      const settlement = await advancePaidInvoice(client, attempt.invoice_id, {
+        kind: "user_command",
+        userId: identityPointer.lock_user_id,
+      });
       await client.query(
         `UPDATE invoice_payment_commands
          SET status = 'succeeded', result = $2, updated_at = now()
@@ -1039,6 +1069,8 @@ export async function registerProviderEventRoutes(
             paymentStatus: "succeeded",
             invoiceStatus: settlement.invoiceStatus,
             orderStatus: settlement.orderStatus ?? null,
+            renewalStatus: settlement.renewalStatus ?? null,
+            serviceStatus: settlement.serviceStatus ?? null,
             feeMinor: attempt.fee_minor,
           },
         ],
@@ -1048,6 +1080,8 @@ export async function registerProviderEventRoutes(
         status: "succeeded",
         invoiceStatus: settlement.invoiceStatus,
         orderStatus: settlement.orderStatus,
+        renewalStatus: settlement.renewalStatus,
+        serviceStatus: settlement.serviceStatus,
       };
     });
     return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
@@ -2110,6 +2144,23 @@ export async function registerProviderEventRoutes(
       if (completed.rowCount !== 1) {
         throw new Error("Order state changed while activating service");
       }
+      const initialInvoiceResult = await client.query<{ id: string }>(
+        `SELECT id
+         FROM invoices
+         WHERE order_id = $1
+         ORDER BY created_at, id
+         LIMIT 1`,
+        [service.order_id],
+      );
+      const initialInvoiceId = initialInvoiceResult.rows[0]?.id;
+      if (!initialInvoiceId) throw new Error("Activated service has no initial invoice");
+      await recordInitialServicePeriod(client, {
+        serviceId: service.id,
+        invoiceId: initialInvoiceId,
+        periodStart: readyAt,
+        periodEnd: termEnd,
+        grantedAt: readyAt,
+      });
       await client.query(
         `INSERT INTO outbox(event_type, unique_key, payload)
          VALUES ('service.activated', $1, $2)

@@ -41,7 +41,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "011_stage_b_add_funds_chargebacks";
+const REQUIRED_SCHEMA_VERSION = "012_stage_b_renewal_lifecycle";
 
 type Job = {
   id: string;
@@ -987,22 +987,55 @@ async function preflightPayment(
     );
     const lockPointers = await client.query<{
       order_id: string;
-      submitted_by_user_id: string;
+      service_id: string;
+      payer_user_id: string;
       client_account_id: string;
     }>(
-      `SELECT o.id AS order_id, o.submitted_by_user_id, o.client_account_id
-       FROM invoices i
-       JOIN orders o ON o.id = i.order_id
-       WHERE i.id = $1`,
-      [invoiceId],
+      `SELECT order_id, service_id, payer_user_id, client_account_id
+       FROM (
+         SELECT original_order.id AS order_id,
+                service.id AS service_id,
+                command.initiated_by_user_id AS payer_user_id,
+                original_order.client_account_id
+         FROM invoices invoice
+         JOIN orders original_order ON original_order.id = invoice.order_id
+         JOIN order_items item ON item.order_id = original_order.id
+         JOIN services service ON service.order_item_id = item.id
+         JOIN invoice_payment_commands command
+           ON command.invoice_id = invoice.id
+          AND command.payment_attempt_id = $2
+          AND command.initiator_type = 'user'
+         WHERE invoice.id = $1
+
+         UNION ALL
+
+         SELECT original_order.id AS order_id,
+                service.id AS service_id,
+                command.initiated_by_user_id AS payer_user_id,
+                service.client_account_id
+         FROM invoices invoice
+         JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+         JOIN services service ON service.id = renewal.service_id
+         JOIN order_items item ON item.id = service.order_item_id
+         JOIN orders original_order ON original_order.id = item.order_id
+         JOIN invoice_payment_commands command
+           ON command.invoice_id = invoice.id
+          AND command.payment_attempt_id = $2
+          AND command.initiator_type = 'user'
+         WHERE invoice.id = $1
+       ) identity`,
+      [invoiceId, paymentAttemptId],
     );
     const lockPointer = lockPointers.rows[0];
     if (lockPointer) {
       await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
         lockPointer.order_id,
       ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        lockPointer.service_id,
+      ]);
       await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-        lockPointer.submitted_by_user_id,
+        lockPointer.payer_user_id,
       ]);
       await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
         lockPointer.client_account_id,
@@ -1025,7 +1058,10 @@ async function preflightPayment(
       order_status: string;
       order_currency: string;
       order_client_account_id: string;
-      submitted_by_user_id: string;
+      payer_user_id: string;
+      payment_context: "order" | "renewal";
+      service_status: string;
+      renewal_status: string | null;
       email_verified_at: Date | null;
       user_restricted_at: Date | null;
       account_restricted_at: Date | null;
@@ -1034,15 +1070,56 @@ async function preflightPayment(
       operation_kind: string;
       operation_attempt_count: number;
     }>(
-      `SELECT
+      `WITH payment_identity AS (
+         SELECT original_order.id AS order_id,
+                original_order.status AS order_status,
+                original_order.currency AS order_currency,
+                original_order.client_account_id AS order_client_account_id,
+                command.initiated_by_user_id AS payer_user_id,
+                'order'::text AS payment_context,
+                service.status AS service_status,
+                NULL::text AS renewal_status
+         FROM invoices invoice
+         JOIN orders original_order ON original_order.id = invoice.order_id
+         JOIN order_items item ON item.order_id = original_order.id
+         JOIN services service ON service.order_item_id = item.id
+         JOIN invoice_payment_commands command
+           ON command.invoice_id = invoice.id
+          AND command.payment_attempt_id = $1
+          AND command.initiator_type = 'user'
+         WHERE invoice.id = $3
+
+         UNION ALL
+
+         SELECT original_order.id AS order_id,
+                original_order.status AS order_status,
+                original_order.currency AS order_currency,
+                service.client_account_id AS order_client_account_id,
+                command.initiated_by_user_id AS payer_user_id,
+                'renewal'::text AS payment_context,
+                service.status AS service_status,
+                renewal.status AS renewal_status
+         FROM invoices invoice
+         JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+         JOIN services service ON service.id = renewal.service_id
+         JOIN order_items item ON item.id = service.order_item_id
+         JOIN orders original_order ON original_order.id = item.order_id
+         JOIN invoice_payment_commands command
+           ON command.invoice_id = invoice.id
+          AND command.payment_attempt_id = $1
+          AND command.initiator_type = 'user'
+         WHERE invoice.id = $3
+       )
+       SELECT
          pa.status AS payment_status, pa.amount_minor::text, pa.principal_minor::text,
          pa.fee_minor::text, pa.currency AS payment_currency,
          pa.scenario, pa.provider_installation_id AS payment_provider_installation_id,
          pa.client_account_id AS payment_client_account_id, pa.invoice_id,
          i.total_minor::text AS invoice_total_minor, i.currency AS invoice_currency,
          i.client_account_id AS invoice_client_account_id,
-         o.id AS order_id, o.status AS order_status, o.currency AS order_currency,
-         o.client_account_id AS order_client_account_id, o.submitted_by_user_id,
+         identity.order_id, identity.order_status, identity.order_currency,
+         identity.order_client_account_id, identity.payer_user_id,
+         identity.payment_context, identity.service_status, identity.renewal_status,
          u.email_verified_at, u.restricted_at AS user_restricted_at,
          ca.restricted_at AS account_restricted_at,
          po.status AS operation_status,
@@ -1051,15 +1128,15 @@ async function preflightPayment(
          po.attempt_count AS operation_attempt_count
        FROM payment_attempts pa
        JOIN invoices i ON i.id = pa.invoice_id
-       JOIN orders o ON o.id = i.order_id
-       JOIN users u ON u.id = o.submitted_by_user_id
-       JOIN client_accounts ca ON ca.id = o.client_account_id
+       JOIN payment_identity identity ON true
+       JOIN users u ON u.id = identity.payer_user_id
+       JOIN client_accounts ca ON ca.id = identity.order_client_account_id
        JOIN provider_operations po
          ON po.id = $2
         AND po.subject_type = 'payment'
         AND po.subject_id = pa.id
        WHERE pa.id = $1`,
-      [paymentAttemptId, providerOperationId],
+      [paymentAttemptId, providerOperationId, invoiceId],
     );
     const payment = result.rows[0];
     if (!payment) {
@@ -1195,12 +1272,12 @@ async function preflightPayment(
       );
     }
 
-    const membership = await client.query<{ removed_at: Date | null }>(
-      `SELECT removed_at
+    const membership = await client.query<{ removed_at: Date | null; role: string }>(
+      `SELECT removed_at, role
        FROM client_memberships
        WHERE client_account_id = $1 AND user_id = $2
        FOR UPDATE`,
-      [payment.order_client_account_id, payment.submitted_by_user_id],
+      [payment.order_client_account_id, payment.payer_user_id],
     );
     const member = membership.rows[0];
     const eligible =
@@ -1208,7 +1285,8 @@ async function preflightPayment(
       !payment.user_restricted_at &&
       !payment.account_restricted_at &&
       Boolean(member) &&
-      !member?.removed_at;
+      !member?.removed_at &&
+      (member?.role === "owner" || member?.role === "billing");
 
     if (!eligible) {
       return cancelKnownUnsentPaymentWithClient(
@@ -1221,8 +1299,12 @@ async function preflightPayment(
         false,
       );
     }
+    const payableBusinessState =
+      payment.payment_context === "order"
+        ? payment.order_status === "waiting_payment"
+        : payment.renewal_status === "invoiced" && payment.service_status === "active";
     if (
-      payment.order_status !== "waiting_payment" ||
+      !payableBusinessState ||
       payment.order_currency !== payment.invoice_currency ||
       payment.invoice_currency !== payment.payment_currency
     ) {
@@ -4357,6 +4439,140 @@ async function reconcileProvision(job: Job): Promise<void> {
   await completeJob(job);
 }
 
+async function sendRenewalNotificationSerialized(
+  job: Job,
+  outboxId: string,
+  payload: {
+    email: string;
+    invoiceId: string;
+    serviceId: string;
+    kind: "renewal_created" | "pre_due" | "overdue_first";
+    offsetDays: number;
+    dueAt: string;
+    currency: string;
+  },
+  locale: "en" | "zh-CN",
+): Promise<void> {
+  await transaction(async (client) => {
+    await assertJobLeaseWithClient(client, job);
+    const state = await client.query<{
+      intent_id: string;
+      kind: "renewal_created" | "pre_due" | "overdue_first";
+      total_minor: string;
+      allocated_minor: string;
+      has_delivery: boolean;
+      has_suppression: boolean;
+    }>(
+      `SELECT reminder.id AS intent_id, reminder.kind,
+              invoice.total_minor::text,
+              allocation.allocated_minor::text,
+              EXISTS (
+                SELECT 1 FROM renewal_reminder_delivery_facts fact
+                WHERE fact.intent_id = reminder.id
+              ) AS has_delivery,
+              EXISTS (
+                SELECT 1 FROM renewal_reminder_suppressions suppression
+                WHERE suppression.intent_id = reminder.id
+              ) AS has_suppression
+       FROM renewal_reminder_intents reminder
+       JOIN invoices invoice ON invoice.id = reminder.invoice_id
+       JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+       WHERE reminder.outbox_id = $1
+       FOR UPDATE OF reminder, invoice`,
+      [outboxId],
+    );
+    const reminder = state.rows[0];
+    if (!reminder) throw new Error("Renewal reminder intent is unavailable");
+    if (reminder.has_delivery || reminder.has_suppression) {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    if (
+      reminder.kind !== "renewal_created" &&
+      BigInt(reminder.allocated_minor) >= BigInt(reminder.total_minor)
+    ) {
+      await client.query(
+        `INSERT INTO renewal_reminder_suppressions(intent_id, reason)
+         VALUES ($1, 'invoice was fully settled before reminder dispatch')
+         ON CONFLICT (intent_id) DO NOTHING`,
+        [reminder.intent_id],
+      );
+      await completeJobWithClient(client, job);
+      return;
+    }
+
+    const currentAmountDue = BigInt(reminder.total_minor) - BigInt(reminder.allocated_minor);
+    const amountMinor = currentAmountDue > 0n ? currentAmountDue : 0n;
+    const amount = `${amountMinor / 100n}.${(amountMinor % 100n).toString().padStart(2, "0")}`;
+    const labels =
+      locale === "zh-CN"
+        ? {
+            renewal_created: "续费发票已创建",
+            pre_due: `续费发票将在 ${payload.offsetDays} 天后到期`,
+            overdue_first: `续费发票已逾期 ${payload.offsetDays} 天`,
+          }
+        : {
+            renewal_created: "Renewal invoice created",
+            pre_due: `Renewal invoice is due in ${payload.offsetDays} days`,
+            overdue_first: `Renewal invoice is ${payload.offsetDays} days overdue`,
+          };
+    const subject = labels[payload.kind];
+    const body =
+      locale === "zh-CN"
+        ? `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${subject}\n发票：${payload.invoiceId}\n服务：${payload.serviceId}\n到期时间：${payload.dueAt}\n当前应付：${payload.currency} ${amount}`
+        : `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${subject}\nInvoice: ${payload.invoiceId}\nService: ${payload.serviceId}\nDue: ${payload.dueAt}\nAmount due: ${payload.currency} ${amount}`;
+
+    // Keep the invoice row locked through the finite Provider request. A payment
+    // allocation therefore commits either before this final check (and is
+    // suppressed) or after the reminder dispatch fact; it cannot slip between
+    // the check and the actual Mock Mail call.
+    const response = await providerRequest(
+      config.MOCK_MAIL_PROVIDER_URL,
+      config.MOCK_MAIL_PROVIDER_TOKEN,
+      "/v1/mail",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": outboxId },
+        body: JSON.stringify({
+          operationId: outboxId,
+          recipient: payload.email,
+          template: `renewal-${payload.kind.replaceAll("_", "-")}-v1`,
+          locale,
+          subject,
+          body,
+          sensitive: false,
+        }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Mock Mail Provider rejected notification with ${response.status}`);
+    }
+    const providerFact = z
+      .object({
+        operationId: z.uuid(),
+        status: z.enum(["delivered", "bounced", "failed"]),
+        deliveredAt: z.iso.datetime({ offset: true }),
+      })
+      .parse(await response.json());
+    if (providerFact.operationId !== outboxId) {
+      throw new Error("Mock Mail Provider returned a mismatched notification operation");
+    }
+    await client.query(
+      `INSERT INTO renewal_reminder_delivery_facts(
+         intent_id, provider_installation_id, provider_message_id,
+         status, provider_occurred_at
+       ) VALUES ($1, 'mock-mail-v1', $2, $3, $4)
+       ON CONFLICT (intent_id) DO NOTHING`,
+      [reminder.intent_id, providerFact.operationId, providerFact.status, providerFact.deliveredAt],
+    );
+    await client.query(
+      "UPDATE outbox SET published_at = now() WHERE id = $1 AND published_at IS NULL",
+      [outboxId],
+    );
+    await completeJobWithClient(client, job);
+  });
+}
+
 async function sendNotification(job: Job): Promise<void> {
   const outboxId = job.payload.outboxId;
   if (!outboxId) throw new Error("Invalid notification.send payload");
@@ -4367,6 +4583,13 @@ async function sendNotification(job: Job): Promise<void> {
       locale?: string;
       verificationUrl?: string;
       expiresAt?: string;
+      invoiceId?: string;
+      serviceId?: string;
+      kind?: "renewal_created" | "pre_due" | "overdue_first";
+      offsetDays?: number;
+      dueAt?: string;
+      amountDueMinor?: string;
+      currency?: string;
     };
     published_at: Date | null;
   }>(
@@ -4380,11 +4603,56 @@ async function sendNotification(job: Job): Promise<void> {
     await completeJob(job);
     return;
   }
+  if (!outbox.payload.email) {
+    throw new Error(`Unsupported notification event: ${outbox.event_type}`);
+  }
+  const locale = outbox.payload.locale === "zh-CN" ? "zh-CN" : "en";
+  let template: string;
+  let subject: string;
+  let body: string;
+  let sensitive: boolean;
   if (
-    outbox.event_type !== "notification.email_verification_requested" ||
-    !outbox.payload.email ||
-    !outbox.payload.verificationUrl
+    outbox.event_type === "notification.email_verification_requested" &&
+    outbox.payload.verificationUrl
   ) {
+    template = "email-verification";
+    subject =
+      locale === "zh-CN"
+        ? "验证 OpenSales System 实验室账号"
+        : "Verify your OpenSales System laboratory account";
+    body = `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${outbox.payload.verificationUrl}\n\nExpires: ${outbox.payload.expiresAt ?? "unknown"}`;
+    sensitive = true;
+  } else if (
+    outbox.event_type === "notification.renewal_reminder_requested" &&
+    outbox.payload.invoiceId &&
+    outbox.payload.serviceId &&
+    outbox.payload.kind &&
+    typeof outbox.payload.offsetDays === "number" &&
+    Number.isInteger(outbox.payload.offsetDays) &&
+    outbox.payload.offsetDays >= 0 &&
+    outbox.payload.offsetDays <= 90 &&
+    outbox.payload.dueAt &&
+    outbox.payload.amountDueMinor &&
+    /^\d+$/.test(outbox.payload.amountDueMinor) &&
+    outbox.payload.currency &&
+    /^[A-Z]{3}$/.test(outbox.payload.currency)
+  ) {
+    await sendRenewalNotificationSerialized(
+      job,
+      outboxId,
+      {
+        email: outbox.payload.email,
+        invoiceId: outbox.payload.invoiceId,
+        serviceId: outbox.payload.serviceId,
+        kind: outbox.payload.kind,
+        offsetDays: outbox.payload.offsetDays,
+        dueAt: outbox.payload.dueAt,
+        currency: outbox.payload.currency,
+      },
+      locale,
+    );
+    return;
+  } else {
     throw new Error(`Unsupported notification event: ${outbox.event_type}`);
   }
   const response = await providerRequest(
@@ -4397,14 +4665,11 @@ async function sendNotification(job: Job): Promise<void> {
       body: JSON.stringify({
         operationId: outboxId,
         recipient: outbox.payload.email,
-        template: "email-verification",
-        locale: outbox.payload.locale ?? "en",
-        subject:
-          outbox.payload.locale === "zh-CN"
-            ? "验证 OpenSales System 实验室账号"
-            : "Verify your OpenSales System laboratory account",
-        body: `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${outbox.payload.verificationUrl}\n\nExpires: ${outbox.payload.expiresAt ?? "unknown"}`,
-        sensitive: true,
+        template,
+        locale,
+        subject,
+        body,
+        sensitive,
       }),
     },
   );

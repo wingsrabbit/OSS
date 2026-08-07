@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DatabaseClient } from "./database.js";
+import { settleRenewalInvoice } from "./renewal-lifecycle.js";
 
 export type PaidInvoiceOutcome = {
   invoiceStatus: "partially_paid" | "paid";
   orderStatus?: string;
+  renewalStatus?: "paid" | "manual_hold";
+  serviceStatus?: string;
 };
+
+export type InvoiceSettlementContext =
+  | { kind: "user_command"; userId: string }
+  | {
+      kind: "staff_manual";
+      staffUserId: string;
+      expectedRenewalVersion?: number;
+      reason?: string;
+    };
 
 export async function advancePaidInvoice(
   client: DatabaseClient,
   invoiceId: string,
+  context?: InvoiceSettlementContext,
 ): Promise<PaidInvoiceOutcome> {
   const invoiceResult = await client.query<{
     total_minor: string;
@@ -33,7 +46,15 @@ export async function advancePaidInvoice(
   if (allocated < BigInt(invoice.total_minor)) {
     return { invoiceStatus: "partially_paid" };
   }
-  if (!invoice.order_id) return { invoiceStatus: "paid" };
+  if (!invoice.order_id) {
+    const renewal = await settleRenewalInvoice(client, invoiceId, context);
+    if (!renewal) return { invoiceStatus: "paid" };
+    return {
+      invoiceStatus: "paid",
+      renewalStatus: renewal.renewalStatus,
+      serviceStatus: renewal.serviceStatus,
+    };
+  }
 
   await client.query(
     `INSERT INTO outbox(event_type, unique_key, payload)

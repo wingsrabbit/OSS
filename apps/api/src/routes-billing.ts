@@ -3,7 +3,7 @@
 import { percentageFeeMinor } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertEligible, requireUser } from "./auth.js";
+import { assertBillingWriteEligible, assertEligible, requireUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -76,7 +76,7 @@ export async function registerBillingRoutes(
 
   app.post("/api/v1/invoices/:invoiceId/payment-quotes", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    assertBillingWriteEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = z
       .object({

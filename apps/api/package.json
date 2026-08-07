@@ -12,6 +12,7 @@
     "seed:termrat": "tsx src/seed-termrat.ts",
     "start": "node dist/server.js",
     "test": "node --test dist/**/*.test.js",
+    "test:integration:renewal-lifecycle": "node dist/renewal-lifecycle-integration.js",
     "test:integration:stage-a": "node dist/stage-a-integration.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
