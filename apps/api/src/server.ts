@@ -6,5 +6,14 @@ import { assertSchemaCompatible } from "./database.js";
 
 const config = loadConfig();
 const { app, pool } = await buildApp(config);
-await assertSchemaCompatible(pool);
+const schemaPreflight = await assertSchemaCompatible(pool, {
+  enable015RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "014-to-015",
+});
+app.log.info(
+  {
+    installedSchemaVersion: schemaPreflight.installedSchemaVersion,
+    schemaMode: schemaPreflight.mode,
+  },
+  "schema startup preflight passed",
+);
 await app.listen({ host: config.API_HOST, port: config.API_PORT });
