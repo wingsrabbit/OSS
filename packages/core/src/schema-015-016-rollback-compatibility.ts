@@ -102,23 +102,58 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
         AND actual.column_name = required.column_name
         AND actual.data_type = required.data_type
         AND actual.is_nullable = required.nullable
-     ), required_constraints(name, kind, definition_fragment) AS (
+     ), required_constraints(
+       table_name, name, kind, fragment_a, fragment_b, fragment_c
+     ) AS (
        VALUES
-         ('fund_receipts_exactly_one_source', 'c', 'reported_manual_receipt_id'),
-         ('fund_receipts_source_provider_fields', 'c', 'provider_installation_id'),
-         ('fund_receipts_disposition_check', 'c', 'reversed'),
-         ('fund_receipts_reported_manual_receipt_id_fkey', 'f', 'manual_receipt_facts'),
-         ('manual_receipt_facts_idempotency_key_key', 'u', 'idempotency_key'),
-         ('manual_receipt_facts_client_account_id_reference_key', 'u', 'client_account_id'),
-         ('manual_receipt_reversals_manual_receipt_id_key', 'u', 'manual_receipt_id'),
-         ('manual_receipt_reversals_idempotency_key_key', 'u', 'idempotency_key'),
-         ('manual_receipt_outflows_idempotency_key_key', 'u', 'idempotency_key')
+         ('fund_receipts', 'fund_receipts_exactly_one_source', 'c',
+            'num_nonnulls', 'reported_manual_receipt_id', '= 1'),
+         ('fund_receipts', 'fund_receipts_source_provider_fields', 'c',
+            'reported_manual_receipt_id', 'provider_installation_id', 'external_payment_id'),
+         ('fund_receipts', 'fund_receipts_disposition_check', 'c',
+            'disposition', 'reversed', NULL),
+         ('fund_receipts', 'fund_receipts_reported_manual_receipt_id_fkey', 'f',
+            'reported_manual_receipt_id', 'manual_receipt_facts', NULL),
+         ('manual_receipt_facts', 'manual_receipt_facts_client_account_id_fkey', 'f',
+            'client_account_id', 'client_accounts', NULL),
+         ('manual_receipt_facts', 'manual_receipt_facts_actor_id_fkey', 'f',
+            'actor_id', 'users', NULL),
+         ('manual_receipt_facts', 'manual_receipt_facts_idempotency_key_key', 'u',
+            'idempotency_key', NULL, NULL),
+         ('manual_receipt_facts', 'manual_receipt_facts_client_account_id_reference_key', 'u',
+            'client_account_id', 'reference', NULL),
+         ('manual_receipt_reversals', 'manual_receipt_reversals_manual_receipt_id_fkey', 'f',
+            'manual_receipt_id', 'manual_receipt_facts', NULL),
+         ('manual_receipt_reversals', 'manual_receipt_reversals_fund_receipt_id_fkey', 'f',
+            'fund_receipt_id', 'fund_receipts', NULL),
+         ('manual_receipt_reversals', 'manual_receipt_reversals_actor_id_fkey', 'f',
+            'actor_id', 'users', NULL),
+         ('manual_receipt_reversals', 'manual_receipt_reversals_manual_receipt_id_key', 'u',
+            'manual_receipt_id', NULL, NULL),
+         ('manual_receipt_reversals', 'manual_receipt_reversals_idempotency_key_key', 'u',
+            'idempotency_key', NULL, NULL),
+         ('manual_receipt_outflows', 'manual_receipt_outflows_manual_receipt_id_fkey', 'f',
+            'manual_receipt_id', 'manual_receipt_facts', NULL),
+         ('manual_receipt_outflows', 'manual_receipt_outflows_fund_receipt_id_fkey', 'f',
+            'fund_receipt_id', 'fund_receipts', NULL),
+         ('manual_receipt_outflows', 'manual_receipt_outflows_actor_id_fkey', 'f',
+            'actor_id', 'users', NULL),
+         ('manual_receipt_outflows', 'manual_receipt_outflows_idempotency_key_key', 'u',
+            'idempotency_key', NULL, NULL)
      ), constraint_shape AS (
        SELECT count(*) = (SELECT count(*) FROM required_constraints) AS valid
        FROM required_constraints required
-       JOIN pg_constraint actual ON actual.conname = required.name
+       JOIN pg_namespace namespace ON namespace.nspname = 'public'
+       JOIN pg_class relation ON relation.relnamespace = namespace.oid
+                             AND relation.relname = required.table_name
+       JOIN pg_constraint actual ON actual.conrelid = relation.oid
+                                AND actual.conname = required.name
        WHERE actual.contype::text = required.kind
-         AND pg_get_constraintdef(actual.oid) ILIKE '%' || required.definition_fragment || '%'
+         AND pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_a || '%'
+         AND (required.fragment_b IS NULL
+              OR pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_b || '%')
+         AND (required.fragment_c IS NULL
+              OR pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_c || '%')
      ), required_triggers(table_name, trigger_name) AS (
        VALUES
          ('manual_receipt_facts', 'manual_receipt_facts_append_only'),
