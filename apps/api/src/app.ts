@@ -32,7 +32,8 @@ export async function buildApp(
 ): Promise<{ app: ReturnType<typeof Fastify>; pool: DatabasePool }> {
   const app = Fastify({
     logger: {
-      level: config.OSS_ENV === "test" ? "silent" : "info",
+      level:
+        config.OSS_LOG_LEVEL ?? (config.OSS_ENV === "test" ? "silent" : "info"),
       redact: {
         paths: [
           "req.headers.authorization",

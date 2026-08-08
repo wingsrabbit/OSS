@@ -10,6 +10,9 @@ import {
 const schema = z.object({
   DATABASE_URL: z.string().min(1),
   OSS_ENV: z.enum(["development", "test", "laboratory"]).default("development"),
+  OSS_LOG_LEVEL: z
+    .enum(["silent", "fatal", "error", "warn", "info", "debug", "trace"])
+    .optional(),
   OSS_PUBLIC_URL: z.url(),
   API_HOST: z.string().default("0.0.0.0"),
   API_PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
