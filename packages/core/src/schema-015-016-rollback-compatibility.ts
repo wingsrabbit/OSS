@@ -256,6 +256,12 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ('manual')
      )
      SELECT
+       (SELECT count(*) = 2
+        FROM schema_migrations
+        WHERE version IN (
+          '015_stage_b_saved_payment_auto_renew',
+          '016_stage_b_manual_receipts'
+        )) AS has_contiguous_history,
        to_regclass('public.manual_receipt_facts') IS NOT NULL
          AND to_regclass('public.manual_receipt_reversals') IS NOT NULL
          AND to_regclass('public.manual_receipt_outflows') IS NOT NULL
@@ -272,6 +278,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
   );
   const shape = rowRecord(result.rows[0]);
   if (
+    shape.has_contiguous_history !== true ||
     shape.has_columns !== true ||
     shape.has_constraints !== true ||
     shape.has_triggers !== true ||

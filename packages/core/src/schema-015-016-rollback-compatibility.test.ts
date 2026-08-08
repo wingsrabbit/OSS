@@ -29,6 +29,7 @@ function fakeDatabase(input: {
         return {
           rows: [
             {
+              has_contiguous_history: valid,
               has_columns: valid,
               has_constraints: valid,
               has_triggers: valid,
