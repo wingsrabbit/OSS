@@ -247,6 +247,8 @@ jobs:
 
       - name: Restart API for isolated browser journey
         shell: bash
+        env:
+          OSS_LOG_LEVEL: error
         run: |
           set -euo pipefail
           read -r api_pid < api.pid
@@ -295,9 +297,12 @@ jobs:
           set -e
           if [[ "${browser_status}" -ne 0 ]]; then
             echo "Browser journey failed; redacted API errors follow"
+            grep '"msg":"request failed"' api-browser.log > request-failures.log || true
             sed -E \
               -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[UUID]/g' \
               -e 's/[A-Za-z0-9._%+-]+@example[.]invalid/[SYNTHETIC_EMAIL]/g' \
-              api-browser.log | tail -n 200
+              -e 's/ci-only-[A-Za-z0-9_-]+/[CI_SECRET]/g' \
+              -e 's/[A-Za-z0-9_-]{43}/[KEY_MATERIAL]/g' \
+              request-failures.log | tail -n 50
           fi
           exit "${browser_status}"
