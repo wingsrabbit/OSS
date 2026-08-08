@@ -14,6 +14,7 @@ import pg from "pg";
 import {
   assertSchemaCompatible,
   holdSchema015RollbackBridgeGuard,
+  runMigrations,
 } from "./database.js";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -42,6 +43,10 @@ try {
   const contender = new pg.Client({ connectionString: databaseUrl });
   await contender.connect();
   try {
+    await assert.rejects(
+      runMigrations(pool),
+      /blocked by a running compatibility-bridge API or Worker/,
+    );
     await contender.query("SET lock_timeout = '200ms'");
     await assert.rejects(
       contender.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
@@ -170,6 +175,52 @@ try {
     CREATE TRIGGER manual_receipt_outflow_write_guard
       BEFORE INSERT ON manual_receipt_outflows
       FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_write_guard();
+
+    CREATE FUNCTION opensales_manual_receipt_marker_write_guard()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE row_data jsonb := to_jsonb(NEW);
+    DECLARE is_manual boolean := false;
+    BEGIN
+      is_manual :=
+        (TG_TABLE_NAME = 'ledger_journals'
+          AND row_data->>'source_type' IN (
+            'manual_receipt', 'manual_receipt_reversal', 'manual_receipt_outflow'
+          ))
+        OR (TG_TABLE_NAME = 'provider_operations'
+          AND row_data->>'subject_type' IN ('manual_receipt', 'manual_receipt_outflow'))
+        OR (TG_TABLE_NAME = 'durable_jobs'
+          AND ((row_data->>'job_type') LIKE 'manual_receipt.%'
+            OR row_data->'payload' ? 'manualReceiptId'
+            OR row_data->'payload' ? 'manualReceiptOutflowId'))
+        OR (TG_TABLE_NAME = 'provider_inbox'
+          AND (row_data->'payload' ? 'manualReceiptId'
+            OR row_data->'payload' ? 'manualReceiptOutflowId'))
+        OR (TG_TABLE_NAME = 'outbox'
+          AND ((row_data->>'event_type') LIKE 'manual_receipt.%'
+            OR row_data->'payload' ? 'manualReceiptId'
+            OR row_data->'payload' ? 'manualReceiptOutflowId'));
+      IF is_manual THEN
+        PERFORM pg_advisory_xact_lock(
+          hashtextextended('opensales:schema-015-016-rollback-bridge', 0)
+        );
+      END IF;
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER manual_receipt_ledger_write_guard
+      BEFORE INSERT ON ledger_journals
+      FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
+    CREATE TRIGGER manual_receipt_provider_operation_write_guard
+      BEFORE INSERT ON provider_operations
+      FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
+    CREATE TRIGGER manual_receipt_job_write_guard
+      BEFORE INSERT ON durable_jobs
+      FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
+    CREATE TRIGGER manual_receipt_inbox_write_guard
+      BEFORE INSERT ON provider_inbox
+      FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
+    CREATE TRIGGER manual_receipt_outbox_write_guard
+      BEFORE INSERT ON outbox
+      FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
 
     CREATE FUNCTION opensales_reject_manual_receipt_mutation()
     RETURNS trigger LANGUAGE plpgsql AS $$
@@ -439,6 +490,33 @@ try {
        '00000000-0000-4000-8000-000000000272', 'Guard test outflow',
        'guard-test-outflow', 'guard-test-outflow-fingerprint', '{}'::jsonb
      )`,
+    `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+     VALUES (
+       'manual_receipt', '00000000-0000-4000-8000-000000000275',
+       'USD', 'Guarded manual marker'
+     )`,
+    `INSERT INTO provider_operations(
+       provider_installation_id, kind, subject_type, subject_id, stable_key, status
+     ) VALUES (
+       'guard-test-provider', 'payment_create', 'manual_receipt',
+       '00000000-0000-4000-8000-000000000275', 'guard-test-operation', 'queued'
+     )`,
+    `INSERT INTO durable_jobs(job_type, unique_key, payload)
+     VALUES (
+       'manual_receipt.reconcile', 'guard-test-job',
+       '{"manualReceiptId":"00000000-0000-4000-8000-000000000275"}'::jsonb
+     )`,
+    `INSERT INTO provider_inbox(
+       provider_installation_id, external_event_id, event_type, payload
+     ) VALUES (
+       'guard-test-provider', 'guard-test-inbox', 'manual_receipt.test',
+       '{"manualReceiptId":"00000000-0000-4000-8000-000000000275"}'::jsonb
+     )`,
+    `INSERT INTO outbox(event_type, unique_key, payload)
+     VALUES (
+       'manual_receipt.test', 'guard-test-outbox',
+       '{"manualReceiptId":"00000000-0000-4000-8000-000000000275"}'::jsonb
+     )`,
   ];
   try {
     for (const [index, statement] of blockedInsertStatements.entries()) {
@@ -469,6 +547,79 @@ try {
     /incomplete or counterfeit/,
   );
   await client.query("ALTER TABLE manual_receipt_facts ENABLE TRIGGER manual_receipt_facts_append_only");
+
+  await client.query("SAVEPOINT replica_trigger");
+  await client.query(
+    "ALTER TABLE manual_receipt_facts ENABLE REPLICA TRIGGER manual_receipt_fact_write_guard",
+  );
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT replica_trigger");
+
+  await client.query("SAVEPOINT counterfeit_constraint");
+  await client.query(`
+    ALTER TABLE fund_receipts DROP CONSTRAINT fund_receipts_exactly_one_source;
+    ALTER TABLE fund_receipts
+      ADD CONSTRAINT fund_receipts_exactly_one_source CHECK (true);
+  `);
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT counterfeit_constraint");
+
+  await client.query("SAVEPOINT counterfeit_column");
+  await client.query("ALTER TABLE manual_receipt_facts ADD COLUMN hidden_bypass text");
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT counterfeit_column");
+
+  await client.query("SAVEPOINT counterfeit_function");
+  await client.query(`
+    CREATE OR REPLACE FUNCTION opensales_manual_receipt_write_guard()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RETURN NEW;
+    END $$;
+  `);
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT counterfeit_function");
+
+  await client.query("SAVEPOINT privileged_function");
+  await client.query(
+    "ALTER FUNCTION opensales_manual_receipt_write_guard() SECURITY DEFINER",
+  );
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT privileged_function");
+
+  await client.query("SAVEPOINT counterfeit_view");
+  await client.query(`
+    CREATE OR REPLACE VIEW unclaimed_fund_refund_capacity AS
+    SELECT
+      receipt.id AS fund_receipt_id,
+      receipt.amount_minor,
+      receipt.allocated_minor,
+      0::bigint AS reserved_refund_minor,
+      0::bigint AS confirmed_outflow_minor,
+      false AS capacity_frozen,
+      receipt.amount_minor::bigint AS available_minor
+    FROM fund_receipts receipt;
+  `);
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT counterfeit_view");
 
   await client.query("SAVEPOINT manual_facts");
   const userId = "00000000-0000-4000-8000-000000000261";
@@ -555,7 +706,14 @@ try {
       incompleteSchema016Rejected: true,
       emptySchema016Accepted: true,
       disabledTriggerRejected: true,
+      replicaTriggerRejected: true,
+      counterfeitConstraintRejected: true,
+      counterfeitColumnRejected: true,
+      counterfeitFunctionRejected: true,
+      securityDefinerFunctionRejected: true,
+      counterfeitViewRejected: true,
       lifetimeGuardBlocksWriter: true,
+      lifetimeGuardBlocksMigration: true,
       actualManualInsertsBlocked: blockedInsertStatements.length,
       blockerCodes: [...blockerCodes].sort(),
       databaseMutationPersisted: false,

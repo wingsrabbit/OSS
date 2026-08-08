@@ -10,6 +10,8 @@ import {
 export const SCHEMA_016 = "016_stage_b_manual_receipts" as const;
 export const SCHEMA_015_016_GUARD =
   "opensales:schema-015-016-rollback-bridge" as const;
+export const SCHEMA_016_CATALOG_DIGEST =
+  "a14053c617df8be59e8af15fcc4d5dec250481aa20711b47c594d14cf14e220f" as const;
 
 export type Schema015RollbackPreflightReport = Readonly<{
   installedSchemaVersion: string;
@@ -149,6 +151,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
        JOIN pg_constraint actual ON actual.conrelid = relation.oid
                                 AND actual.conname = required.name
        WHERE actual.contype::text = required.kind
+         AND actual.convalidated
          AND pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_a || '%'
          AND (required.fragment_b IS NULL
               OR pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_b || '%')
@@ -156,38 +159,53 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
               OR pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_c || '%')
      ), required_triggers(
        table_name, trigger_name, function_name, event_fragments,
-       is_deferrable, is_initially_deferred
+       trigger_type, is_deferrable, is_initially_deferred
      ) AS (
        VALUES
          ('manual_receipt_facts', 'manual_receipt_fact_write_guard',
-            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], false, false),
+            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
          ('manual_receipt_reversals', 'manual_receipt_reversal_write_guard',
-            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], false, false),
+            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
          ('manual_receipt_outflows', 'manual_receipt_outflow_write_guard',
-            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], false, false),
+            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
          ('manual_receipt_facts', 'manual_receipt_facts_append_only',
             'opensales_reject_manual_receipt_mutation',
-            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], false, false),
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false),
          ('manual_receipt_facts', 'manual_receipt_fact_completeness_guard',
-            'opensales_assert_manual_receipt_complete', ARRAY['AFTER', 'INSERT']::text[], true, true),
+            'opensales_assert_manual_receipt_complete', ARRAY['AFTER', 'INSERT']::text[], 5, true, true),
          ('manual_receipt_reversals', 'manual_receipt_reversals_append_only',
             'opensales_reject_manual_receipt_mutation',
-            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], false, false),
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false),
          ('manual_receipt_reversals', 'manual_receipt_reversal_completeness_guard',
             'opensales_assert_manual_receipt_reversal_complete',
-            ARRAY['AFTER', 'INSERT']::text[], true, true),
+            ARRAY['AFTER', 'INSERT']::text[], 5, true, true),
          ('manual_receipt_outflows', 'manual_receipt_outflows_append_only',
             'opensales_reject_manual_receipt_mutation',
-            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], false, false),
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false),
          ('manual_receipt_outflows', 'manual_receipt_outflow_completeness_guard',
             'opensales_assert_manual_receipt_outflow_complete',
-            ARRAY['AFTER', 'INSERT']::text[], true, true),
+            ARRAY['AFTER', 'INSERT']::text[], 5, true, true),
          ('refunds', 'manual_receipt_provider_refund_guard',
             'opensales_guard_manual_provider_refund',
-            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], false, false),
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('fund_receipt_resolutions', 'manual_receipt_resolution_guard',
             'opensales_guard_manual_receipt_resolution',
-            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], false, false)
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
+         ('ledger_journals', 'manual_receipt_ledger_write_guard',
+            'opensales_manual_receipt_marker_write_guard',
+            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+         ('provider_operations', 'manual_receipt_provider_operation_write_guard',
+            'opensales_manual_receipt_marker_write_guard',
+            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+         ('durable_jobs', 'manual_receipt_job_write_guard',
+            'opensales_manual_receipt_marker_write_guard',
+            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+         ('provider_inbox', 'manual_receipt_inbox_write_guard',
+            'opensales_manual_receipt_marker_write_guard',
+            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+         ('outbox', 'manual_receipt_outbox_write_guard',
+            'opensales_manual_receipt_marker_write_guard',
+            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false)
      ), trigger_shape AS (
        SELECT count(*) = (SELECT count(*) FROM required_triggers) AS valid
        FROM required_triggers required
@@ -197,9 +215,13 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
        JOIN pg_trigger actual ON actual.tgrelid = relation.oid
                              AND actual.tgname = required.trigger_name
                              AND NOT actual.tgisinternal
-                             AND actual.tgenabled <> 'D'
+                             AND actual.tgenabled = 'O'
        JOIN pg_proc procedure ON procedure.oid = actual.tgfoid
+       JOIN pg_namespace procedure_namespace
+         ON procedure_namespace.oid = procedure.pronamespace
+        AND procedure_namespace.nspname = 'public'
        WHERE procedure.proname = required.function_name
+         AND actual.tgtype = required.trigger_type
          AND actual.tgdeferrable = required.is_deferrable
          AND actual.tginitdeferred = required.is_initially_deferred
          AND NOT EXISTS (
@@ -212,6 +234,11 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ('opensales_manual_receipt_write_guard',
             ARRAY['pg_advisory_xact_lock',
                   'opensales:schema-015-016-rollback-bridge']::text[]),
+         ('opensales_manual_receipt_marker_write_guard',
+            ARRAY['pg_advisory_xact_lock',
+                  'opensales:schema-015-016-rollback-bridge',
+                  'manual_receipt', 'ledger_journals', 'provider_operations',
+                  'durable_jobs', 'provider_inbox', 'outbox']::text[]),
          ('opensales_reject_manual_receipt_mutation',
             ARRAY['RAISE EXCEPTION', 'append-only']::text[]),
          ('opensales_assert_manual_receipt_complete',
@@ -254,6 +281,129 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ('charged_back'),
          ('unknown'),
          ('manual')
+     ), catalog_items(item) AS (
+       SELECT concat_ws('|', 'relation', namespace.nspname, relation.relname,
+                        relation.relkind::text, relation.relpersistence::text,
+                        relation.relreplident::text, relation.relrowsecurity::text,
+                        relation.relforcerowsecurity::text)
+       FROM pg_namespace namespace
+       JOIN pg_class relation ON relation.relnamespace = namespace.oid
+       WHERE namespace.nspname = 'public'
+         AND relation.relname IN (
+           'manual_receipt_facts',
+           'manual_receipt_reversals',
+           'manual_receipt_outflows'
+         )
+       UNION ALL
+       SELECT concat_ws('|', 'column', actual.table_name,
+                        actual.ordinal_position::text, actual.column_name,
+                        actual.data_type, actual.udt_name, actual.is_nullable,
+                        COALESCE(actual.column_default, ''),
+                        actual.is_identity, COALESCE(actual.identity_generation, ''),
+                        actual.is_generated, COALESCE(actual.generation_expression, ''),
+                        COALESCE(actual.collation_name, ''))
+       FROM information_schema.columns actual
+       WHERE actual.table_schema = 'public'
+         AND (
+           actual.table_name IN (
+             'manual_receipt_facts',
+             'manual_receipt_reversals',
+             'manual_receipt_outflows'
+           )
+           OR (actual.table_name = 'fund_receipts'
+             AND actual.column_name IN (
+               'reported_manual_receipt_id',
+               'provider_installation_id',
+               'external_payment_id'
+             ))
+         )
+       UNION ALL
+       SELECT concat_ws('|', 'constraint', relation.relname, actual.conname,
+                        actual.contype::text, actual.convalidated::text,
+                        actual.condeferrable::text, actual.condeferred::text,
+                        actual.connoinherit::text,
+                        regexp_replace(pg_get_constraintdef(actual.oid), '\s+', ' ', 'g'))
+       FROM pg_namespace namespace
+       JOIN pg_class relation ON relation.relnamespace = namespace.oid
+       JOIN pg_constraint actual ON actual.conrelid = relation.oid
+       WHERE namespace.nspname = 'public'
+         AND (
+           relation.relname IN (
+             'manual_receipt_facts',
+             'manual_receipt_reversals',
+             'manual_receipt_outflows'
+           )
+           OR (relation.relname = 'fund_receipts'
+             AND actual.conname IN (
+               'fund_receipts_reported_manual_receipt_id_fkey',
+               'fund_receipts_exactly_one_source',
+               'fund_receipts_source_provider_fields',
+               'fund_receipts_disposition_check'
+             ))
+         )
+       UNION ALL
+       SELECT concat_ws('|', 'trigger', relation.relname, actual.tgname,
+                        actual.tgenabled::text, actual.tgtype::text,
+                        actual.tgdeferrable::text, actual.tginitdeferred::text,
+                        procedure_namespace.nspname, procedure.proname,
+                        regexp_replace(pg_get_triggerdef(actual.oid, true), '\s+', ' ', 'g'))
+       FROM pg_namespace namespace
+       JOIN pg_class relation ON relation.relnamespace = namespace.oid
+       JOIN pg_trigger actual ON actual.tgrelid = relation.oid
+       JOIN pg_proc procedure ON procedure.oid = actual.tgfoid
+       JOIN pg_namespace procedure_namespace ON procedure_namespace.oid = procedure.pronamespace
+       WHERE namespace.nspname = 'public'
+         AND NOT actual.tgisinternal
+         AND (
+           relation.relname IN (
+             'manual_receipt_facts',
+             'manual_receipt_reversals',
+             'manual_receipt_outflows'
+           )
+           OR actual.tgname IN (
+             'manual_receipt_provider_refund_guard',
+             'manual_receipt_resolution_guard',
+             'manual_receipt_ledger_write_guard',
+             'manual_receipt_provider_operation_write_guard',
+             'manual_receipt_job_write_guard',
+             'manual_receipt_inbox_write_guard',
+             'manual_receipt_outbox_write_guard'
+           )
+         )
+       UNION ALL
+       SELECT concat_ws('|', 'function', namespace.nspname, actual.proname,
+                        language.lanname, actual.provolatile::text,
+                        actual.prosecdef::text, actual.proleakproof::text,
+                        COALESCE(array_to_string(actual.proconfig, ','), ''),
+                        pg_get_function_identity_arguments(actual.oid),
+                        pg_get_function_result(actual.oid),
+                        regexp_replace(btrim(actual.prosrc), '\s+', ' ', 'g'))
+       FROM pg_namespace namespace
+       JOIN pg_proc actual ON actual.pronamespace = namespace.oid
+       JOIN pg_language language ON language.oid = actual.prolang
+       WHERE namespace.nspname = 'public'
+         AND actual.proname IN (
+           'opensales_manual_receipt_write_guard',
+           'opensales_manual_receipt_marker_write_guard',
+           'opensales_reject_manual_receipt_mutation',
+           'opensales_assert_manual_receipt_complete',
+           'opensales_assert_manual_receipt_reversal_complete',
+           'opensales_assert_manual_receipt_outflow_complete',
+           'opensales_guard_manual_provider_refund',
+           'opensales_guard_manual_receipt_resolution'
+         )
+       UNION ALL
+       SELECT concat_ws('|', 'view', 'unclaimed_fund_refund_capacity',
+                        regexp_replace(
+                          pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true),
+                          '\s+', ' ', 'g'
+                        ))
+     ), catalog_digest(value) AS (
+       SELECT encode(
+         public.digest(string_agg(item, E'\n' ORDER BY item), 'sha256'),
+         'hex'
+       )
+       FROM catalog_items
      )
      SELECT
        (SELECT count(*) = 2
@@ -269,6 +419,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
        (SELECT valid FROM constraint_shape) AS has_constraints,
        (SELECT valid FROM trigger_shape) AS has_triggers,
        (SELECT valid FROM function_shape) AS has_functions,
+       (SELECT value FROM catalog_digest) AS catalog_digest,
        to_regclass('public.unclaimed_fund_refund_capacity') IS NOT NULL
          AND NOT EXISTS (
            SELECT 1 FROM required_view_fragments required
@@ -277,6 +428,12 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ) AS has_capacity_view`,
   );
   const shape = rowRecord(result.rows[0]);
+  if (shape.catalog_digest !== SCHEMA_016_CATALOG_DIGEST) {
+    throw new SchemaRollbackPreflightError(
+      `Schema 016 is incomplete or counterfeit: catalog digest ${String(shape.catalog_digest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start the 015 rollback bridge.`,
+      SCHEMA_016,
+    );
+  }
   if (
     shape.has_contiguous_history !== true ||
     shape.has_columns !== true ||

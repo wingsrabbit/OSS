@@ -151,6 +151,15 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
     await client.query(
       "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
     );
+    const compatibilityGuard = await client.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+      [SCHEMA_015_016_GUARD],
+    );
+    if (compatibilityGuard.rows[0]?.locked !== true) {
+      throw new Error(
+        "Schema migration is blocked by a running compatibility-bridge API or Worker; stop every application process before migrating",
+      );
+    }
     await client.query(
       "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
@@ -178,6 +187,11 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       }
     }
   } finally {
+    await client
+      .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+        SCHEMA_015_016_GUARD,
+      ])
+      .catch(() => undefined);
     await client
       .query("SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0))")
       .catch(() => undefined);

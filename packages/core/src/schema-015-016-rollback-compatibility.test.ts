@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   assert015RollbackBridgeSafe,
   SCHEMA_016,
+  SCHEMA_016_CATALOG_DIGEST,
 } from "./schema-015-016-rollback-compatibility.js";
 import {
   SCHEMA_015,
@@ -35,6 +36,7 @@ function fakeDatabase(input: {
               has_triggers: valid,
               has_functions: valid,
               has_capacity_view: valid,
+              catalog_digest: valid ? SCHEMA_016_CATALOG_DIGEST : "counterfeit",
             },
           ],
         };
