@@ -52,7 +52,9 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   const admin = page.locator("section.admin-panel");
   const renewalAdmin = admin.locator('[aria-label="Renewal billing automation"]');
   await expect(
-    renewalAdmin.getByRole("heading", { name: "Renewal generation and reminders" }),
+    renewalAdmin.getByRole("heading", {
+      name: "Renewal, Late Fee and service state automation",
+    }),
   ).toBeVisible();
   const syntheticDayOffset = 40 + (Number.parseInt(unique.slice(0, 8), 16) % 300);
   const effectiveAt = new Date(Date.now() + syntheticDayOffset * 24 * 60 * 60 * 1_000)

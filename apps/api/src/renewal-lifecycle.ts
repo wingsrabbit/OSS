@@ -3,12 +3,21 @@
 import { randomUUID } from "node:crypto";
 import { addBillingCycle, type BillingCycle } from "@opensales/core";
 import type { DatabaseClient } from "./database.js";
+import {
+  assessLateFeesAndScheduleSuspensions,
+  scheduleResumeAfterRenewalSettlement,
+  type RenewalResumeScheduleOutcome,
+} from "./delinquency-lifecycle.js";
 
 export type RenewalAutomationOutcome = {
   runId: string;
   businessDate: string;
   invoicesCreated: number;
   remindersCreated: number;
+  lateFeesAssessed: number;
+  lateFeeMinor: string;
+  suspensionCasesCreated: number;
+  delinquencyDeferralsCreated: number;
   replayed: boolean;
 };
 
@@ -16,6 +25,7 @@ export type RenewalSettlementOutcome = {
   serviceId: string;
   renewalStatus: "paid" | "manual_hold";
   serviceStatus: string;
+  resumeSchedule?: RenewalResumeScheduleOutcome;
 };
 
 type ReminderKind = "renewal_created" | "pre_due" | "overdue_first";
@@ -258,34 +268,49 @@ async function autoApplyRenewalCredit(
 export async function runRenewalAutomation(
   client: DatabaseClient,
   input: {
-    requestedByUserId: string;
+    requestedByUserId: string | null;
     reason: string;
-    idempotencyKey: string;
-    requestFingerprint: string;
+    idempotencyKey?: string;
+    requestFingerprint?: string;
+    scheduledBusinessDate?: string;
     effectiveAt: Date;
   },
 ): Promise<RenewalAutomationOutcome> {
-  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-    `billing-automation-request:${input.requestedByUserId}:${input.idempotencyKey}`,
-  ]);
+  const isScheduled = input.requestedByUserId === null;
+  if (!isScheduled && (!input.idempotencyKey || !input.requestFingerprint)) {
+    throw new Error("Staff billing automation requires an idempotency key and fingerprint");
+  }
+  const staffIdempotencyKey = isScheduled ? null : input.idempotencyKey!;
+  const staffRequestFingerprint = isScheduled ? null : input.requestFingerprint!;
+  if (!isScheduled) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `billing-automation-request:${input.requestedByUserId}:${staffIdempotencyKey}`,
+    ]);
+  }
   const requestReplayResult = await client.query<{
     request_fingerprint: string;
     run_id: string;
     business_date: string;
     invoices_created: number;
     reminders_created: number;
+    late_fees_assessed: number;
+    late_fee_minor: string;
+    suspension_cases_created: number;
+    delinquency_deferrals_created: number;
   }>(
     `SELECT request.request_fingerprint, run.id AS run_id,
-            run.business_date::text, run.invoices_created, run.reminders_created
+            run.business_date::text, run.invoices_created, run.reminders_created,
+            run.late_fees_assessed, run.late_fee_minor::text,
+            run.suspension_cases_created, run.delinquency_deferrals_created
      FROM billing_automation_run_requests request
      JOIN billing_automation_runs run ON run.id = request.run_id
      WHERE request.requested_by_user_id = $1 AND request.idempotency_key = $2
      FOR UPDATE OF request, run`,
-    [input.requestedByUserId, input.idempotencyKey],
+    [input.requestedByUserId, staffIdempotencyKey],
   );
   const requestReplay = requestReplayResult.rows[0];
-  if (requestReplay) {
-    if (requestReplay.request_fingerprint !== input.requestFingerprint) {
+  if (!isScheduled && requestReplay) {
+    if (requestReplay.request_fingerprint !== staffRequestFingerprint) {
       throw Object.assign(new Error("The idempotency key was used for a different automation run"), {
         statusCode: 409,
         code: "IDEMPOTENCY_CONFLICT",
@@ -296,6 +321,10 @@ export async function runRenewalAutomation(
       businessDate: requestReplay.business_date,
       invoicesCreated: requestReplay.invoices_created,
       remindersCreated: requestReplay.reminders_created,
+      lateFeesAssessed: requestReplay.late_fees_assessed,
+      lateFeeMinor: requestReplay.late_fee_minor,
+      suspensionCasesCreated: requestReplay.suspension_cases_created,
+      delinquencyDeferralsCreated: requestReplay.delinquency_deferrals_created,
       replayed: true,
     };
   }
@@ -307,11 +336,23 @@ export async function runRenewalAutomation(
     renewal_lead_days: number;
     pre_due_reminder_days: number;
     overdue_reminder_days: number;
+    late_fee_enabled: boolean;
+    late_fee_days: number;
+    late_fee_basis_points: number;
+    overdue_suspension_enabled: boolean;
+    overdue_suspension_days: number;
+    run_local_time: string;
     business_date: string;
+    scheduled_time_reached: boolean;
   }>(
     `SELECT id, enabled, timezone, renewal_lead_days,
             pre_due_reminder_days, overdue_reminder_days,
-            ($1::timestamptz AT TIME ZONE timezone)::date::text AS business_date
+            late_fee_enabled, late_fee_days, late_fee_basis_points,
+            overdue_suspension_enabled, overdue_suspension_days,
+            run_local_time::text,
+            ($1::timestamptz AT TIME ZONE timezone)::date::text AS business_date,
+            (($1::timestamptz AT TIME ZONE timezone)::time >= run_local_time)
+              AS scheduled_time_reached
      FROM billing_automation_policies
      WHERE id = 'default'
      FOR UPDATE`,
@@ -325,13 +366,38 @@ export async function runRenewalAutomation(
       code: "AUTOMATION_PAUSED",
     });
   }
+  if (isScheduled) {
+    if (!input.scheduledBusinessDate || input.scheduledBusinessDate !== policy.business_date) {
+      throw Object.assign(
+        new Error("Scheduled billing business date does not match the signed effective time"),
+        { statusCode: 409, code: "SCHEDULED_DATE_CONFLICT" },
+      );
+    }
+    if (!policy.scheduled_time_reached) {
+      throw Object.assign(
+        new Error(
+          `Scheduled billing is not due before ${policy.run_local_time} in ${policy.timezone}`,
+        ),
+        { statusCode: 409, code: "SCHEDULE_NOT_DUE" },
+      );
+    }
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `billing-automation-scheduled:${policy.id}:${policy.business_date}`,
+    ]);
+  }
 
   const businessReplayResult = await client.query<{
     id: string;
     invoices_created: number;
     reminders_created: number;
+    late_fees_assessed: number;
+    late_fee_minor: string;
+    suspension_cases_created: number;
+    delinquency_deferrals_created: number;
   }>(
-    `SELECT id, invoices_created, reminders_created
+    `SELECT id, invoices_created, reminders_created,
+            late_fees_assessed, late_fee_minor::text, suspension_cases_created,
+            delinquency_deferrals_created
      FROM billing_automation_runs
      WHERE policy_id = $1 AND business_date = $2::date
      FOR UPDATE`,
@@ -339,36 +405,56 @@ export async function runRenewalAutomation(
   );
   const businessReplay = businessReplayResult.rows[0];
   if (businessReplay) {
-    await client.query(
-      `INSERT INTO billing_automation_run_requests(
-         requested_by_user_id, idempotency_key, request_fingerprint, run_id
-       ) VALUES ($1, $2, $3, $4)`,
-      [input.requestedByUserId, input.idempotencyKey, input.requestFingerprint, businessReplay.id],
-    );
+    if (!isScheduled) {
+      await client.query(
+        `INSERT INTO billing_automation_run_requests(
+           requested_by_user_id, idempotency_key, request_fingerprint, run_id
+         ) VALUES ($1, $2, $3, $4)`,
+        [
+          input.requestedByUserId,
+          staffIdempotencyKey,
+          staffRequestFingerprint,
+          businessReplay.id,
+        ],
+      );
+    }
     return {
       runId: businessReplay.id,
       businessDate: policy.business_date,
       invoicesCreated: businessReplay.invoices_created,
       remindersCreated: businessReplay.reminders_created,
+      lateFeesAssessed: businessReplay.late_fees_assessed,
+      lateFeeMinor: businessReplay.late_fee_minor,
+      suspensionCasesCreated: businessReplay.suspension_cases_created,
+      delinquencyDeferralsCreated: businessReplay.delinquency_deferrals_created,
       replayed: true,
     };
   }
 
   const runResult = await client.query<{ id: string }>(
     `INSERT INTO billing_automation_runs(
-       policy_id, business_date, effective_at, requested_by_user_id, reason
-     ) VALUES ($1, $2::date, $3, $4, $5)
+       policy_id, business_date, effective_at, requested_by_user_id, trigger_kind, reason
+     ) VALUES ($1, $2::date, $3, $4, $5, $6)
      RETURNING id`,
-    [policy.id, policy.business_date, input.effectiveAt, input.requestedByUserId, input.reason],
+    [
+      policy.id,
+      policy.business_date,
+      input.effectiveAt,
+      input.requestedByUserId,
+      isScheduled ? "scheduled" : "staff",
+      input.reason,
+    ],
   );
   const runId = runResult.rows[0]?.id;
   if (!runId) throw new Error("Unable to record billing automation run");
-  await client.query(
-    `INSERT INTO billing_automation_run_requests(
-       requested_by_user_id, idempotency_key, request_fingerprint, run_id
-     ) VALUES ($1, $2, $3, $4)`,
-    [input.requestedByUserId, input.idempotencyKey, input.requestFingerprint, runId],
-  );
+  if (!isScheduled) {
+    await client.query(
+      `INSERT INTO billing_automation_run_requests(
+         requested_by_user_id, idempotency_key, request_fingerprint, run_id
+       ) VALUES ($1, $2, $3, $4)`,
+      [input.requestedByUserId, staffIdempotencyKey, staffRequestFingerprint, runId],
+    );
+  }
 
   const candidates = await client.query<{
     service_id: string;
@@ -509,6 +595,21 @@ export async function runRenewalAutomation(
     }
   }
 
+  const delinquency = await assessLateFeesAndScheduleSuspensions(client, {
+    runId,
+    policy: {
+      policyId: policy.id,
+      timezone: policy.timezone,
+      businessDate: policy.business_date,
+      effectiveAt: input.effectiveAt,
+      lateFeeEnabled: policy.late_fee_enabled,
+      lateFeeDays: policy.late_fee_days,
+      lateFeeBasisPoints: policy.late_fee_basis_points,
+      overdueSuspensionEnabled: policy.overdue_suspension_enabled,
+      overdueSuspensionDays: policy.overdue_suspension_days,
+    },
+  });
+
   const reminderCandidates = await client.query<{
     invoice_id: string;
     service_id: string;
@@ -591,16 +692,28 @@ export async function runRenewalAutomation(
 
   await client.query(
     `UPDATE billing_automation_runs
-     SET invoices_created = $2, reminders_created = $3, completed_at = now()
+     SET invoices_created = $2, reminders_created = $3,
+         late_fees_assessed = $4, late_fee_minor = $5,
+         suspension_cases_created = $6, delinquency_deferrals_created = $7,
+         completed_at = now()
      WHERE id = $1`,
-    [runId, invoicesCreated, remindersCreated],
+    [
+      runId,
+      invoicesCreated,
+      remindersCreated,
+      delinquency.lateFeesAssessed,
+      delinquency.lateFeeMinor.toString(),
+      delinquency.suspensionCasesCreated,
+      delinquency.delinquencyDeferralsCreated,
+    ],
   );
   await client.query(
     `INSERT INTO audit_events(
        actor_type, actor_id, action, target_type, target_id, reason, metadata
-     ) VALUES ('staff', $1, 'billing.automation_run', 'billing_automation_run', $2, $3, $4)`,
+     ) VALUES ($1, $2, 'billing.automation_run', 'billing_automation_run', $3, $4, $5)`,
     [
-      input.requestedByUserId,
+      isScheduled ? "system" : "staff",
+      input.requestedByUserId ?? "billing-worker",
       runId,
       input.reason,
       {
@@ -609,6 +722,10 @@ export async function runRenewalAutomation(
         timezone: policy.timezone,
         invoicesCreated,
         remindersCreated,
+        lateFeesAssessed: delinquency.lateFeesAssessed,
+        lateFeeMinor: delinquency.lateFeeMinor.toString(),
+        suspensionCasesCreated: delinquency.suspensionCasesCreated,
+        delinquencyDeferralsCreated: delinquency.delinquencyDeferralsCreated,
       },
     ],
   );
@@ -617,6 +734,10 @@ export async function runRenewalAutomation(
     businessDate: policy.business_date,
     invoicesCreated,
     remindersCreated,
+    lateFeesAssessed: delinquency.lateFeesAssessed,
+    lateFeeMinor: delinquency.lateFeeMinor.toString(),
+    suspensionCasesCreated: delinquency.suspensionCasesCreated,
+    delinquencyDeferralsCreated: delinquency.delinquencyDeferralsCreated,
     replayed: false,
   };
 }
@@ -629,8 +750,13 @@ export async function settleRenewalInvoice(
     | {
         kind: "staff_manual";
         staffUserId: string;
-        expectedRenewalVersion?: number;
         reason?: string;
+      }
+    | {
+        kind: "staff_hold_resolution";
+        staffUserId: string;
+        expectedRenewalVersion: number;
+        reason: string;
       },
 ): Promise<RenewalSettlementOutcome | null> {
   const pointerResult = await client.query<{
@@ -672,6 +798,16 @@ export async function settleRenewalInvoice(
       [pointer.client_account_id, commandUserId],
     );
   }
+  await client.query("SELECT id FROM service_renewals WHERE id = $1 FOR UPDATE", [
+    pointer.renewal_id,
+  ]);
+  await client.query(
+    `SELECT id
+     FROM service_suspension_cases
+     WHERE service_renewal_id = $1
+     FOR UPDATE`,
+    [pointer.renewal_id],
+  );
 
   const renewalResult = await client.query<{
     id: string;
@@ -689,6 +825,7 @@ export async function settleRenewalInvoice(
     removed_at: Date | null;
     membership_client_account_id: string | null;
     membership_role: "owner" | "billing" | "technical" | "viewer" | null;
+    suspension_case_status: string | null;
     version: number;
   }>(
     `SELECT
@@ -707,6 +844,7 @@ export async function settleRenewalInvoice(
        membership.removed_at,
        membership.client_account_id AS membership_client_account_id,
        membership.role AS membership_role,
+       suspension_case.status AS suspension_case_status,
        renewal.version
      FROM service_renewals renewal
      JOIN invoices invoice ON invoice.id = renewal.invoice_id
@@ -718,8 +856,9 @@ export async function settleRenewalInvoice(
      LEFT JOIN client_memberships membership
        ON membership.client_account_id = service.client_account_id
       AND membership.user_id = customer.id
-     WHERE renewal.id = $1
-     FOR UPDATE OF renewal`,
+     LEFT JOIN service_suspension_cases suspension_case
+       ON suspension_case.service_renewal_id = renewal.id
+     WHERE renewal.id = $1`,
     [pointer.renewal_id, commandUserId],
   );
   const renewal = renewalResult.rows[0];
@@ -731,8 +870,7 @@ export async function settleRenewalInvoice(
     throw new Error("Renewal invoice ownership is inconsistent");
   }
   if (
-    context?.kind === "staff_manual" &&
-    context.expectedRenewalVersion !== undefined &&
+    context?.kind === "staff_hold_resolution" &&
     renewal.version !== context.expectedRenewalVersion
   ) {
     throw Object.assign(new Error("Renewal changed; refresh and confirm the hold again"), {
@@ -747,6 +885,16 @@ export async function settleRenewalInvoice(
       serviceStatus: renewal.service_status,
     };
   }
+  const authorizedHoldResolution =
+    renewal.status === "manual_hold" &&
+    context?.kind === "staff_hold_resolution";
+  if (renewal.status === "manual_hold" && !authorizedHoldResolution) {
+    return {
+      serviceId: renewal.service_id,
+      renewalStatus: "manual_hold",
+      serviceStatus: renewal.service_status,
+    };
+  }
 
   await client.query(
     `INSERT INTO outbox(event_type, unique_key, payload)
@@ -754,8 +902,14 @@ export async function settleRenewalInvoice(
      ON CONFLICT (event_type, unique_key) DO NOTHING`,
     [`invoice:${invoiceId}`, { invoiceId, serviceId: renewal.service_id, renewal: true }],
   );
+  const delinquencySuspended =
+    renewal.service_status === "suspended" &&
+    ["suspended", "resume_queued", "resume_processing", "resume_unknown"].includes(
+      renewal.suspension_case_status ?? "",
+    );
   const accountAndServiceEligible =
-    !renewal.account_restricted_at && renewal.service_status === "active";
+    !renewal.account_restricted_at &&
+    (renewal.service_status === "active" || delinquencySuspended);
   const userCommandEligible =
     context?.kind === "user_command" &&
     Boolean(renewal.membership_client_account_id) &&
@@ -765,7 +919,9 @@ export async function settleRenewalInvoice(
     (renewal.membership_role === "owner" || renewal.membership_role === "billing");
   const eligible =
     accountAndServiceEligible &&
-    (context?.kind === "staff_manual" || userCommandEligible);
+    (context?.kind === "staff_manual" ||
+      context?.kind === "staff_hold_resolution" ||
+      userCommandEligible);
   const fundedAt = new Date();
   if (!eligible) {
     await client.query(
@@ -840,7 +996,7 @@ export async function settleRenewalInvoice(
   const advanced = await client.query(
     `UPDATE services
      SET term_end = $3, updated_at = now(), version = version + 1
-     WHERE id = $1 AND status = 'active' AND term_end = $2
+     WHERE id = $1 AND status IN ('active', 'suspended') AND term_end = $2
      RETURNING id`,
     [renewal.service_id, renewal.period_start, renewal.period_end],
   );
@@ -854,7 +1010,11 @@ export async function settleRenewalInvoice(
      WHERE id = $1 AND status <> 'paid'`,
     [renewal.id, settledAt],
   );
-  if (context?.kind === "staff_manual") {
+  const resumeSchedule = await scheduleResumeAfterRenewalSettlement(client, {
+    renewalId: renewal.id,
+    serviceId: renewal.service_id,
+  });
+  if (context?.kind === "staff_manual" || context?.kind === "staff_hold_resolution") {
     await client.query(
       `INSERT INTO audit_events(
          actor_type, actor_id, action, target_type, target_id, reason, metadata
@@ -871,5 +1031,6 @@ export async function settleRenewalInvoice(
     serviceId: renewal.service_id,
     renewalStatus: "paid",
     serviceStatus: renewal.service_status,
+    resumeSchedule,
   };
 }

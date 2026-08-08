@@ -15,6 +15,7 @@ import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 
 const checkoutSchema = z.object({
   priceId: z.uuid(),
@@ -429,6 +430,24 @@ export async function registerOrderRoutes(
       if (!serviceId) throw new Error("Unable to create service");
 
       await client.query(
+        `INSERT INTO service_provider_bindings(
+           service_id, provider_installation_id, overdue_action_snapshot,
+           capability_snapshot, product_policy_version
+         )
+         SELECT
+           $1,
+           policy.provider_installation_id,
+           policy.overdue_action,
+           COALESCE(provider.capabilities, '[]'::jsonb),
+           policy.version
+         FROM product_service_automation_policies policy
+         LEFT JOIN provider_installation_capabilities provider
+           ON provider.provider_installation_id = policy.provider_installation_id
+         WHERE policy.product_id = $2`,
+        [serviceId, snapshot.productId],
+      );
+
+      await client.query(
         `INSERT INTO outbox(event_type, unique_key, payload)
          VALUES ('order.submitted', $1, $2)`,
         [`order:${orderId}`, { orderId, invoiceId, clientAccountId: user.clientAccountId }],
@@ -640,8 +659,12 @@ export async function registerOrderRoutes(
           code: "QUOTE_STALE",
         });
       }
-      const invoiceResult = await client.query<{ total_minor: string; currency: string }>(
-        `SELECT total_minor::text, currency
+      const invoiceResult = await client.query<{
+        total_minor: string;
+        currency: string;
+        order_id: string | null;
+      }>(
+        `SELECT total_minor::text, currency, order_id
          FROM invoices
          WHERE id = $1 AND client_account_id = $2
          FOR UPDATE`,
@@ -649,6 +672,7 @@ export async function registerOrderRoutes(
       );
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
+      await assertInvoicePaymentBusinessStateLocked(client, params.invoiceId, invoice.order_id);
       await assertEligibilityLocked(client, user.userId, user.clientAccountId, true);
       const allocationResult = await client.query<{
         payment_minor: string;

@@ -301,6 +301,41 @@ type RenewalItem = {
   settledAt: string | null;
   version: number;
   reminders: RenewalReminder[];
+  lateFee: {
+    disposition: "charged" | "skipped_zero";
+    basisMinor: string;
+    basisPoints: number;
+    amountMinor: string;
+    businessDate: string;
+  } | null;
+  delinquency: {
+    caseId: string;
+    action: "automatic" | "manual" | "none";
+    decisionReason: string;
+    status: string;
+    resumeRequired: boolean;
+    providerInstallationId: string | null;
+    lastError: string | null;
+    version: number;
+    suspendOperation: { status: string; attempts: number } | null;
+    resumeOperation: { status: string; attempts: number } | null;
+    manualControl: {
+      allowedActions: Array<"confirm_suspended" | "confirm_restored">;
+      requiresReauthentication: true;
+      actionCount: string;
+      latestActionAt: string | null;
+      blockedReason: string | null;
+      impact: {
+        confirmSuspended: string;
+        confirmRestored: string;
+      };
+    } | null;
+  } | null;
+  paymentReconciliationHold: {
+    active: boolean;
+    deferralCount: string;
+    latestDeferredAt: string | null;
+  };
 };
 type AdminRenewalItem = RenewalItem & {
   clientAccountId: string;
@@ -491,6 +526,9 @@ export function App() {
   const [automationReason, setAutomationReason] = useState("");
   const [renewalHoldReason, setRenewalHoldReason] = useState("");
   const [renewalHoldPendingId, setRenewalHoldPendingId] = useState<string | null>(null);
+  const [manualSuspensionReason, setManualSuspensionReason] = useState("");
+  const [manualSuspensionPendingId, setManualSuspensionPendingId] = useState<string | null>(null);
+  const manualSuspensionIntentKeys = useRef(new Map<string, string>());
   const [paymentQuote, setPaymentQuote] = useState<PaymentQuote | null>(null);
   const [addFundsPrincipalMinor, setAddFundsPrincipalMinor] = useState("5000");
   const [addFundsMethod, setAddFundsMethod] = useState("card");
@@ -1065,6 +1103,7 @@ export function App() {
         businessDate: string;
         invoicesCreated: number;
         remindersCreated: number;
+        delinquencyDeferralsCreated: number;
         replayed: boolean;
       }>("/api/v1/admin/billing/automation/run", {
         method: "POST",
@@ -1079,7 +1118,7 @@ export function App() {
       setAutomationReason("");
       await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
       setNotice(
-        `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s).`,
+        `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s), ${result.delinquencyDeferralsCreated} payment reconciliation hold(s).`,
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Billing automation failed");
@@ -1119,6 +1158,70 @@ export function App() {
       setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
     } finally {
       setRenewalHoldPendingId(null);
+    }
+  }
+
+  async function performManualSuspensionAction(
+    renewal: AdminRenewalItem,
+    action: "confirm_suspended" | "confirm_restored",
+  ) {
+    const delinquency = renewal.delinquency;
+    if (
+      !me?.staff ||
+      !delinquency?.manualControl?.allowedActions.includes(action) ||
+      manualSuspensionReason.trim().length < 10 ||
+      manualSuspensionPendingId
+    ) {
+      return;
+    }
+    const requestIdentity = JSON.stringify({
+      caseId: delinquency.caseId,
+      action,
+      expectedVersion: delinquency.version,
+      reason: manualSuspensionReason.trim(),
+    });
+    let idempotencyKey = manualSuspensionIntentKeys.current.get(requestIdentity);
+    if (!idempotencyKey) {
+      idempotencyKey = crypto.randomUUID();
+      manualSuspensionIntentKeys.current.set(requestIdentity, idempotencyKey);
+    }
+    setError("");
+    setManualSuspensionPendingId(delinquency.caseId);
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const outcome = await api<{
+        caseStatus: string;
+        serviceStatus: string;
+        providerCalled: false;
+        replayed: boolean;
+      }>(
+        `/api/v1/admin/billing/delinquency-cases/${delinquency.caseId}/manual-actions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            reason: manualSuspensionReason.trim(),
+            expectedVersion: delinquency.version,
+            idempotencyKey,
+          }),
+        },
+      );
+      manualSuspensionIntentKeys.current.delete(requestIdentity);
+      setManualSuspensionReason("");
+      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      setNotice(
+        action === "confirm_suspended"
+          ? `Manual suspension recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`
+          : `Manual restoration recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Manual service action failed");
+    } finally {
+      setManualSuspensionPendingId(null);
     }
   }
 
@@ -2008,6 +2111,29 @@ export function App() {
                         was not extended.
                       </span>
                     )}
+                    {renewal.lateFee && (
+                      <span data-testid="renewal-late-fee">
+                        Late Fee {renewal.lateFee.disposition}: {usd(renewal.lateFee.amountMinor)}
+                        {" "}on eligible unpaid basis {usd(renewal.lateFee.basisMinor)} at {" "}
+                        {(renewal.lateFee.basisPoints / 100).toFixed(2)}% · assessed {" "}
+                        {renewal.lateFee.businessDate}
+                      </span>
+                    )}
+                    {renewal.paymentReconciliationHold.active && (
+                      <span className="notice" data-testid="renewal-payment-reconciliation-hold">
+                        Payment result is still being reconciled. No new Late Fee or suspension is
+                        applied while the result remains unknown.
+                      </span>
+                    )}
+                    {renewal.delinquency && (
+                      <span data-testid="renewal-delinquency-status">
+                        Overdue action {renewal.delinquency.action} · {renewal.delinquency.status}
+                        {renewal.delinquency.resumeRequired ? " · restore required after reconciliation" : ""}
+                        {renewal.delinquency.lastError
+                          ? ` · staff attention: ${renewal.delinquency.lastError}`
+                          : ""}
+                      </span>
+                    )}
                     <span>
                       Reminders: {" "}
                       {renewal.reminders.length === 0
@@ -2273,12 +2399,15 @@ export function App() {
             <div className="admin-subsection" aria-label="Renewal billing automation">
               <div>
                 <p className="eyebrow">Manual laboratory billing run · Asia/Shanghai</p>
-                <h3>Renewal generation and reminders</h3>
+                <h3>Renewal, Late Fee and service state automation</h3>
                 <p>
                   This run creates the next non-overlapping invoice 14 days before paid-through and
-                  queues the configured pre-due and first overdue reminders. The laboratory time
-                  override is synthetic acceptance control, not a production clock setting. The
-                  unattended 09:00 scheduler is not enabled in this laboratory slice yet.
+                  queues the configured reminders. On Shanghai calendar day 5 it assesses one 10%
+                  Late Fee only on eligible unpaid charges, then queues suspension only when both
+                  the product policy and Provider explicitly allow suspend and resume. The laboratory
+                  time override is synthetic acceptance control, not a production clock setting. The
+                  durable Worker runs the policy once at or after 09:00 Asia/Shanghai and catches up
+                  safely after a restart; repeated scheduling returns the existing business-day run.
                 </p>
               </div>
               <div className="inline-form admin-confirm">
@@ -2308,6 +2437,12 @@ export function App() {
                   value={renewalHoldReason}
                   onChange={(event) => setRenewalHoldReason(event.target.value)}
                   placeholder="Funded Hold review reason (10+ characters)"
+                />
+                <input
+                  aria-label="Manual suspension or restoration reason"
+                  value={manualSuspensionReason}
+                  onChange={(event) => setManualSuspensionReason(event.target.value)}
+                  placeholder="Manual service state reason (10+ characters)"
                 />
               </div>
               {adminRenewals.length === 0 ? (
@@ -2339,6 +2474,51 @@ export function App() {
                             ? " — funds recorded; staff disposition required"
                             : ""}
                         </span>
+                        {renewal.lateFee && (
+                          <span data-testid="admin-renewal-late-fee">
+                            Late Fee {renewal.lateFee.disposition} · basis {usd(renewal.lateFee.basisMinor)}
+                            {" "}· {(renewal.lateFee.basisPoints / 100).toFixed(2)}% = {" "}
+                            {usd(renewal.lateFee.amountMinor)}
+                          </span>
+                        )}
+                        {renewal.paymentReconciliationHold.active && (
+                          <span data-testid="admin-renewal-payment-reconciliation-hold">
+                            Delinquency deferred for unresolved payment result · recorded holds {" "}
+                            {renewal.paymentReconciliationHold.deferralCount}
+                          </span>
+                        )}
+                        {renewal.delinquency && (
+                          <>
+                            <span data-testid="admin-renewal-delinquency-status">
+                              Action {renewal.delinquency.action} · case {renewal.delinquency.status}
+                              {renewal.delinquency.providerInstallationId
+                                ? ` · Provider ${renewal.delinquency.providerInstallationId}`
+                                : " · no Provider mutation"}
+                              {renewal.delinquency.suspendOperation
+                                ? ` · suspend ${renewal.delinquency.suspendOperation.status}/${renewal.delinquency.suspendOperation.attempts}`
+                                : ""}
+                              {renewal.delinquency.resumeOperation
+                                ? ` · resume ${renewal.delinquency.resumeOperation.status}/${renewal.delinquency.resumeOperation.attempts}`
+                                : ""}
+                              {renewal.delinquency.lastError
+                                ? ` · ${renewal.delinquency.lastError}`
+                                : ""}
+                            </span>
+                            {renewal.delinquency.manualControl && (
+                              <span data-testid="admin-renewal-manual-control">
+                                Manual records {renewal.delinquency.manualControl.actionCount}
+                                {renewal.delinquency.manualControl.latestActionAt
+                                  ? ` · latest ${new Date(
+                                      renewal.delinquency.manualControl.latestActionAt,
+                                    ).toLocaleString()}`
+                                  : ""}
+                                {renewal.delinquency.manualControl.blockedReason
+                                  ? ` · blocked: ${renewal.delinquency.manualControl.blockedReason}`
+                                  : " · password confirmation and a 10+ character reason are required"}
+                              </span>
+                            )}
+                          </>
+                        )}
                         <span>
                           Notification delivery: {" "}
                           {renewal.reminders.length === 0
@@ -2348,6 +2528,50 @@ export function App() {
                                 .join(", ")}
                         </span>
                       </div>
+                      {renewal.delinquency?.manualControl?.allowedActions.includes(
+                        "confirm_suspended",
+                      ) && (
+                        <div className="fund-actions" data-testid="manual-suspension-control">
+                          <span>{renewal.delinquency.manualControl.impact.confirmSuspended}</span>
+                          <button
+                            className="primary"
+                            disabled={
+                              manualSuspensionPendingId !== null ||
+                              adminPassword.length === 0 ||
+                              manualSuspensionReason.trim().length < 10
+                            }
+                            onClick={() =>
+                              void performManualSuspensionAction(renewal, "confirm_suspended")
+                            }
+                          >
+                            {manualSuspensionPendingId === renewal.delinquency.caseId
+                              ? "Recording suspension…"
+                              : "Confirm service suspended"}
+                          </button>
+                        </div>
+                      )}
+                      {renewal.delinquency?.manualControl?.allowedActions.includes(
+                        "confirm_restored",
+                      ) && (
+                        <div className="fund-actions" data-testid="manual-restoration-control">
+                          <span>{renewal.delinquency.manualControl.impact.confirmRestored}</span>
+                          <button
+                            className="primary"
+                            disabled={
+                              manualSuspensionPendingId !== null ||
+                              adminPassword.length === 0 ||
+                              manualSuspensionReason.trim().length < 10
+                            }
+                            onClick={() =>
+                              void performManualSuspensionAction(renewal, "confirm_restored")
+                            }
+                          >
+                            {manualSuspensionPendingId === renewal.delinquency.caseId
+                              ? "Recording restoration…"
+                              : "Confirm service restored"}
+                          </button>
+                        </div>
+                      )}
                       {renewal.renewalStatus === "manual_hold" && (
                         <button
                           className="primary"

@@ -6,6 +6,7 @@ import {
   addBillingCycle,
   buildPriceSnapshot,
   canTransitionPayment,
+  isPaymentBusinessStatePayable,
   percentageFeeMinor,
 } from "./index.js";
 
@@ -36,6 +37,54 @@ test("settled payment cannot be moved backwards by a late event", () => {
   assert.equal(canTransitionPayment("processing", "succeeded"), true);
   assert.equal(canTransitionPayment("succeeded", "failed"), false);
   assert.equal(canTransitionPayment("unknown", "succeeded"), true);
+});
+
+test("order payments require the order to remain waiting for payment", () => {
+  assert.equal(
+    isPaymentBusinessStatePayable({
+      paymentContext: "order",
+      orderStatus: "waiting_payment",
+    }),
+    true,
+  );
+  assert.equal(
+    isPaymentBusinessStatePayable({ paymentContext: "order", orderStatus: "cancelled" }),
+    false,
+  );
+});
+
+test("invoiced renewals remain payable after delinquency suspension", () => {
+  for (const serviceStatus of ["active", "suspended"]) {
+    assert.equal(
+      isPaymentBusinessStatePayable({
+        paymentContext: "renewal",
+        renewalStatus: "invoiced",
+        serviceStatus,
+      }),
+      true,
+    );
+  }
+});
+
+test("renewal payments reject terminal services and non-invoiced renewals", () => {
+  assert.equal(
+    isPaymentBusinessStatePayable({
+      paymentContext: "renewal",
+      renewalStatus: "invoiced",
+      serviceStatus: "terminated",
+    }),
+    false,
+  );
+  for (const renewalStatus of ["paid", "manual_hold"]) {
+    assert.equal(
+      isPaymentBusinessStatePayable({
+        paymentContext: "renewal",
+        renewalStatus,
+        serviceStatus: "suspended",
+      }),
+      false,
+    );
+  }
 });
 
 test("calendar billing clamps month end", () => {

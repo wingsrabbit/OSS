@@ -73,6 +73,15 @@ const resourceCreateSchema = z.object({
   scenario: z.enum(["success", "failed", "timeout_existing"]),
 });
 
+const resourceActionSchema = z.object({
+  operationId: z.uuid(),
+  serviceId: z.uuid(),
+  externalResourceId: z.string().min(1).max(200),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  action: z.enum(["suspend", "resume"]),
+  scenario: z.enum(["success", "failed", "timeout_success", "duplicate_out_of_order"]),
+});
+
 const mailCreateSchema = z.object({
   operationId: z.uuid(),
   recipient: z.email(),
@@ -161,6 +170,24 @@ await pool.query(`
     create_calls integer NOT NULL DEFAULT 1,
     request_fingerprint text NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS mock_resource_action_operations (
+    operation_id uuid PRIMARY KEY,
+    service_id uuid NOT NULL,
+    external_resource_id text NOT NULL,
+    callback_capability text NOT NULL,
+    action text NOT NULL CHECK (action IN ('suspend', 'resume')),
+    scenario text NOT NULL CHECK (
+      scenario IN ('success', 'failed', 'timeout_success', 'duplicate_out_of_order')
+    ),
+    status text NOT NULL CHECK (status IN ('succeeded', 'failed')),
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    action_calls integer NOT NULL DEFAULT 1 CHECK (action_calls > 0),
+    query_calls integer NOT NULL DEFAULT 0 CHECK (query_calls >= 0),
+    request_fingerprint text NOT NULL
+  );
+  ALTER TABLE mock_resource_action_operations
+    ADD COLUMN IF NOT EXISTS query_calls integer NOT NULL DEFAULT 0
+      CHECK (query_calls >= 0);
   CREATE TABLE IF NOT EXISTS mock_resource_faults (
     operation_id uuid PRIMARY KEY,
     behavior text NOT NULL CHECK (behavior IN ('callback_success_then_reject'))
@@ -201,6 +228,13 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
   ALTER TABLE mock_resource_operations
     ADD COLUMN IF NOT EXISTS callback_capability text;
+  ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS resource_state text NOT NULL DEFAULT 'active';
+  ALTER TABLE mock_resource_operations
+    DROP CONSTRAINT IF EXISTS mock_resource_operations_resource_state_check;
+  ALTER TABLE mock_resource_operations
+    ADD CONSTRAINT mock_resource_operations_resource_state_check
+    CHECK (resource_state IN ('active', 'suspended'));
   UPDATE mock_resource_operations
   SET callback_capability = repeat('A', 43)
   WHERE callback_capability IS NULL;
@@ -222,6 +256,8 @@ await pool.query(`
     ON mock_refund_operations (original_external_payment_id, status);
   CREATE INDEX IF NOT EXISTS mock_chargeback_operations_original_idx
     ON mock_chargeback_operations (original_operation_id, occurred_at);
+  CREATE INDEX IF NOT EXISTS mock_resource_action_service_idx
+    ON mock_resource_action_operations (service_id, occurred_at);
   CREATE OR REPLACE FUNCTION opensales_guard_mock_refund_operation_mutation()
   RETURNS trigger
   LANGUAGE plpgsql
@@ -274,6 +310,37 @@ await pool.query(`
   CREATE TRIGGER mock_chargeback_operations_append_only
   BEFORE UPDATE OR DELETE ON mock_chargeback_operations
   FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_chargeback_operation_mutation();
+  CREATE OR REPLACE FUNCTION opensales_guard_mock_resource_action_mutation()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF TG_OP = 'DELETE'
+       OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+       OR NEW.service_id IS DISTINCT FROM OLD.service_id
+       OR NEW.external_resource_id IS DISTINCT FROM OLD.external_resource_id
+       OR NEW.callback_capability IS DISTINCT FROM OLD.callback_capability
+       OR NEW.action IS DISTINCT FROM OLD.action
+       OR NEW.scenario IS DISTINCT FROM OLD.scenario
+       OR NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+       OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
+       OR NOT (
+         (NEW.action_calls = OLD.action_calls + 1 AND NEW.query_calls = OLD.query_calls)
+         OR
+         (NEW.action_calls = OLD.action_calls AND NEW.query_calls = OLD.query_calls + 1)
+       ) THEN
+      RAISE EXCEPTION
+        'Mock resource actions are append-only except for request call counting';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS mock_resource_action_operations_append_only
+    ON mock_resource_action_operations;
+  CREATE TRIGGER mock_resource_action_operations_append_only
+  BEFORE UPDATE OR DELETE ON mock_resource_action_operations
+  FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_resource_action_mutation();
 `);
 
 const app = Fastify({
@@ -292,7 +359,8 @@ app.addHook("onRequest", async (request, reply) => {
   const expectedToken =
     request.url.startsWith("/v1/payments") || request.url.startsWith("/v1/refunds")
       ? config.MOCK_PAYMENT_PROVIDER_TOKEN
-      : request.url.startsWith("/v1/resources")
+      : request.url.startsWith("/v1/resources") ||
+          request.url.startsWith("/v1/resource-actions")
         ? config.MOCK_PROVISIONING_PROVIDER_TOKEN
         : request.url.startsWith("/v1/mailbox")
           ? config.LAB_MAILBOX_TOKEN
@@ -998,10 +1066,12 @@ app.get("/v1/resources/:operationId", async (request, reply) => {
     callback_capability: string;
     external_resource_id: string | null;
     status: "succeeded" | "failed";
+    resource_state: "active" | "suspended";
     ready_at: Date | null;
     occurred_at: Date;
   }>(
-    `SELECT callback_capability, external_resource_id, status, ready_at, occurred_at
+    `SELECT callback_capability, external_resource_id, status, resource_state,
+            ready_at, occurred_at
      FROM mock_resource_operations
      WHERE operation_id = $1`,
     [params.operationId],
@@ -1011,8 +1081,178 @@ app.get("/v1/resources/:operationId", async (request, reply) => {
   return {
     callbackCapability: row.callback_capability,
     status: row.status,
+    resourceState: row.resource_state,
     ...(row.external_resource_id ? { externalResourceId: row.external_resource_id } : {}),
     ...(row.ready_at ? { readyAt: row.ready_at.toISOString() } : {}),
+    occurredAt: row.occurred_at.toISOString(),
+  };
+});
+
+app.post("/v1/resource-actions", async (request, reply) => {
+  const body = resourceActionSchema.parse(request.body);
+  const callbackSecret = config.MOCK_PROVISIONING_WEBHOOK_SECRET;
+  if (!callbackSecret) {
+    return reply.code(503).send({ error: "provisioning callback is not configured" });
+  }
+  if (request.headers["idempotency-key"] !== body.operationId) {
+    return reply.code(400).send({ error: "stable idempotency key is required" });
+  }
+  const fingerprint = requestFingerprint(`resource.${body.action}:v1`, body);
+  const status = body.scenario === "failed" ? "failed" : "succeeded";
+  type ResourceActionResult = {
+    external_resource_id: string;
+    action: "suspend" | "resume";
+    status: "succeeded" | "failed";
+    occurred_at: Date;
+  };
+  const client = await pool.connect();
+  let operation: ResourceActionResult | undefined;
+  try {
+    await client.query("BEGIN");
+    const replay = await client.query<ResourceActionResult & { request_fingerprint: string }>(
+      `SELECT external_resource_id, action, status, occurred_at, request_fingerprint
+       FROM mock_resource_action_operations
+       WHERE operation_id = $1
+       FOR UPDATE`,
+      [body.operationId],
+    );
+    const existing = replay.rows[0];
+    if (existing) {
+      if (existing.request_fingerprint !== fingerprint) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({
+          error: "idempotency key was reused with a different action",
+        });
+      }
+      const repeated = await client.query<ResourceActionResult>(
+        `UPDATE mock_resource_action_operations
+         SET action_calls = action_calls + 1
+         WHERE operation_id = $1
+         RETURNING external_resource_id, action, status, occurred_at`,
+        [body.operationId],
+      );
+      operation = repeated.rows[0];
+    } else {
+      const resource = await client.query<{ resource_state: "active" | "suspended" }>(
+        `SELECT resource_state
+         FROM mock_resource_operations
+         WHERE service_id = $1
+           AND external_resource_id = $2
+           AND status = 'succeeded'
+         FOR UPDATE`,
+        [body.serviceId, body.externalResourceId],
+      );
+      const currentState = resource.rows[0]?.resource_state;
+      if (!currentState) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "resource not found" });
+      }
+      const expectedState = body.action === "suspend" ? "active" : "suspended";
+      if (currentState !== expectedState) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({
+          error: `resource is ${currentState}; ${body.action} requires ${expectedState}`,
+        });
+      }
+      const inserted = await client.query<ResourceActionResult>(
+        `INSERT INTO mock_resource_action_operations(
+           operation_id, service_id, external_resource_id, callback_capability,
+           action, scenario, status, request_fingerprint
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING external_resource_id, action, status, occurred_at`,
+        [
+          body.operationId,
+          body.serviceId,
+          body.externalResourceId,
+          body.callbackCapability,
+          body.action,
+          body.scenario,
+          status,
+          fingerprint,
+        ],
+      );
+      operation = inserted.rows[0];
+      if (status === "succeeded") {
+        await client.query(
+          `UPDATE mock_resource_operations
+           SET resource_state = $3
+           WHERE service_id = $1 AND external_resource_id = $2`,
+          [body.serviceId, body.externalResourceId, body.action === "suspend" ? "suspended" : "active"],
+        );
+      }
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+  if (!operation) throw new Error("Unable to record Mock resource action");
+  const event = {
+    eventId: `resource-action:${body.operationId}:${operation.status}`,
+    providerOperationId: body.operationId,
+    callbackCapability: body.callbackCapability,
+    serviceId: body.serviceId,
+    externalResourceId: operation.external_resource_id,
+    action: operation.action,
+    status: operation.status,
+    occurredAt: operation.occurred_at.toISOString(),
+  };
+  // The timeout-success callback deliberately arrives after the first normal
+  // reconcile opportunity. This proves that Core learns the external result
+  // through the Provider query rather than a conveniently early callback.
+  const delayMs = body.scenario === "timeout_success" ? 8_000 : 20;
+  scheduleCallback("/api/v1/provider-events/resource-action", event, delayMs, callbackSecret);
+  if (body.scenario === "duplicate_out_of_order") {
+    scheduleCallback("/api/v1/provider-events/resource-action", event, 40, callbackSecret);
+    scheduleCallback(
+      "/api/v1/provider-events/resource-action",
+      {
+        ...event,
+        eventId: `resource-action:${body.operationId}:stale-conflict`,
+        status: operation.status === "succeeded" ? "failed" : "succeeded",
+        occurredAt: new Date(operation.occurred_at.getTime() - 1_000).toISOString(),
+      },
+      60,
+      callbackSecret,
+    );
+  }
+  if (body.scenario === "timeout_success") {
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+  return reply.code(202).send({
+    operationId: body.operationId,
+    action: operation.action,
+    status: operation.status,
+  });
+});
+
+app.get("/v1/resource-actions/:operationId", async (request, reply) => {
+  const params = z.object({ operationId: z.uuid() }).parse(request.params);
+  const result = await pool.query<{
+    callback_capability: string;
+    service_id: string;
+    external_resource_id: string;
+    action: "suspend" | "resume";
+    status: "succeeded" | "failed";
+    occurred_at: Date;
+  }>(
+    `UPDATE mock_resource_action_operations
+     SET query_calls = query_calls + 1
+     WHERE operation_id = $1
+     RETURNING callback_capability, service_id, external_resource_id,
+               action, status, occurred_at`,
+    [params.operationId],
+  );
+  const row = result.rows[0];
+  if (!row) return reply.code(404).send({ error: "operation not found" });
+  return {
+    callbackCapability: row.callback_capability,
+    serviceId: row.service_id,
+    externalResourceId: row.external_resource_id,
+    action: row.action,
+    status: row.status,
     occurredAt: row.occurred_at.toISOString(),
   };
 });
