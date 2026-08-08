@@ -3754,19 +3754,33 @@ try {
 
     await releasePaymentStart(sharedWorkerCommand.paymentAttemptId);
     await waitFor(
-      "three callback types and a Worker to wait at the same User row",
+      "three callback types to wait at User while the Worker waits at the account payment-settings fence",
       async () => {
-        const result = await corePool.query<{ waiting: string }>(
-          `SELECT count(*)::text AS waiting
-           FROM pg_stat_activity
-           WHERE application_name IN ('opensales-api', 'opensales-worker')
-             AND state = 'active'
-             AND wait_event_type = 'Lock'
-             AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+        const result = await corePool.query<{
+          callbacks_waiting: string;
+          worker_fence_waiting: string;
+        }>(
+          `SELECT
+             (SELECT count(*)::text
+                FROM pg_stat_activity
+               WHERE application_name = 'opensales-api'
+                 AND state = 'active'
+                 AND wait_event_type = 'Lock'
+                 AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%')
+               AS callbacks_waiting,
+             (SELECT count(*)::text
+                FROM pg_stat_activity
+               WHERE application_name = 'opensales-worker'
+                 AND state = 'active'
+                 AND wait_event_type = 'Lock'
+                 AND query ILIKE '%SELECT pg_advisory_xact_lock(hashtextextended($1, 0))%')
+               AS worker_fence_waiting`,
         );
-        return result.rows[0]?.waiting ?? "0";
+        return result.rows[0];
       },
-      (waiting) => BigInt(waiting) >= 4n,
+      (waiting) =>
+        BigInt(waiting?.callbacks_waiting ?? "0") >= 3n &&
+        BigInt(waiting?.worker_fence_waiting ?? "0") >= 1n,
     );
 
     const accountProbe = await corePool.connect();
