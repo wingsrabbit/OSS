@@ -297,12 +297,16 @@ jobs:
           set -e
           if [[ "${browser_status}" -ne 0 ]]; then
             echo "Browser journey failed; redacted API errors follow"
+            # This filter is intentionally limited to synthetic CI diagnostics;
+            # production logging must use an independently reviewed policy.
             grep '"msg":"request failed"' api-browser.log > request-failures.log || true
-            sed -E \
+            if ! sed -E \
               -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[UUID]/g' \
               -e 's/[A-Za-z0-9._%+-]+@example[.]invalid/[SYNTHETIC_EMAIL]/g' \
               -e 's/ci-only-[A-Za-z0-9_-]+/[CI_SECRET]/g' \
               -e 's/[A-Za-z0-9_-]{43}/[KEY_MATERIAL]/g' \
-              request-failures.log | tail -n 50
+              request-failures.log | tail -n 50; then
+              echo "Redacted API diagnostics were unavailable"
+            fi
           fi
           exit "${browser_status}"
