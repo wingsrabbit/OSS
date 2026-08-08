@@ -33,10 +33,12 @@ schema 015 cannot faithfully display or administer their source and accounting h
    catalog mismatch means repair forward with a schema-016-capable image.
 7. Start the bridge API and Worker. Each repeats the preflight and holds the schema compatibility
    guard for its entire process lifetime. Schema-016 manual receipt, reversal, and outflow writes
-   must take the conflicting transaction lock, so an old process and a new financial write cannot
-   run concurrently.
-8. Keep all schema-016 functions and new financial mutation disabled. Deploy the corrected
-   schema-016 application, reconcile, remove the bridge setting, and only then resume mutation.
+   and updates that introduce their markers must take the conflicting transaction lock, so an old
+   process and a new financial write cannot run concurrently.
+8. Keep all schema-016 functions and new financial mutation disabled. Stop every bridge API and
+   Worker before running the forward migration; the migration command refuses to race a live
+   bridge process. Deploy the corrected schema-016 application, reconcile, remove the bridge
+   setting, and only then resume mutation.
 
 ## What fails closed
 
@@ -44,8 +46,9 @@ The bridge rejects missing, older, future, or counterfeit schemas; absent or wro
 or disabled schema-016 constraints, foreign keys, append-only/completeness/refund/resolution
 triggers, or refund-capacity semantics; and every historical manual receipt, reversal, outflow,
 Fund Receipt marker, downstream allocation/refund, Ledger journal, job, inbox, outbox, or Provider
-operation marker. Reports contain counts and stable blocker codes, never customer references or
-payment metadata.
+operation marker. The preflight reads the explicitly qualified public migration history and rejects
+catalog substitution through a role schema. Reports contain counts and stable blocker codes, never
+customer references or payment metadata.
 
 ## Verification
 

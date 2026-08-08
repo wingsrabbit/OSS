@@ -22,6 +22,7 @@ function fakeDatabase(input: {
   return {
     query: async (text) => {
       if (text.includes("max(version)")) {
+        assert.match(text, /FROM public[.]schema_migrations/);
         if (input.missingTable) throw Object.assign(new Error("missing"), { code: "42P01" });
         return { rows: [{ version: input.version ?? null }] };
       }

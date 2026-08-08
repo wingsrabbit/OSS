@@ -11,7 +11,7 @@ export const SCHEMA_016 = "016_stage_b_manual_receipts" as const;
 export const SCHEMA_015_016_GUARD =
   "opensales:schema-015-016-rollback-bridge" as const;
 export const SCHEMA_016_CATALOG_DIGEST =
-  "a14053c617df8be59e8af15fcc4d5dec250481aa20711b47c594d14cf14e220f" as const;
+  "7a8cc81b8e69d55c9e450fea7d5feb6262f13e188ff694877110cb63c488b635" as const;
 
 export type Schema015RollbackPreflightReport = Readonly<{
   installedSchemaVersion: string;
@@ -41,7 +41,9 @@ async function installedSchemaVersion(
 ): Promise<string | null> {
   let result: Readonly<{ rows: unknown[] }>;
   try {
-    result = await database.query("SELECT max(version) AS version FROM schema_migrations");
+    result = await database.query(
+      "SELECT max(version) AS version FROM public.schema_migrations",
+    );
   } catch (error) {
     const code =
       typeof error === "object" && error !== null && "code" in error
@@ -193,19 +195,22 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
             ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('ledger_journals', 'manual_receipt_ledger_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('provider_operations', 'manual_receipt_provider_operation_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('durable_jobs', 'manual_receipt_job_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('provider_inbox', 'manual_receipt_inbox_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false),
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('outbox', 'manual_receipt_outbox_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT']::text[], 7, false, false)
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
+         ('fund_receipts', 'manual_receipt_fund_receipt_write_guard',
+            'opensales_manual_receipt_marker_write_guard',
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false)
      ), trigger_shape AS (
        SELECT count(*) = (SELECT count(*) FROM required_triggers) AS valid
        FROM required_triggers required
@@ -238,7 +243,8 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
             ARRAY['pg_advisory_xact_lock',
                   'opensales:schema-015-016-rollback-bridge',
                   'manual_receipt', 'ledger_journals', 'provider_operations',
-                  'durable_jobs', 'provider_inbox', 'outbox']::text[]),
+                  'durable_jobs', 'provider_inbox', 'outbox', 'fund_receipts',
+                  'reported_manual_receipt_id', 'reversed']::text[]),
          ('opensales_reject_manual_receipt_mutation',
             ARRAY['RAISE EXCEPTION', 'append-only']::text[]),
          ('opensales_assert_manual_receipt_complete',
@@ -367,7 +373,8 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
              'manual_receipt_provider_operation_write_guard',
              'manual_receipt_job_write_guard',
              'manual_receipt_inbox_write_guard',
-             'manual_receipt_outbox_write_guard'
+             'manual_receipt_outbox_write_guard',
+             'manual_receipt_fund_receipt_write_guard'
            )
          )
        UNION ALL
@@ -407,7 +414,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
      )
      SELECT
        (SELECT count(*) = 2
-        FROM schema_migrations
+        FROM public.schema_migrations
         WHERE version IN (
           '015_stage_b_saved_payment_auto_renew',
           '016_stage_b_manual_receipts'
@@ -454,54 +461,54 @@ async function schema016Blockers(
 ): Promise<readonly SchemaRollbackBlocker[]> {
   const result = await database.query(
     `WITH blocker_counts(code, count) AS (
-       SELECT 'manual_receipt_facts', count(*)::bigint FROM manual_receipt_facts
+       SELECT 'manual_receipt_facts', count(*)::bigint FROM public.manual_receipt_facts
        UNION ALL
-       SELECT 'manual_receipt_reversals', count(*)::bigint FROM manual_receipt_reversals
+       SELECT 'manual_receipt_reversals', count(*)::bigint FROM public.manual_receipt_reversals
        UNION ALL
-       SELECT 'manual_receipt_outflows', count(*)::bigint FROM manual_receipt_outflows
+       SELECT 'manual_receipt_outflows', count(*)::bigint FROM public.manual_receipt_outflows
        UNION ALL
        SELECT 'manual_fund_receipts', count(*)::bigint
-       FROM fund_receipts
+       FROM public.fund_receipts
        WHERE reported_manual_receipt_id IS NOT NULL OR disposition = 'reversed'
        UNION ALL
        SELECT 'manual_fund_resolutions', count(*)::bigint
-       FROM fund_receipt_resolutions resolution
-       JOIN fund_receipts receipt ON receipt.id = resolution.fund_receipt_id
+       FROM public.fund_receipt_resolutions resolution
+       JOIN public.fund_receipts receipt ON receipt.id = resolution.fund_receipt_id
        WHERE receipt.reported_manual_receipt_id IS NOT NULL
        UNION ALL
        SELECT 'manual_fund_allocations', count(*)::bigint
-       FROM fund_receipt_allocations allocation
-       JOIN fund_receipts receipt ON receipt.id = allocation.fund_receipt_id
+       FROM public.fund_receipt_allocations allocation
+       JOIN public.fund_receipts receipt ON receipt.id = allocation.fund_receipt_id
        WHERE receipt.reported_manual_receipt_id IS NOT NULL
        UNION ALL
        SELECT 'manual_refunds', count(*)::bigint
-       FROM refunds refund
-       JOIN fund_receipts receipt ON receipt.id = refund.source_fund_receipt_id
+       FROM public.refunds refund
+       JOIN public.fund_receipts receipt ON receipt.id = refund.source_fund_receipt_id
        WHERE receipt.reported_manual_receipt_id IS NOT NULL
        UNION ALL
        SELECT 'manual_ledger_journals', count(*)::bigint
-       FROM ledger_journals journal
+       FROM public.ledger_journals journal
        WHERE journal.source_type IN (
          'manual_receipt', 'manual_receipt_reversal', 'manual_receipt_outflow'
        )
        UNION ALL
        SELECT 'manual_provider_operations', count(*)::bigint
-       FROM provider_operations operation
+       FROM public.provider_operations operation
        WHERE operation.subject_type IN ('manual_receipt', 'manual_receipt_outflow')
        UNION ALL
        SELECT 'manual_durable_jobs', count(*)::bigint
-       FROM durable_jobs job
+       FROM public.durable_jobs job
        WHERE job.payload ? 'manualReceiptId'
           OR job.payload ? 'manualReceiptOutflowId'
           OR job.job_type LIKE 'manual_receipt.%'
        UNION ALL
        SELECT 'manual_provider_inbox', count(*)::bigint
-       FROM provider_inbox inbox
+       FROM public.provider_inbox inbox
        WHERE inbox.payload ? 'manualReceiptId'
           OR inbox.payload ? 'manualReceiptOutflowId'
        UNION ALL
        SELECT 'manual_outbox', count(*)::bigint
-       FROM outbox event
+       FROM public.outbox event
        WHERE event.payload ? 'manualReceiptId'
           OR event.payload ? 'manualReceiptOutflowId'
           OR event.event_type LIKE 'manual_receipt.%'

@@ -35,6 +35,7 @@ export function createPool(
   return new Pool({
     connectionString: config.DATABASE_URL,
     max: 20,
+    options: "-c search_path=pg_catalog,public",
     statement_timeout: 15_000,
     query_timeout: 20_000,
     application_name: applicationName,
@@ -152,6 +153,7 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   let failed = false;
   let failure: unknown;
   try {
+    await client.query("SET search_path TO public, pg_catalog");
     await client.query(
       "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
     );
@@ -167,7 +169,7 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
     }
     compatibilityLockHeld = true;
     await client.query(
-      "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+      "CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
     const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
     const migrationFiles = (await readdir(migrationsDirectory))
@@ -179,12 +181,14 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       await client.query("BEGIN");
       try {
         const existing = await client.query<{ version: string }>(
-          "SELECT version FROM schema_migrations WHERE version = $1",
+          "SELECT version FROM public.schema_migrations WHERE version = $1",
           [version],
         );
         if (existing.rowCount === 0) {
           await client.query(migration);
-          await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [version]);
+          await client.query("INSERT INTO public.schema_migrations(version) VALUES ($1)", [
+            version,
+          ]);
         }
         await client.query("COMMIT");
       } catch (error) {
@@ -199,6 +203,12 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
 
   const cleanupErrors: unknown[] = [];
   let discardClient = false;
+  try {
+    await client.query("SET search_path TO pg_catalog, public");
+  } catch (error) {
+    cleanupErrors.push(error);
+    discardClient = true;
+  }
   const unlock = async (query: string, values?: unknown[]): Promise<void> => {
     try {
       const result = await client.query<{ unlocked: boolean }>(query, values);
@@ -241,6 +251,7 @@ export async function assertSchemaCompatible(
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await client.query("SET LOCAL search_path TO pg_catalog, public");
     const report = await assert015RollbackBridgeSafe(
       {
         query: async (text, values) => client.query(text, values),
@@ -264,6 +275,7 @@ export async function assert014RollbackSchemaCompatible(
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await client.query("SET LOCAL search_path TO pg_catalog, public");
     const report = await assert014RollbackBridgeSafe(
       {
         query: async (text, values) => client.query(text, values),

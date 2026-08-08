@@ -65,6 +65,7 @@ const paymentTokenEncryptionKeyring = createProviderTokenKeyring(
 const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
   max: 10,
+  options: "-c search_path=pg_catalog,public",
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
@@ -7383,6 +7384,7 @@ try {
     await schemaCompatibilityGuard.query(
       "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
     );
+    await schemaCompatibilityGuard.query("SET LOCAL search_path TO pg_catalog, public");
     await assert015RollbackBridgeSafe(
       {
         query: async (text, values) => schemaCompatibilityGuard!.query(text, values),

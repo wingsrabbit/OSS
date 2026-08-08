@@ -78,6 +78,20 @@ try {
 
   await client.query("BEGIN");
   await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [SCHEMA_016]);
+  await client.query("CREATE SCHEMA AUTHORIZATION CURRENT_USER");
+  await client.query('SET LOCAL search_path TO "$user", public');
+  await client.query(`
+    CREATE TABLE schema_migrations(
+      version text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [SCHEMA_015]);
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("SET LOCAL search_path TO public, pg_catalog");
   await assert.rejects(
     assert015RollbackBridgeSafe(database, { enable016RollbackBridge: false }),
     /OSS_SCHEMA_ROLLBACK_BRIDGE=015-to-016/,
@@ -204,7 +218,10 @@ try {
         OR (TG_TABLE_NAME = 'outbox'
           AND ((row_data->>'event_type') LIKE 'manual_receipt.%'
             OR row_data->'payload' ? 'manualReceiptId'
-            OR row_data->'payload' ? 'manualReceiptOutflowId'));
+            OR row_data->'payload' ? 'manualReceiptOutflowId'))
+        OR (TG_TABLE_NAME = 'fund_receipts'
+          AND (row_data->>'reported_manual_receipt_id' IS NOT NULL
+            OR row_data->>'disposition' = 'reversed'));
       IF is_manual THEN
         PERFORM pg_advisory_xact_lock(
           hashtextextended('opensales:schema-015-016-rollback-bridge', 0)
@@ -213,19 +230,22 @@ try {
       RETURN NEW;
     END $$;
     CREATE TRIGGER manual_receipt_ledger_write_guard
-      BEFORE INSERT ON ledger_journals
+      BEFORE INSERT OR UPDATE ON ledger_journals
       FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
     CREATE TRIGGER manual_receipt_provider_operation_write_guard
-      BEFORE INSERT ON provider_operations
+      BEFORE INSERT OR UPDATE ON provider_operations
       FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
     CREATE TRIGGER manual_receipt_job_write_guard
-      BEFORE INSERT ON durable_jobs
+      BEFORE INSERT OR UPDATE ON durable_jobs
       FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
     CREATE TRIGGER manual_receipt_inbox_write_guard
-      BEFORE INSERT ON provider_inbox
+      BEFORE INSERT OR UPDATE ON provider_inbox
       FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
     CREATE TRIGGER manual_receipt_outbox_write_guard
-      BEFORE INSERT ON outbox
+      BEFORE INSERT OR UPDATE ON outbox
+      FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
+    CREATE TRIGGER manual_receipt_fund_receipt_write_guard
+      BEFORE INSERT OR UPDATE ON fund_receipts
       FOR EACH ROW EXECUTE FUNCTION opensales_manual_receipt_marker_write_guard();
 
     CREATE FUNCTION opensales_reject_manual_receipt_mutation()
@@ -466,6 +486,77 @@ try {
         ) AS present
     ) blocked ON true;
   `);
+  await client.query("SET LOCAL search_path TO pg_catalog, public");
+
+  await client.query(`
+    INSERT INTO users(id, email, password_hash, email_verified_at)
+    VALUES (
+      '00000000-0000-4000-8000-000000000280',
+      'schema-016-update-guard@example.invalid',
+      'synthetic-not-a-password', now()
+    );
+    INSERT INTO client_accounts(id, name, owner_user_id)
+    VALUES (
+      '00000000-0000-4000-8000-000000000281',
+      'Synthetic update guard account',
+      '00000000-0000-4000-8000-000000000280'
+    );
+    INSERT INTO invoices(id, client_account_id, currency, total_minor, due_at)
+    VALUES (
+      '00000000-0000-4000-8000-000000000282',
+      '00000000-0000-4000-8000-000000000281', 'USD', 0, now()
+    );
+    INSERT INTO payment_attempts(
+      id, client_account_id, invoice_id, provider_installation_id,
+      external_payment_id, status, amount_minor, currency, scenario,
+      idempotency_key, request_fingerprint
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000283',
+      '00000000-0000-4000-8000-000000000281',
+      '00000000-0000-4000-8000-000000000282',
+      'guard-test-provider', 'ordinary-payment', 'succeeded', 100, 'USD',
+      'success', 'guard-test-payment-attempt', 'guard-test-payment-fingerprint'
+    );
+    INSERT INTO fund_receipts(
+      id, provider_installation_id, external_payment_id,
+      reported_payment_attempt_id, reported_add_funds_attempt_id,
+      reported_manual_receipt_id, client_account_id, amount_minor,
+      allocated_minor, currency, occurred_at, disposition, reason
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000284',
+      'guard-test-provider', 'ordinary-payment',
+      '00000000-0000-4000-8000-000000000283', NULL, NULL,
+      '00000000-0000-4000-8000-000000000281', 100, 0, 'USD', now(),
+      'unclaimed', 'Ordinary receipt for update guard'
+    );
+    INSERT INTO provider_operations(
+      id, provider_installation_id, kind, subject_type, subject_id,
+      stable_key, status
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000285', 'guard-test-provider',
+      'payment_create', 'payment_attempt',
+      '00000000-0000-4000-8000-000000000283', 'ordinary-operation', 'queued'
+    );
+    INSERT INTO durable_jobs(id, job_type, unique_key, payload)
+    VALUES (
+      '00000000-0000-4000-8000-000000000286', 'payment.reconcile',
+      'ordinary-job', '{"paymentAttemptId":"00000000-0000-4000-8000-000000000283"}'::jsonb
+    );
+    INSERT INTO provider_inbox(
+      id, provider_installation_id, external_event_id, event_type, payload
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000287', 'guard-test-provider',
+      'ordinary-inbox', 'payment.succeeded',
+      '{"paymentAttemptId":"00000000-0000-4000-8000-000000000283"}'::jsonb
+    );
+    INSERT INTO outbox(id, event_type, unique_key, payload)
+    VALUES (
+      '00000000-0000-4000-8000-000000000288', 'invoice.paid',
+      'ordinary-outbox', '{"invoiceId":"00000000-0000-4000-8000-000000000282"}'::jsonb
+    );
+  `);
+  await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+  await client.query("SET CONSTRAINTS ALL DEFERRED");
 
   const releaseInsertGuard = await holdSchema015RollbackBridgeGuard(pool);
   const blockedInsertStatements = [
@@ -524,7 +615,40 @@ try {
        '{"manualReceiptId":"00000000-0000-4000-8000-000000000275"}'::jsonb
      )`,
   ];
+  const blockedUpdateStatements = [
+    `UPDATE provider_operations
+     SET subject_type = 'manual_receipt', updated_at = now()
+     WHERE id = '00000000-0000-4000-8000-000000000285'`,
+    `UPDATE durable_jobs
+     SET payload = payload ||
+       '{"manualReceiptId":"00000000-0000-4000-8000-000000000275"}'::jsonb,
+       updated_at = now()
+     WHERE id = '00000000-0000-4000-8000-000000000286'`,
+    `UPDATE provider_inbox
+     SET payload = payload ||
+       '{"manualReceiptId":"00000000-0000-4000-8000-000000000275"}'::jsonb
+     WHERE id = '00000000-0000-4000-8000-000000000287'`,
+    `UPDATE outbox
+     SET event_type = 'manual_receipt.recorded'
+     WHERE id = '00000000-0000-4000-8000-000000000288'`,
+    `UPDATE fund_receipts
+     SET disposition = 'reversed', updated_at = now()
+     WHERE id = '00000000-0000-4000-8000-000000000284'`,
+  ];
   try {
+    const ordinaryJobUpdate = await client.query(`
+      UPDATE durable_jobs
+      SET status = 'completed', updated_at = now()
+      WHERE id = '00000000-0000-4000-8000-000000000286'
+    `);
+    assert.equal(ordinaryJobUpdate.rowCount, 1);
+    const ordinaryReceiptUpdate = await client.query(`
+      UPDATE fund_receipts
+      SET reason = 'Ordinary non-marker update', updated_at = now()
+      WHERE id = '00000000-0000-4000-8000-000000000284'
+    `);
+    assert.equal(ordinaryReceiptUpdate.rowCount, 1);
+
     for (const [index, statement] of blockedInsertStatements.entries()) {
       await client.query(`SAVEPOINT writer_guard_${index}`);
       await client.query("SET LOCAL lock_timeout = '200ms'");
@@ -538,9 +662,24 @@ try {
       );
       await client.query(`ROLLBACK TO SAVEPOINT writer_guard_${index}`);
     }
+    for (const [index, statement] of blockedUpdateStatements.entries()) {
+      await client.query(`SAVEPOINT update_guard_${index}`);
+      await client.query("SET LOCAL lock_timeout = '200ms'");
+      await assert.rejects(
+        client.query(statement),
+        (error: unknown) =>
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "55P03",
+      );
+      await client.query(`ROLLBACK TO SAVEPOINT update_guard_${index}`);
+    }
   } finally {
     await releaseInsertGuard();
   }
+  await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+  await client.query("SET CONSTRAINTS ALL DEFERRED");
 
   const empty016 = await assert015RollbackBridgeSafe(database, {
     enable016RollbackBridge: true,
@@ -586,7 +725,7 @@ try {
 
   await client.query("SAVEPOINT counterfeit_function");
   await client.query(`
-    CREATE OR REPLACE FUNCTION opensales_manual_receipt_write_guard()
+    CREATE OR REPLACE FUNCTION public.opensales_manual_receipt_write_guard()
     RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       RETURN NEW;
@@ -600,7 +739,7 @@ try {
 
   await client.query("SAVEPOINT privileged_function");
   await client.query(
-    "ALTER FUNCTION opensales_manual_receipt_write_guard() SECURITY DEFINER",
+    "ALTER FUNCTION public.opensales_manual_receipt_write_guard() SECURITY DEFINER",
   );
   await assert.rejects(
     assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
@@ -610,7 +749,7 @@ try {
 
   await client.query("SAVEPOINT counterfeit_view");
   await client.query(`
-    CREATE OR REPLACE VIEW unclaimed_fund_refund_capacity AS
+    CREATE OR REPLACE VIEW public.unclaimed_fund_refund_capacity AS
     SELECT
       receipt.id AS fund_receipt_id,
       receipt.amount_minor,
@@ -709,6 +848,7 @@ try {
     `${JSON.stringify({
       schema015Native: true,
       schema016RequiresOptIn: true,
+      shadowSchemaRejected: true,
       incompleteSchema016Rejected: true,
       emptySchema016Accepted: true,
       disabledTriggerRejected: true,
@@ -721,6 +861,8 @@ try {
       lifetimeGuardBlocksWriter: true,
       lifetimeGuardBlocksMigration: true,
       actualManualInsertsBlocked: blockedInsertStatements.length,
+      actualManualUpdatesBlocked: blockedUpdateStatements.length,
+      ordinaryUpdatesAllowed: 2,
       blockerCodes: [...blockerCodes].sort(),
       databaseMutationPersisted: false,
     })}\n`,

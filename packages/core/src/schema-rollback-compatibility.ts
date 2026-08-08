@@ -57,7 +57,9 @@ function countValue(value: unknown, code: string): number {
 async function installedSchemaVersion(database: RollbackPreflightQueryable): Promise<string | null> {
   let result: Readonly<{ rows: unknown[] }>;
   try {
-    result = await database.query("SELECT max(version) AS version FROM schema_migrations");
+    result = await database.query(
+      "SELECT max(version) AS version FROM public.schema_migrations",
+    );
   } catch (error) {
     const code =
       typeof error === "object" && error !== null && "code" in error

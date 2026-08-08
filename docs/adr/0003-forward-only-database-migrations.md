@@ -96,8 +96,14 @@ The bridge also holds a shared advisory compatibility lock for the whole API or
 Worker process lifetime. Every write path introduced by the newer schema takes
 the conflicting transaction lock. This closes the race between a successful
 startup preflight and a later business fact that the older application cannot
-interpret. Each bridge covers one exact adjacent pair; bridge settings are not
-treated as a permissive schema-version range.
+interpret. Inserts and updates that can introduce a newer-schema marker take
+that lock. The migration runner takes the exclusive form of the same lock and
+refuses to migrate while any guarded API or Worker remains online. Runtime
+connections use a trusted `pg_catalog,public` search path, and migration/version
+queries name `public.schema_migrations` explicitly so a same-name relation in a
+role schema cannot spoof the installed version. Each bridge covers one exact
+adjacent pair; bridge settings are not treated as a permissive schema-version
+range.
 
 ### Data recovery
 
