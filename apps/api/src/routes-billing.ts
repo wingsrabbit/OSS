@@ -7,6 +7,7 @@ import { assertBillingWriteEligible, assertEligible, requireUser } from "./auth.
 import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 
 export async function registerBillingRoutes(
   app: FastifyInstance,
@@ -108,8 +109,9 @@ export async function registerBillingRoutes(
       const invoiceResult = await client.query<{
         total_minor: string;
         currency: string;
+        order_id: string | null;
       }>(
-        `SELECT total_minor::text, currency
+        `SELECT total_minor::text, currency, order_id
          FROM invoices
          WHERE id = $1 AND client_account_id = $2
          FOR SHARE`,
@@ -119,6 +121,11 @@ export async function registerBillingRoutes(
       if (!invoice) {
         throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
       }
+      await assertInvoicePaymentBusinessStateLocked(
+        client,
+        params.invoiceId,
+        invoice.order_id,
+      );
       const allocationResult = await client.query<{
         payment_minor: string;
         credit_minor: string;

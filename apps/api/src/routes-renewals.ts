@@ -165,13 +165,14 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
          JOIN invoice_allocation_totals other_allocation
            ON other_allocation.invoice_id = other_invoice.id
          WHERE other_renewal.service_id = service.id
+           AND other_renewal.status <> 'cancelled'
            AND other_allocation.allocated_minor < other_invoice.total_minor
        ) AS all_service_renewals_settled,
        NOT EXISTS (
          SELECT 1
          FROM service_renewals other_renewal
          WHERE other_renewal.service_id = service.id
-           AND other_renewal.status <> 'paid'
+           AND other_renewal.status NOT IN ('paid', 'cancelled')
        ) AS all_service_renewal_periods_granted,
        (SELECT count(*)::text
         FROM service_suspension_manual_actions manual_action
@@ -239,9 +240,9 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
       totalMinor: string;
       allocatedMinor: string;
       dueMinor: string;
-      status: "open" | "partially_paid" | "paid";
-      fundingStatus: "open" | "partially_paid" | "paid";
-      renewalStatus: "invoiced" | "paid" | "manual_hold";
+      status: "open" | "partially_paid" | "paid" | "cancelled";
+      fundingStatus: "open" | "partially_paid" | "paid" | "cancelled";
+      renewalStatus: "invoiced" | "paid" | "manual_hold" | "cancelled";
       fundedAt: string | null;
       dueAt: string;
       periodStart: string;
@@ -305,7 +306,12 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
     if (!item) {
       const total = BigInt(row.total_minor);
       const allocated = BigInt(row.allocated_minor);
-      const due = total > allocated ? total - allocated : 0n;
+      const due =
+        row.renewal_status === "cancelled"
+          ? 0n
+          : total > allocated
+            ? total - allocated
+            : 0n;
       const providerOutcomeIsManualTakeoverSafe = (status: string | null, attempts: number | null) =>
         Boolean(
           status &&
@@ -384,7 +390,13 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
                 ? "A funded renewal still needs its exact service period granted."
               : "The current service and delinquency states do not allow a manual transition.";
       const fundingStatus =
-        allocated === 0n ? "open" : allocated < total ? "partially_paid" : "paid";
+        row.renewal_status === "cancelled"
+          ? "cancelled"
+          : allocated === 0n
+            ? "open"
+            : allocated < total
+              ? "partially_paid"
+              : "paid";
       item = {
         renewalId: row.renewal_id,
         serviceId: row.service_id,
@@ -402,7 +414,11 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
         dueMinor: due.toString(),
         status: fundingStatus,
         fundingStatus,
-        renewalStatus: row.renewal_status as "invoiced" | "paid" | "manual_hold",
+        renewalStatus: row.renewal_status as
+          | "invoiced"
+          | "paid"
+          | "manual_hold"
+          | "cancelled",
         fundedAt: row.funded_at?.toISOString() ?? null,
         dueAt: row.due_at.toISOString(),
         periodStart: row.period_start.toISOString(),

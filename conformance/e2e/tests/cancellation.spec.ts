@@ -4,12 +4,15 @@ import { expect, test } from "@playwright/test";
 
 test.describe.configure({ retries: 0 });
 
-test("customer and staff complete a duplicate-safe renewal through real pages", async ({ page }) => {
+test("customer cancellation withdraws a pristine renewal and preserves the paid service term", async ({
+  page,
+}) => {
   test.setTimeout(180_000);
   const unique = crypto.randomUUID();
-  const email = `renewal-browser-${unique}@example.invalid`;
-  const password = `Synthetic-${unique}-Renewal!`;
-  const clientName = `Synthetic Renewal Browser ${unique.slice(0, 8)}`;
+  const email = `cancellation-browser-${unique}@example.invalid`;
+  const password = `Synthetic-${unique}-Cancellation!`;
+  const clientName = `Synthetic Cancellation Browser ${unique.slice(0, 8)}`;
+  const cancellationReason = `Synthetic Mock-only cycle-end cancellation ${unique}`;
 
   await page.goto("/");
   await expect(page.getByText("NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", { exact: true }))
@@ -36,21 +39,28 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   const product = page.locator("article").filter({ hasText: "HKBGP VPS" }).first();
   await product.getByRole("button", { name: /monthly/i }).click();
   const checkoutDialog = page.getByRole("dialog");
+  await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
   await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
+  await expect(checkoutDialog).toBeHidden();
+
   const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await journey.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await journey.getByRole("button", { name: "Start mock payment" }).click();
   await expect(journey.getByText("active", { exact: true })).toBeVisible({ timeout: 30_000 });
-  const paidTerm = journey.getByLabel("Schedule service cancellation");
-  await expect(paidTerm).toBeVisible();
-  const originalTermEndDisplay = ((await paidTerm.locator("strong").textContent()) ?? "").trim();
+
+  const scheduleCancellation = journey.getByLabel("Schedule service cancellation");
+  await expect(scheduleCancellation).toBeVisible();
+  const originalTermEndDisplay = (
+    (await scheduleCancellation.locator("strong").textContent()) ?? ""
+  ).trim();
+  expect(originalTermEndDisplay).not.toBe("");
   const originalTermEndMs = Date.parse(originalTermEndDisplay);
   expect(Number.isNaN(originalTermEndMs)).toBe(false);
 
-  await page.context().clearCookies();
-  await page.goto("/");
   const staffEmail = "stage-a-browser-admin@example.invalid";
   const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  await page.context().clearCookies();
+  await page.goto("/");
   await page.getByPlaceholder("Email").last().fill(staffEmail);
   await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
@@ -72,7 +82,7 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
       .fill(billingEffectiveAt.toISOString().slice(0, 16));
     await renewalAdmin
       .getByPlaceholder("Automation run reason (10+ characters)")
-      .fill(`Browser acceptance generated the next paid service period ${unique}`);
+      .fill(`Mock-only pristine renewal before cancellation ${unique}`);
     await admin
       .getByPlaceholder("Re-enter password (15-minute fixed window)")
       .fill(staffPassword);
@@ -98,11 +108,6 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
     }
   }
   expect(completedBillingDay, "a fresh eligible laboratory billing day must run").toBe(true);
-  const adminRenewal = renewalAdmin
-    .getByTestId("admin-renewal-item")
-    .filter({ hasText: clientName });
-  await expect(adminRenewal).toHaveCount(1);
-  await expect(adminRenewal).toContainText("Funding open · term grant invoiced");
 
   await page.context().clearCookies();
   await page.goto("/");
@@ -110,34 +115,51 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   await page.getByPlaceholder("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
 
+  await scheduleCancellation.getByLabel("Cancellation reason (optional)").fill(cancellationReason);
+  await scheduleCancellation
+    .getByRole("button", { name: "Cancel at paid period end", exact: true })
+    .click();
+
+  const scheduledCancellation = journey.getByLabel("Service cancellation status");
+  await expect(scheduledCancellation).toBeVisible();
+  await expect(scheduledCancellation).toContainText(originalTermEndDisplay);
+  await expect(scheduledCancellation).toContainText(
+    "The service remains available through its current paid period.",
+  );
+  await expect(scheduledCancellation).toContainText(
+    "No new renewal invoice will be generated. This action does not issue a refund.",
+  );
+  await expect(journey.getByText("active", { exact: true })).toBeVisible();
+
+  const immediateCancelledRenewal = page
+    .locator('[aria-label="Service renewals"]')
+    .getByTestId("renewal-item")
+    .filter({ hasText: "HKBGP VPS" });
+  await expect(immediateCancelledRenewal).toContainText("funding cancelled");
+  await expect(immediateCancelledRenewal).toContainText("due $0.00");
+
+  await page.reload();
+  await expect(page.getByText("NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", { exact: true }))
+    .toBeVisible();
+  const restoredJourney = page
+    .locator("section.order-panel")
+    .filter({ hasText: "Live customer journey" });
+  const restoredCancellation = restoredJourney.getByLabel("Service cancellation status");
+  await expect(restoredCancellation).toBeVisible();
+  await expect(restoredCancellation).toContainText(originalTermEndDisplay);
+  await expect(restoredJourney.getByText("active", { exact: true })).toBeVisible();
+  await expect(restoredCancellation).toContainText("No new renewal invoice will be generated.");
+  await expect(restoredCancellation).toContainText("This action does not issue a refund.");
+
   const renewalSection = page.locator('[aria-label="Service renewals"]');
-  await expect(
-    renewalSection.getByRole("heading", { name: "Renewal invoices and paid-through dates" }),
-  ).toBeVisible();
-  const renewal = renewalSection.getByTestId("renewal-item").filter({ hasText: "HKBGP VPS" });
-  await expect(renewal).toHaveCount(1);
-  await expect(renewal).toContainText("funding open · term grant invoiced");
-  await renewal.getByLabel(/Renewal payment method/).selectOption("usdt");
-  await renewal.getByLabel(/Renewal Provider scenario/).selectOption("duplicate_out_of_order");
-  await renewal.getByRole("button", { name: "Pay renewal with Mock Provider" }).click();
-  await expect(renewal).toContainText("funding paid · term grant paid", { timeout: 30_000 });
-  await expect(renewal).toContainText("due $0.00");
-
-  await renewalSection.getByRole("button", { name: "Open my Mock Provider mailbox" }).click();
-  await expect(renewalSection.getByText("Renewal invoice created", { exact: true })).toBeVisible({
-    timeout: 15_000,
-  });
-  await expect(renewalSection.getByText(/delivered/).first()).toBeVisible();
-
-  await page.context().clearCookies();
-  await page.goto("/");
-  await page.getByPlaceholder("Email").last().fill(staffEmail);
-  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  const refreshedAdmin = page
-    .locator('[aria-label="Renewal billing automation"]')
-    .getByTestId("admin-renewal-item")
-    .filter({ hasText: clientName });
-  await expect(refreshedAdmin).toContainText("Funding paid · term grant paid");
-  await expect(refreshedAdmin).toContainText("invoice created=delivered");
+  const cancelledServiceRenewal = renewalSection
+    .getByTestId("renewal-item")
+    .filter({ hasText: "HKBGP VPS" });
+  await expect(cancelledServiceRenewal).toHaveCount(1);
+  await expect(cancelledServiceRenewal).toContainText("funding cancelled");
+  await expect(cancelledServiceRenewal).toContainText("term grant cancelled");
+  await expect(cancelledServiceRenewal).toContainText("due $0.00");
+  await expect(cancelledServiceRenewal.getByTestId("renewal-cancelled")).toContainText(
+    "collectible due is zero",
+  );
 });

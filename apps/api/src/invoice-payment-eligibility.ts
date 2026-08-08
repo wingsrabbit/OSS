@@ -56,6 +56,12 @@ export async function assertInvoicePaymentBusinessStateLocked(
     );
     const renewal = renewalResult.rows[0];
     if (!renewal) throw new Error("Renewal invoice is linked to an invalid service");
+    if (renewal.renewal_status === "cancelled") {
+      throw Object.assign(new Error("Renewal invoice was cancelled and is no longer payable"), {
+        statusCode: 409,
+        code: "INVOICE_CANCELLED",
+      });
+    }
     payable = isPaymentBusinessStatePayable({
       paymentContext: "renewal",
       renewalStatus: renewal.renewal_status,

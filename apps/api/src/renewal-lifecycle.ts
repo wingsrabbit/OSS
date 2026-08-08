@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import { addBillingCycle, type BillingCycle } from "@opensales/core";
+import type { BillingCycle } from "@opensales/core";
 import type { DatabaseClient } from "./database.js";
 import {
   assessLateFeesAndScheduleSuspensions,
@@ -155,8 +155,6 @@ async function autoApplyRenewalCredit(
     clientAccountId: string;
     currency: string;
     invoiceTotalMinor: bigint;
-    periodStart: Date;
-    periodEnd: Date;
   },
 ): Promise<bigint> {
   const account = await client.query<{ restricted_at: Date | null }>(
@@ -232,15 +230,22 @@ async function autoApplyRenewalCredit(
     await client.query(
       `INSERT INTO service_periods(
          service_id, invoice_id, period_kind, period_start, period_end, granted_at
-       ) VALUES ($1, $2, 'renewal', $3, $4, $5)`,
-      [input.serviceId, input.invoiceId, input.periodStart, input.periodEnd, grantedAt],
+       )
+       SELECT $1, $2, 'renewal', renewal.period_start, renewal.period_end, $3
+       FROM service_renewals renewal
+       WHERE renewal.id = $4`,
+      [input.serviceId, input.invoiceId, grantedAt, input.renewalId],
     );
     const advanced = await client.query(
-      `UPDATE services
-       SET term_end = $3, updated_at = now(), version = version + 1
-       WHERE id = $1 AND status = 'active' AND term_end = $2
-       RETURNING id`,
-      [input.serviceId, input.periodStart, input.periodEnd],
+      `UPDATE services service
+       SET term_end = renewal.period_end, updated_at = now(), version = service.version + 1
+       FROM service_renewals renewal
+       WHERE service.id = $1
+         AND renewal.id = $2
+         AND service.status = 'active'
+         AND service.term_end = renewal.period_start
+       RETURNING service.id`,
+      [input.serviceId, input.renewalId],
     );
     if (advanced.rowCount !== 1) {
       throw new Error("Service term changed while applying renewal Credit");
@@ -485,6 +490,7 @@ export async function runRenewalAutomation(
      JOIN client_accounts account ON account.id = service.client_account_id
      JOIN users owner ON owner.id = account.owner_user_id
      WHERE service.status = 'active'
+       AND service.cancellation_request_id IS NULL
        AND service.billing_cycle <> 'one_time'
        AND service.term_end IS NOT NULL
        AND (service.term_end AT TIME ZONE $3)::date
@@ -504,17 +510,18 @@ export async function runRenewalAutomation(
   let remindersCreated = 0;
   for (const candidate of candidates.rows) {
     const recurringMinor = historicalRecurringMinor(candidate.price_snapshot);
-    const periodEnd = addBillingCycle(candidate.term_end, candidate.billing_cycle);
-    if (!periodEnd) throw new Error("Recurring service produced no next period end");
     const invoiceResult = await client.query<{ id: string }>(
       `INSERT INTO invoices(client_account_id, order_id, currency, total_minor, due_at)
-       VALUES ($1, NULL, $2, $3, $4)
+       VALUES (
+         $1, NULL, $2, $3,
+         (SELECT term_end FROM services WHERE id = $4)
+       )
        RETURNING id`,
       [
         candidate.client_account_id,
         candidate.currency,
         recurringMinor.toString(),
-        candidate.term_end,
+        candidate.service_id,
       ],
     );
     const invoiceId = invoiceResult.rows[0]?.id;
@@ -547,14 +554,27 @@ export async function runRenewalAutomation(
       `INSERT INTO service_renewals(
          service_id, invoice_id, automation_run_id, period_start, period_end,
          recurring_minor, currency, price_snapshot
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       )
+       SELECT
+         $1, $2, $3, service.term_end,
+         (
+           (service.term_end AT TIME ZONE 'UTC')
+           + CASE service.billing_cycle
+               WHEN 'monthly' THEN interval '1 month'
+               WHEN 'quarterly' THEN interval '3 months'
+               WHEN 'semiannual' THEN interval '6 months'
+               WHEN 'annual' THEN interval '12 months'
+               ELSE interval '0 months'
+             END
+         ) AT TIME ZONE 'UTC',
+         $4, $5, $6
+       FROM services service
+       WHERE service.id = $1
        RETURNING id`,
       [
         candidate.service_id,
         invoiceId,
         runId,
-        candidate.term_end,
-        periodEnd,
         recurringMinor.toString(),
         candidate.currency,
         candidate.price_snapshot,
@@ -569,8 +589,6 @@ export async function runRenewalAutomation(
       clientAccountId: candidate.client_account_id,
       currency: candidate.currency,
       invoiceTotalMinor: recurringMinor,
-      periodStart: candidate.term_end,
-      periodEnd,
     });
     invoicesCreated += 1;
     if (
@@ -990,15 +1008,23 @@ export async function settleRenewalInvoice(
   await client.query(
     `INSERT INTO service_periods(
        service_id, invoice_id, period_kind, period_start, period_end, granted_at
-     ) VALUES ($1, $2, 'renewal', $3, $4, $5)`,
-    [renewal.service_id, invoiceId, renewal.period_start, renewal.period_end, settledAt],
+     )
+     SELECT renewal.service_id, $2, 'renewal',
+            renewal.period_start, renewal.period_end, $3
+     FROM service_renewals renewal
+     WHERE renewal.id = $1`,
+    [renewal.id, invoiceId, settledAt],
   );
   const advanced = await client.query(
-    `UPDATE services
-     SET term_end = $3, updated_at = now(), version = version + 1
-     WHERE id = $1 AND status IN ('active', 'suspended') AND term_end = $2
-     RETURNING id`,
-    [renewal.service_id, renewal.period_start, renewal.period_end],
+    `UPDATE services service
+     SET term_end = renewal.period_end, updated_at = now(), version = service.version + 1
+     FROM service_renewals renewal
+     WHERE service.id = $1
+       AND renewal.id = $2
+       AND service.status IN ('active', 'suspended')
+       AND service.term_end = renewal.period_start
+     RETURNING service.id`,
+    [renewal.service_id, renewal.id],
   );
   if (advanced.rowCount !== 1) {
     throw new Error("Service term changed while settling renewal");

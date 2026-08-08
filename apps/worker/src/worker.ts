@@ -47,7 +47,7 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "013_stage_b_late_fee_suspension";
+const REQUIRED_SCHEMA_VERSION = "014_stage_b_cycle_end_cancellation";
 
 type Job = {
   id: string;
@@ -150,7 +150,8 @@ async function enqueueReconcileWithClient(
     | "provision.reconcile"
     | "refund.reconcile"
     | "service.suspend.reconcile"
-    | "service.resume.reconcile",
+    | "service.resume.reconcile"
+    | "service.cancellation.reconcile",
   uniqueKey: string,
   payload: Record<string, string>,
   delaySeconds: number,
@@ -377,7 +378,8 @@ async function recoverStaleJobs(): Promise<number> {
        AND job_type NOT IN (
          'refund.start', 'refund.reconcile',
          'service.suspend.start', 'service.suspend.reconcile',
-         'service.resume.start', 'service.resume.reconcile'
+         'service.resume.start', 'service.resume.reconcile',
+         'service.cancellation.due', 'service.cancellation.reconcile'
        )
      ORDER BY locked_at, created_at
      LIMIT 50`,
@@ -4544,6 +4546,773 @@ async function reconcileServiceAction(job: Job, action: ServiceAction): Promise<
   await completeJob(job);
 }
 
+type CancellationExecutionState = {
+  request_id: string;
+  effective_at: Date;
+  execution_id: string;
+  execution_mode: "automatic" | "manual";
+  execution_status: "scheduled" | "processing" | "unknown" | "manual" | "terminated";
+  execution_provider_installation_id: string | null;
+  service_id: string;
+  service_status: string;
+  service_cancellation_request_id: string | null;
+  external_resource_id: string | null;
+  binding_cancellation_execution_mode: string | null;
+  binding_provider_installation_id: string | null;
+  binding_capabilities: unknown;
+  provider_enabled: boolean | null;
+  current_provider_capabilities: unknown;
+  operation_id: string | null;
+  operation_provider_installation_id: string | null;
+  operation_kind: string | null;
+  operation_subject_type: string | null;
+  operation_subject_id: string | null;
+  operation_stable_key: string | null;
+  operation_status: string | null;
+  operation_attempt_count: number | null;
+};
+
+type CancellationCall = { externalResourceId: string };
+
+async function lockCancellationState(
+  client: DatabaseClient,
+  job: Job,
+  requestId: string,
+  executionId: string,
+  serviceId: string,
+  providerOperationId: string | null,
+): Promise<CancellationExecutionState | null> {
+  if (providerOperationId) await lockProviderOperation(client, providerOperationId);
+  const pointer = await client.query<{ order_item_id: string; service_id: string }>(
+    `SELECT service.order_item_id, service.id AS service_id
+     FROM service_cancellation_executions execution
+     JOIN service_cancellation_requests cancellation_request
+       ON cancellation_request.id = execution.cancellation_request_id
+     JOIN services service ON service.id = execution.service_id
+     WHERE cancellation_request.id = $1
+       AND execution.id = $2
+       AND service.id = $3`,
+    [requestId, executionId, serviceId],
+  );
+  const target = pointer.rows[0];
+  if (!target) {
+    await assertJobLeaseWithClient(client, job);
+    return null;
+  }
+  await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+    target.order_item_id,
+  ]);
+  await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [target.service_id]);
+  await client.query(
+    "SELECT id FROM service_cancellation_requests WHERE id = $1 FOR UPDATE",
+    [requestId],
+  );
+  await client.query(
+    "SELECT id FROM service_cancellation_executions WHERE id = $1 FOR UPDATE",
+    [executionId],
+  );
+  if (providerOperationId) {
+    await client.query("SELECT id FROM provider_operations WHERE id = $1 FOR UPDATE", [
+      providerOperationId,
+    ]);
+  }
+  await assertJobLeaseWithClient(client, job);
+  const result = await client.query<CancellationExecutionState>(
+    `SELECT cancellation_request.id AS request_id,
+            cancellation_request.effective_at,
+            execution.id AS execution_id,
+            execution.execution_mode,
+            execution.status AS execution_status,
+            execution.provider_installation_id AS execution_provider_installation_id,
+            service.id AS service_id,
+            service.status AS service_status,
+            service.cancellation_request_id AS service_cancellation_request_id,
+            service.external_resource_id,
+            binding.cycle_end_cancellation_execution_mode_snapshot
+              AS binding_cancellation_execution_mode,
+            binding.provider_installation_id AS binding_provider_installation_id,
+            binding.capability_snapshot AS binding_capabilities,
+            provider.enabled AS provider_enabled,
+            provider.capabilities AS current_provider_capabilities,
+            operation.id AS operation_id,
+            operation.provider_installation_id AS operation_provider_installation_id,
+            operation.kind AS operation_kind,
+            operation.subject_type AS operation_subject_type,
+            operation.subject_id AS operation_subject_id,
+            operation.stable_key AS operation_stable_key,
+            operation.status AS operation_status,
+            operation.attempt_count AS operation_attempt_count
+     FROM service_cancellation_requests cancellation_request
+     JOIN service_cancellation_executions execution
+       ON execution.cancellation_request_id = cancellation_request.id
+     JOIN services service ON service.id = execution.service_id
+     LEFT JOIN service_provider_bindings binding ON binding.service_id = service.id
+     LEFT JOIN provider_installation_capabilities provider
+       ON provider.provider_installation_id = binding.provider_installation_id
+     LEFT JOIN provider_operations operation
+       ON operation.id = $4
+      AND operation.subject_type = 'service_cancellation_execution'
+      AND operation.subject_id = execution.id
+     WHERE cancellation_request.id = $1
+       AND execution.id = $2
+       AND service.id = $3`,
+    [requestId, executionId, serviceId, providerOperationId],
+  );
+  return result.rows[0] ?? null;
+}
+
+async function setCancellationManualWithClient(
+  client: DatabaseClient,
+  job: Job,
+  state: CancellationExecutionState,
+  reason: string,
+  definitivelyRejected: boolean,
+): Promise<void> {
+  const potentiallySent =
+    (state.operation_attempt_count ?? 0) > 0 ||
+    state.operation_status === "running" ||
+    state.operation_status === "unknown";
+  if (state.operation_id) {
+    await client.query(
+      `UPDATE provider_operations
+       SET status = $2, last_error = $3, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [
+        state.operation_id,
+        definitivelyRejected || !potentiallySent ? "failed" : "unknown",
+        reason.slice(0, 1_000),
+      ],
+    );
+  }
+  if (state.execution_status !== "manual" && state.execution_status !== "terminated") {
+    await client.query(
+      `UPDATE service_cancellation_executions
+       SET status = 'manual', result = $2, last_error = $3,
+           updated_at = now(), version = version + 1
+       WHERE id = $1 AND status NOT IN ('manual', 'terminated')`,
+      [
+        state.execution_id,
+        {
+          status: "manual",
+          interventionRequired: true,
+          potentiallySent,
+        },
+        reason.slice(0, 1_000),
+      ],
+    );
+  }
+  await client.query(
+    `INSERT INTO audit_events(
+       actor_type, actor_id, action, target_type, target_id, reason, metadata
+     ) VALUES ('system', $1, 'service.cancellation_manual',
+               'service_cancellation_execution', $2, $3, $4)`,
+    [
+      config.WORKER_ID,
+      state.execution_id,
+      reason.slice(0, 1_000),
+      {
+        cancellationRequestId: state.request_id,
+        serviceId: state.service_id,
+        providerOperationId: state.operation_id,
+        potentiallySent,
+        definitivelyRejected,
+      },
+    ],
+  );
+  await manualJobWithClient(client, job, reason);
+}
+
+async function preflightCancellation(
+  job: Job,
+  requestId: string,
+  executionId: string,
+  serviceId: string,
+  providerOperationId: string | null,
+  mode: "start" | "reconcile",
+): Promise<PreflightResult<CancellationCall>> {
+  return transaction(async (client) => {
+    const state = await lockCancellationState(
+      client,
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(
+        client,
+        job,
+        "cancellation job references missing or inconsistent Core records",
+      );
+      return { kind: "halted" };
+    }
+    if (state.execution_status === "terminated" && state.service_status === "terminated") {
+      await completeJobWithClient(client, job);
+      return { kind: "halted" };
+    }
+    if (state.execution_mode === "manual") {
+      await setCancellationManualWithClient(
+        client,
+        job,
+        state,
+        "Paid-period cancellation reached its due time and requires an administrator to terminate the manually delivered service",
+        true,
+      );
+      return { kind: "halted" };
+    }
+    if (!providerOperationId || !state.operation_id) {
+      await setCancellationManualWithClient(
+        client,
+        job,
+        state,
+        "automatic cancellation is missing its stable Provider operation",
+        true,
+      );
+      return { kind: "halted" };
+    }
+
+    const stableIdentity =
+      state.request_id === requestId &&
+      state.execution_id === executionId &&
+      state.service_id === serviceId &&
+      state.service_cancellation_request_id === requestId &&
+      state.operation_id === providerOperationId &&
+      state.operation_provider_installation_id === "mock-provisioning-v1" &&
+      state.execution_provider_installation_id === "mock-provisioning-v1" &&
+      state.operation_kind === "resource_terminate" &&
+      state.operation_subject_type === "service_cancellation_execution" &&
+      state.operation_subject_id === executionId &&
+      state.operation_stable_key === job.unique_key &&
+      state.binding_provider_installation_id === "mock-provisioning-v1";
+    const currentlyAuthorized =
+      state.binding_cancellation_execution_mode === "automatic" &&
+      state.provider_enabled === true &&
+      capabilityList(state.binding_capabilities).includes("resource_terminate") &&
+      capabilityList(state.current_provider_capabilities).includes("resource_terminate");
+    if (!stableIdentity || (mode === "start" && !currentlyAuthorized)) {
+      await setCancellationManualWithClient(
+        client,
+        job,
+        state,
+        !stableIdentity
+          ? "cancellation Provider ownership or stable operation identity is inconsistent"
+          : "cancellation Provider is paused or no longer authorized for resource termination",
+        false,
+      );
+      return { kind: "halted" };
+    }
+    if (state.effective_at.getTime() > Date.now()) {
+      const deferred = await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending', available_at = $2,
+             locked_at = NULL, locked_by = NULL,
+             last_error = 'cancellation was claimed before its paid period ended',
+             updated_at = now()
+         WHERE id = $1 AND status = 'running' AND locked_by = $3 AND attempts = $4
+         RETURNING id`,
+        [job.id, state.effective_at, config.WORKER_ID, job.attempts],
+      );
+      if (deferred.rowCount !== 1) throw new LostJobLeaseError(job.id);
+      return { kind: "halted" };
+    }
+    if (!state.external_resource_id) {
+      await setCancellationManualWithClient(
+        client,
+        job,
+        state,
+        "automatic cancellation requires an existing external resource id",
+        true,
+      );
+      return { kind: "halted" };
+    }
+    if (
+      mode === "start" &&
+      !["active", "suspended", "provisioned_hold"].includes(state.service_status)
+    ) {
+      await setCancellationManualWithClient(
+        client,
+        job,
+        state,
+        "service is no longer in a state eligible for paid-period termination",
+        true,
+      );
+      return { kind: "halted" };
+    }
+    if (mode === "reconcile") {
+      const possiblySent =
+        (state.operation_attempt_count ?? 0) > 0 ||
+        state.operation_status === "running" ||
+        state.operation_status === "unknown" ||
+        state.operation_status === "failed";
+      if (!possiblySent) {
+        await setCancellationManualWithClient(
+          client,
+          job,
+          state,
+          "cancellation reconciliation has no evidence that a terminate request was sent",
+          true,
+        );
+        return { kind: "halted" };
+      }
+      return { kind: "call", value: { externalResourceId: state.external_resource_id } };
+    }
+
+    const mayHaveRun =
+      state.execution_status !== "scheduled" ||
+      state.operation_status !== "queued" ||
+      state.operation_attempt_count !== 0;
+    if (mayHaveRun) {
+      const reason =
+        "terminate may already have been sent; only Provider query reconciliation is allowed";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId, reason],
+      );
+      if (state.execution_status === "processing") {
+        await client.query(
+          `UPDATE service_cancellation_executions
+           SET status = 'unknown', result = $2, last_error = $3,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'processing'`,
+          [executionId, { status: "unknown", reconciliation: "query_only" }, reason],
+        );
+      }
+      await enqueueReconcileWithClient(
+        client,
+        "service.cancellation.reconcile",
+        job.unique_key,
+        { requestId, executionId, serviceId, providerOperationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeJobWithClient(client, job);
+      return { kind: "halted" };
+    }
+
+    const executionUpdated = await client.query(
+      `UPDATE service_cancellation_executions
+       SET status = 'processing', result = $2, last_error = NULL,
+           updated_at = now(), version = version + 1
+       WHERE id = $1 AND status = 'scheduled'
+       RETURNING id`,
+      [executionId, { status: "processing", providerAction: "terminate" }],
+    );
+    const operationUpdated = await client.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = attempt_count + 1,
+           last_error = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'queued' AND attempt_count = 0
+       RETURNING id`,
+      [providerOperationId],
+    );
+    if (executionUpdated.rowCount !== 1 || operationUpdated.rowCount !== 1) {
+      throw new Error("cancellation state changed while beginning Provider termination");
+    }
+    return { kind: "call", value: { externalResourceId: state.external_resource_id } };
+  });
+}
+
+async function markCancellationUnknown(
+  job: Job,
+  requestId: string,
+  executionId: string,
+  serviceId: string,
+  providerOperationId: string,
+  reason: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    const state = await lockCancellationState(
+      client,
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(client, job, reason);
+      return;
+    }
+    if (state.execution_status === "terminated" && state.service_status === "terminated") {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [providerOperationId, reason.slice(0, 1_000)],
+    );
+    if (state.execution_status === "processing") {
+      await client.query(
+        `UPDATE service_cancellation_executions
+         SET status = 'unknown', result = $2, last_error = $3,
+             updated_at = now(), version = version + 1
+         WHERE id = $1 AND status = 'processing'`,
+        [
+          executionId,
+          { status: "unknown", reconciliation: "query_only" },
+          reason.slice(0, 1_000),
+        ],
+      );
+    }
+    await enqueueReconcileWithClient(
+      client,
+      "service.cancellation.reconcile",
+      job.unique_key,
+      { requestId, executionId, serviceId, providerOperationId },
+      config.RECONCILE_BASE_DELAY_SECONDS,
+    );
+    await completeJobWithClient(client, job);
+  });
+}
+
+async function finishCancellationStart(
+  job: Job,
+  requestId: string,
+  executionId: string,
+  serviceId: string,
+  providerOperationId: string,
+): Promise<void> {
+  await transaction(async (client) => {
+    await lockProviderOperation(client, providerOperationId);
+    await assertJobLeaseWithClient(client, job);
+    const operation = await client.query<{ status: string }>(
+      "SELECT status FROM provider_operations WHERE id = $1 FOR UPDATE",
+      [providerOperationId],
+    );
+    const status = operation.rows[0]?.status;
+    if (status && status !== "succeeded" && status !== "failed") {
+      await enqueueReconcileWithClient(
+        client,
+        "service.cancellation.reconcile",
+        job.unique_key,
+        { requestId, executionId, serviceId, providerOperationId },
+        config.WATCHDOG_DELAY_SECONDS,
+      );
+    }
+    await completeJobWithClient(client, job);
+  });
+}
+
+async function delayCancellationReconcile(
+  job: Job,
+  requestId: string,
+  executionId: string,
+  serviceId: string,
+  providerOperationId: string,
+  reason: string,
+  forceManual = false,
+): Promise<void> {
+  await transaction(async (client) => {
+    const state = await lockCancellationState(
+      client,
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+    );
+    if (!state) {
+      await manualJobWithClient(client, job, reason);
+      return;
+    }
+    if (state.execution_status === "terminated" && state.service_status === "terminated") {
+      await completeJobWithClient(client, job);
+      return;
+    }
+    if (forceManual || job.attempts >= config.RECONCILE_MAX_ATTEMPTS) {
+      await setCancellationManualWithClient(client, job, state, reason, false);
+      return;
+    }
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [providerOperationId, reason.slice(0, 1_000)],
+    );
+    if (state.execution_status === "processing") {
+      await client.query(
+        `UPDATE service_cancellation_executions
+         SET status = 'unknown', result = $2, last_error = $3,
+             updated_at = now(), version = version + 1
+         WHERE id = $1 AND status = 'processing'`,
+        [executionId, { status: "unknown", reconciliation: "query_only" }, reason.slice(0, 1_000)],
+      );
+    }
+    const delayed = await client.query(
+      `UPDATE durable_jobs
+       SET status = 'pending',
+           available_at = now() + make_interval(secs => $2),
+           locked_at = NULL, locked_by = NULL,
+           last_error = $3, updated_at = now()
+       WHERE id = $1 AND status = 'running' AND locked_by = $4 AND attempts = $5
+       RETURNING id`,
+      [
+        job.id,
+        reconcileDelaySeconds(job.attempts),
+        reason.slice(0, 1_000),
+        config.WORKER_ID,
+        job.attempts,
+      ],
+    );
+    if (delayed.rowCount !== 1) throw new LostJobLeaseError(job.id);
+  });
+}
+
+async function startCancellation(job: Job): Promise<void> {
+  const requestId = job.payload.cancellationRequestId ?? job.payload.requestId;
+  const executionId = job.payload.executionId;
+  const serviceId = job.payload.serviceId;
+  const providerOperationId = job.payload.providerOperationId ?? null;
+  if (!requestId || !executionId || !serviceId) {
+    throw new Error("Invalid service.cancellation.due payload");
+  }
+  const preflight = await preflightCancellation(
+    job,
+    requestId,
+    executionId,
+    serviceId,
+    providerOperationId,
+    "start",
+  );
+  if (preflight.kind === "halted") return;
+  if (!providerOperationId) throw new Error("Automatic cancellation lacks Provider operation id");
+  const configuredScenario = job.payload.scenario;
+  const scenario =
+    configuredScenario === "success" ||
+    configuredScenario === "failed" ||
+    configuredScenario === "timeout_success" ||
+    configuredScenario === "duplicate_out_of_order"
+      ? configuredScenario
+      : config.MOCK_RESOURCE_ACTION_SCENARIO;
+  const callbackCapability = providerOperationCapability(
+    config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+    "mock-provisioning-v1",
+    providerOperationId,
+  );
+  try {
+    const response = await providerRequest(
+      config.MOCK_PROVISIONING_PROVIDER_URL,
+      config.MOCK_PROVISIONING_PROVIDER_TOKEN,
+      "/v1/resource-actions",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": providerOperationId },
+        body: JSON.stringify({
+          operationId: providerOperationId,
+          serviceId,
+          externalResourceId: preflight.value.externalResourceId,
+          callbackCapability,
+          action: "terminate",
+          scenario,
+        }),
+      },
+    );
+    if (!response.ok) {
+      if (
+        response.status === 408 ||
+        response.status === 409 ||
+        response.status === 425 ||
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        await markCancellationUnknown(
+          job,
+          requestId,
+          executionId,
+          serviceId,
+          providerOperationId,
+          `resource terminate returned ambiguous HTTP ${response.status}; query-only reconciliation required`,
+        );
+        return;
+      }
+      await transaction(async (client) => {
+        const state = await lockCancellationState(
+          client,
+          job,
+          requestId,
+          executionId,
+          serviceId,
+          providerOperationId,
+        );
+        if (!state) return manualJobWithClient(client, job, "termination request was rejected");
+        return setCancellationManualWithClient(
+          client,
+          job,
+          state,
+          `resource terminate was definitively rejected with HTTP ${response.status}`,
+          true,
+        );
+      });
+      return;
+    }
+    await finishCancellationStart(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await markCancellationUnknown(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      `resource terminate transport result is unknown (${message}); query-only reconciliation required`,
+    );
+  }
+}
+
+async function reconcileCancellation(job: Job): Promise<void> {
+  const requestId = job.payload.cancellationRequestId ?? job.payload.requestId;
+  const executionId = job.payload.executionId;
+  const serviceId = job.payload.serviceId;
+  const providerOperationId = job.payload.providerOperationId ?? job.payload.operationId;
+  if (!requestId || !executionId || !serviceId || !providerOperationId) {
+    throw new Error("Invalid service.cancellation.reconcile payload");
+  }
+  const preflight = await preflightCancellation(
+    job,
+    requestId,
+    executionId,
+    serviceId,
+    providerOperationId,
+    "reconcile",
+  );
+  if (preflight.kind === "halted") return;
+
+  let response: Response;
+  try {
+    response = await providerRequest(
+      config.MOCK_PROVISIONING_PROVIDER_URL,
+      config.MOCK_PROVISIONING_PROVIDER_TOKEN,
+      `/v1/resource-actions/${encodeURIComponent(providerOperationId)}`,
+      { method: "GET" },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown transport error";
+    await delayCancellationReconcile(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      `termination reconciliation transport failed: ${message}`,
+    );
+    return;
+  }
+  if (
+    response.status === 404 ||
+    response.status === 408 ||
+    response.status === 425 ||
+    response.status === 429 ||
+    response.status >= 500
+  ) {
+    await delayCancellationReconcile(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      `termination is not yet reconcilable at the Provider (HTTP ${response.status})`,
+    );
+    return;
+  }
+  if (!response.ok) {
+    await delayCancellationReconcile(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      `termination reconciliation requires manual intervention (HTTP ${response.status})`,
+      true,
+    );
+    return;
+  }
+
+  let fact: {
+    callbackCapability: string;
+    serviceId: string;
+    externalResourceId: string;
+    action: "terminate";
+    status: "succeeded" | "failed";
+    occurredAt: string;
+  };
+  try {
+    fact = z
+      .object({
+        callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+        serviceId: z.uuid(),
+        externalResourceId: z.string().min(1).max(200),
+        action: z.literal("terminate"),
+        status: z.enum(["succeeded", "failed"]),
+        occurredAt: z.iso.datetime({ offset: true }),
+      })
+      .parse(await response.json());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid Provider response";
+    await delayCancellationReconcile(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      `termination reconciliation response is invalid: ${message}`,
+      true,
+    );
+    return;
+  }
+  if (
+    fact.serviceId !== serviceId ||
+    fact.externalResourceId !== preflight.value.externalResourceId ||
+    !providerOperationCapabilityMatches(
+      fact.callbackCapability,
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+      "mock-provisioning-v1",
+      providerOperationId,
+    )
+  ) {
+    await delayCancellationReconcile(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      "termination reconciliation returned mismatched ownership or operation capability",
+      true,
+    );
+    return;
+  }
+  const coreOutcome = await submitReconciledEvent(
+    "/api/v1/provider-events/resource-termination",
+    {
+      eventId: `reconcile:resource-termination:${providerOperationId}:${randomUUID()}`,
+      providerOperationId,
+      ...fact,
+    },
+    config.MOCK_PROVISIONING_WEBHOOK_SECRET,
+  );
+  if (coreOutcome.kind === "retry") {
+    await delayCancellationReconcile(
+      job,
+      requestId,
+      executionId,
+      serviceId,
+      providerOperationId,
+      coreOutcome.reason,
+    );
+    return;
+  }
+  await completeJob(job);
+}
+
 async function recoverOneStaleServiceActionJob(candidate: Job): Promise<boolean> {
   const action: ServiceAction | null = candidate.job_type.startsWith("service.suspend.")
     ? "suspend"
@@ -4810,6 +5579,272 @@ async function recoverStaleServiceActionJobs(): Promise<number> {
   let recovered = 0;
   for (const candidate of candidates.rows) {
     if (await recoverOneStaleServiceActionJob(candidate)) recovered += 1;
+  }
+  return recovered;
+}
+
+async function recoverOneStaleCancellationJob(candidate: Job): Promise<boolean> {
+  const requestId = candidate.payload.cancellationRequestId ?? candidate.payload.requestId;
+  const executionId = candidate.payload.executionId;
+  const serviceId = candidate.payload.serviceId;
+  const providerOperationId = candidate.payload.providerOperationId ?? null;
+  if (!requestId || !executionId || !serviceId) {
+    return transaction(async (client) => {
+      const job = await lockStaleJobWithClient(client, candidate);
+      if (!job) return false;
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale cancellation job has an invalid payload; manual inspection required",
+      );
+      return true;
+    });
+  }
+
+  return transaction(async (client) => {
+    if (providerOperationId) await lockProviderOperation(client, providerOperationId);
+    const pointer = await client.query<{ order_item_id: string }>(
+      `SELECT service.order_item_id
+       FROM service_cancellation_executions execution
+       JOIN service_cancellation_requests cancellation_request
+         ON cancellation_request.id = execution.cancellation_request_id
+       JOIN services service ON service.id = execution.service_id
+       WHERE cancellation_request.id = $1
+         AND execution.id = $2
+         AND service.id = $3`,
+      [requestId, executionId, serviceId],
+    );
+    const target = pointer.rows[0];
+    if (target) {
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        target.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [serviceId]);
+      await client.query(
+        "SELECT id FROM service_cancellation_requests WHERE id = $1 FOR UPDATE",
+        [requestId],
+      );
+      await client.query(
+        "SELECT id FROM service_cancellation_executions WHERE id = $1 FOR UPDATE",
+        [executionId],
+      );
+      if (providerOperationId) {
+        await client.query("SELECT id FROM provider_operations WHERE id = $1 FOR UPDATE", [
+          providerOperationId,
+        ]);
+      }
+    }
+    const job = await lockStaleJobWithClient(client, candidate);
+    if (!job) return false;
+    if (!target) {
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale cancellation job references missing Core records",
+      );
+      return true;
+    }
+    const stateResult = await client.query<{
+      execution_mode: "automatic" | "manual";
+      execution_status: string;
+      service_status: string;
+      operation_status: string | null;
+      operation_attempt_count: number | null;
+      operation_kind: string | null;
+      operation_subject_id: string | null;
+    }>(
+      `SELECT execution.execution_mode,
+              execution.status AS execution_status,
+              service.status AS service_status,
+              operation.status AS operation_status,
+              operation.attempt_count AS operation_attempt_count,
+              operation.kind AS operation_kind,
+              operation.subject_id AS operation_subject_id
+       FROM service_cancellation_executions execution
+       JOIN services service ON service.id = execution.service_id
+       LEFT JOIN provider_operations operation ON operation.id = $2
+       WHERE execution.id = $1`,
+      [executionId, providerOperationId],
+    );
+    const state = stateResult.rows[0];
+    if (!state) {
+      await manualRecoveredJobWithClient(client, job, "cancellation execution disappeared");
+      return true;
+    }
+    if (state.execution_status === "terminated" && state.service_status === "terminated") {
+      await completeRecoveredJobWithClient(client, job);
+      return true;
+    }
+    if (state.execution_mode === "manual") {
+      if (state.execution_status === "scheduled") {
+        await client.query(
+          `UPDATE service_cancellation_executions
+           SET status = 'manual', result = $2, last_error = $3,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'scheduled'`,
+          [
+            executionId,
+            { status: "manual", interventionRequired: true },
+            "worker lease expired while placing the due cancellation into the manual queue",
+          ],
+        );
+      }
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "manual cancellation remains queued for administrator intervention",
+      );
+      return true;
+    }
+    if (
+      !providerOperationId ||
+      state.operation_kind !== "resource_terminate" ||
+      state.operation_subject_id !== executionId
+    ) {
+      await client.query(
+        `UPDATE service_cancellation_executions
+         SET status = 'manual', result = $2, last_error = $3,
+             updated_at = now(), version = version + 1
+         WHERE id = $1 AND status NOT IN ('manual', 'terminated')`,
+        [
+          executionId,
+          { status: "manual", interventionRequired: true },
+          "stale automatic cancellation has inconsistent Provider ownership",
+        ],
+      );
+      await manualRecoveredJobWithClient(
+        client,
+        job,
+        "stale automatic cancellation has inconsistent Provider ownership",
+      );
+      return true;
+    }
+
+    const dueJob = job.job_type === "service.cancellation.due";
+    const knownUnsent =
+      dueJob &&
+      state.execution_status === "scheduled" &&
+      state.operation_status === "queued" &&
+      state.operation_attempt_count === 0;
+    if (knownUnsent && job.attempts < config.MAX_JOB_ATTEMPTS) {
+      await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending',
+             available_at = now() + make_interval(secs => $3),
+             locked_at = NULL, locked_by = NULL,
+             last_error = 'worker lease expired before terminate dispatch began',
+             updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2`,
+        [job.id, job.attempts, reconcileDelaySeconds(job.attempts)],
+      );
+      return true;
+    }
+    if (knownUnsent) {
+      const reason =
+        "known-unsent termination repeatedly lost its worker lease; manual intervention required";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'failed', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'queued' AND attempt_count = 0`,
+        [providerOperationId, reason],
+      );
+      await client.query(
+        `UPDATE service_cancellation_executions
+         SET status = 'manual', result = $2, last_error = $3,
+             updated_at = now(), version = version + 1
+         WHERE id = $1 AND status = 'scheduled'`,
+        [executionId, { status: "manual", interventionRequired: true }, reason],
+      );
+      await manualRecoveredJobWithClient(client, job, reason);
+      return true;
+    }
+
+    if (dueJob) {
+      const reason =
+        "worker lease expired after terminate may have been sent; query-only reconciliation required";
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'unknown', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+        [providerOperationId, reason],
+      );
+      if (state.execution_status === "processing") {
+        await client.query(
+          `UPDATE service_cancellation_executions
+           SET status = 'unknown', result = $2, last_error = $3,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'processing'`,
+          [executionId, { status: "unknown", reconciliation: "query_only" }, reason],
+        );
+      } else if (state.execution_status === "scheduled") {
+        await client.query(
+          `UPDATE service_cancellation_executions
+           SET status = 'manual', result = $2, last_error = $3,
+               updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'scheduled'`,
+          [executionId, { status: "manual", interventionRequired: true }, reason],
+        );
+        await manualRecoveredJobWithClient(client, job, reason);
+        return true;
+      }
+      await enqueueReconcileWithClient(
+        client,
+        "service.cancellation.reconcile",
+        job.unique_key,
+        { requestId, executionId, serviceId, providerOperationId },
+        config.RECONCILE_BASE_DELAY_SECONDS,
+      );
+      await completeRecoveredJobWithClient(client, job);
+      return true;
+    }
+
+    const manual = job.attempts >= config.RECONCILE_MAX_ATTEMPTS;
+    const reason = manual
+      ? "termination reconciliation lease repeatedly expired; manual intervention required"
+      : "termination reconciliation lease expired; retrying Provider query only";
+    await client.query(
+      `UPDATE provider_operations
+       SET status = 'unknown', last_error = $2, updated_at = now()
+       WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+      [providerOperationId, reason],
+    );
+    if (manual) {
+      await client.query(
+        `UPDATE service_cancellation_executions
+         SET status = 'manual', result = $2, last_error = $3,
+             updated_at = now(), version = version + 1
+         WHERE id = $1 AND status NOT IN ('manual', 'terminated')`,
+        [executionId, { status: "manual", interventionRequired: true }, reason],
+      );
+      await manualRecoveredJobWithClient(client, job, reason);
+    } else {
+      await client.query(
+        `UPDATE durable_jobs
+         SET status = 'pending',
+             available_at = now() + make_interval(secs => $3),
+             locked_at = NULL, locked_by = NULL, last_error = $4, updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2`,
+        [job.id, job.attempts, reconcileDelaySeconds(job.attempts), reason],
+      );
+    }
+    return true;
+  });
+}
+
+async function recoverStaleCancellationJobs(): Promise<number> {
+  const candidates = await pool.query<Job>(
+    `SELECT id, job_type, unique_key, payload, attempts
+     FROM durable_jobs
+     WHERE status = 'running'
+       AND job_type IN ('service.cancellation.due', 'service.cancellation.reconcile')
+       AND locked_at < now() - make_interval(secs => $1)
+     ORDER BY locked_at, created_at
+     LIMIT 50`,
+    [config.JOB_LOCK_TIMEOUT_SECONDS],
+  );
+  let recovered = 0;
+  for (const candidate of candidates.rows) {
+    if (await recoverOneStaleCancellationJob(candidate)) recovered += 1;
   }
   return recovered;
 }
@@ -5842,6 +6877,10 @@ async function sendNotification(job: Job): Promise<void> {
       dueAt?: string;
       amountDueMinor?: string;
       currency?: string;
+      cancellationRequestId?: string;
+      productName?: string;
+      effectiveAt?: string;
+      executionMode?: "automatic" | "manual";
     };
     published_at: Date | null;
   }>(
@@ -5904,6 +6943,25 @@ async function sendNotification(job: Job): Promise<void> {
       locale,
     );
     return;
+  } else if (
+    outbox.event_type === "notification.service_cancellation_scheduled" &&
+    outbox.payload.cancellationRequestId &&
+    outbox.payload.serviceId &&
+    outbox.payload.productName &&
+    outbox.payload.effectiveAt &&
+    (outbox.payload.executionMode === "automatic" ||
+      outbox.payload.executionMode === "manual")
+  ) {
+    template = "service-cancellation-scheduled-v1";
+    subject =
+      locale === "zh-CN"
+        ? "服务已安排在账期末取消"
+        : "Service cancellation scheduled for period end";
+    body =
+      locale === "zh-CN"
+        ? `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${subject}\n产品：${outbox.payload.productName}\n服务：${outbox.payload.serviceId}\n生效时间：${outbox.payload.effectiveAt}\n执行方式：${outbox.payload.executionMode === "automatic" ? "Mock Provider 自动终止" : "管理员人工终止"}`
+        : `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${subject}\nProduct: ${outbox.payload.productName}\nService: ${outbox.payload.serviceId}\nEffective at: ${outbox.payload.effectiveAt}\nExecution: ${outbox.payload.executionMode === "automatic" ? "automatic Mock Provider termination" : "administrator manual termination"}`;
+    sensitive = false;
   } else {
     throw new Error(`Unsupported notification event: ${outbox.event_type}`);
   }
@@ -5992,6 +7050,8 @@ async function processJob(job: Job): Promise<void> {
   if (job.job_type === "service.resume.reconcile") {
     return reconcileServiceAction(job, "resume");
   }
+  if (job.job_type === "service.cancellation.due") return startCancellation(job);
+  if (job.job_type === "service.cancellation.reconcile") return reconcileCancellation(job);
   throw new Error(`Unsupported job type: ${job.job_type}`);
 }
 
@@ -6034,7 +7094,8 @@ while (!stopping) {
       const recovered =
         (await recoverStaleJobs()) +
         (await recoverStaleRefundJobs()) +
-        (await recoverStaleServiceActionJobs());
+        (await recoverStaleServiceActionJobs()) +
+        (await recoverStaleCancellationJobs());
       if (recovered > 0) {
         console.warn("recovered stale durable jobs", { count: recovered });
       }

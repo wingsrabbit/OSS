@@ -10,6 +10,10 @@ type SeedProduct = {
   zh: string;
   fulfillment: "automatic" | "review" | "manual" | "quote";
   overdueAction: "automatic" | "manual" | "none";
+  cancellationMode: "self_service" | "authenticated_ticket" | "manual_review" | "disabled";
+  cancellationExecutionMode: "automatic" | "manual";
+  cancellationMinNoticeHours?: number;
+  cancellationRequirementKey?: string;
   overdueDelayMode?: "policy_calendar_days" | "exact_hours";
   overdueDelayValue?: number;
   providerInstallationId?: string;
@@ -37,6 +41,8 @@ const products: SeedProduct[] = [
     zh: "HKBGP VPS",
     fulfillment: "automatic",
     overdueAction: "automatic",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "automatic",
     providerInstallationId: "mock-provisioning-v1",
     monthlyMinor: 300,
     setupMinor: 200,
@@ -48,6 +54,8 @@ const products: SeedProduct[] = [
     zh: "HKBGP-CN VPS",
     fulfillment: "automatic",
     overdueAction: "automatic",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "automatic",
     providerInstallationId: "mock-provisioning-v1",
     monthlyMinor: 2_000,
     setupMinor: 200,
@@ -59,6 +67,8 @@ const products: SeedProduct[] = [
     zh: "HK-R640 HKBGP 独立服务器",
     fulfillment: "manual",
     overdueAction: "manual",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "manual",
     monthlyMinor: 28_000,
     setupMinor: 1_000,
   },
@@ -69,6 +79,8 @@ const products: SeedProduct[] = [
     zh: "HK-R640 HKBGP-CN 独立服务器",
     fulfillment: "manual",
     overdueAction: "manual",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "manual",
     monthlyMinor: 125_000,
     setupMinor: 1_000,
   },
@@ -79,6 +91,8 @@ const products: SeedProduct[] = [
     zh: "HKBGP IP Transit",
     fulfillment: "manual",
     overdueAction: "manual",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "manual",
     monthlyMinor: 3_000,
   },
   {
@@ -88,6 +102,8 @@ const products: SeedProduct[] = [
     zh: "HKBGP-CN IP Transit",
     fulfillment: "manual",
     overdueAction: "manual",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "manual",
     monthlyMinor: 100_000,
   },
   {
@@ -97,6 +113,10 @@ const products: SeedProduct[] = [
     zh: "Equinix HK2 机房托管",
     fulfillment: "quote",
     overdueAction: "manual",
+    cancellationMode: "authenticated_ticket",
+    cancellationExecutionMode: "manual",
+    cancellationMinNoticeHours: 72,
+    cancellationRequirementKey: "termrat.colocation.termination-ready.v1",
     overdueDelayMode: "exact_hours",
     overdueDelayValue: 72,
     monthlyMinor: 0,
@@ -129,6 +149,8 @@ const products: SeedProduct[] = [
     zh: "Remote Hands 现场协助",
     fulfillment: "manual",
     overdueAction: "none",
+    cancellationMode: "disabled",
+    cancellationExecutionMode: "manual",
     repeatable: true,
     hidden: true,
     oneTimeMinor: 10_000,
@@ -140,6 +162,8 @@ const products: SeedProduct[] = [
     zh: "GSL Inbound",
     fulfillment: "manual",
     overdueAction: "manual",
+    cancellationMode: "self_service",
+    cancellationExecutionMode: "manual",
     monthlyMinor: 0,
     optionSchema: [
       {
@@ -218,7 +242,7 @@ await transaction(pool, async (client) => {
        provider_installation_id, provider_type, enabled, capabilities
      ) VALUES (
        'mock-provisioning-v1', 'provisioning', true,
-       '["resource_create","resource_reconcile","resource_suspend","resource_resume"]'::jsonb
+       '["resource_create","resource_reconcile","resource_suspend","resource_resume","resource_terminate"]'::jsonb
      )
      ON CONFLICT (provider_installation_id) DO UPDATE SET
        provider_type = EXCLUDED.provider_type,
@@ -281,13 +305,21 @@ await transaction(pool, async (client) => {
     await client.query(
       `INSERT INTO product_service_automation_policies(
          product_id, overdue_action, provider_installation_id,
-         overdue_delay_mode, overdue_delay_value
-       ) VALUES ($1, $2, $3, $4, $5)
+         overdue_delay_mode, overdue_delay_value,
+         cycle_end_cancellation_mode,
+         cycle_end_cancellation_execution_mode,
+         cycle_end_cancellation_min_notice_hours,
+         cycle_end_cancellation_requirement_key
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (product_id) DO UPDATE SET
          overdue_action = EXCLUDED.overdue_action,
          provider_installation_id = EXCLUDED.provider_installation_id,
          overdue_delay_mode = EXCLUDED.overdue_delay_mode,
          overdue_delay_value = EXCLUDED.overdue_delay_value,
+         cycle_end_cancellation_mode = EXCLUDED.cycle_end_cancellation_mode,
+         cycle_end_cancellation_execution_mode = EXCLUDED.cycle_end_cancellation_execution_mode,
+         cycle_end_cancellation_min_notice_hours = EXCLUDED.cycle_end_cancellation_min_notice_hours,
+         cycle_end_cancellation_requirement_key = EXCLUDED.cycle_end_cancellation_requirement_key,
          version = product_service_automation_policies.version + 1,
          updated_at = now()
        WHERE product_service_automation_policies.overdue_action IS DISTINCT FROM EXCLUDED.overdue_action
@@ -296,13 +328,25 @@ await transaction(pool, async (client) => {
           OR product_service_automation_policies.overdue_delay_mode
                IS DISTINCT FROM EXCLUDED.overdue_delay_mode
           OR product_service_automation_policies.overdue_delay_value
-               IS DISTINCT FROM EXCLUDED.overdue_delay_value`,
+               IS DISTINCT FROM EXCLUDED.overdue_delay_value
+          OR product_service_automation_policies.cycle_end_cancellation_mode
+               IS DISTINCT FROM EXCLUDED.cycle_end_cancellation_mode
+          OR product_service_automation_policies.cycle_end_cancellation_execution_mode
+               IS DISTINCT FROM EXCLUDED.cycle_end_cancellation_execution_mode
+          OR product_service_automation_policies.cycle_end_cancellation_min_notice_hours
+               IS DISTINCT FROM EXCLUDED.cycle_end_cancellation_min_notice_hours
+          OR product_service_automation_policies.cycle_end_cancellation_requirement_key
+               IS DISTINCT FROM EXCLUDED.cycle_end_cancellation_requirement_key`,
       [
         product.id,
         product.overdueAction,
         product.providerInstallationId ?? null,
         product.overdueDelayMode ?? "policy_calendar_days",
         product.overdueDelayValue ?? 5,
+        product.cancellationMode,
+        product.cancellationExecutionMode,
+        product.cancellationMinNoticeHours ?? 0,
+        product.cancellationRequirementKey ?? null,
       ],
     );
 
