@@ -11947,10 +11947,25 @@ await corePool.query("UPDATE users SET email_verified_at = now() WHERE id = $1",
 ]);
 const cancellationOrder = await createOrder(automaticPrice.id, legal);
 await pay(cancellationOrder, "success");
-const cancellationActive = await waitFor(
+const cancellationInitiallyActive = await waitFor(
   "cycle-end cancellation fixture service activation",
   () => request<OrderDetail>(`/api/v1/orders/${cancellationOrder.order.id}`),
   (value) => value.service.status === "active",
+);
+// Use a deterministic term boundary that cannot share a billing day with the
+// earlier real-time renewal fixture when the CI run crosses midnight in
+// Asia/Shanghai. A replayed billing day cannot discover a service that did not
+// exist during the original run, so this scenario requires a genuinely fresh
+// day rather than accepting a 200 replay.
+const cancellationTermEnd = new Date(Date.UTC(2039, 10, 20, 1));
+await corePool.query(
+  `UPDATE services
+   SET term_end = $2, updated_at = now(), version = version + 1
+   WHERE id = $1`,
+  [cancellationInitiallyActive.service.id, cancellationTermEnd],
+);
+const cancellationActive = await request<OrderDetail>(
+  `/api/v1/orders/${cancellationOrder.order.id}`,
 );
 assert.ok(cancellationActive.service.termEnd);
 assert.equal(cancellationActive.service.cancellation, null);

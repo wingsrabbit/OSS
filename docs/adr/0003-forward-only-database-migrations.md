@@ -84,6 +84,14 @@ Release metadata binds:
 Deploy tooling verifies this metadata before starting API or Worker. A rollback
 that falls outside the compatibility range is blocked rather than attempted.
 
+Compatibility metadata is necessary but not sufficient when a newer schema can
+contain business facts the older application cannot interpret. The designated
+rollback bridge performs a read-only business-fact preflight before startup. It
+fails closed when newer pending or historical facts could be lost, replayed, or
+misinterpreted. A structural expansion therefore does not by itself make every
+older image a safe rollback target; only the reviewed bridge image may declare
+that guarded range.
+
 ### Data recovery
 
 When no compatible image rollback exists, recovery uses a verified backup and

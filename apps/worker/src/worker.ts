@@ -6,6 +6,7 @@ import {
   providerOperationCapability,
   providerOperationCapabilityMatches,
 } from "@opensales/core/provider-capability";
+import { assert014RollbackBridgeSafe } from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -21,6 +22,7 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
+    OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "014-to-015"]).optional(),
     MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
     MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
     CORE_INTERNAL_URL: z.url().default("http://api:3000"),
@@ -47,7 +49,6 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const REQUIRED_SCHEMA_VERSION = "014_stage_b_cycle_end_cancellation";
 
 type Job = {
   id: string;
@@ -7063,16 +7064,28 @@ process.on("SIGINT", () => {
   stopping = true;
 });
 
-const schema = await pool.query<{ version: string | null }>(
-  "SELECT max(version) AS version FROM schema_migrations",
-);
-if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
-  throw new Error(
-    `OpenSales schema ${schema.rows[0]?.version ?? "missing"} is incompatible with worker requirement ${REQUIRED_SCHEMA_VERSION}`,
+const schemaClient = await pool.connect();
+let schemaPreflight;
+try {
+  await schemaClient.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  schemaPreflight = await assert014RollbackBridgeSafe(
+    {
+      query: async (text, values) => schemaClient.query(text, values),
+    },
+    { enable015RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "014-to-015" },
   );
+  await schemaClient.query("COMMIT");
+} catch (error) {
+  await schemaClient.query("ROLLBACK").catch(() => undefined);
+  throw error;
+} finally {
+  schemaClient.release();
 }
 
-console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`);
+console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`, {
+  installedSchemaVersion: schemaPreflight.installedSchemaVersion,
+  schemaMode: schemaPreflight.mode,
+});
 let nextRecoveryAt = 0;
 let nextBillingScheduleAt = 0;
 while (!stopping) {

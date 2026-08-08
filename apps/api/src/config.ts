@@ -16,6 +16,7 @@ const schema = z.object({
   MOCK_MAILBOX_URL: z.url().default("http://localhost:4000"),
   LAB_MAILBOX_TOKEN: z.string().min(32),
   PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
+  OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "014-to-015"]).optional(),
   MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
   MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
   LAB_MAILBOX_ENABLED: z

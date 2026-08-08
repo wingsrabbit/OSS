@@ -3,13 +3,18 @@
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  assert014RollbackBridgeSafe,
+  SCHEMA_014,
+  type SchemaRollbackPreflightReport,
+} from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
 import type { Config } from "./config.js";
 
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = "014_stage_b_cycle_end_cancellation";
+export const REQUIRED_SCHEMA_VERSION = SCHEMA_014;
 
 export function createPool(config: Config): DatabasePool {
   return new Pool({
@@ -79,15 +84,25 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   }
 }
 
-export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> {
-  const result = await pool.query<{ version: string | null }>(
-    `SELECT max(version) AS version
-     FROM schema_migrations`,
-  );
-  const installed = result.rows[0]?.version ?? null;
-  if (installed !== REQUIRED_SCHEMA_VERSION) {
-    throw new Error(
-      `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
+export async function assertSchemaCompatible(
+  pool: DatabasePool,
+  input: Readonly<{ enable015RollbackBridge?: boolean }> = {},
+): Promise<SchemaRollbackPreflightReport> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await assert014RollbackBridgeSafe(
+      {
+        query: async (text, values) => client.query(text, values),
+      },
+      { enable015RollbackBridge: input.enable015RollbackBridge === true },
     );
+    await client.query("COMMIT");
+    return report;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
   }
 }
