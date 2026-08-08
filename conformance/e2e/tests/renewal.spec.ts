@@ -5,6 +5,7 @@ import { expect, test } from "@playwright/test";
 test.describe.configure({ retries: 0 });
 
 test("customer and staff complete a duplicate-safe renewal through real pages", async ({ page }) => {
+  test.setTimeout(180_000);
   const unique = crypto.randomUUID();
   const email = `renewal-browser-${unique}@example.invalid`;
   const password = `Synthetic-${unique}-Renewal!`;
@@ -40,6 +41,11 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   await journey.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await journey.getByRole("button", { name: "Start mock payment" }).click();
   await expect(journey.getByText("active", { exact: true })).toBeVisible({ timeout: 30_000 });
+  const paidTerm = journey.getByLabel("Schedule service cancellation");
+  await expect(paidTerm).toBeVisible();
+  const originalTermEndDisplay = ((await paidTerm.locator("strong").textContent()) ?? "").trim();
+  const originalTermEndMs = Date.parse(originalTermEndDisplay);
+  expect(Number.isNaN(originalTermEndMs)).toBe(false);
 
   await page.context().clearCookies();
   await page.goto("/");
@@ -56,19 +62,42 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
       name: "Renewal, Late Fee and service state automation",
     }),
   ).toBeVisible();
-  const syntheticDayOffset = 40 + (Number.parseInt(unique.slice(0, 8), 16) % 300);
-  const effectiveAt = new Date(Date.now() + syntheticDayOffset * 24 * 60 * 60 * 1_000)
-    .toISOString()
-    .slice(0, 16);
-  await renewalAdmin.getByLabel("Laboratory billing effective time").fill(effectiveAt);
-  await renewalAdmin
-    .getByPlaceholder("Automation run reason (10+ characters)")
-    .fill("Browser acceptance generated the next paid service period");
-  await admin
-    .getByPlaceholder("Re-enter password (15-minute fixed window)")
-    .fill(staffPassword);
-  await renewalAdmin.getByRole("button", { name: "Run billing day" }).click();
-  await expect(page.getByText(/Completed Asia\/Shanghai billing day/)).toBeVisible();
+  let completedBillingDay = false;
+  for (const daysBeforeTerm of [13, 12, 11, 10, 9, 8, 7, 6, 4, 3, 2, 1]) {
+    const billingEffectiveAt = new Date(
+      originalTermEndMs - daysBeforeTerm * 24 * 60 * 60 * 1_000,
+    );
+    await renewalAdmin
+      .getByLabel("Laboratory billing effective time")
+      .fill(billingEffectiveAt.toISOString().slice(0, 16));
+    await renewalAdmin
+      .getByPlaceholder("Automation run reason (10+ characters)")
+      .fill(`Browser acceptance generated the next paid service period ${unique}`);
+    await admin
+      .getByPlaceholder("Re-enter password (15-minute fixed window)")
+      .fill(staffPassword);
+    const billingResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/v1/admin/billing/automation/run") &&
+        response.request().method() === "POST",
+    );
+    await renewalAdmin.getByRole("button", { name: "Run billing day" }).click();
+    const billingResponse = await billingResponsePromise;
+    const billingResult = (await billingResponse.json()) as { replayed: boolean };
+    expect(billingResponse.status()).toBe(billingResult.replayed ? 200 : 201);
+    await expect(
+      page.getByText(
+        new RegExp(
+          `${billingResult.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day`,
+        ),
+      ),
+    ).toBeVisible();
+    if (!billingResult.replayed) {
+      completedBillingDay = true;
+      break;
+    }
+  }
+  expect(completedBillingDay, "a fresh eligible laboratory billing day must run").toBe(true);
   const adminRenewal = renewalAdmin
     .getByTestId("admin-renewal-item")
     .filter({ hasText: clientName });
