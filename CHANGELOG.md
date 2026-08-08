@@ -217,9 +217,9 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Still planned
 
-- Chargeback debt recovery and audited restriction release, renewal,
-  suspension/recovery, cancellation/termination, saved payment methods,
-  customer operations, plugin, and two-VPS laboratory stages.
+- Audited restriction release after Chargeback debt recovery, saved payment
+  methods and automatic-renewal authorization, customer operations, plugin,
+  and two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 
