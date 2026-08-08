@@ -13456,7 +13456,10 @@ const invalidActiveRecurringSnapshots = await corePool.query<{ count: string }>(
    JOIN order_items item ON item.id = service.order_item_id
    WHERE service.status = 'active'
      AND service.billing_cycle <> 'one_time'
-     AND COALESCE(item.price_snapshot->>'recurringSubtotalMinor', '') !~ '^[1-9][0-9]*$'`,
+     AND (
+       jsonb_typeof(item.price_snapshot->'recurringSubtotalMinor') IS DISTINCT FROM 'string'
+       OR COALESCE(item.price_snapshot->>'recurringSubtotalMinor', '') !~ '^[1-9][0-9]*$'
+     )`,
 );
 assert.equal(
   invalidActiveRecurringSnapshots.rows[0]?.count,
