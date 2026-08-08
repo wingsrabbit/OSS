@@ -16,6 +16,11 @@ import { transaction, type DatabaseClient, type DatabasePool } from "./database.
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
+import {
+  AUTOMATIC_RENEWAL_CONSENT_VERSION,
+  PAYMENT_METHOD_SAVE_CONSENT_VERSION,
+} from "./routes-payment-methods.js";
+import { requireRecentReauth, requireRecentReauthLocked } from "./routes-admin.js";
 
 const checkoutSchema = z.object({
   priceId: z.uuid(),
@@ -25,23 +30,49 @@ const checkoutSchema = z.object({
   idempotencyKey: z.string().min(8).max(128),
 });
 
-const paymentSchema = z.object({
-  quoteId: z.uuid(),
-  scenario: z
-    .enum([
-      "success",
-      "failed",
-      "cancelled",
-      "timeout_success",
-      "duplicate_out_of_order",
-      "definitive_reject",
-      "success_then_reject",
-      "partial_then_reject",
-      "partial_then_timeout",
-    ])
-    .default("success"),
-  idempotencyKey: z.string().min(8).max(128),
-});
+const paymentSchema = z
+  .object({
+    quoteId: z.uuid(),
+    scenario: z
+      .enum([
+        "success",
+        "failed",
+        "cancelled",
+        "timeout_success",
+        "duplicate_out_of_order",
+        "definitive_reject",
+        "success_then_reject",
+        "partial_then_reject",
+        "partial_then_timeout",
+      ])
+      .default("success"),
+    savePaymentMethod: z.boolean().default(false),
+    saveConsentVersion: z.string().min(1).max(80).optional(),
+    enableAutomaticRenewal: z.boolean().default(false),
+    automaticRenewalConsentVersion: z.string().min(1).max(80).optional(),
+    idempotencyKey: z.string().min(8).max(128),
+  })
+  .strict()
+  .superRefine((body, context) => {
+    if (body.savePaymentMethod !== (body.saveConsentVersion !== undefined)) {
+      context.addIssue({ code: "custom", path: ["saveConsentVersion"], message: "saving a payment method requires explicit versioned consent" });
+    }
+    if (body.saveConsentVersion && body.saveConsentVersion !== PAYMENT_METHOD_SAVE_CONSENT_VERSION) {
+      context.addIssue({ code: "custom", path: ["saveConsentVersion"], message: "payment-method consent version is not current" });
+    }
+    if (body.enableAutomaticRenewal !== (body.automaticRenewalConsentVersion !== undefined)) {
+      context.addIssue({ code: "custom", path: ["automaticRenewalConsentVersion"], message: "automatic renewal requires separate explicit versioned consent" });
+    }
+    if (body.enableAutomaticRenewal && !body.savePaymentMethod) {
+      context.addIssue({ code: "custom", path: ["enableAutomaticRenewal"], message: "automatic renewal requires saving this payment method first" });
+    }
+    if (
+      body.automaticRenewalConsentVersion &&
+      body.automaticRenewalConsentVersion !== AUTOMATIC_RENEWAL_CONSENT_VERSION
+    ) {
+      context.addIssue({ code: "custom", path: ["automaticRenewalConsentVersion"], message: "automatic-renewal consent version is not current" });
+    }
+  });
 
 function buildOptionComponents(
   optionSchema: unknown,
@@ -658,16 +689,28 @@ export async function registerOrderRoutes(
     assertBillingWriteEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = paymentSchema.parse(request.body);
+    if (body.savePaymentMethod || body.enableAutomaticRenewal) {
+      await requireRecentReauth(pool, user);
+    }
     const fingerprint = requestFingerprint("payments.create:v2", {
       invoiceId: params.invoiceId,
       quoteId: body.quoteId,
       scenario: body.scenario,
+      savePaymentMethod: body.savePaymentMethod,
+      saveConsentVersion: body.saveConsentVersion ?? null,
+      enableAutomaticRenewal: body.enableAutomaticRenewal,
+      automaticRenewalConsentVersion: body.automaticRenewalConsentVersion ?? null,
     });
 
     const result = await transaction(pool, async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
+      if (body.savePaymentMethod || body.enableAutomaticRenewal) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `payment-settings:${user.clientAccountId}`,
+        ]);
+      }
       const idempotentCommand = await client.query<{
         id: string;
         invoice_id: string;
@@ -708,6 +751,8 @@ export async function registerOrderRoutes(
         provider_installation_id: string;
         current_provider_installation_id: string;
         enabled: boolean;
+        saved_method_enabled: boolean;
+        automatic_renewal_enabled: boolean;
         current_fee_basis_points: number;
         fee_basis_points: number;
         currency: string;
@@ -724,6 +769,7 @@ export async function registerOrderRoutes(
         `SELECT
            q.id, q.payment_method_code, q.provider_installation_id,
            pm.provider_installation_id AS current_provider_installation_id, pm.enabled,
+           pm.saved_method_enabled, pm.automatic_renewal_enabled,
            pm.fee_basis_points AS current_fee_basis_points, q.fee_basis_points,
            q.currency, q.invoice_total_minor::text,
            q.payment_allocated_minor::text, q.credit_allocated_minor::text,
@@ -756,6 +802,18 @@ export async function registerOrderRoutes(
           code: "QUOTE_STALE",
         });
       }
+      if (body.savePaymentMethod && !quote.saved_method_enabled) {
+        throw Object.assign(new Error("This payment method cannot be saved"), {
+          statusCode: 409,
+          code: "SAVED_PAYMENT_METHOD_UNSUPPORTED",
+        });
+      }
+      if (body.enableAutomaticRenewal && !quote.automatic_renewal_enabled) {
+        throw Object.assign(new Error("This payment method cannot be used for automatic renewal"), {
+          statusCode: 409,
+          code: "AUTOMATIC_RENEWAL_UNSUPPORTED",
+        });
+      }
       const invoiceResult = await client.query<{
         total_minor: string;
         currency: string;
@@ -770,7 +828,66 @@ export async function registerOrderRoutes(
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
       await assertInvoicePaymentBusinessStateLocked(client, params.invoiceId, invoice.order_id);
+      let automaticRenewalDecisionGeneration: string | null = null;
+      let automaticRenewalServiceId: string | null = null;
+      if (body.enableAutomaticRenewal) {
+        const renewableService = await client.query<{
+          id: string;
+          automatic_renewal_decision_generation: string;
+        }>(
+          `SELECT service.id, service.automatic_renewal_decision_generation::text
+           FROM services service
+           WHERE service.client_account_id = $2
+             AND service.billing_cycle <> 'one_time'
+             AND service.status <> 'terminated'
+             AND service.cancellation_request_id IS NULL
+             AND (
+               EXISTS (
+                 SELECT 1
+                 FROM order_items item
+                 WHERE item.id = service.order_item_id AND item.order_id = $3
+               )
+               OR EXISTS (
+                 SELECT 1 FROM service_renewals renewal
+                 WHERE renewal.invoice_id = $1 AND renewal.service_id = service.id
+               )
+             )
+           FOR UPDATE OF service`,
+          [params.invoiceId, user.clientAccountId, invoice.order_id],
+        );
+        const renewable = renewableService.rows[0];
+        if (!renewable) {
+          throw Object.assign(new Error("This invoice is not linked to a renewable service"), {
+            statusCode: 409,
+            code: "SERVICE_NOT_RENEWABLE",
+          });
+        }
+        const reservedDecision = await client.query<{
+          automatic_renewal_decision_generation: string;
+        }>(
+          `UPDATE services
+           SET automatic_renewal_decision_generation =
+                 automatic_renewal_decision_generation + 1,
+               updated_at = now(), version = version + 1
+           WHERE id = $1
+             AND automatic_renewal_decision_generation = $2
+           RETURNING automatic_renewal_decision_generation::text`,
+          [renewable.id, renewable.automatic_renewal_decision_generation],
+        );
+        automaticRenewalDecisionGeneration =
+          reservedDecision.rows[0]?.automatic_renewal_decision_generation ?? null;
+        if (!automaticRenewalDecisionGeneration) {
+          throw Object.assign(
+            new Error("Automatic-renewal consent changed; refresh and confirm again"),
+            { statusCode: 409, code: "VERSION_CONFLICT" },
+          );
+        }
+        automaticRenewalServiceId = renewable.id;
+      }
       await assertEligibilityLocked(client, user.userId, user.clientAccountId, true);
+      if (body.savePaymentMethod || body.enableAutomaticRenewal) {
+        await requireRecentReauthLocked(client, user);
+      }
       const allocationResult = await client.query<{
         payment_minor: string;
         credit_minor: string;
@@ -904,6 +1021,12 @@ export async function registerOrderRoutes(
       }
 
       if (BigInt(quote.external_due_minor) === 0n) {
+        if (body.savePaymentMethod || body.enableAutomaticRenewal) {
+          throw Object.assign(new Error("A fully Credit-funded invoice cannot create a saved Provider payment method"), {
+            statusCode: 409,
+            code: "NO_EXTERNAL_PAYMENT_METHOD_SETUP",
+          });
+        }
         const settlement = await advancePaidInvoice(client, params.invoiceId, {
           kind: "user_command",
           userId: user.userId,
@@ -936,8 +1059,11 @@ export async function registerOrderRoutes(
            client_account_id, invoice_id, provider_installation_id, status,
            amount_minor, principal_minor, fee_basis_points, fee_minor,
            currency, scenario, idempotency_key, request_fingerprint,
-           payment_method_code, payment_quote_id
-         ) VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           payment_method_code, payment_quote_id,
+           save_payment_method_requested, save_consent_version,
+           automatic_renewal_requested, automatic_renewal_consent_version,
+           automatic_renewal_service_id, automatic_renewal_decision_generation
+         ) VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
          RETURNING id`,
         [
           user.clientAccountId,
@@ -953,6 +1079,12 @@ export async function registerOrderRoutes(
           fingerprint,
           quote.payment_method_code,
           quote.id,
+          body.savePaymentMethod,
+          body.saveConsentVersion ?? null,
+          body.enableAutomaticRenewal,
+          body.automaticRenewalConsentVersion ?? null,
+          automaticRenewalServiceId,
+          automaticRenewalDecisionGeneration,
         ],
       );
       const paymentAttemptId = paymentResult.rows[0]?.id;

@@ -12,6 +12,10 @@
     "./provider-capability": {
       "types": "./dist/provider-capability.d.ts",
       "default": "./dist/provider-capability.js"
+    },
+    "./provider-token-vault": {
+      "types": "./dist/provider-token-vault.d.ts",
+      "default": "./dist/provider-token-vault.js"
     }
   },
   "scripts": {

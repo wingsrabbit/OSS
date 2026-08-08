@@ -2,9 +2,18 @@
 
 import { buildApp } from "./app.js";
 import { loadConfig } from "./config.js";
-import { assertSchemaCompatible } from "./database.js";
+import {
+  assertPaymentMethodTokenKeyringsCompatible,
+  assertSchemaCompatible,
+} from "./database.js";
 
 const config = loadConfig();
 const { app, pool } = await buildApp(config);
-await assertSchemaCompatible(pool);
-await app.listen({ host: config.API_HOST, port: config.API_PORT });
+try {
+  await assertSchemaCompatible(pool);
+  await assertPaymentMethodTokenKeyringsCompatible(pool, config);
+  await app.listen({ host: config.API_HOST, port: config.API_PORT });
+} catch (error) {
+  await app.close().catch(() => undefined);
+  throw error;
+}

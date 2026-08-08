@@ -29,8 +29,11 @@ export async function registerBillingRoutes(
       display_name: Record<string, string>;
       fee_basis_points: number;
       add_funds_enabled: boolean;
+      saved_method_enabled: boolean;
+      automatic_renewal_enabled: boolean;
     }>(
-      `SELECT code, display_name, fee_basis_points, add_funds_enabled
+      `SELECT code, display_name, fee_basis_points, add_funds_enabled,
+              saved_method_enabled, automatic_renewal_enabled
        FROM payment_methods
        WHERE enabled
       ORDER BY code`,
@@ -56,6 +59,8 @@ export async function registerBillingRoutes(
         name: method.display_name[user.locale] ?? method.display_name.en ?? method.code,
         feeBasisPoints: method.fee_basis_points,
         addFundsEnabled: method.add_funds_enabled,
+        savedMethodEnabled: method.saved_method_enabled,
+        automaticRenewalEnabled: method.automatic_renewal_enabled,
       })),
       addFunds: policy
         ? {

@@ -107,6 +107,10 @@ type RenewalListRow = {
   pending_payment_result: boolean;
   delinquency_deferral_count: string;
   latest_delinquency_deferral_at: Date | null;
+  automatic_payment_status: "processing" | "unknown" | "succeeded" | "failed" | "requires_action" | "blocked" | null;
+  automatic_payment_attempt_count: number | null;
+  automatic_payment_max_attempts: number | null;
+  automatic_payment_last_error: string | null;
 };
 
 async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
@@ -193,7 +197,11 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
         WHERE deferral.invoice_id = invoice.id) AS delinquency_deferral_count,
        (SELECT max(deferral.created_at)
         FROM invoice_delinquency_deferrals deferral
-        WHERE deferral.invoice_id = invoice.id) AS latest_delinquency_deferral_at
+        WHERE deferral.invoice_id = invoice.id) AS latest_delinquency_deferral_at,
+       automatic_run.status AS automatic_payment_status,
+       automatic_run.attempt_count AS automatic_payment_attempt_count,
+       automatic_run.max_attempts AS automatic_payment_max_attempts,
+       automatic_run.last_error AS automatic_payment_last_error
      FROM service_renewals renewal
      JOIN services service ON service.id = renewal.service_id
      JOIN order_items item ON item.id = service.order_item_id
@@ -219,6 +227,8 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
        ON resume_operation.subject_type = 'service_suspension_case'
       AND resume_operation.subject_id = suspension_case.id
       AND resume_operation.kind = 'resource_resume'
+     LEFT JOIN automatic_renewal_runs automatic_run
+       ON automatic_run.service_renewal_id = renewal.id
      WHERE ($1::uuid IS NULL OR account.id = $1::uuid)
      ORDER BY renewal.created_at DESC, renewal.id, reminder.created_at, reminder.id`,
     [clientAccountId ?? null],
@@ -299,6 +309,13 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
         deferralCount: string;
         latestDeferredAt: string | null;
       };
+      automaticPayment: {
+        status: "processing" | "unknown" | "succeeded" | "failed" | "requires_action" | "blocked";
+        attemptCount: number;
+        maxAttempts: number;
+        lastError: string | null;
+        customerActionRequired: boolean;
+      } | null;
     }
   >();
   for (const row of result.rows) {
@@ -491,6 +508,15 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
           deferralCount: row.delinquency_deferral_count,
           latestDeferredAt: row.latest_delinquency_deferral_at?.toISOString() ?? null,
         },
+        automaticPayment: row.automatic_payment_status
+          ? {
+              status: row.automatic_payment_status,
+              attemptCount: row.automatic_payment_attempt_count ?? 0,
+              maxAttempts: row.automatic_payment_max_attempts ?? 1,
+              lastError: row.automatic_payment_last_error,
+              customerActionRequired: row.automatic_payment_status === "requires_action",
+            }
+          : null,
       };
       items.set(row.renewal_id, item);
     }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import type { BillingCycle } from "@opensales/core";
+import { percentageFeeMinor, type BillingCycle } from "@opensales/core";
 import type { DatabaseClient } from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
 import {
   assessLateFeesAndScheduleSuspensions,
   scheduleResumeAfterRenewalSettlement,
@@ -268,6 +269,218 @@ async function autoApplyRenewalCredit(
     );
   }
   return applied;
+}
+
+async function startAuthorizedAutomaticRenewalPayment(
+  client: DatabaseClient,
+  input: {
+    renewalId: string;
+    invoiceId: string;
+    serviceId: string;
+    clientAccountId: string;
+    currency: string;
+    invoiceTotalMinor: bigint;
+    creditAppliedMinor: bigint;
+  },
+): Promise<string | null> {
+  const principalMinor = input.invoiceTotalMinor - input.creditAppliedMinor;
+  if (principalMinor <= 0n) return null;
+  const authorizationResult = await client.query<{
+    authorization_id: string;
+    saved_payment_method_id: string;
+    payment_method_code: string;
+    provider_installation_id: string;
+    fee_basis_points: number;
+  }>(
+    `SELECT renewal_authorization.id AS authorization_id,
+            saved.id AS saved_payment_method_id,
+            saved.payment_method_code,
+            saved.provider_installation_id,
+            method.fee_basis_points
+     FROM automatic_renewal_authorizations renewal_authorization
+     JOIN saved_payment_methods saved
+       ON saved.id = renewal_authorization.saved_payment_method_id
+     JOIN payment_methods method
+       ON method.code = saved.payment_method_code
+      AND method.provider_installation_id = saved.provider_installation_id
+     JOIN provider_installation_capabilities provider
+       ON provider.provider_installation_id = saved.provider_installation_id
+     JOIN services service ON service.id = renewal_authorization.service_id
+     JOIN client_accounts account ON account.id = renewal_authorization.client_account_id
+     WHERE renewal_authorization.service_id = $1
+       AND renewal_authorization.client_account_id = $2
+       AND renewal_authorization.status = 'active'
+       AND renewal_authorization.consent_generation =
+             service.automatic_renewal_consent_generation
+       AND saved.status = 'active'
+       AND saved.client_account_id = renewal_authorization.client_account_id
+       AND method.enabled
+       AND method.automatic_renewal_enabled
+       AND provider.provider_type = 'payment'
+       AND provider.enabled
+       AND provider.capabilities @> '["payment_create","payment_reconcile","payment_off_session"]'::jsonb
+       AND account.restricted_at IS NULL
+       AND service.status IN ('active', 'suspended')
+       AND service.cancellation_request_id IS NULL
+     FOR UPDATE OF renewal_authorization, saved, method, provider`,
+    [input.serviceId, input.clientAccountId],
+  );
+  const authorization = authorizationResult.rows[0];
+  if (!authorization) return null;
+
+  const availableCreditResult = await client.query<{ balance_minor: string }>(
+    `SELECT COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text AS balance_minor
+     FROM credit_accounts account
+     LEFT JOIN credit_transactions transaction ON transaction.credit_account_id = account.id
+     WHERE account.client_account_id = $1 AND account.currency = $2`,
+    [input.clientAccountId, input.currency],
+  );
+  const availableCreditMinor = availableCreditResult.rows[0]?.balance_minor ?? "0";
+  const feeMinor = percentageFeeMinor(principalMinor, authorization.fee_basis_points);
+  const externalDueMinor = principalMinor + feeMinor;
+  const fingerprint = requestFingerprint("automatic-renewal.payment:v1", {
+    renewalId: input.renewalId,
+    authorizationId: authorization.authorization_id,
+    savedPaymentMethodId: authorization.saved_payment_method_id,
+    invoiceTotalMinor: input.invoiceTotalMinor.toString(),
+    creditAppliedMinor: input.creditAppliedMinor.toString(),
+    principalMinor: principalMinor.toString(),
+    feeBasisPoints: authorization.fee_basis_points,
+    feeMinor: feeMinor.toString(),
+    currency: input.currency,
+    attemptNumber: 1,
+  });
+  const quote = await client.query<{ id: string }>(
+    `INSERT INTO invoice_payment_quotes(
+       client_account_id, invoice_id, payment_method_code,
+       provider_installation_id, currency,
+       invoice_total_minor, payment_allocated_minor, credit_allocated_minor,
+       available_credit_minor, credit_to_apply_minor, external_non_fee_minor,
+       fee_basis_points, fee_minor, external_due_minor, request_fingerprint,
+       expires_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, 0, $9, $10, $11, $12, $13,
+               now() + interval '30 minutes')
+     RETURNING id`,
+    [
+      input.clientAccountId,
+      input.invoiceId,
+      authorization.payment_method_code,
+      authorization.provider_installation_id,
+      input.currency,
+      input.invoiceTotalMinor.toString(),
+      input.creditAppliedMinor.toString(),
+      availableCreditMinor,
+      principalMinor.toString(),
+      authorization.fee_basis_points,
+      feeMinor.toString(),
+      externalDueMinor.toString(),
+      fingerprint,
+    ],
+  );
+  const quoteId = quote.rows[0]?.id;
+  if (!quoteId) throw new Error("Unable to create automatic-renewal payment quote");
+  const commandId = randomUUID();
+  const paymentAttemptId = randomUUID();
+  await client.query(
+    `INSERT INTO invoice_payment_commands(
+       id, client_account_id, invoice_id, quote_id,
+       status, idempotency_key, request_fingerprint,
+       initiator_type, initiated_by_user_id
+     ) VALUES ($1, $2, $3, $4, 'created', $5, $6, 'system', NULL)`,
+    [
+      commandId,
+      input.clientAccountId,
+      input.invoiceId,
+      quoteId,
+      `automatic-renewal:${input.renewalId}:1`,
+      fingerprint,
+    ],
+  );
+  await client.query(
+    `INSERT INTO payment_attempts(
+       id, client_account_id, invoice_id, provider_installation_id, status,
+       amount_minor, principal_minor, fee_basis_points, fee_minor,
+       currency, scenario, idempotency_key, request_fingerprint,
+       payment_method_code, payment_quote_id, saved_payment_method_id,
+       automatic_renewal_authorization_id, automatic_attempt_number
+     ) VALUES ($1, $2, $3, $4, 'created', $5, $6, $7, $8, $9, 'automatic',
+               $10, $11, $12, $13, $14, $15, 1)`,
+    [
+      paymentAttemptId,
+      input.clientAccountId,
+      input.invoiceId,
+      authorization.provider_installation_id,
+      externalDueMinor.toString(),
+      principalMinor.toString(),
+      authorization.fee_basis_points,
+      feeMinor.toString(),
+      input.currency,
+      `automatic-renewal:${input.renewalId}:1`,
+      fingerprint,
+      authorization.payment_method_code,
+      quoteId,
+      authorization.saved_payment_method_id,
+      authorization.authorization_id,
+    ],
+  );
+  await client.query(
+    `UPDATE invoice_payment_commands
+     SET payment_attempt_id = $2, status = 'processing',
+         result = $3, updated_at = now()
+     WHERE id = $1`,
+    [
+      commandId,
+      paymentAttemptId,
+      {
+        automaticRenewal: true,
+        creditAppliedMinor: input.creditAppliedMinor.toString(),
+        externalDueMinor: externalDueMinor.toString(),
+        feeMinor: feeMinor.toString(),
+        maxAttempts: 1,
+      },
+    ],
+  );
+  const operation = await client.query<{ id: string }>(
+    `INSERT INTO provider_operations(
+       provider_installation_id, kind, subject_type, subject_id, stable_key, status
+     ) VALUES ($1, 'payment_create', 'payment', $2, $3, 'queued')
+     RETURNING id`,
+    [
+      authorization.provider_installation_id,
+      paymentAttemptId,
+      `payment:${paymentAttemptId}`,
+    ],
+  );
+  const operationId = operation.rows[0]?.id;
+  if (!operationId) throw new Error("Unable to create automatic-renewal Provider operation");
+  const run = await client.query<{ id: string }>(
+    `INSERT INTO automatic_renewal_runs(
+       service_renewal_id, client_account_id,
+       automatic_renewal_authorization_id, saved_payment_method_id,
+       invoice_payment_command_id, payment_attempt_id, status,
+       attempt_count, max_attempts
+     ) VALUES ($1, $2, $3, $4, $5, $6, 'processing', 1, 1)
+     RETURNING id`,
+    [
+      input.renewalId,
+      input.clientAccountId,
+      authorization.authorization_id,
+      authorization.saved_payment_method_id,
+      commandId,
+      paymentAttemptId,
+    ],
+  );
+  const runId = run.rows[0]?.id;
+  if (!runId) throw new Error("Unable to create automatic-renewal run");
+  await client.query(
+    `INSERT INTO durable_jobs(job_type, unique_key, payload)
+     VALUES ('payment.start', $1, $2)`,
+    [
+      `payment:${paymentAttemptId}`,
+      { paymentAttemptId, providerOperationId: operationId, automaticRenewalRunId: runId },
+    ],
+  );
+  return runId;
 }
 
 export async function runRenewalAutomation(
@@ -590,6 +803,15 @@ export async function runRenewalAutomation(
       currency: candidate.currency,
       invoiceTotalMinor: recurringMinor,
     });
+    await startAuthorizedAutomaticRenewalPayment(client, {
+      renewalId,
+      invoiceId,
+      serviceId: candidate.service_id,
+      clientAccountId: candidate.client_account_id,
+      currency: candidate.currency,
+      invoiceTotalMinor: recurringMinor,
+      creditAppliedMinor: creditApplied,
+    });
     invoicesCreated += 1;
     if (
       await enqueueReminder(client, {
@@ -766,6 +988,10 @@ export async function settleRenewalInvoice(
   context?:
     | { kind: "user_command"; userId: string }
     | {
+        kind: "automatic_renewal";
+        authorizationId: string;
+      }
+    | {
         kind: "staff_manual";
         staffUserId: string;
         reason?: string;
@@ -844,6 +1070,19 @@ export async function settleRenewalInvoice(
     membership_client_account_id: string | null;
     membership_role: "owner" | "billing" | "technical" | "viewer" | null;
     suspension_case_status: string | null;
+    automatic_authorization_status: string | null;
+    automatic_authorization_service_id: string | null;
+    automatic_authorization_client_account_id: string | null;
+    automatic_authorization_consent_generation: string | null;
+    service_automatic_renewal_consent_generation: string;
+    automatic_method_status: string | null;
+    automatic_method_client_account_id: string | null;
+    automatic_method_provider_installation_id: string | null;
+    automatic_config_provider_installation_id: string | null;
+    automatic_method_enabled: boolean | null;
+    automatic_provider_enabled: boolean | null;
+    automatic_provider_type: string | null;
+    automatic_provider_capabilities: unknown;
     version: number;
   }>(
     `SELECT
@@ -863,6 +1102,20 @@ export async function settleRenewalInvoice(
        membership.client_account_id AS membership_client_account_id,
        membership.role AS membership_role,
        suspension_case.status AS suspension_case_status,
+       automatic_authorization.status AS automatic_authorization_status,
+       automatic_authorization.service_id AS automatic_authorization_service_id,
+       automatic_authorization.client_account_id AS automatic_authorization_client_account_id,
+       automatic_authorization.consent_generation::text AS automatic_authorization_consent_generation,
+       service.automatic_renewal_consent_generation::text
+         AS service_automatic_renewal_consent_generation,
+       automatic_method.status AS automatic_method_status,
+       automatic_method.client_account_id AS automatic_method_client_account_id,
+       automatic_method.provider_installation_id AS automatic_method_provider_installation_id,
+       automatic_method_config.provider_installation_id AS automatic_config_provider_installation_id,
+       automatic_method_config.automatic_renewal_enabled AS automatic_method_enabled,
+       automatic_provider.enabled AS automatic_provider_enabled,
+       automatic_provider.provider_type AS automatic_provider_type,
+       automatic_provider.capabilities AS automatic_provider_capabilities,
        renewal.version
      FROM service_renewals renewal
      JOIN invoices invoice ON invoice.id = renewal.invoice_id
@@ -876,8 +1129,21 @@ export async function settleRenewalInvoice(
       AND membership.user_id = customer.id
      LEFT JOIN service_suspension_cases suspension_case
        ON suspension_case.service_renewal_id = renewal.id
+     LEFT JOIN automatic_renewal_authorizations automatic_authorization
+       ON automatic_authorization.id = $3
+      AND automatic_authorization.service_id = service.id
+     LEFT JOIN saved_payment_methods automatic_method
+       ON automatic_method.id = automatic_authorization.saved_payment_method_id
+     LEFT JOIN payment_methods automatic_method_config
+       ON automatic_method_config.code = automatic_method.payment_method_code
+     LEFT JOIN provider_installation_capabilities automatic_provider
+       ON automatic_provider.provider_installation_id = automatic_method.provider_installation_id
      WHERE renewal.id = $1`,
-    [pointer.renewal_id, commandUserId],
+    [
+      pointer.renewal_id,
+      commandUserId,
+      context?.kind === "automatic_renewal" ? context.authorizationId : null,
+    ],
   );
   const renewal = renewalResult.rows[0];
   if (!renewal) throw new Error("Renewal invoice points to an invalid service");
@@ -935,11 +1201,30 @@ export async function settleRenewalInvoice(
     !renewal.user_restricted_at &&
     !renewal.removed_at &&
     (renewal.membership_role === "owner" || renewal.membership_role === "billing");
+  const automaticRenewalEligible =
+    context?.kind === "automatic_renewal" &&
+    renewal.automatic_authorization_status === "active" &&
+    renewal.automatic_authorization_service_id === renewal.service_id &&
+    renewal.automatic_authorization_client_account_id === renewal.service_client_account_id &&
+    renewal.automatic_authorization_consent_generation ===
+      renewal.service_automatic_renewal_consent_generation &&
+    renewal.automatic_method_status === "active" &&
+    renewal.automatic_method_client_account_id === renewal.service_client_account_id &&
+    renewal.automatic_method_provider_installation_id ===
+      renewal.automatic_config_provider_installation_id &&
+    renewal.automatic_method_enabled === true &&
+    renewal.automatic_provider_enabled === true &&
+    renewal.automatic_provider_type === "payment" &&
+    Array.isArray(renewal.automatic_provider_capabilities) &&
+    ["payment_create", "payment_reconcile", "payment_off_session"].every((capability) =>
+      (renewal.automatic_provider_capabilities as unknown[]).includes(capability),
+    );
   const eligible =
     accountAndServiceEligible &&
     (context?.kind === "staff_manual" ||
       context?.kind === "staff_hold_resolution" ||
-      userCommandEligible);
+      userCommandEligible ||
+      automaticRenewalEligible);
   const fundedAt = new Date();
   if (!eligible) {
     await client.query(

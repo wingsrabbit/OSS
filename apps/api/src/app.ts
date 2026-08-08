@@ -7,7 +7,12 @@ import { LAB_BANNER } from "@opensales/core";
 import Fastify from "fastify";
 import { ZodError } from "zod";
 import type { Config } from "./config.js";
-import { createPool, type DatabasePool } from "./database.js";
+import {
+  assertPaymentMethodTokenKeyringsCompatible,
+  createPool,
+  holdPaymentMethodTokenRegistryExtensionGuard,
+  type DatabasePool,
+} from "./database.js";
 import { registerAddFundsRoutes } from "./routes-add-funds.js";
 import { registerAuthRoutes } from "./routes-auth.js";
 import { registerAdminRoutes } from "./routes-admin.js";
@@ -15,6 +20,7 @@ import { registerCatalogRoutes } from "./routes-catalog.js";
 import { registerBillingRoutes } from "./routes-billing.js";
 import { registerChargebackRoutes } from "./routes-chargebacks.js";
 import { registerOrderRoutes } from "./routes-orders.js";
+import { registerPaymentMethodRoutes } from "./routes-payment-methods.js";
 import { registerProviderEventRoutes } from "./routes-provider-events.js";
 import { registerRefundRoutes } from "./routes-refunds.js";
 import { registerRenewalRoutes } from "./routes-renewals.js";
@@ -44,6 +50,9 @@ export async function buildApp(
     bodyLimit: 256 * 1024,
   });
   const pool = providedPool ?? createPool(config);
+  const releaseTokenRegistryGuard = providedPool
+    ? null
+    : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
 
   await app.register(cookie);
   await app.register(cors, {
@@ -116,6 +125,7 @@ export async function buildApp(
   app.get("/health/ready", async (_request, reply) => {
     try {
       await pool.query("SELECT 1");
+      await assertPaymentMethodTokenKeyringsCompatible(pool, config);
       return { status: "ready" };
     } catch {
       return reply.code(503).send({ status: "not_ready" });
@@ -129,12 +139,14 @@ export async function buildApp(
   await registerAddFundsRoutes(app, pool, config);
   await registerCatalogRoutes(app, pool);
   await registerOrderRoutes(app, pool, config);
+  await registerPaymentMethodRoutes(app, pool, config);
   await registerRefundRoutes(app, pool, config);
   await registerRenewalRoutes(app, pool, config);
   await registerServiceRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
   app.addHook("onClose", async () => {
+    if (releaseTokenRegistryGuard) await releaseTokenRegistryGuard();
     if (!providedPool) await pool.end();
   });
 

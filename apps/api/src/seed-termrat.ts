@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { loadConfig } from "./config.js";
-import { createPool, runMigrations, transaction } from "./database.js";
+import {
+  bootstrapPaymentMethodTokenKeyrings,
+  createPool,
+  runMigrations,
+  transaction,
+} from "./database.js";
 
 type SeedProduct = {
   id: string;
@@ -185,6 +190,7 @@ function cyclePrice(monthlyMinor: number, months: number): number {
 const config = loadConfig();
 const pool = createPool(config);
 await runMigrations(pool);
+await bootstrapPaymentMethodTokenKeyrings(pool, config);
 
 await transaction(pool, async (client) => {
   for (const [id, sortOrder, names] of groups) {
@@ -211,17 +217,19 @@ await transaction(pool, async (client) => {
   await client.query(
     `INSERT INTO payment_methods(
        code, display_name, provider_installation_id, fee_basis_points, enabled,
-       add_funds_enabled
+       add_funds_enabled, saved_method_enabled, automatic_renewal_enabled
      ) VALUES
-       ('card', '{"en":"Card (Mock)","zh-CN":"银行卡（Mock）"}', 'mock-payment-v1', 350, true, true),
-       ('alipay', '{"en":"Alipay (Mock)","zh-CN":"支付宝（Mock）"}', 'mock-payment-v1', 350, true, true),
-       ('usdt', '{"en":"USDT-style asset (Mock)","zh-CN":"USDT 风格资产（Mock）"}', 'mock-payment-v1', 0, true, true)
+       ('card', '{"en":"Card (Mock)","zh-CN":"银行卡（Mock）"}', 'mock-payment-v1', 350, true, true, true, true),
+       ('alipay', '{"en":"Alipay (Mock)","zh-CN":"支付宝（Mock）"}', 'mock-payment-v1', 350, true, true, true, true),
+       ('usdt', '{"en":"USDT-style asset (Mock)","zh-CN":"USDT 风格资产（Mock）"}', 'mock-payment-v1', 0, true, true, false, false)
      ON CONFLICT (code) DO UPDATE SET
        display_name = EXCLUDED.display_name,
        provider_installation_id = EXCLUDED.provider_installation_id,
        fee_basis_points = EXCLUDED.fee_basis_points,
        enabled = EXCLUDED.enabled,
        add_funds_enabled = EXCLUDED.add_funds_enabled,
+       saved_method_enabled = EXCLUDED.saved_method_enabled,
+       automatic_renewal_enabled = EXCLUDED.automatic_renewal_enabled,
        updated_at = now()`,
   );
 
@@ -235,6 +243,16 @@ await transaction(pool, async (client) => {
        max_principal_minor = EXCLUDED.max_principal_minor,
        balance_cap_minor = EXCLUDED.balance_cap_minor,
        updated_at = now()`,
+  );
+
+  await client.query(
+    `INSERT INTO provider_installation_capabilities(
+       provider_installation_id, provider_type, enabled, capabilities
+     ) VALUES (
+       'mock-payment-v1', 'payment', true,
+       '["payment_create","payment_reconcile","payment_method_setup","payment_off_session"]'::jsonb
+     )
+     ON CONFLICT (provider_installation_id) DO NOTHING`,
   );
 
   await client.query(

@@ -20,7 +20,8 @@ export type PaymentStatus =
   | "succeeded"
   | "failed"
   | "cancelled"
-  | "expired";
+  | "expired"
+  | "requires_action";
 export type ProviderOperationStatus = "queued" | "running" | "unknown" | "succeeded" | "failed";
 export type ServiceStatus =
   | "pending"
@@ -114,16 +115,18 @@ const terminalPayments = new Set<PaymentStatus>([
   "failed",
   "cancelled",
   "expired",
+  "requires_action",
 ]);
 
 const paymentTransitions: Readonly<Record<PaymentStatus, ReadonlySet<PaymentStatus>>> = {
-  created: new Set(["processing", "failed", "cancelled", "expired", "succeeded"]),
-  processing: new Set(["unknown", "failed", "cancelled", "expired", "succeeded"]),
-  unknown: new Set(["failed", "cancelled", "expired", "succeeded"]),
+  created: new Set(["processing", "failed", "cancelled", "expired", "requires_action", "succeeded"]),
+  processing: new Set(["unknown", "failed", "cancelled", "expired", "requires_action", "succeeded"]),
+  unknown: new Set(["failed", "cancelled", "expired", "requires_action", "succeeded"]),
   succeeded: new Set(),
   failed: new Set(),
   cancelled: new Set(),
   expired: new Set(),
+  requires_action: new Set(),
 };
 
 export function canTransitionPayment(from: PaymentStatus, to: PaymentStatus): boolean {
