@@ -10,6 +10,13 @@ const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
 export const REQUIRED_SCHEMA_VERSION = "014_stage_b_cycle_end_cancellation";
+export const COMPATIBLE_SCHEMA_VERSIONS = new Set([
+  REQUIRED_SCHEMA_VERSION,
+  // 015 is an expand-only migration. This bridge release must be deployed
+  // before that migration so the 014 application remains a valid rollback
+  // target after the database advances.
+  "015_stage_b_saved_payment_auto_renew",
+]);
 
 export function createPool(config: Config): DatabasePool {
   return new Pool({
@@ -85,9 +92,11 @@ export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> 
      FROM schema_migrations`,
   );
   const installed = result.rows[0]?.version ?? null;
-  if (installed !== REQUIRED_SCHEMA_VERSION) {
+  if (!installed || !COMPATIBLE_SCHEMA_VERSIONS.has(installed)) {
     throw new Error(
-      `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
+      `OpenSales schema ${installed ?? "missing"} is incompatible; supported versions are ${[
+        ...COMPATIBLE_SCHEMA_VERSIONS,
+      ].join(", ")}`,
     );
   }
 }

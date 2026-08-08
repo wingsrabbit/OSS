@@ -48,6 +48,12 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 const REQUIRED_SCHEMA_VERSION = "014_stage_b_cycle_end_cancellation";
+const COMPATIBLE_SCHEMA_VERSIONS = new Set([
+  REQUIRED_SCHEMA_VERSION,
+  // 015 only expands the 014 representation. Keeping this bridge Worker
+  // compatible makes the previous application image a safe rollback target.
+  "015_stage_b_saved_payment_auto_renew",
+]);
 
 type Job = {
   id: string;
@@ -7066,9 +7072,12 @@ process.on("SIGINT", () => {
 const schema = await pool.query<{ version: string | null }>(
   "SELECT max(version) AS version FROM schema_migrations",
 );
-if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
+const installedSchemaVersion = schema.rows[0]?.version ?? null;
+if (!installedSchemaVersion || !COMPATIBLE_SCHEMA_VERSIONS.has(installedSchemaVersion)) {
   throw new Error(
-    `OpenSales schema ${schema.rows[0]?.version ?? "missing"} is incompatible with worker requirement ${REQUIRED_SCHEMA_VERSION}`,
+    `OpenSales schema ${installedSchemaVersion ?? "missing"} is incompatible with worker supported versions ${[
+      ...COMPATIBLE_SCHEMA_VERSIONS,
+    ].join(", ")}`,
   );
 }
 
