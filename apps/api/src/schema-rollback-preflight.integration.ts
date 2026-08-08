@@ -66,14 +66,39 @@ try {
   );
 
   await client.query(`
+    ALTER TABLE payment_methods
+      ADD COLUMN saved_method_enabled boolean NOT NULL DEFAULT false,
+      ADD COLUMN automatic_renewal_enabled boolean NOT NULL DEFAULT false;
+    ALTER TABLE services
+      ADD COLUMN automatic_renewal_consent_generation bigint NOT NULL DEFAULT 0,
+      ADD COLUMN automatic_renewal_decision_generation bigint NOT NULL DEFAULT 0;
     ALTER TABLE payment_attempts
       ADD COLUMN save_payment_method_requested boolean NOT NULL DEFAULT false,
+      ADD COLUMN save_consent_version text,
       ADD COLUMN automatic_renewal_requested boolean NOT NULL DEFAULT false,
-      ADD COLUMN automatic_renewal_consent_generation bigint,
+      ADD COLUMN automatic_renewal_consent_version text,
+      ADD COLUMN automatic_renewal_service_id uuid,
+      ADD COLUMN automatic_renewal_decision_generation bigint,
       ADD COLUMN saved_payment_method_id uuid,
       ADD COLUMN automatic_renewal_authorization_id uuid,
       ADD COLUMN created_automatic_renewal_authorization_id uuid,
       ADD COLUMN automatic_attempt_number integer NOT NULL DEFAULT 0;
+    CREATE TABLE payment_method_token_key_materials(
+      material_fingerprint bytea PRIMARY KEY,
+      key_kind text NOT NULL,
+      key_version integer NOT NULL,
+      registered_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE payment_method_token_encryption_keys(
+      version integer PRIMARY KEY,
+      key_fingerprint bytea NOT NULL,
+      registered_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE payment_method_token_lookup_keys(
+      version integer PRIMARY KEY,
+      key_fingerprint bytea NOT NULL,
+      registered_at timestamptz NOT NULL DEFAULT now()
+    );
     CREATE TABLE saved_payment_methods(id uuid PRIMARY KEY);
     CREATE TABLE automatic_renewal_authorizations(id uuid PRIMARY KEY);
     CREATE TABLE payment_consent_events(id uuid PRIMARY KEY);
@@ -105,15 +130,41 @@ try {
       '00000000-0000-4000-8000-000000000158',
       '00000000-0000-4000-8000-000000000157', 'USD', 100, now()
     );
+    INSERT INTO orders(
+      id, client_account_id, submitted_by_user_id, status, currency,
+      price_snapshot, one_time_minor, setup_minor, recurring_minor, total_minor,
+      idempotency_key, request_fingerprint
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000159',
+      '00000000-0000-4000-8000-000000000157',
+      '00000000-0000-4000-8000-000000000156', 'accepted', 'USD', '{}'::jsonb,
+      0, 0, 0, 0, 'rollback-preflight-order', 'rollback-preflight-order-fingerprint'
+    );
+    INSERT INTO order_items(
+      id, order_id, product_id, product_name, fulfillment_mode,
+      billing_cycle, configuration, price_snapshot
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000160',
+      '00000000-0000-4000-8000-000000000159', 'synthetic-product',
+      'Synthetic product', 'automatic', 'monthly', '{}'::jsonb, '{}'::jsonb
+    );
+    INSERT INTO services(
+      id, client_account_id, order_item_id, status, billing_cycle,
+      automatic_renewal_decision_generation
+    ) VALUES (
+      '00000000-0000-4000-8000-000000000161',
+      '00000000-0000-4000-8000-000000000157',
+      '00000000-0000-4000-8000-000000000160', 'pending', 'monthly', 1
+    );
     INSERT INTO payment_attempts(
       id, client_account_id, invoice_id, provider_installation_id, status,
       amount_minor, currency, scenario, idempotency_key, request_fingerprint,
-      save_payment_method_requested
+      save_payment_method_requested, save_consent_version
     ) VALUES (
       '${paymentAttemptId}', '00000000-0000-4000-8000-000000000157',
       '00000000-0000-4000-8000-000000000158', 'rollback-preflight-mock', 'processing',
       100, 'USD', 'success', 'rollback-preflight-payment',
-      'rollback-preflight-payment-fingerprint', true
+      'rollback-preflight-payment-fingerprint', true, 'rollback-preflight-consent-v1'
     );
     INSERT INTO saved_payment_methods(id)
     VALUES ('00000000-0000-4000-8000-000000000152');
@@ -162,6 +213,7 @@ try {
     "automatic_renewal_authorizations",
     "payment_consent_events",
     "automatic_renewal_runs",
+    "automatic_renewal_service_generations",
     "automatic_provider_operations",
     "automatic_durable_jobs",
     "saved_payment_provider_inbox",

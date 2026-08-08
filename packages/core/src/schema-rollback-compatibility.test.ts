@@ -25,10 +25,15 @@ function fakeDatabase(input: {
         return {
           rows: [
             {
+              has_token_key_materials: valid,
+              has_token_encryption_keys: valid,
+              has_token_lookup_keys: valid,
               has_saved_methods: valid,
               has_authorizations: valid,
               has_consent_events: valid,
               has_automatic_runs: valid,
+              has_payment_method_columns: valid,
+              has_service_generation_columns: valid,
               has_payment_attempt_columns: valid,
             },
           ],

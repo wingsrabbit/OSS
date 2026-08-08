@@ -62,8 +62,11 @@ The bridge fails closed for:
 - a missing `schema_migrations` table or no applied migration;
 - schema 013 or any other version older than 014;
 - schema 016 or any unknown future version;
-- a schema claiming to be 015 without the expected tables and Payment Attempt columns;
+- a schema claiming to be 015 without its token-key registries, Saved Method and automatic-renewal
+  tables, Payment Method capability columns, both Service consent/decision generation columns, and
+  all ten Payment Attempt expansion columns;
 - any Saved Payment Method, automatic-renewal authorization, consent event, or automatic run;
+- any non-zero Service automatic-renewal consent or decision generation;
 - any Payment Attempt carrying a Saved Method, automatic-renewal, or `requires_action` marker;
 - unresolved automatic-payment Provider operations or durable jobs;
 - Provider inbox facts containing Saved Method or `requires_action` results;

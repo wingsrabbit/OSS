@@ -73,19 +73,68 @@ async function installedSchemaVersion(database: RollbackPreflightQueryable): Pro
 async function assertExpandedSchemaShape(database: RollbackPreflightQueryable): Promise<void> {
   const result = await database.query(
     `SELECT
+       to_regclass('public.payment_method_token_key_materials') IS NOT NULL
+         AND (
+           SELECT count(*) = 4
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'payment_method_token_key_materials'
+             AND column_name IN (
+               'material_fingerprint', 'key_kind', 'key_version', 'registered_at'
+             )
+         ) AS has_token_key_materials,
+       to_regclass('public.payment_method_token_encryption_keys') IS NOT NULL
+         AND (
+           SELECT count(*) = 3
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'payment_method_token_encryption_keys'
+             AND column_name IN ('version', 'key_fingerprint', 'registered_at')
+         ) AS has_token_encryption_keys,
+       to_regclass('public.payment_method_token_lookup_keys') IS NOT NULL
+         AND (
+           SELECT count(*) = 3
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'payment_method_token_lookup_keys'
+             AND column_name IN ('version', 'key_fingerprint', 'registered_at')
+         ) AS has_token_lookup_keys,
        to_regclass('public.saved_payment_methods') IS NOT NULL AS has_saved_methods,
        to_regclass('public.automatic_renewal_authorizations') IS NOT NULL AS has_authorizations,
        to_regclass('public.payment_consent_events') IS NOT NULL AS has_consent_events,
        to_regclass('public.automatic_renewal_runs') IS NOT NULL AS has_automatic_runs,
        (
-         SELECT count(*) = 7
+         SELECT count(*) = 2
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'payment_methods'
+           AND column_name IN (
+             'saved_method_enabled',
+             'automatic_renewal_enabled'
+           )
+       ) AS has_payment_method_columns,
+       (
+         SELECT count(*) = 2
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'services'
+           AND column_name IN (
+             'automatic_renewal_consent_generation',
+             'automatic_renewal_decision_generation'
+           )
+       ) AS has_service_generation_columns,
+       (
+         SELECT count(*) = 10
          FROM information_schema.columns
          WHERE table_schema = 'public'
            AND table_name = 'payment_attempts'
            AND column_name IN (
              'save_payment_method_requested',
+             'save_consent_version',
              'automatic_renewal_requested',
-             'automatic_renewal_consent_generation',
+             'automatic_renewal_consent_version',
+             'automatic_renewal_service_id',
+             'automatic_renewal_decision_generation',
              'saved_payment_method_id',
              'automatic_renewal_authorization_id',
              'created_automatic_renewal_authorization_id',
@@ -95,10 +144,15 @@ async function assertExpandedSchemaShape(database: RollbackPreflightQueryable): 
   );
   const shape = rowRecord(result.rows[0]);
   const valid = [
+    "has_token_key_materials",
+    "has_token_encryption_keys",
+    "has_token_lookup_keys",
     "has_saved_methods",
     "has_authorizations",
     "has_consent_events",
     "has_automatic_runs",
+    "has_payment_method_columns",
+    "has_service_generation_columns",
     "has_payment_attempt_columns",
   ].every((key) => shape[key] === true);
   if (!valid) {
@@ -126,11 +180,19 @@ async function expandedSchemaBlockers(
        SELECT 'automatic_renewal_runs', count(*)::bigint
        FROM automatic_renewal_runs
        UNION ALL
+       SELECT 'automatic_renewal_service_generations', count(*)::bigint
+       FROM services service
+       WHERE service.automatic_renewal_consent_generation <> 0
+          OR service.automatic_renewal_decision_generation <> 0
+       UNION ALL
        SELECT 'saved_payment_attempts', count(*)::bigint
        FROM payment_attempts attempt
        WHERE attempt.save_payment_method_requested
+          OR attempt.save_consent_version IS NOT NULL
           OR attempt.automatic_renewal_requested
-          OR attempt.automatic_renewal_consent_generation IS NOT NULL
+          OR attempt.automatic_renewal_consent_version IS NOT NULL
+          OR attempt.automatic_renewal_service_id IS NOT NULL
+          OR attempt.automatic_renewal_decision_generation IS NOT NULL
           OR attempt.saved_payment_method_id IS NOT NULL
           OR attempt.automatic_renewal_authorization_id IS NOT NULL
           OR attempt.created_automatic_renewal_authorization_id IS NOT NULL
@@ -150,9 +212,16 @@ async function expandedSchemaBlockers(
              WHERE attempt.id = operation.subject_id
                AND (
                  attempt.save_payment_method_requested
+                 OR attempt.save_consent_version IS NOT NULL
                  OR attempt.automatic_renewal_requested
+                 OR attempt.automatic_renewal_consent_version IS NOT NULL
+                 OR attempt.automatic_renewal_service_id IS NOT NULL
+                 OR attempt.automatic_renewal_decision_generation IS NOT NULL
+                 OR attempt.saved_payment_method_id IS NOT NULL
                  OR attempt.automatic_renewal_authorization_id IS NOT NULL
+                 OR attempt.created_automatic_renewal_authorization_id IS NOT NULL
                  OR attempt.automatic_attempt_number <> 0
+                 OR attempt.status = 'requires_action'
                )
            )
          )
@@ -167,9 +236,16 @@ async function expandedSchemaBlockers(
              WHERE attempt.id::text = job.payload->>'paymentAttemptId'
                AND (
                  attempt.save_payment_method_requested
+                 OR attempt.save_consent_version IS NOT NULL
                  OR attempt.automatic_renewal_requested
+                 OR attempt.automatic_renewal_consent_version IS NOT NULL
+                 OR attempt.automatic_renewal_service_id IS NOT NULL
+                 OR attempt.automatic_renewal_decision_generation IS NOT NULL
+                 OR attempt.saved_payment_method_id IS NOT NULL
                  OR attempt.automatic_renewal_authorization_id IS NOT NULL
+                 OR attempt.created_automatic_renewal_authorization_id IS NOT NULL
                  OR attempt.automatic_attempt_number <> 0
+                 OR attempt.status = 'requires_action'
                )
            )
          )
