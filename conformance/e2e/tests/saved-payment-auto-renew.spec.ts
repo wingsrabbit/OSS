@@ -53,29 +53,38 @@ function shanghaiBusinessDate(date: Date): string {
 async function runAutomation(request: APIRequestContext, termEnd: string): Promise<void> {
   const secret = process.env.PROVIDER_OPERATION_CAPABILITY_SECRET;
   expect(secret, "billing automation signature secret is required").toBeTruthy();
-  const candidate = new Date(new Date(termEnd).getTime() - 13 * 24 * 60 * 60 * 1_000);
-  const businessDate = shanghaiBusinessDate(candidate);
-  // Asia/Shanghai has a fixed UTC+08 offset. Run just after the configured
-  // 09:00 local boundary so a service activated near local midnight does not
-  // accidentally exercise the scheduler's intentional SCHEDULE_NOT_DUE path.
-  const effectiveAt = new Date(`${businessDate}T01:05:00.000Z`);
-  const body = {
-    policyId: "default",
-    businessDate,
-    effectiveAt: effectiveAt.toISOString(),
-  } as const;
-  const timestamp = Date.now().toString();
-  const signature = createHmac("sha256", secret!)
-    .update(`${timestamp}.${canonicalJson(body)}`, "utf8")
-    .digest("hex");
-  const response = await request.post("/api/v1/internal/billing/automation/run", {
-    headers: {
-      "X-OSS-Timestamp": timestamp,
-      "X-OSS-Signature": signature,
-    },
-    data: body,
-  });
-  expect(response.status(), await response.text()).toBe(201);
+  for (const daysBeforeTerm of [13, 12, 11, 10, 9, 8, 7, 6, 4, 3, 2, 1]) {
+    const candidate = new Date(
+      new Date(termEnd).getTime() - daysBeforeTerm * 24 * 60 * 60 * 1_000,
+    );
+    const businessDate = shanghaiBusinessDate(candidate);
+    // Asia/Shanghai has a fixed UTC+08 offset. Run just after the configured
+    // 09:00 local boundary so a service activated near local midnight does not
+    // accidentally exercise the scheduler's intentional SCHEDULE_NOT_DUE path.
+    const effectiveAt = new Date(`${businessDate}T01:05:00.000Z`);
+    const body = {
+      policyId: "default",
+      businessDate,
+      effectiveAt: effectiveAt.toISOString(),
+    } as const;
+    const timestamp = Date.now().toString();
+    const signature = createHmac("sha256", secret!)
+      .update(`${timestamp}.${canonicalJson(body)}`, "utf8")
+      .digest("hex");
+    const response = await request.post("/api/v1/internal/billing/automation/run", {
+      headers: {
+        "X-OSS-Timestamp": timestamp,
+        "X-OSS-Signature": signature,
+      },
+      data: body,
+    });
+    const responseText = await response.text();
+    if (response.status() === 201) return;
+    expect(response.status(), responseText).toBe(200);
+    const replay = JSON.parse(responseText) as { replayed?: boolean };
+    expect(replay.replayed, responseText).toBe(true);
+  }
+  throw new Error("No fresh eligible Asia/Shanghai billing day remained in the renewal window");
 }
 
 async function renewals(page: Page): Promise<Renewal[]> {
