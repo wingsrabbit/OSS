@@ -87,6 +87,8 @@ jobs:
       MOCK_PAYMENT_WEBHOOK_SECRET: ci-only-payment-webhook-secret-0000000000
       MOCK_PROVISIONING_WEBHOOK_SECRET: ci-only-provision-webhook-secret-0000000
       MOCK_PROVISION_SCENARIO: timeout_existing
+      MOCK_RESOURCE_ACTION_SCENARIO: timeout_success
+      EXPECT_RESOURCE_ACTION_SCENARIO: timeout_success
       JOB_LOCK_TIMEOUT_SECONDS: "2"
       GLOBAL_RATE_LIMIT_MAX: "1000"
       LAB_MAILBOX_ENABLED: "true"
