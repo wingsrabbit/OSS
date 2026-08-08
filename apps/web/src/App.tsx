@@ -4,6 +4,21 @@ import { LAB_BANNER } from "@opensales/core";
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Locale = "en" | "zh-CN";
+
+function newIdempotencyKey(): string {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
+    throw new Error("Secure random number generation is unavailable");
+  }
+  if (typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 type Me = {
   id: string;
   email: string;
@@ -57,7 +72,26 @@ type OrderDetail = {
     activatedAt: string | null;
     termStart: string | null;
     termEnd: string | null;
+    version: number;
+    cancellation: {
+      requestId: string;
+      status: "scheduled" | "processing" | "unknown" | "manual" | "terminated";
+      executionMode: "automatic" | "manual";
+      scheduledAt: string;
+      effectiveAt: string;
+      result: Record<string, unknown>;
+      lastError: string | null;
+      providerOperation: { status: string; attempts: number } | null;
+    } | null;
   };
+};
+type OrderSummary = {
+  orderId: string;
+  orderStatus: string;
+  productName: string;
+  serviceId: string;
+  serviceStatus: string;
+  createdAt: string;
 };
 type LabMessage = {
   id: string;
@@ -76,6 +110,45 @@ type ManualItem = {
   totalMinor: string;
   submittedAt: string;
 };
+type AdminCancellationItem = {
+  requestId: string;
+  executionId: string;
+  serviceId: string;
+  serviceStatus: string;
+  clientAccountName: string;
+  productName: string;
+  effectiveAt: string;
+  executionMode: "automatic" | "manual";
+  executionStatus: "scheduled" | "processing" | "unknown" | "manual" | "terminated";
+  executionVersion: number;
+  serviceVersion: number;
+  lastError: string | null;
+  providerOperation: { status: string; attempts: number } | null;
+  job: { status: string; lastError: string | null };
+  interventionRequired: boolean;
+};
+
+function cancellationStatusLabel(
+  status: AdminCancellationItem["executionStatus"],
+  locale: Locale,
+): string {
+  if (locale === "en") return status.replaceAll("_", " ");
+  return {
+    scheduled: "已安排",
+    processing: "正在终止",
+    unknown: "结果未知，正在对账",
+    manual: "等待管理员处理",
+    terminated: "已终止",
+  }[status];
+}
+
+function cancellationExecutionLabel(
+  mode: AdminCancellationItem["executionMode"],
+  locale: Locale,
+): string {
+  if (locale === "en") return mode;
+  return mode === "automatic" ? "Mock Provider 自动执行" : "管理员人工执行";
+}
 type UnclaimedFundItem = {
   receiptId: string;
   clientAccountId: string;
@@ -291,9 +364,9 @@ type RenewalItem = {
   totalMinor: string;
   allocatedMinor: string;
   dueMinor: string;
-  status: "open" | "partially_paid" | "paid";
-  fundingStatus: "open" | "partially_paid" | "paid";
-  renewalStatus: "invoiced" | "paid" | "manual_hold";
+  status: "open" | "partially_paid" | "paid" | "cancelled";
+  fundingStatus: "open" | "partially_paid" | "paid" | "cancelled";
+  renewalStatus: "invoiced" | "paid" | "manual_hold" | "cancelled";
   fundedAt: string | null;
   dueAt: string;
   periodStart: string;
@@ -518,6 +591,9 @@ export function App() {
   const [paymentScenario, setPaymentScenario] = useState("success");
   const [paymentMethod, setPaymentMethod] = useState("card");
   const [applyCredit, setApplyCredit] = useState(true);
+  const [cancellationReason, setCancellationReason] = useState("");
+  const [cancellationPending, setCancellationPending] = useState(false);
+  const cancellationIntentKeys = useRef(new Map<string, string>());
   const [billing, setBilling] = useState<BillingSummary | null>(null);
   const [renewals, setRenewals] = useState<RenewalItem[]>([]);
   const [adminRenewals, setAdminRenewals] = useState<AdminRenewalItem[]>([]);
@@ -546,6 +622,12 @@ export function App() {
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
+  const [adminCancellations, setAdminCancellations] = useState<AdminCancellationItem[]>([]);
+  const [cancellationCompletionReason, setCancellationCompletionReason] = useState("");
+  const [cancellationCompletionPendingId, setCancellationCompletionPendingId] = useState<
+    string | null
+  >(null);
+  const cancellationCompletionIntentKeys = useRef(new Map<string, string>());
   const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
   const [refundRecords, setRefundRecords] = useState<Record<string, RefundRecord>>({});
@@ -610,6 +692,20 @@ export function App() {
     }
   }, []);
 
+  const refreshLatestOrder = useCallback(async () => {
+    if (!me?.eligible) {
+      setOrder(null);
+      return;
+    }
+    const result = await api<{ items: OrderSummary[] }>("/api/v1/orders");
+    const latest = result.items[0];
+    if (!latest) {
+      setOrder(null);
+      return;
+    }
+    setOrder(await api<OrderDetail>(`/api/v1/orders/${latest.orderId}`));
+  }, [me?.clientAccountId, me?.eligible]);
+
   const refreshBilling = useCallback(async () => {
     if (!me) {
       setBilling(null);
@@ -661,6 +757,10 @@ export function App() {
       setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
     );
   }, [locale, refreshMe]);
+
+  useEffect(() => {
+    void refreshLatestOrder().catch(() => undefined);
+  }, [refreshLatestOrder]);
 
   useEffect(() => {
     void refreshBilling().catch(() => undefined);
@@ -798,7 +898,11 @@ export function App() {
   useEffect(() => {
     if (
       !order ||
-      ["active", "provisioned_hold", "provision_failed"].includes(order.service.status)
+      (order.service.cancellation
+        ? ["manual", "terminated"].includes(order.service.cancellation.status)
+        : ["active", "provisioned_hold", "provision_failed", "terminated"].includes(
+            order.service.status,
+          ))
     ) {
       return;
     }
@@ -817,6 +921,17 @@ export function App() {
     }
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
     setManualItems(result.items);
+  }, [me?.staff]);
+
+  const refreshAdminCancellations = useCallback(async () => {
+    if (!me?.staff) {
+      setAdminCancellations([]);
+      return;
+    }
+    const result = await api<{ items: AdminCancellationItem[] }>(
+      "/api/v1/admin/services/cancellations",
+    );
+    setAdminCancellations(result.items);
   }, [me?.staff]);
 
   const refreshUnclaimedFunds = useCallback(async () => {
@@ -901,6 +1016,7 @@ export function App() {
   useEffect(() => {
     void Promise.all([
       refreshManualItems(),
+      refreshAdminCancellations(),
       refreshUnclaimedFunds(),
       refreshRefundCandidates(),
       refreshRefundRecords(),
@@ -911,6 +1027,7 @@ export function App() {
     ]).catch(() => undefined);
   }, [
     refreshManualItems,
+    refreshAdminCancellations,
     refreshRefundCandidates,
     refreshRefundRecords,
     refreshRefundSecurityHolds,
@@ -1009,7 +1126,7 @@ export function App() {
           configuration,
           termsVersion: legal.documents.terms.version,
           aupVersion: legal.documents.aup.version,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
         }),
       });
       setOrder(await api<OrderDetail>(`/api/v1/orders/${created.orderId}`));
@@ -1034,13 +1151,62 @@ export function App() {
         body: JSON.stringify({
           quoteId: quote.quoteId,
           scenario: paymentScenario,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
         }),
       });
       setOrder(await api<OrderDetail>(`/api/v1/orders/${order.order.id}`));
       await refreshBilling();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Payment could not start");
+    }
+  }
+
+  async function scheduleServiceCancellation() {
+    if (!order || cancellationPending) return;
+    const reason = cancellationReason.trim();
+    const requestIdentity = JSON.stringify({
+      serviceId: order.service.id,
+      expectedVersion: order.service.version,
+      reason: reason || null,
+    });
+    let idempotencyKey = cancellationIntentKeys.current.get(requestIdentity);
+    if (!idempotencyKey) {
+      idempotencyKey = newIdempotencyKey();
+      cancellationIntentKeys.current.set(requestIdentity, idempotencyKey);
+    }
+    setError("");
+    setCancellationPending(true);
+    try {
+      await api(`/api/v1/services/${order.service.id}/cancellation`, {
+        method: "POST",
+        body: JSON.stringify({
+          expectedVersion: order.service.version,
+          ...(reason ? { reason } : {}),
+          idempotencyKey,
+        }),
+      });
+      cancellationIntentKeys.current.delete(requestIdentity);
+      const [refreshed] = await Promise.all([
+        api<OrderDetail>(`/api/v1/orders/${order.order.id}`),
+        refreshRenewals(),
+      ]);
+      setOrder(refreshed);
+      setCancellationReason("");
+      setNotice(
+        locale === "zh-CN"
+          ? `服务已安排在 ${new Date(refreshed.service.cancellation!.effectiveAt).toLocaleString()} 取消。在此之前，已付费服务保持可用，并且不会生成下一张续费发票。`
+          : `Cancellation scheduled for ${new Date(refreshed.service.cancellation!.effectiveAt).toLocaleString()}. The paid service remains available until then and no new renewal invoice will be generated.`,
+      );
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : locale === "zh-CN"
+            ? "无法安排账期末取消"
+            : "Cancellation could not be scheduled",
+      );
+    } finally {
+      setCancellationPending(false);
     }
   }
 
@@ -1062,7 +1228,7 @@ export function App() {
         body: JSON.stringify({
           quoteId: quote.quoteId,
           scenario: paymentScenario,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
         }),
       });
       paymentStarted = true;
@@ -1109,7 +1275,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({
           reason: automationReason.trim(),
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
           ...(automationEffectiveAt
             ? { effectiveAt: new Date(automationEffectiveAt).toISOString() }
             : {}),
@@ -1148,7 +1314,7 @@ export function App() {
           action: "grant_period",
           reason: renewalHoldReason.trim(),
           expectedVersion: renewal.version,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
         }),
       });
       setRenewalHoldReason("");
@@ -1182,7 +1348,7 @@ export function App() {
     });
     let idempotencyKey = manualSuspensionIntentKeys.current.get(requestIdentity);
     if (!idempotencyKey) {
-      idempotencyKey = crypto.randomUUID();
+      idempotencyKey = newIdempotencyKey();
       manualSuspensionIntentKeys.current.set(requestIdentity, idempotencyKey);
     }
     setError("");
@@ -1225,6 +1391,65 @@ export function App() {
     }
   }
 
+  async function completeCycleEndCancellation(item: AdminCancellationItem) {
+    if (
+      !me?.staff ||
+      !item.interventionRequired ||
+      cancellationCompletionReason.trim().length < 10 ||
+      cancellationCompletionPendingId
+    ) {
+      return;
+    }
+    const requestIdentity = JSON.stringify({
+      executionId: item.executionId,
+      expectedExecutionVersion: item.executionVersion,
+      expectedServiceVersion: item.serviceVersion,
+      reason: cancellationCompletionReason.trim(),
+    });
+    let idempotencyKey = cancellationCompletionIntentKeys.current.get(requestIdentity);
+    if (!idempotencyKey) {
+      idempotencyKey = newIdempotencyKey();
+      cancellationCompletionIntentKeys.current.set(requestIdentity, idempotencyKey);
+    }
+    setError("");
+    setCancellationCompletionPendingId(item.executionId);
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const outcome = await api<{
+        executionStatus: "terminated";
+        serviceStatus: "terminated";
+        providerCalled: false;
+        replayed: boolean;
+      }>(`/api/v1/admin/services/cancellations/${item.executionId}/complete-manual`, {
+        method: "POST",
+        body: JSON.stringify({
+          expectedExecutionVersion: item.executionVersion,
+          expectedServiceVersion: item.serviceVersion,
+          reason: cancellationCompletionReason.trim(),
+          idempotencyKey,
+        }),
+      });
+      cancellationCompletionIntentKeys.current.delete(requestIdentity);
+      setCancellationCompletionReason("");
+      await Promise.all([refreshAdminCancellations(), refreshLatestOrder()]);
+      setNotice(
+        `${outcome.replayed ? "Replayed" : "Recorded"} manual cycle-end termination: Core service ${outcome.serviceStatus}, execution ${outcome.executionStatus}. No Provider request was sent.`,
+      );
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Manual cycle-end termination could not be recorded",
+      );
+    } finally {
+      setCancellationCompletionPendingId(null);
+    }
+  }
+
   async function startAddFunds() {
     if (!addFundsQuote) return;
     setError("");
@@ -1236,7 +1461,7 @@ export function App() {
         body: JSON.stringify({
           quoteId: addFundsQuote.quoteId,
           scenario: addFundsScenario,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
         }),
       });
       const command = await api<AddFundsCommand>(
@@ -1323,7 +1548,7 @@ export function App() {
           amountMinor: creditAdjustmentMinor,
           currency: "USD",
           reason: creditAdjustmentReason,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: newIdempotencyKey(),
         }),
       });
       await refreshBilling();
@@ -1443,7 +1668,7 @@ export function App() {
         storedKey = null;
       }
       const idempotencyKey =
-        refundIntentKeys.current.get(identity) ?? storedKey ?? crypto.randomUUID();
+        refundIntentKeys.current.get(identity) ?? storedKey ?? newIdempotencyKey();
       refundIntentKeys.current.set(identity, idempotencyKey);
       try {
         window.localStorage.setItem(storageKey, idempotencyKey);
@@ -1527,7 +1752,7 @@ export function App() {
         storedKey = null;
       }
       const idempotencyKey =
-        refundIntentKeys.current.get(identity) ?? storedKey ?? crypto.randomUUID();
+        refundIntentKeys.current.get(identity) ?? storedKey ?? newIdempotencyKey();
       refundIntentKeys.current.set(identity, idempotencyKey);
       try {
         window.localStorage.setItem(storageKey, idempotencyKey);
@@ -1610,7 +1835,7 @@ export function App() {
       } catch {
         idempotencyKey = null;
       }
-      idempotencyKey ??= crypto.randomUUID();
+      idempotencyKey ??= newIdempotencyKey();
       try {
         window.localStorage.setItem(storageKey, idempotencyKey);
       } catch {
@@ -1690,7 +1915,7 @@ export function App() {
       } catch {
         idempotencyKey = null;
       }
-      idempotencyKey ??= crypto.randomUUID();
+      idempotencyKey ??= newIdempotencyKey();
       try {
         window.localStorage.setItem(storageKey, idempotencyKey);
       } catch {
@@ -1762,7 +1987,7 @@ export function App() {
       } catch {
         idempotencyKey = null;
       }
-      idempotencyKey ??= crypto.randomUUID();
+      idempotencyKey ??= newIdempotencyKey();
       try {
         window.localStorage.setItem(storageKey, idempotencyKey);
       } catch {
@@ -1843,7 +2068,7 @@ export function App() {
       } catch {
         idempotencyKey = null;
       }
-      idempotencyKey ??= crypto.randomUUID();
+      idempotencyKey ??= newIdempotencyKey();
       try {
         window.localStorage.setItem(storageKey, idempotencyKey);
       } catch {
@@ -2111,6 +2336,13 @@ export function App() {
                         was not extended.
                       </span>
                     )}
+                    {renewal.renewalStatus === "cancelled" && (
+                      <span className="notice" data-testid="renewal-cancelled">
+                        {locale === "zh-CN"
+                          ? "账期末取消被接受后，这张续费发票已撤回。原始开票记录仍保留，应收金额为零，反向分录作为独立账务事实保存。"
+                          : "This renewal invoice was withdrawn when cycle-end cancellation was accepted. Its issuance remains in history, collectible due is zero, and the reversal is a separate ledger fact."}
+                      </span>
+                    )}
                     {renewal.lateFee && (
                       <span data-testid="renewal-late-fee">
                         Late Fee {renewal.lateFee.disposition}: {usd(renewal.lateFee.amountMinor)}
@@ -2143,7 +2375,7 @@ export function App() {
                             .join(", ")}
                     </span>
                   </div>
-                  {renewal.status !== "paid" && (
+                  {renewal.status !== "paid" && renewal.status !== "cancelled" && (
                     <div className="fund-actions">
                       <select
                         aria-label={`Renewal payment method ${renewal.invoiceId}`}
@@ -2472,6 +2704,8 @@ export function App() {
                           Funding {renewal.fundingStatus} · term grant {renewal.renewalStatus}
                           {renewal.renewalStatus === "manual_hold"
                             ? " — funds recorded; staff disposition required"
+                            : renewal.renewalStatus === "cancelled"
+                              ? " — withdrawn by cycle-end cancellation; collectible due is zero"
                             : ""}
                         </span>
                         {renewal.lateFee && (
@@ -2587,6 +2821,102 @@ export function App() {
                             : "Review and grant exact period"}
                         </button>
                       )}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="admin-subsection" aria-label="Cycle-end service cancellations">
+              <div>
+                <p className="eyebrow">
+                  {locale === "zh-CN" ? "已付账期终止控制" : "Paid-period termination control"}
+                </p>
+                <h3>{locale === "zh-CN" ? "账期末取消" : "Cycle-end cancellations"}</h3>
+                <p>
+                  {locale === "zh-CN"
+                    ? "自动服务只会在 Provider 事实确认后显示为已终止。未知结果仅通过查询对账，不会发送第二次终止请求。人工服务保留真实服务状态，并明确进入管理员处理队列。"
+                    : "Automatic services become terminated only after a confirmed Provider fact. Unknown results are reconciled by query without sending a second terminate. Manual services remain in their real service state and are explicitly queued for administrator intervention."}
+                </p>
+              </div>
+              <button onClick={() => void refreshAdminCancellations()}>
+                {locale === "zh-CN" ? "刷新取消队列" : "Refresh cancellations"}
+              </button>
+              <input
+                aria-label={locale === "zh-CN" ? "人工账期末终止原因" : "Manual cycle-end termination reason"}
+                value={cancellationCompletionReason}
+                onChange={(event) => setCancellationCompletionReason(event.target.value)}
+                placeholder={
+                  locale === "zh-CN"
+                    ? "人工终止证据和原因（至少 10 个字符）"
+                    : "Manual termination evidence and reason (10+ characters)"
+                }
+              />
+              {adminCancellations.length === 0 ? (
+                <p className="muted">
+                  {locale === "zh-CN"
+                    ? "当前没有已安排的账期末取消。"
+                    : "No cycle-end cancellation has been scheduled."}
+                </p>
+              ) : (
+                <div data-testid="admin-cancellation-list">
+                  {adminCancellations.map((item) => (
+                    <article
+                      className="manual-item"
+                      data-testid="admin-cancellation-item"
+                      key={item.executionId}
+                    >
+                      <div>
+                        <strong>
+                          {item.clientAccountName} · {item.productName} ·{" "}
+                          {cancellationStatusLabel(item.executionStatus, locale)}
+                        </strong>
+                        <span>
+                          {locale === "zh-CN" ? "生效时间" : "Effective"}{" "}
+                          {new Date(item.effectiveAt).toLocaleString()} ·{" "}
+                          {locale === "zh-CN" ? "执行方式" : "execution"}{" "}
+                          {cancellationExecutionLabel(item.executionMode, locale)} ·{" "}
+                          {locale === "zh-CN" ? "当前服务状态" : "service remains"}{" "}
+                          {item.serviceStatus}
+                        </span>
+                        <span>
+                          {locale === "zh-CN" ? "到期任务" : "Due job"} {item.job.status}
+                          {item.providerOperation
+                            ? ` · Provider ${item.providerOperation.status}/${item.providerOperation.attempts}`
+                            : locale === "zh-CN"
+                              ? " · 无 Provider 操作"
+                              : " · no Provider operation"}
+                        </span>
+                        {item.interventionRequired && (
+                          <>
+                            <span data-testid="admin-cancellation-manual">
+                              {locale === "zh-CN"
+                                ? "需要管理员介入；系统尚未把此服务表示为已终止。"
+                                : "Administrator intervention required; this service has not been represented as terminated."}
+                            </span>
+                            <button
+                              className="primary"
+                              disabled={
+                                cancellationCompletionPendingId !== null ||
+                                adminPassword.length === 0 ||
+                                cancellationCompletionReason.trim().length < 10
+                              }
+                              onClick={() => void completeCycleEndCancellation(item)}
+                            >
+                              {cancellationCompletionPendingId === item.executionId
+                                ? locale === "zh-CN"
+                                  ? "正在记录终止…"
+                                  : "Recording termination…"
+                                : locale === "zh-CN"
+                                  ? "确认人工终止"
+                                  : "Confirm manual termination"}
+                            </button>
+                          </>
+                        )}
+                        {(item.lastError || item.job.lastError) && (
+                          <span>{item.lastError ?? item.job.lastError}</span>
+                        )}
+                        <span className="mono">service {item.serviceId}</span>
+                      </div>
                     </article>
                   ))}
                 </div>
@@ -3399,6 +3729,106 @@ export function App() {
                   : "one-time"}
               </p>
             )}
+            {order.service.cancellation ? (
+              <div
+                className="quote-summary"
+                aria-label={locale === "zh-CN" ? "服务取消状态" : "Service cancellation status"}
+              >
+                <strong>
+                  {locale === "zh-CN" ? "取消状态" : "Cancellation"} {" "}
+                  {cancellationStatusLabel(order.service.cancellation.status, locale)} ·{" "}
+                  {new Date(order.service.cancellation.effectiveAt).toLocaleString()}
+                </strong>
+                {order.service.cancellation.status === "scheduled" && (
+                  <span>
+                    {locale === "zh-CN"
+                      ? "服务在当前已付账期结束前保持可用。"
+                      : "The service remains available through its current paid period."}
+                  </span>
+                )}
+                {order.service.cancellation.status === "processing" && (
+                  <span>
+                    {locale === "zh-CN"
+                      ? `Provider 正在执行终止；Core 收到确认结果前，服务仍显示为 ${order.service.status}。`
+                      : `Provider termination is in progress. The service remains ${order.service.status} until Core receives a confirmed external result.`}
+                  </span>
+                )}
+                {order.service.cancellation.status === "unknown" && (
+                  <span>
+                    {locale === "zh-CN"
+                      ? "Provider 结果未知。Core 只通过查询对账，不会发送第二次终止请求。"
+                      : "The Provider result is unknown. Core is reconciling by query only and will not send a second terminate request."}
+                  </span>
+                )}
+                {order.service.cancellation.status === "manual" && (
+                  <span>
+                    {locale === "zh-CN"
+                      ? `需要管理员介入。服务仍显示为 ${order.service.status}，系统尚未把它标记为已终止。`
+                      : `Administrator intervention is required. The service is still shown as ${order.service.status}; it has not been reported as terminated.`}
+                  </span>
+                )}
+                {order.service.cancellation.status === "terminated" && (
+                  <span>
+                    {locale === "zh-CN"
+                      ? "终止已经确认，服务现已终止。"
+                      : "Termination was confirmed; the service is now terminated."}
+                  </span>
+                )}
+                <span>
+                  {locale === "zh-CN"
+                    ? "不会生成下一张续费发票；此操作不会自动退款。"
+                    : "No new renewal invoice will be generated. This action does not issue a refund."}
+                </span>
+                <span>
+                  {locale === "zh-CN" ? "执行方式" : "Delivery"}: {cancellationExecutionLabel(order.service.cancellation.executionMode, locale)}
+                  {order.service.cancellation.providerOperation
+                    ? ` · Provider ${order.service.cancellation.providerOperation.status}/${order.service.cancellation.providerOperation.attempts}`
+                    : locale === "zh-CN"
+                      ? " · 不会自动调用 Provider"
+                      : " · no automatic Provider mutation"}
+                </span>
+                {order.service.cancellation.lastError && (
+                  <span>{order.service.cancellation.lastError}</span>
+                )}
+              </div>
+            ) : order.service.termEnd &&
+              (order.service.status === "active" || order.service.status === "suspended") &&
+              (me?.membershipRole === "owner" || me?.membershipRole === "billing") ? (
+              <div
+                className="payment-controls"
+                aria-label={locale === "zh-CN" ? "安排服务取消" : "Schedule service cancellation"}
+              >
+                <p>
+                  {locale === "zh-CN" ? "仅在当前已付账期结束时取消。服务保持可用至 " : "Cancel only at the end of the current paid period. Service stays available until "}
+                  <strong>{new Date(order.service.termEnd).toLocaleString()}</strong>
+                  {locale === "zh-CN"
+                    ? "；此请求不会自动创建退款。"
+                    : "; no refund is created by this request."}
+                </p>
+                <input
+                  aria-label={locale === "zh-CN" ? "取消原因（可选）" : "Cancellation reason (optional)"}
+                  value={cancellationReason}
+                  onChange={(event) => setCancellationReason(event.target.value)}
+                  placeholder={locale === "zh-CN" ? "取消原因（可选）" : "Cancellation reason (optional)"}
+                />
+                <button
+                  disabled={
+                    cancellationPending ||
+                    (cancellationReason.trim().length > 0 &&
+                      cancellationReason.trim().length < 3)
+                  }
+                  onClick={scheduleServiceCancellation}
+                >
+                  {cancellationPending
+                    ? locale === "zh-CN"
+                      ? "正在安排取消…"
+                      : "Scheduling cancellation…"
+                    : locale === "zh-CN"
+                      ? "在已付账期结束时取消"
+                      : "Cancel at paid period end"}
+                </button>
+              </div>
+            ) : null}
           </section>
         )}
 

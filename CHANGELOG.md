@@ -8,6 +8,15 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Eligible recurring-service customers can schedule cancellation for the exact
+  end of their current paid term. The service remains available until that
+  instant, future renewal generation stops, and a still-pristine issued renewal
+  is retained as history with zero collectible due and a balanced reversal.
+- Cycle-end termination is product-policy specific. Automatic Mock provisioning
+  uses a stable Provider operation and query-only reconciliation after an
+  unknown result; manual products remain an explicit staff queue with impact,
+  fixed-window password confirmation, permission, reason, version, and replay
+  checks.
 - Daily billing automation now runs once at or after 09:00 in the configured
   timezone through a signed Worker-to-Core durable job. Restart and duplicate
   delivery reuse the existing business-day run, while early, mismatched-date,
@@ -98,6 +107,11 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Security
 
+- Cancelled renewal invoices reject Payment, Credit, and unclaimed-fund
+  allocations in both application transactions and PostgreSQL. Provider
+  termination callbacks are bound to the approved installation, operation,
+  capability, service, and external resource, and stale events cannot restore
+  a terminated service or consume another side effect.
 - Core rechecks the current Client Account restriction, service ownership,
   product policy, immutable Provider binding, installation status, and approved
   suspend/resume capabilities before each new service-side effect. Capability

@@ -86,8 +86,8 @@ async function createFixtureService(
     label: string;
     productId: string;
     recurringMinor: bigint;
-    termStart?: Date;
-    termEnd?: Date;
+    termStart?: Date | string;
+    termEnd?: Date | string;
   },
 ): Promise<FixtureService> {
   const orderId = randomUUID();
@@ -2158,6 +2158,8 @@ try {
   const holdAccount = await createFixtureAccount(client, "restricted-at-payment");
   const guardAccount = await createFixtureAccount(client, "database-guards");
   const calendarAccount = await createFixtureAccount(client, "calendar-day-cutoff");
+  const microsecondCreditAccount = await createFixtureAccount(client, "microsecond-full-credit");
+  const microsecondPaymentAccount = await createFixtureAccount(client, "microsecond-payment");
 
   const mainService = await createFixtureService(client, mainAccount, {
     label: "Main Service",
@@ -2193,19 +2195,42 @@ try {
     termStart: CALENDAR_TERM_START,
     termEnd: CALENDAR_TERM_END,
   });
+  const microsecondCreditService = await createFixtureService(client, microsecondCreditAccount, {
+    label: "Microsecond Full Credit Service",
+    productId,
+    recurringMinor: 800n,
+    termStart: "2001-01-01T01:00:00.123456Z",
+    termEnd: "2001-02-01T01:00:00.123456Z",
+  });
+  const microsecondPaymentService = await createFixtureService(client, microsecondPaymentAccount, {
+    label: "Microsecond Payment Service",
+    productId,
+    recurringMinor: 600n,
+    termStart: "2001-01-01T01:00:00.654321Z",
+    termEnd: "2001-02-01T01:00:00.654321Z",
+  });
 
   await grantFixtureCredit(client, partialAccount, 400n);
   await grantFixtureCredit(client, fullAccount, 1000n);
+  await grantFixtureCredit(client, microsecondCreditAccount, 800n);
 
   const firstRun = await runBillingDay(client, mainAccount.userId, AT_MINUS_14, "minus-14");
   assert.equal(firstRun.replayed, false);
-  assert.equal(firstRun.invoicesCreated, 5);
+  assert.equal(firstRun.invoicesCreated, 7);
 
   const mainRenewal = await loadRenewal(client, mainService.serviceId);
   const partialRenewal = await loadRenewal(client, partialService.serviceId);
   const fullRenewal = await loadRenewal(client, fullService.serviceId);
   const holdRenewal = await loadRenewal(client, holdService.serviceId);
   const calendarRenewal = await loadRenewal(client, calendarService.serviceId);
+  const microsecondCreditRenewal = await loadRenewal(
+    client,
+    microsecondCreditService.serviceId,
+  );
+  const microsecondPaymentRenewal = await loadRenewal(
+    client,
+    microsecondPaymentService.serviceId,
+  );
   assert.equal(mainRenewal.recurring_minor, "1234");
   assert.equal(mainRenewal.total_minor, "1234");
   assert.notEqual(mainRenewal.total_minor, "9999", "current catalog price must not rewrite history");
@@ -2237,6 +2262,99 @@ try {
     "a term ending late on the fourteenth Shanghai calendar day must be invoiced",
   );
   assert.equal(calendarRenewal.period_end.toISOString(), CALENDAR_NEXT_TERM_END.toISOString());
+
+  const microsecondCreationProof = await client.query<{
+    credit_due_exact: boolean;
+    credit_start_exact: boolean;
+    credit_end_exact: boolean;
+    credit_service_advanced_exact: boolean;
+    credit_period_exact: boolean;
+    payment_due_exact: boolean;
+    payment_start_exact: boolean;
+    payment_end_exact: boolean;
+  }>(
+    `SELECT
+       credit_invoice.due_at = '2001-02-01 01:00:00.123456+00'::timestamptz
+         AS credit_due_exact,
+       credit_renewal.period_start = '2001-02-01 01:00:00.123456+00'::timestamptz
+         AS credit_start_exact,
+       credit_renewal.period_end = '2001-03-01 01:00:00.123456+00'::timestamptz
+         AS credit_end_exact,
+       credit_service.term_end = credit_renewal.period_end
+         AS credit_service_advanced_exact,
+       credit_period.period_start = credit_renewal.period_start
+         AND credit_period.period_end = credit_renewal.period_end
+         AS credit_period_exact,
+       payment_invoice.due_at = '2001-02-01 01:00:00.654321+00'::timestamptz
+         AS payment_due_exact,
+       payment_renewal.period_start = '2001-02-01 01:00:00.654321+00'::timestamptz
+         AS payment_start_exact,
+       payment_renewal.period_end = '2001-03-01 01:00:00.654321+00'::timestamptz
+         AS payment_end_exact
+     FROM service_renewals credit_renewal
+     JOIN invoices credit_invoice ON credit_invoice.id = credit_renewal.invoice_id
+     JOIN services credit_service ON credit_service.id = credit_renewal.service_id
+     JOIN service_periods credit_period
+       ON credit_period.service_id = credit_service.id
+      AND credit_period.invoice_id = credit_invoice.id
+      AND credit_period.period_kind = 'renewal'
+     JOIN service_renewals payment_renewal ON payment_renewal.service_id = $2
+     JOIN invoices payment_invoice ON payment_invoice.id = payment_renewal.invoice_id
+     WHERE credit_renewal.service_id = $1`,
+    [microsecondCreditService.serviceId, microsecondPaymentService.serviceId],
+  );
+  assert.deepEqual(microsecondCreationProof.rows[0], {
+    credit_due_exact: true,
+    credit_start_exact: true,
+    credit_end_exact: true,
+    credit_service_advanced_exact: true,
+    credit_period_exact: true,
+    payment_due_exact: true,
+    payment_start_exact: true,
+    payment_end_exact: true,
+  });
+  assert.equal(microsecondCreditRenewal.status, "paid");
+  assert.equal(microsecondPaymentRenewal.status, "invoiced");
+
+  await recordFixturePayment(client, {
+    clientAccountId: microsecondPaymentAccount.clientAccountId,
+    invoiceId: microsecondPaymentRenewal.invoice_id,
+    amountMinor: 600n,
+  });
+  const microsecondPaymentSettlement = await advancePaidInvoice(
+    client,
+    microsecondPaymentRenewal.invoice_id,
+    {
+      kind: "user_command",
+      userId: microsecondPaymentAccount.userId,
+    },
+  );
+  assert.equal(microsecondPaymentSettlement.renewalStatus, "paid");
+  const microsecondSettlementProof = await client.query<{
+    service_advanced_exact: boolean;
+    period_exact: boolean;
+    periods: string;
+  }>(
+    `SELECT
+       service.term_end = renewal.period_end AS service_advanced_exact,
+       bool_and(period.period_start = renewal.period_start
+                AND period.period_end = renewal.period_end) AS period_exact,
+       count(period.id)::text AS periods
+     FROM service_renewals renewal
+     JOIN services service ON service.id = renewal.service_id
+     JOIN service_periods period
+       ON period.service_id = service.id
+      AND period.invoice_id = renewal.invoice_id
+      AND period.period_kind = 'renewal'
+     WHERE renewal.service_id = $1
+     GROUP BY service.term_end, renewal.period_end`,
+    [microsecondPaymentService.serviceId],
+  );
+  assert.deepEqual(microsecondSettlementProof.rows[0], {
+    service_advanced_exact: true,
+    period_exact: true,
+    periods: "1",
+  });
 
   const fullTermAfterCredit = await client.query<{ term_end: Date; periods: string }>(
     `SELECT service.term_end,
@@ -2703,6 +2821,7 @@ try {
         historicalRecurringMinor: mainRenewal.recurring_minor,
         partialCreditAppliedMinor: partialRenewal.allocated_minor,
         fullCreditStatus: fullRenewal.status,
+        microsecondPrecision: "preserved across invoice, renewal, Credit and payment settlement",
         duplicateSettlementPeriods: mainAfterPayment.rows[0]?.periods,
         restrictedPaymentStatus: held.status,
         resolvedHoldStatus: heldAfterResolution.status,

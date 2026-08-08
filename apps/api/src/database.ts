@@ -9,7 +9,7 @@ import type { Config } from "./config.js";
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = "013_stage_b_late_fee_suspension";
+export const REQUIRED_SCHEMA_VERSION = "014_stage_b_cycle_end_cancellation";
 
 export function createPool(config: Config): DatabasePool {
   return new Pool({

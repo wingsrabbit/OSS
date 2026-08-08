@@ -432,14 +432,22 @@ export async function registerOrderRoutes(
       await client.query(
         `INSERT INTO service_provider_bindings(
            service_id, provider_installation_id, overdue_action_snapshot,
-           capability_snapshot, product_policy_version
+           capability_snapshot, product_policy_version,
+           cycle_end_cancellation_mode_snapshot,
+           cycle_end_cancellation_execution_mode_snapshot,
+           cycle_end_cancellation_min_notice_hours_snapshot,
+           cycle_end_cancellation_requirement_key_snapshot
          )
          SELECT
            $1,
            policy.provider_installation_id,
            policy.overdue_action,
            COALESCE(provider.capabilities, '[]'::jsonb),
-           policy.version
+           policy.version,
+           policy.cycle_end_cancellation_mode,
+           policy.cycle_end_cancellation_execution_mode,
+           policy.cycle_end_cancellation_min_notice_hours,
+           policy.cycle_end_cancellation_requirement_key
          FROM product_service_automation_policies policy
          LEFT JOIN provider_installation_capabilities provider
            ON provider.provider_installation_id = policy.provider_installation_id
@@ -456,6 +464,42 @@ export async function registerOrderRoutes(
     });
 
     return reply.code(created.replayed ? 200 : 201).send(created);
+  });
+
+  app.get("/api/v1/orders", async (request) => {
+    const user = await requireUser(request, pool, config);
+    const result = await pool.query<{
+      order_id: string;
+      order_status: string;
+      product_name: string;
+      service_id: string;
+      service_status: string;
+      created_at: Date;
+    }>(
+      `SELECT order_record.id AS order_id,
+              order_record.status AS order_status,
+              item.product_name,
+              service.id AS service_id,
+              service.status AS service_status,
+              order_record.submitted_at AS created_at
+       FROM orders order_record
+       JOIN order_items item ON item.order_id = order_record.id
+       JOIN services service ON service.order_item_id = item.id
+       WHERE order_record.client_account_id = $1
+       ORDER BY order_record.submitted_at DESC, order_record.id DESC
+       LIMIT 50`,
+      [user.clientAccountId],
+    );
+    return {
+      items: result.rows.map((row) => ({
+        orderId: row.order_id,
+        orderStatus: row.order_status,
+        productName: row.product_name,
+        serviceId: row.service_id,
+        serviceStatus: row.service_status,
+        createdAt: row.created_at.toISOString(),
+      })),
+    };
   });
 
   app.get("/api/v1/orders/:orderId", async (request, reply) => {
@@ -478,6 +522,22 @@ export async function registerOrderRoutes(
       activated_at: Date | null;
       term_start: Date | null;
       term_end: Date | null;
+      service_version: number;
+      cancellation_request_id: string | null;
+      cancellation_scheduled_at: Date | null;
+      cancellation_effective_at: Date | null;
+      cancellation_execution_mode: "automatic" | "manual" | null;
+      cancellation_execution_status:
+        | "scheduled"
+        | "processing"
+        | "unknown"
+        | "manual"
+        | "terminated"
+        | null;
+      cancellation_execution_result: Record<string, unknown> | null;
+      cancellation_last_error: string | null;
+      cancellation_operation_status: string | null;
+      cancellation_operation_attempt_count: number | null;
       payment_status: string | null;
       provider_operation_status: string | null;
     }>(
@@ -498,12 +558,28 @@ export async function registerOrderRoutes(
          s.activated_at,
          s.term_start,
          s.term_end,
+         s.version AS service_version,
+         s.cancellation_request_id,
+         s.cancellation_scheduled_at,
+         s.cancellation_effective_at,
+         cancellation_execution.execution_mode AS cancellation_execution_mode,
+         cancellation_execution.status AS cancellation_execution_status,
+         cancellation_execution.result AS cancellation_execution_result,
+         cancellation_execution.last_error AS cancellation_last_error,
+         cancellation_operation.status AS cancellation_operation_status,
+         cancellation_operation.attempt_count AS cancellation_operation_attempt_count,
          pay.status AS payment_status,
          provision.status AS provider_operation_status
        FROM orders o
        JOIN invoices i ON i.order_id = o.id
        JOIN order_items oi ON oi.order_id = o.id
        JOIN services s ON s.order_item_id = oi.id
+       LEFT JOIN service_cancellation_executions cancellation_execution
+         ON cancellation_execution.cancellation_request_id = s.cancellation_request_id
+       LEFT JOIN provider_operations cancellation_operation
+         ON cancellation_operation.subject_type = 'service_cancellation_execution'
+        AND cancellation_operation.subject_id = cancellation_execution.id
+        AND cancellation_operation.kind = 'resource_terminate'
        JOIN invoice_allocation_totals alloc ON alloc.invoice_id = i.id
        LEFT JOIN LATERAL (
          SELECT COALESCE(sum(amount_minor), 0) AS amount_minor
@@ -552,6 +628,27 @@ export async function registerOrderRoutes(
         activatedAt: row.activated_at?.toISOString() ?? null,
         termStart: row.term_start?.toISOString() ?? null,
         termEnd: row.term_end?.toISOString() ?? null,
+        version: row.service_version,
+        cancellation:
+          row.cancellation_request_id &&
+          row.cancellation_scheduled_at &&
+          row.cancellation_effective_at
+            ? {
+                requestId: row.cancellation_request_id,
+                status: row.cancellation_execution_status ?? "scheduled",
+                executionMode: row.cancellation_execution_mode ?? "manual",
+                scheduledAt: row.cancellation_scheduled_at.toISOString(),
+                effectiveAt: row.cancellation_effective_at.toISOString(),
+                result: row.cancellation_execution_result ?? {},
+                lastError: row.cancellation_last_error,
+                providerOperation: row.cancellation_operation_status
+                  ? {
+                      status: row.cancellation_operation_status,
+                      attempts: row.cancellation_operation_attempt_count ?? 0,
+                    }
+                  : null,
+              }
+            : null,
       },
     };
   });

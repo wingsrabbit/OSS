@@ -78,7 +78,7 @@ const resourceActionSchema = z.object({
   serviceId: z.uuid(),
   externalResourceId: z.string().min(1).max(200),
   callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-  action: z.enum(["suspend", "resume"]),
+  action: z.enum(["suspend", "resume", "terminate"]),
   scenario: z.enum(["success", "failed", "timeout_success", "duplicate_out_of_order"]),
 });
 
@@ -175,7 +175,7 @@ await pool.query(`
     service_id uuid NOT NULL,
     external_resource_id text NOT NULL,
     callback_capability text NOT NULL,
-    action text NOT NULL CHECK (action IN ('suspend', 'resume')),
+    action text NOT NULL CHECK (action IN ('suspend', 'resume', 'terminate')),
     scenario text NOT NULL CHECK (
       scenario IN ('success', 'failed', 'timeout_success', 'duplicate_out_of_order')
     ),
@@ -188,6 +188,11 @@ await pool.query(`
   ALTER TABLE mock_resource_action_operations
     ADD COLUMN IF NOT EXISTS query_calls integer NOT NULL DEFAULT 0
       CHECK (query_calls >= 0);
+  ALTER TABLE mock_resource_action_operations
+    DROP CONSTRAINT IF EXISTS mock_resource_action_operations_action_check;
+  ALTER TABLE mock_resource_action_operations
+    ADD CONSTRAINT mock_resource_action_operations_action_check
+    CHECK (action IN ('suspend', 'resume', 'terminate'));
   CREATE TABLE IF NOT EXISTS mock_resource_faults (
     operation_id uuid PRIMARY KEY,
     behavior text NOT NULL CHECK (behavior IN ('callback_success_then_reject'))
@@ -234,7 +239,7 @@ await pool.query(`
     DROP CONSTRAINT IF EXISTS mock_resource_operations_resource_state_check;
   ALTER TABLE mock_resource_operations
     ADD CONSTRAINT mock_resource_operations_resource_state_check
-    CHECK (resource_state IN ('active', 'suspended'));
+    CHECK (resource_state IN ('active', 'suspended', 'terminated'));
   UPDATE mock_resource_operations
   SET callback_capability = repeat('A', 43)
   WHERE callback_capability IS NULL;
@@ -1066,7 +1071,7 @@ app.get("/v1/resources/:operationId", async (request, reply) => {
     callback_capability: string;
     external_resource_id: string | null;
     status: "succeeded" | "failed";
-    resource_state: "active" | "suspended";
+    resource_state: "active" | "suspended" | "terminated";
     ready_at: Date | null;
     occurred_at: Date;
   }>(
@@ -1101,7 +1106,7 @@ app.post("/v1/resource-actions", async (request, reply) => {
   const status = body.scenario === "failed" ? "failed" : "succeeded";
   type ResourceActionResult = {
     external_resource_id: string;
-    action: "suspend" | "resume";
+    action: "suspend" | "resume" | "terminate";
     status: "succeeded" | "failed";
     occurred_at: Date;
   };
@@ -1133,7 +1138,9 @@ app.post("/v1/resource-actions", async (request, reply) => {
       );
       operation = repeated.rows[0];
     } else {
-      const resource = await client.query<{ resource_state: "active" | "suspended" }>(
+      const resource = await client.query<{
+        resource_state: "active" | "suspended" | "terminated";
+      }>(
         `SELECT resource_state
          FROM mock_resource_operations
          WHERE service_id = $1
@@ -1147,11 +1154,15 @@ app.post("/v1/resource-actions", async (request, reply) => {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "resource not found" });
       }
-      const expectedState = body.action === "suspend" ? "active" : "suspended";
-      if (currentState !== expectedState) {
+      const eligibleState = body.action === "suspend"
+        ? currentState === "active"
+        : body.action === "resume"
+          ? currentState === "suspended"
+          : currentState === "active" || currentState === "suspended";
+      if (!eligibleState) {
         await client.query("ROLLBACK");
         return reply.code(409).send({
-          error: `resource is ${currentState}; ${body.action} requires ${expectedState}`,
+          error: `resource is ${currentState}; ${body.action} is not allowed from that state`,
         });
       }
       const inserted = await client.query<ResourceActionResult>(
@@ -1177,7 +1188,15 @@ app.post("/v1/resource-actions", async (request, reply) => {
           `UPDATE mock_resource_operations
            SET resource_state = $3
            WHERE service_id = $1 AND external_resource_id = $2`,
-          [body.serviceId, body.externalResourceId, body.action === "suspend" ? "suspended" : "active"],
+          [
+            body.serviceId,
+            body.externalResourceId,
+            body.action === "suspend"
+              ? "suspended"
+              : body.action === "resume"
+                ? "active"
+                : "terminated",
+          ],
         );
       }
     }
@@ -1203,11 +1222,14 @@ app.post("/v1/resource-actions", async (request, reply) => {
   // reconcile opportunity. This proves that Core learns the external result
   // through the Provider query rather than a conveniently early callback.
   const delayMs = body.scenario === "timeout_success" ? 8_000 : 20;
-  scheduleCallback("/api/v1/provider-events/resource-action", event, delayMs, callbackSecret);
+  const callbackPath = body.action === "terminate"
+    ? "/api/v1/provider-events/resource-termination"
+    : "/api/v1/provider-events/resource-action";
+  scheduleCallback(callbackPath, event, delayMs, callbackSecret);
   if (body.scenario === "duplicate_out_of_order") {
-    scheduleCallback("/api/v1/provider-events/resource-action", event, 40, callbackSecret);
+    scheduleCallback(callbackPath, event, 40, callbackSecret);
     scheduleCallback(
-      "/api/v1/provider-events/resource-action",
+      callbackPath,
       {
         ...event,
         eventId: `resource-action:${body.operationId}:stale-conflict`,
@@ -1234,7 +1256,7 @@ app.get("/v1/resource-actions/:operationId", async (request, reply) => {
     callback_capability: string;
     service_id: string;
     external_resource_id: string;
-    action: "suspend" | "resume";
+    action: "suspend" | "resume" | "terminate";
     status: "succeeded" | "failed";
     occurred_at: Date;
   }>(

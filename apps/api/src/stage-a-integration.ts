@@ -132,7 +132,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
            AS account_restrictions
        FROM schema_migrations`,
     );
-    assert.equal(upgraded.rows[0]?.version, "013_stage_b_late_fee_suspension");
+    assert.equal(upgraded.rows[0]?.version, "014_stage_b_cycle_end_cancellation");
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
@@ -219,6 +219,17 @@ type OrderDetail = {
     activatedAt: string | null;
     termStart: string | null;
     termEnd: string | null;
+    version: number;
+    cancellation: {
+      requestId: string;
+      status: "scheduled" | "processing" | "unknown" | "manual" | "terminated";
+      executionMode: "automatic" | "manual";
+      scheduledAt: string;
+      effectiveAt: string;
+      result: Record<string, unknown>;
+      lastError: string | null;
+      providerOperation: { status: string; attempts: number } | null;
+    } | null;
   };
 };
 type ManualItem = {
@@ -949,6 +960,7 @@ async function releasePaymentStart(paymentAttemptId: string): Promise<void> {
 async function pay(
   order: OrderDetail,
   scenario: "success" | "failed" | "timeout_success" | "duplicate_out_of_order",
+  timeoutMs = 25_000,
 ): Promise<OrderDetail> {
   const quote = await createPaymentQuote(order.invoice.id);
   await request(
@@ -966,6 +978,7 @@ async function pay(
       scenario === "failed"
         ? current.payment.status === "failed"
         : current.invoice.status === "paid",
+    timeoutMs,
   );
 }
 
@@ -5709,7 +5722,7 @@ try {
   assert.equal(successfulProviderSettlement.status, 202);
   assert.equal(successfulProviderSettlement.body.status, "succeeded");
   assert.equal(staleStaffAllocation.status, 409);
-  assert.equal(staleStaffAllocation.body.code, "INVOICE_ALLOCATION_EXCEEDS_DUE");
+  assert.equal(staleStaffAllocation.body.code, "INVOICE_NOT_PAYABLE");
   const accountLockFinal = await corePool.query<{
     source_allocated_minor: string;
     source_resolutions: string;
@@ -11160,10 +11173,18 @@ try {
   const binding = await resourceLifecycleSetup.query(
     `INSERT INTO service_provider_bindings(
        service_id, provider_installation_id, overdue_action_snapshot,
-       capability_snapshot, product_policy_version
+       capability_snapshot, product_policy_version,
+       cycle_end_cancellation_mode_snapshot,
+       cycle_end_cancellation_execution_mode_snapshot,
+       cycle_end_cancellation_min_notice_hours_snapshot,
+       cycle_end_cancellation_requirement_key_snapshot
      )
      SELECT $1, policy.provider_installation_id, policy.overdue_action,
-            provider.capabilities, policy.version
+            provider.capabilities, policy.version,
+            policy.cycle_end_cancellation_mode,
+            policy.cycle_end_cancellation_execution_mode,
+            policy.cycle_end_cancellation_min_notice_hours,
+            policy.cycle_end_cancellation_requirement_key
      FROM product_service_automation_policies policy
      JOIN provider_installation_capabilities provider
        ON provider.provider_installation_id = policy.provider_installation_id
@@ -11887,6 +11908,1453 @@ assert.deepEqual(terminatedCreditAfter.rows[0], {
   renewal_status: "invoiced",
   service_status: "terminated",
 });
+
+// A customer schedules cancellation from the service boundary before the
+// renewal window. The service remains active through the paid term, exact
+// retries replay one request, cross-account callers learn nothing, and the
+// billing run must not create the next invoice after locking the same service.
+const cancellationNamespace = randomUUID();
+const cancellationEmail = `cycle-end-cancellation-${cancellationNamespace}@example.invalid`;
+const cancellationPassword = `Synthetic-${cancellationNamespace}-Cancellation!`;
+await request("/api/v1/auth/register", {
+  method: "POST",
+  body: JSON.stringify({
+    email: cancellationEmail,
+    password: cancellationPassword,
+    clientName: `Synthetic Cycle End Cancellation ${cancellationNamespace.slice(0, 8)}`,
+    locale: "en",
+  }),
+}, 201);
+await request("/api/v1/auth/login", {
+  method: "POST",
+  body: JSON.stringify({ email: cancellationEmail, password: cancellationPassword }),
+});
+const cancellationCookie = cookie;
+const cancellationIdentity = await corePool.query<{
+  user_id: string;
+  client_account_id: string;
+}>(
+  `SELECT user_account.id AS user_id, membership.client_account_id
+   FROM users user_account
+   JOIN client_memberships membership ON membership.user_id = user_account.id
+   WHERE user_account.email = $1 AND membership.removed_at IS NULL`,
+  [cancellationEmail],
+);
+const cancellationIdentityRow = cancellationIdentity.rows[0];
+assert.ok(cancellationIdentityRow);
+await corePool.query("UPDATE users SET email_verified_at = now() WHERE id = $1", [
+  cancellationIdentityRow.user_id,
+]);
+const cancellationOrder = await createOrder(automaticPrice.id, legal);
+await pay(cancellationOrder, "success");
+const cancellationActive = await waitFor(
+  "cycle-end cancellation fixture service activation",
+  () => request<OrderDetail>(`/api/v1/orders/${cancellationOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+assert.ok(cancellationActive.service.termEnd);
+assert.equal(cancellationActive.service.cancellation, null);
+const cancellationKey = randomUUID();
+const cancellationBody = {
+  expectedVersion: cancellationActive.service.version,
+  reason: "Synthetic customer ends service after the paid period",
+  idempotencyKey: cancellationKey,
+};
+const scheduledCancellation = await request<{
+  cancellation: {
+    requestId: string;
+    status: "scheduled";
+    executionMode: "automatic" | "manual";
+    executionStatus: "scheduled";
+    effectiveAt: string;
+    requestedAt: string;
+  };
+  serviceVersion: number;
+  replayed: boolean;
+}>(`/api/v1/services/${cancellationActive.service.id}/cancellation`, {
+  method: "POST",
+  body: JSON.stringify(cancellationBody),
+}, 201);
+assert.equal(scheduledCancellation.replayed, false);
+assert.equal(scheduledCancellation.cancellation.status, "scheduled");
+assert.equal(scheduledCancellation.cancellation.effectiveAt, cancellationActive.service.termEnd);
+assert.equal(scheduledCancellation.serviceVersion, cancellationActive.service.version + 1);
+const replayedCancellation = await request<typeof scheduledCancellation>(
+  `/api/v1/services/${cancellationActive.service.id}/cancellation`,
+  { method: "POST", body: JSON.stringify(cancellationBody) },
+);
+assert.equal(replayedCancellation.replayed, true);
+assert.deepEqual(replayedCancellation.cancellation, scheduledCancellation.cancellation);
+assert.equal(replayedCancellation.serviceVersion, scheduledCancellation.serviceVersion);
+
+const scheduledService = await request<OrderDetail>(
+  `/api/v1/orders/${cancellationOrder.order.id}`,
+);
+assert.equal(scheduledService.service.status, "active");
+assert.equal(scheduledService.service.termEnd, cancellationActive.service.termEnd);
+assert.equal(scheduledService.service.version, cancellationActive.service.version + 1);
+assert.deepEqual(scheduledService.service.cancellation, {
+  requestId: scheduledCancellation.cancellation.requestId,
+  status: "scheduled",
+  executionMode: "automatic",
+  scheduledAt: scheduledCancellation.cancellation.requestedAt,
+  effectiveAt: cancellationActive.service.termEnd,
+  result: { status: "scheduled" },
+  lastError: null,
+  providerOperation: { status: "queued", attempts: 0 },
+});
+
+cookie = terminatedCreditCookie;
+const crossAccountCancellation = await rawCoreRequest(
+  `/api/v1/services/${cancellationActive.service.id}/cancellation`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      expectedVersion: scheduledService.service.version,
+      reason: "Synthetic cross-account cancellation must be rejected",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(crossAccountCancellation.status, 404);
+assert.equal(crossAccountCancellation.body.code, "SERVICE_NOT_FOUND");
+
+cookie = cancellationCookie;
+const staleCancellation = await rawCoreRequest(
+  `/api/v1/services/${cancellationActive.service.id}/cancellation`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      expectedVersion: cancellationActive.service.version,
+      reason: "Synthetic stale customer decision cannot overwrite the schedule",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(staleCancellation.status, 409);
+assert.equal(staleCancellation.body.code, "VERSION_CONFLICT");
+
+const cancellationEffectiveAt = new Date(
+  new Date(cancellationActive.service.termEnd).getTime() - 12 * 24 * 60 * 60 * 1_000,
+);
+const cancellationBusinessDateParts = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+}).formatToParts(cancellationEffectiveAt);
+const cancellationBusinessDatePart = (type: "year" | "month" | "day") =>
+  cancellationBusinessDateParts.find((part) => part.type === type)?.value;
+const cancellationBusinessDate = `${cancellationBusinessDatePart("year")}-${cancellationBusinessDatePart("month")}-${cancellationBusinessDatePart("day")}`;
+assert.match(cancellationBusinessDate, /^\d{4}-\d{2}-\d{2}$/);
+const cancellationBillingRun = await runSignedBillingDay({
+  businessDate: cancellationBusinessDate,
+  effectiveAt: cancellationEffectiveAt.toISOString(),
+});
+assert.equal(cancellationBillingRun.status, 201);
+const cancellationFacts = await corePool.query<{
+  requests: string;
+  audits: string;
+  renewals: string;
+  service_status: string;
+  service_version: number;
+  cancellation_effective_at: Date | null;
+}>(
+  `SELECT
+     (SELECT count(*)::text
+      FROM service_cancellation_requests request
+      WHERE request.service_id = service.id) AS requests,
+     (SELECT count(*)::text
+      FROM audit_events audit
+      WHERE audit.target_type = 'service'
+        AND audit.target_id = service.id::text
+        AND audit.action = 'service.cancellation_scheduled') AS audits,
+     (SELECT count(*)::text
+      FROM service_renewals renewal
+      WHERE renewal.service_id = service.id) AS renewals,
+     service.status AS service_status,
+     service.version AS service_version,
+     service.cancellation_effective_at
+   FROM services service
+   WHERE service.id = $1`,
+  [cancellationActive.service.id],
+);
+assert.deepEqual(cancellationFacts.rows[0], {
+  requests: "1",
+  audits: "1",
+  renewals: "0",
+  service_status: "active",
+  service_version: scheduledCancellation.serviceVersion,
+  cancellation_effective_at: new Date(cancellationActive.service.termEnd),
+});
+await assert.rejects(
+  corePool.query(
+    `UPDATE service_cancellation_requests
+     SET reason = 'Synthetic mutation must be rejected'
+     WHERE id = $1`,
+    [scheduledCancellation.cancellation.requestId],
+  ),
+  /service cancellation requests are immutable/i,
+  "database must reject mutation of an accepted cancellation request fact",
+);
+await assert.rejects(
+  corePool.query(
+    `UPDATE services
+     SET cancellation_effective_at = cancellation_effective_at + interval '1 day',
+         term_end = term_end + interval '1 day'
+     WHERE id = $1`,
+    [cancellationActive.service.id],
+  ),
+  /accepted cycle-end cancellation schedule is immutable/i,
+  "database must reject rewrites of accepted cancellation fields and term_end",
+);
+
+type CancellationRenewalFixture = {
+  order: OrderDetail;
+  service: OrderDetail;
+  renewalId: string;
+  invoiceId: string;
+  totalMinor: string;
+  periodStart: Date;
+  periodEnd: Date;
+};
+let cancellationRenewalFixtureSequence = 0;
+async function createCancellationRenewalFixture(
+  label: string,
+): Promise<CancellationRenewalFixture> {
+  cookie = cancellationCookie;
+  const order = await createOrder(automaticPrice!.id, legal);
+  await pay(order, "success", 60_000);
+  const active = await waitFor(
+    `${label} service activation`,
+    () => request<OrderDetail>(`/api/v1/orders/${order.order.id}`),
+    (value) => value.service.status === "active",
+  );
+  cancellationRenewalFixtureSequence += 1;
+  const termEnd = new Date(Date.UTC(2040, cancellationRenewalFixtureSequence * 2, 20, 1));
+  await corePool.query(
+    `UPDATE services
+     SET term_end = $2, updated_at = now(), version = version + 1
+     WHERE id = $1`,
+    [active.service.id, termEnd],
+  );
+  const service = await request<OrderDetail>(`/api/v1/orders/${order.order.id}`);
+  const effectiveAt = new Date(termEnd.getTime() - 12 * 24 * 60 * 60 * 1_000);
+  const billingRun = await runSignedBillingDay({
+    businessDate: effectiveAt.toISOString().slice(0, 10),
+    effectiveAt: effectiveAt.toISOString(),
+  });
+  assert.equal(billingRun.status, 201, `${label} must create a fresh billing run`);
+  const renewal = await corePool.query<{
+    renewal_id: string;
+    invoice_id: string;
+    total_minor: string;
+    period_start: Date;
+    period_end: Date;
+  }>(
+    `SELECT renewal.id AS renewal_id,
+            renewal.invoice_id,
+            invoice.total_minor::text,
+            renewal.period_start,
+            renewal.period_end
+     FROM service_renewals renewal
+     JOIN invoices invoice ON invoice.id = renewal.invoice_id
+     WHERE renewal.service_id = $1 AND renewal.status = 'invoiced'`,
+    [service.service.id],
+  );
+  const row = renewal.rows[0];
+  assert.ok(row, `${label} must create an unsettled renewal`);
+  assert.equal(row.period_start.toISOString(), termEnd.toISOString());
+  return {
+    order,
+    service,
+    renewalId: row.renewal_id,
+    invoiceId: row.invoice_id,
+    totalMinor: row.total_minor,
+    periodStart: row.period_start,
+    periodEnd: row.period_end,
+  };
+}
+
+async function scheduleFixtureCancellation(
+  fixture: CancellationRenewalFixture,
+  reason: string,
+  idempotencyKey = randomUUID(),
+) {
+  cookie = cancellationCookie;
+  const current = await request<OrderDetail>(`/api/v1/orders/${fixture.order.order.id}`);
+  const body = {
+    expectedVersion: current.service.version,
+    reason,
+    idempotencyKey,
+  };
+  const result = await request<{
+    cancellation: { requestId: string; status: "scheduled" };
+    serviceVersion: number;
+    replayed: boolean;
+  }>(
+    `/api/v1/services/${fixture.service.service.id}/cancellation`,
+    { method: "POST", body: JSON.stringify(body) },
+    201,
+  );
+  return { body, result };
+}
+
+// A generated, completely pristine renewal is withdrawn without deleting its
+// issuance. The collectible API due becomes zero and a separate balanced
+// reversal journal records the accounting effect exactly once.
+const pristineCancellationRenewal = await createCancellationRenewalFixture(
+  "pristine generated renewal cancellation",
+);
+const pristineOldQuote = await createPaymentQuote(
+  pristineCancellationRenewal.invoiceId,
+  "usdt",
+  false,
+);
+const pristineSchedule = await scheduleFixtureCancellation(
+  pristineCancellationRenewal,
+  "Synthetic customer withdraws a pristine generated renewal at cycle end",
+);
+assert.equal(pristineSchedule.result.replayed, false);
+const pristineReplay = await request<typeof pristineSchedule.result>(
+  `/api/v1/services/${pristineCancellationRenewal.service.service.id}/cancellation`,
+  { method: "POST", body: JSON.stringify(pristineSchedule.body) },
+  200,
+);
+assert.equal(pristineReplay.replayed, true);
+assert.equal(
+  pristineReplay.cancellation.requestId,
+  pristineSchedule.result.cancellation.requestId,
+);
+const customerRenewalsAfterCancellation = await request<{
+  items: Array<{
+    renewalId: string;
+    invoiceId: string;
+    totalMinor: string;
+    dueMinor: string;
+    status: string;
+    fundingStatus: string;
+    renewalStatus: string;
+  }>;
+}>("/api/v1/billing/renewals");
+const cancelledCustomerRenewal = customerRenewalsAfterCancellation.items.find(
+  (item) => item.renewalId === pristineCancellationRenewal.renewalId,
+);
+assert.ok(cancelledCustomerRenewal);
+assert.equal(cancelledCustomerRenewal.invoiceId, pristineCancellationRenewal.invoiceId);
+assert.equal(cancelledCustomerRenewal.totalMinor, pristineCancellationRenewal.totalMinor);
+assert.equal(cancelledCustomerRenewal.dueMinor, "0");
+assert.equal(cancelledCustomerRenewal.status, "cancelled");
+assert.equal(cancelledCustomerRenewal.fundingStatus, "cancelled");
+assert.equal(cancelledCustomerRenewal.renewalStatus, "cancelled");
+const pristineCancellationFacts = await corePool.query<{
+  renewal_status: string;
+  invoice_total_minor: string;
+  cancellation_facts: string;
+  reversal_journals: string;
+  reversal_lines: string;
+  debit_minor: string;
+  credit_minor: string;
+  deferred_revenue_debit_minor: string;
+  receivable_credit_minor: string;
+}>(
+  `SELECT renewal.status AS renewal_status,
+          invoice.total_minor::text AS invoice_total_minor,
+          (SELECT count(*)::text
+           FROM service_renewal_cancellations cancellation
+           WHERE cancellation.renewal_id = renewal.id) AS cancellation_facts,
+          (SELECT count(*)::text
+           FROM ledger_journals journal
+           WHERE journal.source_type = 'service_renewal_cancellation'
+             AND journal.source_id IN (
+               SELECT cancellation.id
+               FROM service_renewal_cancellations cancellation
+               WHERE cancellation.renewal_id = renewal.id
+             )) AS reversal_journals,
+          (SELECT count(*)::text
+           FROM ledger_lines line
+           JOIN ledger_journals journal ON journal.id = line.journal_id
+           WHERE journal.source_type = 'service_renewal_cancellation'
+             AND journal.source_id IN (
+               SELECT cancellation.id
+               FROM service_renewal_cancellations cancellation
+               WHERE cancellation.renewal_id = renewal.id
+             )) AS reversal_lines,
+          COALESCE((SELECT sum(line.debit_minor)::text
+           FROM ledger_lines line
+           JOIN ledger_journals journal ON journal.id = line.journal_id
+           WHERE journal.source_type = 'service_renewal_cancellation'
+             AND journal.source_id IN (
+               SELECT cancellation.id FROM service_renewal_cancellations cancellation
+               WHERE cancellation.renewal_id = renewal.id
+             )), '0') AS debit_minor,
+          COALESCE((SELECT sum(line.credit_minor)::text
+           FROM ledger_lines line
+           JOIN ledger_journals journal ON journal.id = line.journal_id
+           WHERE journal.source_type = 'service_renewal_cancellation'
+             AND journal.source_id IN (
+               SELECT cancellation.id FROM service_renewal_cancellations cancellation
+               WHERE cancellation.renewal_id = renewal.id
+             )), '0') AS credit_minor,
+          COALESCE((SELECT sum(line.debit_minor)::text
+           FROM ledger_lines line
+           JOIN ledger_journals journal ON journal.id = line.journal_id
+           WHERE journal.source_type = 'service_renewal_cancellation'
+             AND journal.source_id IN (
+               SELECT cancellation.id FROM service_renewal_cancellations cancellation
+               WHERE cancellation.renewal_id = renewal.id
+             ) AND line.account_code = 'deferred_service_revenue'), '0')
+            AS deferred_revenue_debit_minor,
+          COALESCE((SELECT sum(line.credit_minor)::text
+           FROM ledger_lines line
+           JOIN ledger_journals journal ON journal.id = line.journal_id
+           WHERE journal.source_type = 'service_renewal_cancellation'
+             AND journal.source_id IN (
+               SELECT cancellation.id FROM service_renewal_cancellations cancellation
+               WHERE cancellation.renewal_id = renewal.id
+             ) AND line.account_code = 'accounts_receivable'), '0')
+            AS receivable_credit_minor
+   FROM service_renewals renewal
+   JOIN invoices invoice ON invoice.id = renewal.invoice_id
+   WHERE renewal.id = $1`,
+  [pristineCancellationRenewal.renewalId],
+);
+assert.deepEqual(pristineCancellationFacts.rows[0], {
+  renewal_status: "cancelled",
+  invoice_total_minor: pristineCancellationRenewal.totalMinor,
+  cancellation_facts: "1",
+  reversal_journals: "1",
+  reversal_lines: "2",
+  debit_minor: pristineCancellationRenewal.totalMinor,
+  credit_minor: pristineCancellationRenewal.totalMinor,
+  deferred_revenue_debit_minor: pristineCancellationRenewal.totalMinor,
+  receivable_credit_minor: pristineCancellationRenewal.totalMinor,
+});
+const obsoleteRenewalQuote = await rawCoreRequest(
+  `/api/v1/invoices/${pristineCancellationRenewal.invoiceId}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: pristineOldQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(obsoleteRenewalQuote.status, 409);
+assert.equal(obsoleteRenewalQuote.body.code, "INVOICE_CANCELLED");
+
+// A cancelled renewal keeps its historical invoice total, but it is no longer
+// an accounts receivable. Both partial and full staff allocation attempts must
+// leave the unclaimed receipt and every accounting fact unchanged.
+const cancelledAllocationProvider = await corePool.query<{
+  provider_installation_id: string;
+}>(
+  `SELECT provider_installation_id
+   FROM payment_attempts
+   WHERE client_account_id = $1
+   ORDER BY created_at
+   LIMIT 1`,
+  [cancellationIdentityRow.client_account_id],
+);
+const cancelledAllocationProviderId =
+  cancelledAllocationProvider.rows[0]?.provider_installation_id;
+assert.ok(cancelledAllocationProviderId);
+const cancelledAllocationAttemptId = randomUUID();
+const cancelledAllocationReceiptId = randomUUID();
+const cancelledAllocationExternalId = `mock-cancelled-renewal-allocation-${randomUUID()}`;
+await corePool.query(
+  `INSERT INTO payment_attempts(
+     id, client_account_id, invoice_id, provider_installation_id,
+     external_payment_id, status, amount_minor, currency, scenario,
+     idempotency_key, request_fingerprint, provider_occurred_at
+   ) VALUES ($1, $2, $3, $4, $5, 'succeeded', $6, 'USD', 'success', $7, $8, now())`,
+  [
+    cancelledAllocationAttemptId,
+    cancellationIdentityRow.client_account_id,
+    cancellationOrder.invoice.id,
+    cancelledAllocationProviderId,
+    cancelledAllocationExternalId,
+    pristineCancellationRenewal.totalMinor,
+    `cancelled-renewal-allocation-attempt:${randomUUID()}`,
+    `cancelled-renewal-allocation-fingerprint:${randomUUID()}`,
+  ],
+);
+await corePool.query(
+  `INSERT INTO fund_receipts(
+     id, provider_installation_id, external_payment_id,
+     reported_payment_attempt_id, client_account_id, amount_minor,
+     allocated_minor, currency, occurred_at, disposition, reason
+   ) VALUES ($1, $2, $3, $4, $5, $6, 0, 'USD', now(), 'unclaimed', $7)`,
+  [
+    cancelledAllocationReceiptId,
+    cancelledAllocationProviderId,
+    cancelledAllocationExternalId,
+    cancelledAllocationAttemptId,
+    cancellationIdentityRow.client_account_id,
+    pristineCancellationRenewal.totalMinor,
+    "Synthetic unclaimed receipt must not reopen a cancelled renewal receivable",
+  ],
+);
+async function cancelledAllocationSnapshot() {
+  const snapshot = await corePool.query<{
+    allocated_minor: string;
+    disposition: string;
+    resolutions: string;
+    allocations: string;
+    journals: string;
+  }>(
+    `SELECT receipt.allocated_minor::text,
+            receipt.disposition,
+            (SELECT count(*)::text FROM fund_receipt_resolutions resolution
+             WHERE resolution.fund_receipt_id = receipt.id) AS resolutions,
+            (SELECT count(*)::text FROM fund_receipt_allocations allocation
+             WHERE allocation.fund_receipt_id = receipt.id) AS allocations,
+            (SELECT count(*)::text
+             FROM ledger_journals journal
+             WHERE journal.source_type = 'fund_receipt_resolution'
+               AND journal.source_id IN (
+                 SELECT resolution.id FROM fund_receipt_resolutions resolution
+                 WHERE resolution.fund_receipt_id = receipt.id
+               )) AS journals
+     FROM fund_receipts receipt
+     WHERE receipt.id = $1`,
+    [cancelledAllocationReceiptId],
+  );
+  assert.ok(snapshot.rows[0]);
+  return snapshot.rows[0];
+}
+const cancelledAllocationBefore = await cancelledAllocationSnapshot();
+cookie = staffCookie;
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+for (const amountMinor of ["1", pristineCancellationRenewal.totalMinor]) {
+  const rejectedAllocation = await rawCoreRequest(
+    `/api/v1/admin/funds/${cancelledAllocationReceiptId}/resolutions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "allocate_invoice",
+        amountMinor,
+        invoiceId: pristineCancellationRenewal.invoiceId,
+        reason: "Synthetic cancelled renewal must reject this fund allocation",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+  );
+  assert.equal(rejectedAllocation.status, 409);
+  assert.equal(rejectedAllocation.body.code, "INVOICE_CANCELLED");
+  assert.deepEqual(await cancelledAllocationSnapshot(), cancelledAllocationBefore);
+}
+
+// The PostgreSQL boundary independently rejects a valid-looking immutable
+// resolution if a future path tries to attach its funds to the cancelled
+// renewal without going through the API eligibility check.
+const cancelledGuardClient = await corePool.connect();
+try {
+  await cancelledGuardClient.query("BEGIN");
+  const resolutionId = randomUUID();
+  await cancelledGuardClient.query(
+    `INSERT INTO fund_receipt_resolutions(
+       id, fund_receipt_id, client_account_id, action, amount_minor,
+       currency, invoice_id, actor_id, reason, idempotency_key,
+       request_fingerprint, result
+     ) VALUES ($1, $2, $3, 'allocate_invoice', 1, 'USD', $4, $5, $6, $7, $8, $9)`,
+    [
+      resolutionId,
+      cancelledAllocationReceiptId,
+      cancellationIdentityRow.client_account_id,
+      pristineCancellationRenewal.invoiceId,
+      staffMe.id,
+      "Synthetic database guard for a cancelled renewal allocation",
+      `cancelled-renewal-resolution:${randomUUID()}`,
+      `cancelled-renewal-resolution-fingerprint:${randomUUID()}`,
+      { status: "synthetic_guard" },
+    ],
+  );
+  await assert.rejects(
+    cancelledGuardClient.query(
+      `INSERT INTO fund_receipt_allocations(
+         resolution_id, fund_receipt_id, invoice_id, amount_minor
+       ) VALUES ($1, $2, $3, 1)`,
+      [resolutionId, cancelledAllocationReceiptId, pristineCancellationRenewal.invoiceId],
+    ),
+    /cancelled renewal invoices cannot receive allocations/i,
+  );
+} finally {
+  await cancelledGuardClient.query("ROLLBACK").catch(() => undefined);
+  cancelledGuardClient.release();
+}
+cookie = cancellationCookie;
+
+async function cancellationFinancialSnapshot(fixture: CancellationRenewalFixture) {
+  const result = await corePool.query<{
+    requests: string;
+    renewal_cancellations: string;
+    renewal_status: string;
+    invoice_total_minor: string;
+    payment_attempts: string;
+    payment_allocated_minor: string;
+    credit_allocated_minor: string;
+    fund_allocated_minor: string;
+    invoice_journals: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM service_cancellation_requests
+        WHERE service_id = $1) AS requests,
+       (SELECT count(*)::text FROM service_renewal_cancellations
+        WHERE renewal_id = $2) AS renewal_cancellations,
+       (SELECT status FROM service_renewals WHERE id = $2) AS renewal_status,
+       (SELECT total_minor::text FROM invoices WHERE id = $3) AS invoice_total_minor,
+       (SELECT count(*)::text FROM payment_attempts WHERE invoice_id = $3)
+         AS payment_attempts,
+       COALESCE((SELECT sum(amount_minor)::text FROM payment_allocations
+                 WHERE invoice_id = $3), '0') AS payment_allocated_minor,
+       COALESCE((SELECT sum(amount_minor)::text FROM credit_allocations
+                 WHERE invoice_id = $3), '0') AS credit_allocated_minor,
+       COALESCE((SELECT sum(amount_minor)::text FROM fund_receipt_allocations
+                 WHERE invoice_id = $3), '0') AS fund_allocated_minor,
+       (SELECT count(*)::text FROM ledger_journals journal
+        WHERE (journal.source_type = 'invoice_issuance' AND journal.source_id = $3)
+           OR (journal.source_type = 'service_renewal_cancellation'
+               AND journal.source_id IN (
+                 SELECT cancellation.id FROM service_renewal_cancellations cancellation
+                 WHERE cancellation.renewal_id = $2
+               ))) AS invoice_journals`,
+    [fixture.service.service.id, fixture.renewalId, fixture.invoiceId],
+  );
+  assert.ok(result.rows[0]);
+  return result.rows[0];
+}
+
+async function assertCancellationRejectedWithoutFinancialMutation(
+  fixture: CancellationRenewalFixture,
+  expectedCode: string,
+  reason: string,
+): Promise<void> {
+  cookie = cancellationCookie;
+  const current = await request<OrderDetail>(`/api/v1/orders/${fixture.order.order.id}`);
+  const before = await cancellationFinancialSnapshot(fixture);
+  const rejected = await rawCoreRequest(
+    `/api/v1/services/${fixture.service.service.id}/cancellation`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        expectedVersion: current.service.version,
+        reason,
+        idempotencyKey: randomUUID(),
+      }),
+    },
+  );
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.code, expectedCode);
+  assert.deepEqual(await cancellationFinancialSnapshot(fixture), before);
+}
+
+const unresolvedCancellationRenewal = await createCancellationRenewalFixture(
+  "unresolved renewal payment cancellation rejection",
+);
+await installPaymentStartDelay();
+try {
+  const unresolvedQuote = await createPaymentQuote(
+    unresolvedCancellationRenewal.invoiceId,
+    "usdt",
+    false,
+  );
+  const unresolvedCommand = await request<PaymentCommand>(
+    `/api/v1/invoices/${unresolvedCancellationRenewal.invoiceId}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: unresolvedQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(unresolvedCommand.paymentAttemptId);
+  const unresolvedAttempt = await corePool.query<{ status: string }>(
+    "SELECT status FROM payment_attempts WHERE id = $1",
+    [unresolvedCommand.paymentAttemptId],
+  );
+  assert.equal(unresolvedAttempt.rows[0]?.status, "created");
+  await assertCancellationRejectedWithoutFinancialMutation(
+    unresolvedCancellationRenewal,
+    "PAYMENT_RESULT_UNKNOWN",
+    "Synthetic unresolved Provider payment must be reconciled before cancellation",
+  );
+} finally {
+  await dropPaymentStartDelay();
+}
+
+const failedCancellationRenewal = await createCancellationRenewalFixture(
+  "failed renewal payment cancellation rejection",
+);
+const failedRenewalQuote = await createPaymentQuote(
+  failedCancellationRenewal.invoiceId,
+  "usdt",
+  false,
+);
+const failedRenewalCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${failedCancellationRenewal.invoiceId}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: failedRenewalQuote.quoteId,
+      scenario: "failed",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+await waitFor(
+  "failed renewal payment history",
+  () => readPaymentRecords(failedRenewalCommand.commandId),
+  (records) => records.attempt_status === "failed",
+);
+await assertCancellationRejectedWithoutFinancialMutation(
+  failedCancellationRenewal,
+  "RENEWAL_PAYMENT_HISTORY_REQUIRES_REVIEW",
+  "Synthetic failed renewal payment history requires explicit staff review",
+);
+
+const allocatedCancellationRenewal = await createCancellationRenewalFixture(
+  "allocated renewal cancellation rejection",
+);
+const syntheticReceiptAttemptId = randomUUID();
+const syntheticReceiptId = randomUUID();
+const syntheticReceiptExternalId = `mock-cancellation-allocation-${randomUUID()}`;
+const syntheticPaymentProvider = await corePool.query<{ provider_installation_id: string }>(
+  `SELECT provider_installation_id
+   FROM payment_attempts
+   WHERE client_account_id = $1
+   ORDER BY created_at
+   LIMIT 1`,
+  [cancellationIdentityRow.client_account_id],
+);
+assert.ok(syntheticPaymentProvider.rows[0]);
+await corePool.query(
+  `INSERT INTO payment_attempts(
+     id, client_account_id, invoice_id, provider_installation_id,
+     external_payment_id, status, amount_minor, currency, scenario,
+     idempotency_key, request_fingerprint, provider_occurred_at
+   ) VALUES ($1, $2, $3, $4, $5, 'succeeded', 2, 'USD', 'success', $6, $7, now())`,
+  [
+    syntheticReceiptAttemptId,
+    cancellationIdentityRow.client_account_id,
+    cancellationOrder.invoice.id,
+    syntheticPaymentProvider.rows[0].provider_installation_id,
+    syntheticReceiptExternalId,
+    `synthetic-allocation-attempt:${randomUUID()}`,
+    `synthetic-allocation-fingerprint:${randomUUID()}`,
+  ],
+);
+await corePool.query(
+  `INSERT INTO fund_receipts(
+     id, provider_installation_id, external_payment_id,
+     reported_payment_attempt_id, client_account_id, amount_minor,
+     allocated_minor, currency, occurred_at, disposition, reason
+   ) VALUES ($1, $2, $3, $4, $5, 2, 0, 'USD', now(), 'unclaimed', $6)`,
+  [
+    syntheticReceiptId,
+    syntheticPaymentProvider.rows[0].provider_installation_id,
+    syntheticReceiptExternalId,
+    syntheticReceiptAttemptId,
+    cancellationIdentityRow.client_account_id,
+    "Synthetic unmatched receipt for cancellation allocation guard",
+  ],
+);
+cookie = staffCookie;
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+await request(
+  `/api/v1/admin/funds/${syntheticReceiptId}/resolutions`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      action: "allocate_invoice",
+      amountMinor: "1",
+      invoiceId: allocatedCancellationRenewal.invoiceId,
+      reason: "Synthetic partial allocation must prevent silent renewal withdrawal",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+await assertCancellationRejectedWithoutFinancialMutation(
+  allocatedCancellationRenewal,
+  "RENEWAL_FINANCIAL_FACTS_REQUIRE_REVIEW",
+  "Synthetic allocated renewal funds require explicit staff review",
+);
+
+const heldCancellationRenewal = await createCancellationRenewalFixture(
+  "manual hold renewal cancellation rejection",
+);
+const heldRenewalQuote = await createPaymentQuote(
+  heldCancellationRenewal.invoiceId,
+  "usdt",
+  false,
+);
+await corePool.query(
+  `UPDATE services
+   SET term_end = term_end + interval '1 day', updated_at = now(), version = version + 1
+   WHERE id = $1`,
+  [heldCancellationRenewal.service.service.id],
+);
+const heldRenewalCommand = await request<PaymentCommand>(
+  `/api/v1/invoices/${heldCancellationRenewal.invoiceId}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: heldRenewalQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  202,
+);
+assert.ok(heldRenewalCommand.paymentAttemptId);
+await waitFor(
+  "renewal payment to enter manual hold after a term conflict",
+  async () => {
+    const result = await corePool.query<{ status: string }>(
+      "SELECT status FROM service_renewals WHERE id = $1",
+      [heldCancellationRenewal.renewalId],
+    );
+    return result.rows[0]?.status ?? "missing";
+  },
+  (status) => status === "manual_hold",
+  30_000,
+);
+await corePool.query(
+  `UPDATE services
+   SET term_end = $2, updated_at = now(), version = version + 1
+   WHERE id = $1`,
+  [heldCancellationRenewal.service.service.id, heldCancellationRenewal.periodStart],
+);
+await assertCancellationRejectedWithoutFinancialMutation(
+  heldCancellationRenewal,
+  "RENEWAL_HOLD_REQUIRES_STAFF",
+  "Synthetic funded renewal hold cannot be withdrawn by customer cancellation",
+);
+
+const delinquentCancellationRenewal = await createCancellationRenewalFixture(
+  "delinquent renewal cancellation rejection",
+);
+const delinquencyEffectiveAt = new Date(
+  delinquentCancellationRenewal.periodStart.getTime() + 5 * 24 * 60 * 60 * 1_000,
+);
+const delinquencyRun = await runSignedBillingDay({
+  businessDate: delinquencyEffectiveAt.toISOString().slice(0, 10),
+  effectiveAt: delinquencyEffectiveAt.toISOString(),
+});
+assert.equal(delinquencyRun.status, 201);
+const delinquencyFact = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM invoice_late_fee_assessments
+   WHERE invoice_id = $1`,
+  [delinquentCancellationRenewal.invoiceId],
+);
+assert.equal(delinquencyFact.rows[0]?.count, "1");
+await assertCancellationRejectedWithoutFinancialMutation(
+  delinquentCancellationRenewal,
+  "RENEWAL_DELINQUENCY_REQUIRES_REVIEW",
+  "Synthetic renewal delinquency actions require explicit staff review",
+);
+
+async function createCancellationPolicyFixture(input: {
+  productId: "equinix-hk2-colocation" | "remote-hands";
+  productName: string;
+  fulfillmentMode: "quote" | "manual";
+  billingCycle: "monthly" | "one_time";
+  withBinding: boolean;
+}): Promise<string> {
+  const orderId = randomUUID();
+  const orderItemId = randomUUID();
+  const serviceId = randomUUID();
+  const snapshot = {
+    productId: input.productId,
+    productName: input.productName,
+    fulfillmentMode: input.fulfillmentMode,
+    billingCycle: input.billingCycle,
+    components: [],
+    oneTimeSubtotalMinor: "0",
+    setupMinor: "0",
+    recurringSubtotalMinor: "0",
+    invoiceTotalMinor: "0",
+  };
+  const client = await corePool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO orders(
+         id, client_account_id, submitted_by_user_id, status, currency,
+         price_snapshot, one_time_minor, setup_minor, recurring_minor,
+         total_minor, idempotency_key, request_fingerprint
+       ) VALUES ($1, $2, $3, 'completed', 'USD', $4, 0, 0, 0, 0, $5, $6)`,
+      [
+        orderId,
+        cancellationIdentityRow!.client_account_id,
+        cancellationIdentityRow!.user_id,
+        snapshot,
+        `synthetic-policy-order:${randomUUID()}`,
+        `synthetic-policy-order-fingerprint:${randomUUID()}`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO order_items(
+         id, order_id, product_id, product_name, fulfillment_mode,
+         billing_cycle, configuration, price_snapshot
+       ) VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7)`,
+      [
+        orderItemId,
+        orderId,
+        input.productId,
+        input.productName,
+        input.fulfillmentMode,
+        input.billingCycle,
+        snapshot,
+      ],
+    );
+    await client.query(
+      `INSERT INTO services(
+         id, client_account_id, order_item_id, status, billing_cycle,
+         activated_at, term_start, term_end, external_resource_id
+       ) VALUES ($1, $2, $3, 'active', $4, now(), now(),
+                 CASE WHEN $4 = 'one_time' THEN NULL ELSE now() + interval '60 days' END,
+                 $5)`,
+      [
+        serviceId,
+        cancellationIdentityRow!.client_account_id,
+        orderItemId,
+        input.billingCycle,
+        `synthetic-policy-resource-${randomUUID()}`,
+      ],
+    );
+    if (input.withBinding) {
+      const binding = await client.query(
+        `INSERT INTO service_provider_bindings(
+           service_id, provider_installation_id, overdue_action_snapshot,
+           capability_snapshot, product_policy_version,
+           cycle_end_cancellation_mode_snapshot,
+           cycle_end_cancellation_execution_mode_snapshot,
+           cycle_end_cancellation_min_notice_hours_snapshot,
+           cycle_end_cancellation_requirement_key_snapshot
+         )
+         SELECT $1, policy.provider_installation_id, policy.overdue_action,
+                COALESCE(provider.capabilities, '[]'::jsonb), policy.version,
+                policy.cycle_end_cancellation_mode,
+                policy.cycle_end_cancellation_execution_mode,
+                policy.cycle_end_cancellation_min_notice_hours,
+                policy.cycle_end_cancellation_requirement_key
+         FROM product_service_automation_policies policy
+         LEFT JOIN provider_installation_capabilities provider
+           ON provider.provider_installation_id = policy.provider_installation_id
+         WHERE policy.product_id = $2
+         RETURNING service_id`,
+        [serviceId, input.productId],
+      );
+      assert.equal(binding.rowCount, 1);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+  return serviceId;
+}
+
+cookie = cancellationCookie;
+const colocationCancellationServiceId = await createCancellationPolicyFixture({
+  productId: "equinix-hk2-colocation",
+  productName: "Synthetic authenticated-ticket Colocation",
+  fulfillmentMode: "quote",
+  billingCycle: "monthly",
+  withBinding: true,
+});
+const colocationCancellationAttempt = await rawCoreRequest(
+  `/api/v1/services/${colocationCancellationServiceId}/cancellation`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      expectedVersion: 1,
+      reason: "Synthetic Colocation has no authenticated termination ticket",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(colocationCancellationAttempt.status, 409);
+assert.equal(
+  colocationCancellationAttempt.body.code,
+  "CANCELLATION_TICKET_GATE_UNAVAILABLE",
+);
+const colocationScheduleFacts = await corePool.query<{
+  requests: string;
+  cancellation_request_id: string | null;
+}>(
+  `SELECT
+     (SELECT count(*)::text FROM service_cancellation_requests WHERE service_id = service.id)
+       AS requests,
+     service.cancellation_request_id
+   FROM services service WHERE service.id = $1`,
+  [colocationCancellationServiceId],
+);
+assert.deepEqual(colocationScheduleFacts.rows[0], {
+  requests: "0",
+  cancellation_request_id: null,
+});
+
+const remoteHandsCancellationServiceId = await createCancellationPolicyFixture({
+  productId: "remote-hands",
+  productName: "Synthetic one-time Remote Hands",
+  fulfillmentMode: "manual",
+  billingCycle: "one_time",
+  withBinding: false,
+});
+const remoteHandsPolicy = await corePool.query<{
+  cancellation_mode: string;
+  billing_cycle: string;
+}>(
+  `SELECT policy.cycle_end_cancellation_mode AS cancellation_mode,
+          service.billing_cycle
+   FROM services service
+   JOIN order_items item ON item.id = service.order_item_id
+   JOIN product_service_automation_policies policy ON policy.product_id = item.product_id
+   WHERE service.id = $1`,
+  [remoteHandsCancellationServiceId],
+);
+assert.deepEqual(remoteHandsPolicy.rows[0], {
+  cancellation_mode: "disabled",
+  billing_cycle: "one_time",
+});
+const remoteHandsCancellationAttempt = await rawCoreRequest(
+  `/api/v1/services/${remoteHandsCancellationServiceId}/cancellation`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      expectedVersion: 1,
+      reason: "Synthetic one-time Remote Hands has no recurring cycle to cancel",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(remoteHandsCancellationAttempt.status, 409);
+assert.equal(remoteHandsCancellationAttempt.body.code, "CANCELLATION_NOT_ALLOWED");
+const remoteHandsScheduleFacts = await corePool.query<{ requests: string }>(
+  "SELECT count(*)::text AS requests FROM service_cancellation_requests WHERE service_id = $1",
+  [remoteHandsCancellationServiceId],
+);
+assert.equal(remoteHandsScheduleFacts.rows[0]?.requests, "0");
+
+// A scheduled automatic cancellation reaches the paid-through instant. The
+// Mock Provider commits the termination but times out the one and only POST;
+// Worker recovery must use GET-only reconciliation before Core marks the
+// service terminated.
+cookie = cancellationCookie;
+const mixedCancellationPolicy = await corePool.query<{ version: number }>(
+  `UPDATE product_service_automation_policies policy
+   SET overdue_action = 'manual', version = policy.version + 1, updated_at = now()
+   WHERE policy.product_id = (
+     SELECT price.product_id
+     FROM product_prices price
+     WHERE price.id = $1
+   )
+   RETURNING version`,
+  [automaticPrice.id],
+);
+assert.ok(mixedCancellationPolicy.rows[0]?.version);
+const dueCancellationOrder = await createOrder(automaticPrice.id, legal);
+await pay(dueCancellationOrder, "success");
+const dueCancellationActive = await waitFor(
+  "automatic cancellation due fixture activation",
+  () => request<OrderDetail>(`/api/v1/orders/${dueCancellationOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+const mixedCancellationBinding = await corePool.query<{
+  overdue_action_snapshot: string;
+  cancellation_execution_mode: string;
+}>(
+  `SELECT overdue_action_snapshot,
+          cycle_end_cancellation_execution_mode_snapshot AS cancellation_execution_mode
+   FROM service_provider_bindings
+   WHERE service_id = $1`,
+  [dueCancellationActive.service.id],
+);
+assert.deepEqual(mixedCancellationBinding.rows[0], {
+  overdue_action_snapshot: "manual",
+  cancellation_execution_mode: "automatic",
+});
+const dueCancellationVersion = await corePool.query<{ version: number }>(
+  `UPDATE services
+   SET term_end = now() + interval '60 seconds', updated_at = now(), version = version + 1
+   WHERE id = $1
+   RETURNING version`,
+  [dueCancellationActive.service.id],
+);
+const dueCancellationExpectedVersion = dueCancellationVersion.rows[0]?.version;
+assert.ok(dueCancellationExpectedVersion);
+const dueCancellationScheduled = await request<{
+  cancellation: {
+    requestId: string;
+    status: "scheduled";
+    executionMode: "automatic";
+    executionStatus: "scheduled";
+  };
+  serviceVersion: number;
+}>(`/api/v1/services/${dueCancellationActive.service.id}/cancellation`, {
+  method: "POST",
+  body: JSON.stringify({
+    expectedVersion: dueCancellationExpectedVersion,
+    reason: "Synthetic timeout-success cycle-end termination",
+    idempotencyKey: randomUUID(),
+  }),
+}, 201);
+assert.equal(dueCancellationScheduled.cancellation.executionMode, "automatic");
+await assert.rejects(
+  corePool.query(
+    `UPDATE services
+     SET status = 'terminated', updated_at = now(), version = version + 1
+     WHERE id = $1`,
+    [dueCancellationActive.service.id],
+  ),
+  /confirmed Provider success/i,
+  "automatic cancellation cannot mark a service terminated before Provider success",
+);
+await corePool.query(
+  `UPDATE durable_jobs
+   SET payload = payload || '{"scenario":"timeout_success"}'::jsonb
+   WHERE job_type = 'service.cancellation.due'
+     AND unique_key = $1
+     AND status = 'pending'`,
+  [`service-cancellation:${dueCancellationScheduled.cancellation.requestId}:terminate`],
+);
+const dueCancellationTerminated = await waitFor(
+  "timeout-success cancellation to reconcile and terminate",
+  () => request<OrderDetail>(`/api/v1/orders/${dueCancellationOrder.order.id}`),
+  (value) =>
+    value.service.status === "terminated" &&
+    value.service.cancellation?.status === "terminated",
+  120_000,
+);
+assert.equal(dueCancellationTerminated.service.cancellation?.executionMode, "automatic");
+assert.equal(dueCancellationTerminated.service.cancellation?.providerOperation?.attempts, 1);
+const dueCancellationFacts = await corePool.query<{
+  execution_status: string;
+  service_status: string;
+  operation_status: string;
+  attempt_count: number;
+  due_job_status: string;
+  reconcile_job_status: string | null;
+  request_term_exact: boolean;
+  job_effective_exact: boolean;
+}>(
+  `SELECT execution.status AS execution_status,
+          service.status AS service_status,
+          operation.status AS operation_status,
+          operation.attempt_count,
+          due_job.status AS due_job_status,
+          reconcile_job.status AS reconcile_job_status,
+          cancellation_request.effective_at = service.term_end AS request_term_exact,
+          due_job.available_at = cancellation_request.effective_at AS job_effective_exact
+   FROM service_cancellation_requests cancellation_request
+   JOIN service_cancellation_executions execution
+     ON execution.cancellation_request_id = cancellation_request.id
+   JOIN services service ON service.id = execution.service_id
+   JOIN provider_operations operation
+     ON operation.subject_type = 'service_cancellation_execution'
+    AND operation.subject_id = execution.id
+    AND operation.kind = 'resource_terminate'
+   JOIN durable_jobs due_job
+     ON due_job.job_type = 'service.cancellation.due'
+    AND due_job.unique_key = operation.stable_key
+   LEFT JOIN durable_jobs reconcile_job
+     ON reconcile_job.job_type = 'service.cancellation.reconcile'
+    AND reconcile_job.unique_key = operation.stable_key
+   WHERE cancellation_request.id = $1`,
+  [dueCancellationScheduled.cancellation.requestId],
+);
+assert.deepEqual(dueCancellationFacts.rows[0], {
+  execution_status: "terminated",
+  service_status: "terminated",
+  operation_status: "succeeded",
+  attempt_count: 1,
+  due_job_status: "completed",
+  reconcile_job_status: "completed",
+  request_term_exact: true,
+  job_effective_exact: true,
+});
+const dueProviderFacts = await providerPool.query<{
+  action: string;
+  status: string;
+  action_calls: number;
+  query_calls: number;
+}>(
+  `SELECT provider_action.action, provider_action.status,
+          provider_action.action_calls, provider_action.query_calls
+   FROM mock_resource_action_operations provider_action
+   JOIN mock_resource_operations resource
+     ON resource.service_id = provider_action.service_id
+    AND resource.external_resource_id = provider_action.external_resource_id
+   WHERE provider_action.service_id = $1
+     AND provider_action.action = 'terminate'`,
+  [dueCancellationActive.service.id],
+);
+assert.equal(dueProviderFacts.rows.length, 1);
+assert.deepEqual(
+  {
+    action: dueProviderFacts.rows[0]?.action,
+    status: dueProviderFacts.rows[0]?.status,
+    actionCalls: dueProviderFacts.rows[0]?.action_calls,
+  },
+  { action: "terminate", status: "succeeded", actionCalls: 1 },
+);
+assert.ok((dueProviderFacts.rows[0]?.query_calls ?? 0) >= 1);
+
+// A recurring manual product reaches the same due instant without any
+// Provider operation. It remains active and becomes a durable, readable human
+// intervention item instead of masquerading as terminated.
+cookie = staffCookie;
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const manualCancellationOrder = await createOrder(manualPrice.id, legal);
+const manualCancellationPaid = await pay(manualCancellationOrder, "success", 60_000);
+assert.equal(manualCancellationPaid.order.status, "awaiting_manual");
+await request(
+  `/api/v1/admin/services/${manualCancellationPaid.service.id}/complete-manual`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      reason: "Synthetic fresh manual delivery for the cycle-end cancellation queue",
+    }),
+  },
+  200,
+);
+const currentManualService = await request<OrderDetail>(
+  `/api/v1/orders/${manualCancellationOrder.order.id}`,
+);
+assert.equal(currentManualService.service.status, "active");
+const manualCancellationVersion = await corePool.query<{ version: number }>(
+  `UPDATE services
+   SET term_end = now() + interval '60 seconds', updated_at = now(), version = version + 1
+   WHERE id = $1
+   RETURNING version`,
+  [currentManualService.service.id],
+);
+const manualCancellationExpectedVersion = manualCancellationVersion.rows[0]?.version;
+assert.ok(manualCancellationExpectedVersion);
+const manualCancellationScheduled = await request<{
+  cancellation: {
+    requestId: string;
+    executionMode: "manual";
+  };
+}>(`/api/v1/services/${currentManualService.service.id}/cancellation`, {
+  method: "POST",
+  body: JSON.stringify({
+    expectedVersion: manualCancellationExpectedVersion,
+    reason: "Synthetic recurring manual service cycle-end cancellation",
+    idempotencyKey: randomUUID(),
+  }),
+}, 201);
+assert.equal(manualCancellationScheduled.cancellation.executionMode, "manual");
+const manualCancellationDue = await waitFor(
+  "manual cancellation due queue",
+  () => request<OrderDetail>(`/api/v1/orders/${manualCancellationOrder.order.id}`),
+  (value) => value.service.cancellation?.status === "manual",
+  100_000,
+);
+assert.equal(manualCancellationDue.service.status, "active");
+assert.equal(manualCancellationDue.service.cancellation?.providerOperation, null);
+const adminCancellationQueue = await request<{
+  items: Array<{
+    requestId: string;
+    executionId: string;
+    serviceStatus: string;
+    executionStatus: string;
+    executionVersion: number;
+    serviceVersion: number;
+    interventionRequired: boolean;
+    providerOperation: unknown;
+    job: { status: string };
+  }>;
+}>("/api/v1/admin/services/cancellations");
+const manualCancellationQueueItem = adminCancellationQueue.items.find(
+  (item) => item.requestId === manualCancellationScheduled.cancellation.requestId,
+);
+assert.ok(manualCancellationQueueItem);
+assert.equal(manualCancellationQueueItem.serviceStatus, "active");
+assert.equal(manualCancellationQueueItem.executionStatus, "manual");
+assert.equal(manualCancellationQueueItem.interventionRequired, true);
+assert.equal(manualCancellationQueueItem.providerOperation, null);
+assert.equal(manualCancellationQueueItem.job.status, "manual");
+const manualProviderOperation = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM provider_operations operation
+   JOIN service_cancellation_executions execution
+     ON operation.subject_type = 'service_cancellation_execution'
+    AND operation.subject_id = execution.id
+   WHERE execution.cancellation_request_id = $1`,
+  [manualCancellationScheduled.cancellation.requestId],
+);
+assert.equal(manualProviderOperation.rows[0]?.count, "0");
+
+await corePool.query(
+  "UPDATE reauth_grants SET invalidated_at = now() WHERE user_id = $1 AND invalidated_at IS NULL",
+  [staffMe.id],
+);
+const manualCompletionKey = randomUUID();
+const manualCompletionReason =
+  "Synthetic operator confirms the recurring manual service was fully de-racked";
+const manualCompletionBody = {
+  expectedExecutionVersion: manualCancellationQueueItem.executionVersion,
+  expectedServiceVersion: manualCancellationQueueItem.serviceVersion,
+  reason: manualCompletionReason,
+  idempotencyKey: manualCompletionKey,
+};
+const manualCompletionWithoutReauth = await rawCoreRequest(
+  `/api/v1/admin/services/cancellations/${manualCancellationQueueItem.executionId}/complete-manual`,
+  { method: "POST", body: JSON.stringify(manualCompletionBody) },
+);
+assert.equal(manualCompletionWithoutReauth.status, 403);
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+const completedManualCancellation = await request<{
+  actionId: string;
+  executionId: string;
+  serviceId: string;
+  executionStatus: "terminated";
+  serviceStatus: "terminated";
+  takeoverKind: "manual_delivery";
+  providerCalled: false;
+  completedAt: string;
+  replayed: boolean;
+}>(
+  `/api/v1/admin/services/cancellations/${manualCancellationQueueItem.executionId}/complete-manual`,
+  { method: "POST", body: JSON.stringify(manualCompletionBody) },
+  201,
+);
+assert.equal(completedManualCancellation.replayed, false);
+assert.equal(completedManualCancellation.executionStatus, "terminated");
+assert.equal(completedManualCancellation.serviceStatus, "terminated");
+assert.equal(completedManualCancellation.takeoverKind, "manual_delivery");
+assert.equal(completedManualCancellation.providerCalled, false);
+const replayedManualCompletion = await request<typeof completedManualCancellation>(
+  `/api/v1/admin/services/cancellations/${manualCancellationQueueItem.executionId}/complete-manual`,
+  { method: "POST", body: JSON.stringify(manualCompletionBody) },
+  200,
+);
+assert.equal(replayedManualCompletion.replayed, true);
+assert.equal(replayedManualCompletion.actionId, completedManualCancellation.actionId);
+const conflictingManualCompletion = await rawCoreRequest(
+  `/api/v1/admin/services/cancellations/${manualCancellationQueueItem.executionId}/complete-manual`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...manualCompletionBody,
+      reason: `${manualCompletionReason} with a conflicting replay payload`,
+    }),
+  },
+);
+assert.equal(conflictingManualCompletion.status, 409);
+assert.equal(conflictingManualCompletion.body.code, "IDEMPOTENCY_CONFLICT");
+const staleManualCompletion = await rawCoreRequest(
+  `/api/v1/admin/services/cancellations/${manualCancellationQueueItem.executionId}/complete-manual`,
+  {
+    method: "POST",
+    body: JSON.stringify({ ...manualCompletionBody, idempotencyKey: randomUUID() }),
+  },
+);
+assert.equal(staleManualCompletion.status, 409);
+assert.equal(staleManualCompletion.body.code, "VERSION_CONFLICT");
+const completedManualFacts = await corePool.query<{
+  service_status: string;
+  execution_status: string;
+  actions: string;
+  provider_operations: string;
+}>(
+  `SELECT service.status AS service_status,
+          execution.status AS execution_status,
+          (SELECT count(*)::text
+           FROM service_cancellation_manual_actions action
+           WHERE action.execution_id = execution.id) AS actions,
+          (SELECT count(*)::text
+           FROM provider_operations operation
+           WHERE operation.subject_type = 'service_cancellation_execution'
+             AND operation.subject_id = execution.id) AS provider_operations
+   FROM service_cancellation_executions execution
+   JOIN services service ON service.id = execution.service_id
+   WHERE execution.id = $1`,
+  [manualCancellationQueueItem.executionId],
+);
+assert.deepEqual(completedManualFacts.rows[0], {
+  service_status: "terminated",
+  execution_status: "terminated",
+  actions: "1",
+  provider_operations: "0",
+});
+const completedManualProviderCalls = await providerPool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM mock_resource_action_operations
+   WHERE service_id = $1 AND action = 'terminate'`,
+  [currentManualService.service.id],
+);
+assert.equal(completedManualProviderCalls.rows[0]?.count, "0");
+
+// Scheduling against an already-ended term is rejected before any request,
+// execution, Provider operation, or due job can be recorded.
+cookie = cancellationCookie;
+const endedCancellationOrder = await createOrder(automaticPrice.id, legal);
+await pay(endedCancellationOrder, "success");
+const endedCancellationActive = await waitFor(
+  "ended cancellation rejection fixture activation",
+  () => request<OrderDetail>(`/api/v1/orders/${endedCancellationOrder.order.id}`),
+  (value) => value.service.status === "active",
+);
+await corePool.query(
+  `UPDATE services
+   SET term_end = now() - interval '1 second', updated_at = now(), version = version + 1
+   WHERE id = $1`,
+  [endedCancellationActive.service.id],
+);
+const endedCancellationReady = await request<OrderDetail>(
+  `/api/v1/orders/${endedCancellationOrder.order.id}`,
+);
+const endedCancellationAttempt = await rawCoreRequest(
+  `/api/v1/services/${endedCancellationReady.service.id}/cancellation`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      expectedVersion: endedCancellationReady.service.version,
+      reason: "Synthetic ended service cannot schedule cancellation",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(endedCancellationAttempt.status, 409);
+assert.equal(endedCancellationAttempt.body.code, "CANCELLATION_NOT_ALLOWED");
+const endedCancellationFacts = await corePool.query<{ requests: string; jobs: string }>(
+  `SELECT
+     (SELECT count(*)::text FROM service_cancellation_requests WHERE service_id = $1) AS requests,
+     (SELECT count(*)::text FROM durable_jobs
+       WHERE job_type = 'service.cancellation.due'
+         AND payload->>'serviceId' = $1::text) AS jobs`,
+  [endedCancellationReady.service.id],
+);
+assert.deepEqual(endedCancellationFacts.rows[0], { requests: "0", jobs: "0" });
 cookie = staffCookie;
 
 const unbalancedJournals = await corePool.query<{ count: string }>(

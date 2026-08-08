@@ -8,6 +8,7 @@ import { requireUser, type AuthenticatedUser } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { recordInitialServicePeriod } from "./renewal-lifecycle.js";
 
@@ -311,6 +312,7 @@ export async function registerAdminRoutes(
             client_account_id: string;
             currency: string;
             total_minor: string;
+            order_id: string | null;
           }
         | undefined;
       if (body.action === "allocate_invoice") {
@@ -319,8 +321,9 @@ export async function registerAdminRoutes(
           client_account_id: string;
           currency: string;
           total_minor: string;
+          order_id: string | null;
         }>(
-          `SELECT id, client_account_id, currency, total_minor::text
+          `SELECT id, client_account_id, currency, total_minor::text, order_id
            FROM invoices
            WHERE id = $1
            FOR UPDATE`,
@@ -330,6 +333,7 @@ export async function registerAdminRoutes(
         if (!invoice) {
           throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
         }
+        await assertInvoicePaymentBusinessStateLocked(client, invoice.id, invoice.order_id);
       }
 
       await requireStaffActionLocked(client, user, "billing.unclaimed_manage");

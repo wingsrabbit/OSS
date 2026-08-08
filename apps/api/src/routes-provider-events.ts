@@ -60,6 +60,17 @@ const resourceActionEventSchema = z.object({
   occurredAt: z.iso.datetime(),
 });
 
+const resourceTerminationEventSchema = z.object({
+  eventId: z.string().min(1).max(160),
+  providerOperationId: z.uuid(),
+  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  serviceId: z.uuid(),
+  externalResourceId: z.string().min(1).max(200),
+  action: z.literal("terminate"),
+  status: z.enum(["succeeded", "failed"]),
+  occurredAt: z.iso.datetime(),
+});
+
 const refundEventSchema = z.object({
   eventId: z.string().min(1).max(160),
   providerOperationId: z.uuid(),
@@ -1828,6 +1839,314 @@ export async function registerProviderEventRoutes(
         ],
       );
       return { accepted: true, status: "succeeded" };
+    });
+    return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
+  });
+
+  app.post("/api/v1/provider-events/resource-termination", async (request, reply) => {
+    const body = resourceTerminationEventSchema.parse(request.body);
+    assertProviderSignature(request, config.MOCK_PROVISIONING_WEBHOOK_SECRET, body);
+    const outcome = await transaction(pool, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `provider-operation:${body.providerOperationId}`,
+      ]);
+      const pointerResult = await client.query<{
+        execution_id: string;
+        request_id: string;
+        service_id: string;
+        order_item_id: string;
+      }>(
+        `SELECT execution.id AS execution_id,
+                cancellation_request.id AS request_id,
+                service.id AS service_id,
+                service.order_item_id
+         FROM provider_operations operation
+         JOIN service_cancellation_executions execution
+           ON operation.subject_type = 'service_cancellation_execution'
+          AND operation.subject_id = execution.id
+         JOIN service_cancellation_requests cancellation_request
+           ON cancellation_request.id = execution.cancellation_request_id
+         JOIN services service ON service.id = execution.service_id
+         WHERE operation.id = $1`,
+        [body.providerOperationId],
+      );
+      const pointer = pointerResult.rows[0];
+      if (!pointer) return { rejected: true, reason: "unknown_provider_operation" };
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        pointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [pointer.service_id]);
+      await client.query(
+        "SELECT id FROM service_cancellation_requests WHERE id = $1 FOR UPDATE",
+        [pointer.request_id],
+      );
+      await client.query(
+        "SELECT id FROM service_cancellation_executions WHERE id = $1 FOR UPDATE",
+        [pointer.execution_id],
+      );
+      await client.query("SELECT id FROM provider_operations WHERE id = $1 FOR UPDATE", [
+        body.providerOperationId,
+      ]);
+      const stateResult = await client.query<{
+        operation_id: string;
+        operation_provider_installation_id: string;
+        operation_kind: string;
+        operation_status: string;
+        operation_stable_key: string;
+        operation_attempt_count: number;
+        operation_provider_occurred_at: Date | null;
+        execution_id: string;
+        execution_provider_installation_id: string | null;
+        execution_status: string;
+        execution_version: number;
+        execution_provider_occurred_at: Date | null;
+        request_id: string;
+        effective_at: Date;
+        service_id: string;
+        service_status: string;
+        external_resource_id: string | null;
+      }>(
+        `SELECT operation.id AS operation_id,
+                operation.provider_installation_id AS operation_provider_installation_id,
+                operation.kind AS operation_kind,
+                operation.status AS operation_status,
+                operation.stable_key AS operation_stable_key,
+                operation.attempt_count AS operation_attempt_count,
+                operation.provider_occurred_at AS operation_provider_occurred_at,
+                execution.id AS execution_id,
+                execution.provider_installation_id AS execution_provider_installation_id,
+                execution.status AS execution_status,
+                execution.version AS execution_version,
+                execution.provider_occurred_at AS execution_provider_occurred_at,
+                cancellation_request.id AS request_id,
+                cancellation_request.effective_at,
+                service.id AS service_id,
+                service.status AS service_status,
+                service.external_resource_id
+         FROM provider_operations operation
+         JOIN service_cancellation_executions execution
+           ON operation.subject_type = 'service_cancellation_execution'
+          AND operation.subject_id = execution.id
+         JOIN service_cancellation_requests cancellation_request
+           ON cancellation_request.id = execution.cancellation_request_id
+         JOIN services service ON service.id = execution.service_id
+         WHERE operation.id = $1`,
+        [body.providerOperationId],
+      );
+      const state = stateResult.rows[0];
+      if (
+        !state ||
+        state.execution_id !== pointer.execution_id ||
+        state.request_id !== pointer.request_id ||
+        state.service_id !== pointer.service_id
+      ) {
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+      if (
+        state.operation_provider_installation_id !== MOCK_PROVISIONING_INSTALLATION_ID ||
+        state.execution_provider_installation_id !== MOCK_PROVISIONING_INSTALLATION_ID ||
+        state.operation_kind !== "resource_terminate" ||
+        body.serviceId !== state.service_id ||
+        body.externalResourceId !== state.external_resource_id
+      ) {
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.termination_rejected",
+          "service_cancellation_execution",
+          state.execution_id,
+          "Provider termination does not match Core ownership or operation scope",
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+      if (
+        !providerOperationCapabilityMatches(
+          body.callbackCapability,
+          config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          state.operation_id,
+        )
+      ) {
+        return { rejected: true, reason: "invalid_operation_capability" };
+      }
+      if (state.operation_attempt_count === 0) {
+        return { rejected: true, reason: "provider_operation_not_started" };
+      }
+
+      const inbox = await insertInbox(
+        client,
+        MOCK_PROVISIONING_INSTALLATION_ID,
+        body.eventId,
+        "resource.termination",
+        body,
+      );
+      if (inbox === "duplicate") return { duplicate: true };
+      if (inbox === "conflict") {
+        return { rejected: true, reason: "event_id_conflict" };
+      }
+
+      const occurredAt = new Date(body.occurredAt);
+      const enqueueQueryOnly = async (reason: string) => {
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'unknown', last_error = $2, updated_at = now()
+           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+          [state.operation_id, reason],
+        );
+        if (state.execution_status === "processing") {
+          await client.query(
+            `UPDATE service_cancellation_executions
+             SET status = 'unknown', result = $2, last_error = $3,
+                 updated_at = now(), version = version + 1
+             WHERE id = $1 AND version = $4 AND status = 'processing'`,
+            [
+              state.execution_id,
+              { status: "unknown", reconciliation: "query_only" },
+              reason,
+              state.execution_version,
+            ],
+          );
+        }
+        await client.query(
+          `INSERT INTO durable_jobs(job_type, unique_key, payload)
+           VALUES ('service.cancellation.reconcile', $1, $2)
+           ON CONFLICT (job_type, unique_key) DO NOTHING`,
+          [
+            state.operation_stable_key,
+            {
+              cancellationRequestId: state.request_id,
+              executionId: state.execution_id,
+              serviceId: state.service_id,
+              providerOperationId: state.operation_id,
+            },
+          ],
+        );
+      };
+      if (occurredAt.getTime() > Date.now() + 5 * 60_000) {
+        await enqueueQueryOnly("Provider termination time is implausibly far in the future");
+        return { accepted: true, status: "unknown", reconciliationRequired: true };
+      }
+      if (
+        occurredAt.getTime() < state.effective_at.getTime() ||
+        !isAfter(state.operation_provider_occurred_at, occurredAt) ||
+        !isAfter(state.execution_provider_occurred_at, occurredAt)
+      ) {
+        return { ignored: true, reason: "stale_provider_fact" };
+      }
+      if (state.operation_status === "succeeded" || state.execution_status === "terminated") {
+        return { ignored: true, reason: "already_succeeded" };
+      }
+      if (state.operation_status === "failed" && body.status === "succeeded") {
+        await enqueueQueryOnly("Provider contradicted a definitive termination failure");
+        return { accepted: true, status: "manual", reconciliationRequired: true };
+      }
+      if (
+        state.operation_status === "failed" &&
+        state.execution_status === "manual" &&
+        body.status === "failed"
+      ) {
+        return { ignored: true, reason: "already_failed" };
+      }
+
+      if (body.status === "failed") {
+        const reason = "terminate was rejected by the Provider";
+        await client.query(
+          `UPDATE provider_operations
+           SET status = 'failed', provider_occurred_at = $2,
+               last_error = $3, updated_at = now()
+           WHERE id = $1 AND status <> 'succeeded'`,
+          [state.operation_id, occurredAt, reason],
+        );
+        await client.query(
+          `UPDATE service_cancellation_executions
+           SET status = 'manual', result = $2, provider_occurred_at = $3,
+               last_error = $4, updated_at = now(), version = version + 1
+           WHERE id = $1 AND version = $5
+             AND status NOT IN ('manual', 'terminated')`,
+          [
+            state.execution_id,
+            { status: "manual", providerStatus: "failed" },
+            occurredAt,
+            reason,
+            state.execution_version,
+          ],
+        );
+        await auditProvider(
+          client,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          "service.termination_manual",
+          "service_cancellation_execution",
+          state.execution_id,
+          reason,
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { accepted: true, status: "manual" };
+      }
+
+      await client.query(
+        `UPDATE provider_operations
+         SET status = 'succeeded', provider_occurred_at = $2,
+             external_reference = $3, last_error = NULL, updated_at = now()
+         WHERE id = $1 AND status <> 'succeeded'`,
+        [state.operation_id, occurredAt, body.externalResourceId],
+      );
+      const serviceUpdate = await client.query(
+        `UPDATE services
+         SET status = 'terminated', updated_at = now(), version = version + 1
+         WHERE id = $1 AND status IN ('active', 'suspended', 'provisioned_hold')
+         RETURNING id`,
+        [state.service_id],
+      );
+      if (serviceUpdate.rowCount !== 1) {
+        const reason =
+          "Provider confirmed termination but Core service state requires manual reconciliation";
+        await client.query(
+          `UPDATE service_cancellation_executions
+           SET status = 'manual', result = $2, provider_occurred_at = $3,
+               last_error = $4, updated_at = now(), version = version + 1
+           WHERE id = $1 AND version = $5 AND status <> 'terminated'`,
+          [
+            state.execution_id,
+            { status: "manual", providerStatus: "succeeded" },
+            occurredAt,
+            reason,
+            state.execution_version,
+          ],
+        );
+        return { accepted: true, status: "manual" };
+      }
+      await client.query(
+        `UPDATE service_cancellation_executions
+         SET status = 'terminated',
+             result = $2,
+             provider_occurred_at = $3,
+             last_error = NULL,
+             completed_at = $3,
+             updated_at = now(),
+             version = version + 1
+         WHERE id = $1 AND version = $4 AND status <> 'terminated'`,
+        [
+          state.execution_id,
+          { status: "terminated", providerStatus: "succeeded", externalResourceId: body.externalResourceId },
+          occurredAt,
+          state.execution_version,
+        ],
+      );
+      await auditProvider(
+        client,
+        MOCK_PROVISIONING_INSTALLATION_ID,
+        "service.termination_confirmed",
+        "service",
+        state.service_id,
+        "Provider confirmed the resource was terminated at paid period end",
+        {
+          eventId: body.eventId,
+          providerOperationId: body.providerOperationId,
+          cancellationExecutionId: state.execution_id,
+        },
+      );
+      return { accepted: true, status: "terminated" };
     });
     return reply.code(outcome.duplicate ? 200 : 202).send(outcome);
   });
