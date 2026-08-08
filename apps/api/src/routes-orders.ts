@@ -15,6 +15,7 @@ import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 
 const checkoutSchema = z.object({
   priceId: z.uuid(),
@@ -658,8 +659,12 @@ export async function registerOrderRoutes(
           code: "QUOTE_STALE",
         });
       }
-      const invoiceResult = await client.query<{ total_minor: string; currency: string }>(
-        `SELECT total_minor::text, currency
+      const invoiceResult = await client.query<{
+        total_minor: string;
+        currency: string;
+        order_id: string | null;
+      }>(
+        `SELECT total_minor::text, currency, order_id
          FROM invoices
          WHERE id = $1 AND client_account_id = $2
          FOR UPDATE`,
@@ -667,6 +672,7 @@ export async function registerOrderRoutes(
       );
       const invoice = invoiceResult.rows[0];
       if (!invoice) throw Object.assign(new Error("Invoice not found"), { statusCode: 404 });
+      await assertInvoicePaymentBusinessStateLocked(client, params.invoiceId, invoice.order_id);
       await assertEligibilityLocked(client, user.userId, user.clientAccountId, true);
       const allocationResult = await client.query<{
         payment_minor: string;

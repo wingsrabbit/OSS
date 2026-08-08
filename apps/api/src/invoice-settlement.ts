@@ -17,8 +17,13 @@ export type InvoiceSettlementContext =
   | {
       kind: "staff_manual";
       staffUserId: string;
-      expectedRenewalVersion?: number;
       reason?: string;
+    }
+  | {
+      kind: "staff_hold_resolution";
+      staffUserId: string;
+      expectedRenewalVersion: number;
+      reason: string;
     };
 
 export async function advancePaidInvoice(

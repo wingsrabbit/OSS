@@ -1188,7 +1188,7 @@ export async function registerRenewalRoutes(
           });
         }
         const settlement = await advancePaidInvoice(client, renewal.invoice_id, {
-          kind: "staff_manual",
+          kind: "staff_hold_resolution",
           staffUserId: user.userId,
           expectedRenewalVersion: body.expectedVersion,
           reason: body.reason,

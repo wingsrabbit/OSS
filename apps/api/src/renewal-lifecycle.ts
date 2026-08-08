@@ -750,8 +750,13 @@ export async function settleRenewalInvoice(
     | {
         kind: "staff_manual";
         staffUserId: string;
-        expectedRenewalVersion?: number;
         reason?: string;
+      }
+    | {
+        kind: "staff_hold_resolution";
+        staffUserId: string;
+        expectedRenewalVersion: number;
+        reason: string;
       },
 ): Promise<RenewalSettlementOutcome | null> {
   const pointerResult = await client.query<{
@@ -865,8 +870,7 @@ export async function settleRenewalInvoice(
     throw new Error("Renewal invoice ownership is inconsistent");
   }
   if (
-    context?.kind === "staff_manual" &&
-    context.expectedRenewalVersion !== undefined &&
+    context?.kind === "staff_hold_resolution" &&
     renewal.version !== context.expectedRenewalVersion
   ) {
     throw Object.assign(new Error("Renewal changed; refresh and confirm the hold again"), {
@@ -878,6 +882,16 @@ export async function settleRenewalInvoice(
     return {
       serviceId: renewal.service_id,
       renewalStatus: "paid",
+      serviceStatus: renewal.service_status,
+    };
+  }
+  const authorizedHoldResolution =
+    renewal.status === "manual_hold" &&
+    context?.kind === "staff_hold_resolution";
+  if (renewal.status === "manual_hold" && !authorizedHoldResolution) {
+    return {
+      serviceId: renewal.service_id,
+      renewalStatus: "manual_hold",
       serviceStatus: renewal.service_status,
     };
   }
@@ -905,7 +919,9 @@ export async function settleRenewalInvoice(
     (renewal.membership_role === "owner" || renewal.membership_role === "billing");
   const eligible =
     accountAndServiceEligible &&
-    (context?.kind === "staff_manual" || userCommandEligible);
+    (context?.kind === "staff_manual" ||
+      context?.kind === "staff_hold_resolution" ||
+      userCommandEligible);
   const fundedAt = new Date();
   if (!eligible) {
     await client.query(
@@ -998,7 +1014,7 @@ export async function settleRenewalInvoice(
     renewalId: renewal.id,
     serviceId: renewal.service_id,
   });
-  if (context?.kind === "staff_manual") {
+  if (context?.kind === "staff_manual" || context?.kind === "staff_hold_resolution") {
     await client.query(
       `INSERT INTO audit_events(
          actor_type, actor_id, action, target_type, target_id, reason, metadata

@@ -11,6 +11,7 @@ import { assertSchemaCompatible, runMigrations, type DatabaseClient } from "./da
 import { scheduleResumeAfterRenewalSettlement } from "./delinquency-lifecycle.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
+import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 import { providerSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
 
@@ -2216,6 +2217,20 @@ try {
   assert.equal(fullRenewal.status, "paid");
   assert.ok(fullRenewal.funded_at);
   assert.ok(fullRenewal.settled_at);
+  await assertInvoicePaymentBusinessStateLocked(client, holdRenewal.invoice_id, null);
+  await client.query(
+    "UPDATE services SET status = 'terminated', updated_at = now() WHERE id = $1",
+    [holdService.serviceId],
+  );
+  await expectDatabaseRejection(
+    client,
+    "terminated_renewal_payment_business_state",
+    /no longer payable/i,
+    () => assertInvoicePaymentBusinessStateLocked(client, holdRenewal.invoice_id, null),
+  );
+  await client.query("UPDATE services SET status = 'active', updated_at = now() WHERE id = $1", [
+    holdService.serviceId,
+  ]);
   assert.equal(
     calendarRenewal.period_start.toISOString(),
     CALENDAR_TERM_END.toISOString(),
@@ -2505,6 +2520,34 @@ try {
      WHERE client_account_id = $1 AND user_id = $2`,
     [holdAccount.clientAccountId, holdAccount.userId],
   );
+  const lateUserSettlement = await advancePaidInvoice(client, holdRenewal.invoice_id, {
+    kind: "user_command",
+    userId: holdAccount.userId,
+  });
+  assert.equal(
+    lateUserSettlement.renewalStatus,
+    "manual_hold",
+    "a later user or Provider settlement must not bypass a sticky renewal Hold",
+  );
+  const genericStaffSettlement = await advancePaidInvoice(client, holdRenewal.invoice_id, {
+    kind: "staff_manual",
+    staffUserId: mainAccount.userId,
+    reason: "Synthetic generic allocation must not replace the dedicated Hold decision",
+  });
+  assert.equal(
+    genericStaffSettlement.renewalStatus,
+    "manual_hold",
+    "a generic staff allocation must not bypass expected-version Hold resolution",
+  );
+  const heldBeforeResolution = await loadRenewal(client, holdService.serviceId);
+  assert.equal(heldBeforeResolution.version, heldAfterViewer.version);
+  const heldPeriodBeforeResolution = await client.query<{ periods: string }>(
+    `SELECT count(*)::text AS periods
+     FROM service_periods
+     WHERE service_id = $1 AND period_kind = 'renewal'`,
+    [holdService.serviceId],
+  );
+  assert.equal(heldPeriodBeforeResolution.rows[0]?.periods, "0");
   await client.query(
     `INSERT INTO staff_members(user_id, roles, permissions)
      VALUES ($1, ARRAY['billing'], '["billing.automation_manage"]'::jsonb)`,
@@ -2512,16 +2555,16 @@ try {
   );
   await expectDatabaseRejection(client, "renewal_hold_stale_version", /changed/i, () =>
     advancePaidInvoice(client, holdRenewal.invoice_id, {
-      kind: "staff_manual",
+      kind: "staff_hold_resolution",
       staffUserId: mainAccount.userId,
-      expectedRenewalVersion: heldAfterViewer.version - 1,
+      expectedRenewalVersion: heldBeforeResolution.version - 1,
       reason: "Synthetic stale operator decision must be rejected",
     }),
   );
   const staffResolution = await advancePaidInvoice(client, holdRenewal.invoice_id, {
-    kind: "staff_manual",
+    kind: "staff_hold_resolution",
     staffUserId: mainAccount.userId,
-    expectedRenewalVersion: heldAfterViewer.version,
+    expectedRenewalVersion: heldBeforeResolution.version,
     reason: "Synthetic staff reviewed eligibility and granted the exact funded period",
   });
   assert.equal(staffResolution.renewalStatus, "paid");
@@ -2546,7 +2589,7 @@ try {
       holdRenewal.id,
       mainAccount.userId,
       "Synthetic staff reviewed eligibility and granted the exact funded period",
-      heldAfterViewer.version,
+      heldBeforeResolution.version,
       holdResolutionIdempotencyKey,
       `renewal-hold-resolution-fingerprint:${holdRenewal.id}`,
       { renewalStatus: "paid", serviceId: holdService.serviceId },
@@ -2562,7 +2605,7 @@ try {
         holdRenewal.id,
         mainAccount.userId,
         "A different synthetic decision must conflict on the stable key",
-        heldAfterViewer.version,
+        heldBeforeResolution.version,
         holdResolutionIdempotencyKey,
         `different-renewal-hold-resolution-fingerprint:${holdRenewal.id}`,
         { renewalStatus: "paid", serviceId: holdService.serviceId },

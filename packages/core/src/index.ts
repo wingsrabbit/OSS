@@ -132,6 +132,23 @@ export function canTransitionPayment(from: PaymentStatus, to: PaymentStatus): bo
   return paymentTransitions[from].has(to);
 }
 
+export type PaymentBusinessState =
+  | { readonly paymentContext: "order"; readonly orderStatus: string }
+  | {
+      readonly paymentContext: "renewal";
+      readonly renewalStatus: string | null;
+      readonly serviceStatus: string;
+    };
+
+export function isPaymentBusinessStatePayable(state: PaymentBusinessState): boolean {
+  if (state.paymentContext === "order") return state.orderStatus === "waiting_payment";
+
+  return (
+    state.renewalStatus === "invoiced" &&
+    (state.serviceStatus === "active" || state.serviceStatus === "suspended")
+  );
+}
+
 export function addBillingCycle(start: Date, cycle: BillingCycle): Date | null {
   if (cycle === "one_time") return null;
   const months = cycle === "monthly" ? 1 : cycle === "quarterly" ? 3 : cycle === "semiannual" ? 6 : 12;

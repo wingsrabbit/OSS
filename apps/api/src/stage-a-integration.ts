@@ -11693,6 +11693,202 @@ assert.equal(
   "pending payment settlement must not dispatch a late suspension",
 );
 
+// A customer may obtain a full-Credit quote while a renewal is payable, but an
+// immediate termination before submission must invalidate the command before
+// any Credit, allocation, journal, payment, or Provider fact is written.
+cookie = "";
+const terminatedCreditNamespace = randomUUID();
+const terminatedCreditEmail = `terminated-credit-${terminatedCreditNamespace}@example.invalid`;
+const terminatedCreditPassword = `Synthetic-${terminatedCreditNamespace}-Credit!`;
+await request(
+  "/api/v1/auth/register",
+  {
+    method: "POST",
+    body: JSON.stringify({
+      email: terminatedCreditEmail,
+      password: terminatedCreditPassword,
+      clientName: `Synthetic Terminated Credit ${terminatedCreditNamespace.slice(0, 8)}`,
+      locale: "en",
+    }),
+  },
+  201,
+);
+await request(
+  "/api/v1/auth/login",
+  {
+    method: "POST",
+    body: JSON.stringify({
+      email: terminatedCreditEmail,
+      password: terminatedCreditPassword,
+    }),
+  },
+  200,
+);
+const terminatedCreditCookie = cookie;
+const terminatedCreditIdentity = await corePool.query<{
+  user_id: string;
+  client_account_id: string;
+}>(
+  `SELECT user_record.id AS user_id, membership.client_account_id
+   FROM users user_record
+   JOIN client_memberships membership
+     ON membership.user_id = user_record.id AND membership.removed_at IS NULL
+   WHERE user_record.email = $1`,
+  [terminatedCreditEmail],
+);
+const terminatedCreditIdentityRow = terminatedCreditIdentity.rows[0];
+assert.ok(terminatedCreditIdentityRow);
+await corePool.query(
+  "UPDATE users SET email_verified_at = now() WHERE id = $1",
+  [terminatedCreditIdentityRow.user_id],
+);
+const terminatedCreditOrder = await createOrder(automaticPrice.id, legal);
+await pay(terminatedCreditOrder, "success");
+const terminatedCreditActive = await waitFor(
+  "full-Credit termination fixture service activation",
+  () => request<OrderDetail>(`/api/v1/orders/${terminatedCreditOrder.order.id}`),
+  (current) => current.service.status === "active",
+);
+assert.ok(terminatedCreditActive.service.termEnd);
+const renewalLookahead = new Date(
+  new Date(terminatedCreditActive.service.termEnd).getTime() - 13 * 24 * 60 * 60 * 1_000,
+);
+const businessDateParts = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+}).formatToParts(renewalLookahead);
+const businessDatePart = (type: "year" | "month" | "day") =>
+  businessDateParts.find((part) => part.type === type)?.value;
+const terminatedCreditBusinessDate = `${businessDatePart("year")}-${businessDatePart("month")}-${businessDatePart("day")}`;
+assert.match(terminatedCreditBusinessDate, /^\d{4}-\d{2}-\d{2}$/);
+const terminatedCreditBilling = await runSignedBillingDay({
+  businessDate: terminatedCreditBusinessDate,
+  effectiveAt: `${terminatedCreditBusinessDate}T01:00:00.000Z`,
+});
+assert.equal(terminatedCreditBilling.status, 201);
+const terminatedCreditRenewal = await corePool.query<{
+  renewal_id: string;
+  invoice_id: string;
+  total_minor: string;
+}>(
+  `SELECT renewal.id AS renewal_id, renewal.invoice_id, invoice.total_minor::text
+   FROM service_renewals renewal
+   JOIN invoices invoice ON invoice.id = renewal.invoice_id
+   WHERE renewal.service_id = $1 AND renewal.status = 'invoiced'
+   ORDER BY renewal.created_at DESC
+   LIMIT 1`,
+  [terminatedCreditActive.service.id],
+);
+const terminatedCreditRenewalRow = terminatedCreditRenewal.rows[0];
+assert.ok(terminatedCreditRenewalRow);
+
+cookie = staffCookie;
+await request(
+  "/api/v1/auth/reauth",
+  { method: "POST", body: JSON.stringify({ password }) },
+  200,
+);
+await request(
+  `/api/v1/admin/client-accounts/${terminatedCreditIdentityRow.client_account_id}/credit-adjustments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      direction: "increase",
+      amountMinor: terminatedCreditRenewalRow.total_minor,
+      currency: "USD",
+      reason: "Synthetic full-Credit termination race fixture",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+  201,
+);
+cookie = terminatedCreditCookie;
+const terminatedCreditQuote = await createPaymentQuote(
+  terminatedCreditRenewalRow.invoice_id,
+  "usdt",
+  true,
+);
+assert.equal(terminatedCreditQuote.creditToApplyMinor, terminatedCreditRenewalRow.total_minor);
+assert.equal(terminatedCreditQuote.externalDueMinor, "0");
+const terminatedCreditBefore = await corePool.query<{
+  balance_minor: string;
+  credit_allocations: string;
+  payment_commands: string;
+  payment_journals: string;
+}>(
+  `SELECT
+     COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text AS balance_minor,
+     (SELECT count(*)::text FROM credit_allocations WHERE invoice_id = $2) AS credit_allocations,
+     (SELECT count(*)::text FROM invoice_payment_commands WHERE invoice_id = $2) AS payment_commands,
+     (SELECT count(*)::text FROM ledger_journals
+       WHERE source_type = 'invoice_credit_application'
+         AND source_id IN (
+           SELECT id FROM credit_transactions WHERE source_id IN (
+             SELECT id FROM invoice_payment_commands WHERE invoice_id = $2
+           )
+         )) AS payment_journals
+   FROM credit_accounts account
+   LEFT JOIN credit_transactions transaction ON transaction.credit_account_id = account.id
+   WHERE account.client_account_id = $1 AND account.currency = 'USD'`,
+  [terminatedCreditIdentityRow.client_account_id, terminatedCreditRenewalRow.invoice_id],
+);
+await corePool.query(
+  "UPDATE services SET status = 'terminated', updated_at = now(), version = version + 1 WHERE id = $1",
+  [terminatedCreditActive.service.id],
+);
+const terminatedCreditPayment = await rawCoreRequest(
+  `/api/v1/invoices/${terminatedCreditRenewalRow.invoice_id}/payments`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      quoteId: terminatedCreditQuote.quoteId,
+      scenario: "success",
+      idempotencyKey: randomUUID(),
+    }),
+  },
+);
+assert.equal(terminatedCreditPayment.status, 409);
+assert.equal(terminatedCreditPayment.body.code, "INVOICE_NOT_PAYABLE");
+const terminatedCreditAfter = await corePool.query<{
+  balance_minor: string;
+  credit_allocations: string;
+  payment_commands: string;
+  payment_journals: string;
+  renewal_status: string;
+  service_status: string;
+}>(
+  `SELECT
+     COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text AS balance_minor,
+     (SELECT count(*)::text FROM credit_allocations WHERE invoice_id = $2) AS credit_allocations,
+     (SELECT count(*)::text FROM invoice_payment_commands WHERE invoice_id = $2) AS payment_commands,
+     (SELECT count(*)::text FROM ledger_journals
+       WHERE source_type = 'invoice_credit_application'
+         AND source_id IN (
+           SELECT id FROM credit_transactions WHERE source_id IN (
+             SELECT id FROM invoice_payment_commands WHERE invoice_id = $2
+           )
+         )) AS payment_journals,
+     (SELECT status FROM service_renewals WHERE id = $3) AS renewal_status,
+     (SELECT status FROM services WHERE id = $4) AS service_status
+   FROM credit_accounts account
+   LEFT JOIN credit_transactions transaction ON transaction.credit_account_id = account.id
+   WHERE account.client_account_id = $1 AND account.currency = 'USD'`,
+  [
+    terminatedCreditIdentityRow.client_account_id,
+    terminatedCreditRenewalRow.invoice_id,
+    terminatedCreditRenewalRow.renewal_id,
+    terminatedCreditActive.service.id,
+  ],
+);
+assert.deepEqual(terminatedCreditAfter.rows[0], {
+  ...terminatedCreditBefore.rows[0],
+  renewal_status: "invoiced",
+  service_status: "terminated",
+});
+cookie = staffCookie;
+
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count
    FROM (

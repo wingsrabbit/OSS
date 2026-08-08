@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHmac, randomUUID } from "node:crypto";
+import { isPaymentBusinessStatePayable } from "@opensales/core";
 import {
   providerOperationCapability,
   providerOperationCapabilityMatches,
@@ -9,7 +10,6 @@ import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
 import { attemptJobClaim } from "./job-claim.js";
-import { isPaymentBusinessStatePayable } from "./payment-business-state.js";
 
 const config = z
   .object({
@@ -1311,12 +1311,15 @@ async function preflightPayment(
         false,
       );
     }
-    const payableBusinessState = isPaymentBusinessStatePayable({
-      paymentContext: payment.payment_context,
-      orderStatus: payment.order_status,
-      renewalStatus: payment.renewal_status,
-      serviceStatus: payment.service_status,
-    });
+    const payableBusinessState = isPaymentBusinessStatePayable(
+      payment.payment_context === "order"
+        ? { paymentContext: "order", orderStatus: payment.order_status }
+        : {
+            paymentContext: "renewal",
+            renewalStatus: payment.renewal_status,
+            serviceStatus: payment.service_status,
+          },
+    );
     if (
       !payableBusinessState ||
       payment.order_currency !== payment.invoice_currency ||
