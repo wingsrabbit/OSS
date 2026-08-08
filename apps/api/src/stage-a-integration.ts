@@ -97,6 +97,12 @@ async function verifyPublished007Upgrade(): Promise<void> {
       chargeback_effects: string | null;
       debt_transactions: string | null;
       account_restrictions: string | null;
+      saved_payment_methods: string | null;
+      automatic_renewal_authorizations: string | null;
+      token_encryption_keys: string | null;
+      token_lookup_keys: string | null;
+      service_decision_generation: string | null;
+      payment_attempt_decision_generation: string | null;
     }>(
       `SELECT
          max(version) AS version,
@@ -130,9 +136,31 @@ async function verifyPublished007Upgrade(): Promise<void> {
            AS debt_transactions
          ,to_regclass('public.client_account_restrictions')::text
            AS account_restrictions
+         ,to_regclass('public.saved_payment_methods')::text
+           AS saved_payment_methods
+         ,to_regclass('public.automatic_renewal_authorizations')::text
+           AS automatic_renewal_authorizations
+         ,to_regclass('public.payment_method_token_encryption_keys')::text
+           AS token_encryption_keys
+         ,to_regclass('public.payment_method_token_lookup_keys')::text
+           AS token_lookup_keys
+         ,(
+           SELECT column_name
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'services'
+             AND column_name = 'automatic_renewal_decision_generation'
+         ) AS service_decision_generation
+         ,(
+           SELECT column_name
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'payment_attempts'
+             AND column_name = 'automatic_renewal_decision_generation'
+         ) AS payment_attempt_decision_generation
        FROM schema_migrations`,
     );
-    assert.equal(upgraded.rows[0]?.version, "014_stage_b_cycle_end_cancellation");
+    assert.equal(upgraded.rows[0]?.version, "015_stage_b_saved_payment_auto_renew");
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
@@ -156,6 +184,24 @@ async function verifyPublished007Upgrade(): Promise<void> {
       "client_account_debt_transactions",
     );
     assert.equal(upgraded.rows[0]?.account_restrictions, "client_account_restrictions");
+    assert.equal(upgraded.rows[0]?.saved_payment_methods, "saved_payment_methods");
+    assert.equal(
+      upgraded.rows[0]?.automatic_renewal_authorizations,
+      "automatic_renewal_authorizations",
+    );
+    assert.equal(
+      upgraded.rows[0]?.token_encryption_keys,
+      "payment_method_token_encryption_keys",
+    );
+    assert.equal(upgraded.rows[0]?.token_lookup_keys, "payment_method_token_lookup_keys");
+    assert.equal(
+      upgraded.rows[0]?.service_decision_generation,
+      "automatic_renewal_decision_generation",
+    );
+    assert.equal(
+      upgraded.rows[0]?.payment_attempt_decision_generation,
+      "automatic_renewal_decision_generation",
+    );
   } finally {
     await upgradePool?.end().catch(() => undefined);
     upgradePool = null;
