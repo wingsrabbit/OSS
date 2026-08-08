@@ -52,12 +52,40 @@ export async function buildApp(
     bodyLimit: 256 * 1024,
   });
   const pool = providedPool ?? createPool(config);
-  const releaseSchemaRollbackGuard = await holdSchema015RollbackBridgeGuard(pool);
-  const releaseTokenRegistryGuard = providedPool
-    ? null
-    : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
+  let releaseSchemaRollbackGuard: (() => Promise<void>) | null = null;
+  let releaseTokenRegistryGuard: (() => Promise<void>) | null = null;
+  let cleanedUp = false;
+  const cleanup = async (): Promise<void> => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    const errors: unknown[] = [];
+    const releases = [releaseTokenRegistryGuard, releaseSchemaRollbackGuard].filter(
+      (release): release is () => Promise<void> => release !== null,
+    );
+    const releaseResults = await Promise.allSettled(releases.map((release) => release()));
+    for (const result of releaseResults) {
+      if (result.status === "rejected") errors.push(result.reason);
+    }
+    if (!providedPool) {
+      try {
+        await pool.end();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "OpenSales API resource cleanup failed");
+    }
+  };
 
-  await app.register(cookie);
+  try {
+    releaseSchemaRollbackGuard = await holdSchema015RollbackBridgeGuard(pool);
+    releaseTokenRegistryGuard = providedPool
+      ? null
+      : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
+    app.addHook("onClose", cleanup);
+
+    await app.register(cookie);
   await app.register(cors, {
     origin: config.WEB_ORIGIN,
     credentials: true,
@@ -148,11 +176,16 @@ export async function buildApp(
   await registerServiceRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
-  app.addHook("onClose", async () => {
-    if (releaseTokenRegistryGuard) await releaseTokenRegistryGuard();
-    await releaseSchemaRollbackGuard();
-    if (!providedPool) await pool.end();
-  });
-
-  return { app, pool };
+    return { app, pool };
+  } catch (error) {
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "OpenSales API initialization and cleanup failed",
+      );
+    }
+    throw error;
+  }
 }

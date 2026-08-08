@@ -154,16 +154,40 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
               OR pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_b || '%')
          AND (required.fragment_c IS NULL
               OR pg_get_constraintdef(actual.oid) ILIKE '%' || required.fragment_c || '%')
-     ), required_triggers(table_name, trigger_name) AS (
+     ), required_triggers(
+       table_name, trigger_name, function_name, event_fragments,
+       is_deferrable, is_initially_deferred
+     ) AS (
        VALUES
-         ('manual_receipt_facts', 'manual_receipt_facts_append_only'),
-         ('manual_receipt_facts', 'manual_receipt_fact_completeness_guard'),
-         ('manual_receipt_reversals', 'manual_receipt_reversals_append_only'),
-         ('manual_receipt_reversals', 'manual_receipt_reversal_completeness_guard'),
-         ('manual_receipt_outflows', 'manual_receipt_outflows_append_only'),
-         ('manual_receipt_outflows', 'manual_receipt_outflow_completeness_guard'),
-         ('refunds', 'manual_receipt_provider_refund_guard'),
-         ('fund_receipt_resolutions', 'manual_receipt_resolution_guard')
+         ('manual_receipt_facts', 'manual_receipt_fact_write_guard',
+            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], false, false),
+         ('manual_receipt_reversals', 'manual_receipt_reversal_write_guard',
+            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], false, false),
+         ('manual_receipt_outflows', 'manual_receipt_outflow_write_guard',
+            'opensales_manual_receipt_write_guard', ARRAY['BEFORE', 'INSERT']::text[], false, false),
+         ('manual_receipt_facts', 'manual_receipt_facts_append_only',
+            'opensales_reject_manual_receipt_mutation',
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], false, false),
+         ('manual_receipt_facts', 'manual_receipt_fact_completeness_guard',
+            'opensales_assert_manual_receipt_complete', ARRAY['AFTER', 'INSERT']::text[], true, true),
+         ('manual_receipt_reversals', 'manual_receipt_reversals_append_only',
+            'opensales_reject_manual_receipt_mutation',
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], false, false),
+         ('manual_receipt_reversals', 'manual_receipt_reversal_completeness_guard',
+            'opensales_assert_manual_receipt_reversal_complete',
+            ARRAY['AFTER', 'INSERT']::text[], true, true),
+         ('manual_receipt_outflows', 'manual_receipt_outflows_append_only',
+            'opensales_reject_manual_receipt_mutation',
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], false, false),
+         ('manual_receipt_outflows', 'manual_receipt_outflow_completeness_guard',
+            'opensales_assert_manual_receipt_outflow_complete',
+            ARRAY['AFTER', 'INSERT']::text[], true, true),
+         ('refunds', 'manual_receipt_provider_refund_guard',
+            'opensales_guard_manual_provider_refund',
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], false, false),
+         ('fund_receipt_resolutions', 'manual_receipt_resolution_guard',
+            'opensales_guard_manual_receipt_resolution',
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], false, false)
      ), trigger_shape AS (
        SELECT count(*) = (SELECT count(*) FROM required_triggers) AS valid
        FROM required_triggers required
@@ -174,6 +198,62 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                              AND actual.tgname = required.trigger_name
                              AND NOT actual.tgisinternal
                              AND actual.tgenabled <> 'D'
+       JOIN pg_proc procedure ON procedure.oid = actual.tgfoid
+       WHERE procedure.proname = required.function_name
+         AND actual.tgdeferrable = required.is_deferrable
+         AND actual.tginitdeferred = required.is_initially_deferred
+         AND NOT EXISTS (
+           SELECT 1
+           FROM unnest(required.event_fragments) fragment
+           WHERE pg_get_triggerdef(actual.oid, true) NOT ILIKE '%' || fragment || '%'
+         )
+     ), required_functions(function_name, definition_fragments) AS (
+       VALUES
+         ('opensales_manual_receipt_write_guard',
+            ARRAY['pg_advisory_xact_lock',
+                  'opensales:schema-015-016-rollback-bridge']::text[]),
+         ('opensales_reject_manual_receipt_mutation',
+            ARRAY['RAISE EXCEPTION', 'append-only']::text[]),
+         ('opensales_assert_manual_receipt_complete',
+            ARRAY['ledger_journals', 'ledger_lines', 'manual_receipt',
+                  'unclaimed_funds_liability', 'cash_clearing', 'sealed_at']::text[]),
+         ('opensales_assert_manual_receipt_reversal_complete',
+            ARRAY['ledger_journals', 'ledger_lines', 'manual_receipt_reversal',
+                  'unclaimed_funds_liability', 'cash_clearing', 'sealed_at']::text[]),
+         ('opensales_assert_manual_receipt_outflow_complete',
+            ARRAY['ledger_journals', 'ledger_lines', 'manual_receipt_outflow',
+                  'unclaimed_funds_liability', 'cash_clearing', 'sealed_at']::text[]),
+         ('opensales_guard_manual_provider_refund',
+            ARRAY['reported_manual_receipt_id', 'RAISE EXCEPTION']::text[]),
+         ('opensales_guard_manual_receipt_resolution',
+            ARRAY['reported_manual_receipt_id', 'manual_receipt_reversals',
+                  'RAISE EXCEPTION']::text[])
+     ), function_shape AS (
+       SELECT count(*) = (SELECT count(*) FROM required_functions) AS valid
+       FROM required_functions required
+       JOIN pg_namespace namespace ON namespace.nspname = 'public'
+       JOIN pg_proc actual ON actual.pronamespace = namespace.oid
+                          AND actual.proname = required.function_name
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM unnest(required.definition_fragments) fragment
+         WHERE pg_get_functiondef(actual.oid) NOT ILIKE '%' || fragment || '%'
+       )
+     ), required_view_fragments(fragment) AS (
+       VALUES
+         ('refunds'),
+         ('refund_settlements'),
+         ('refund_discrepancy_settlements'),
+         ('refund_security_hold_adjudications'),
+         ('refund_adjudication_corrections'),
+         ('refund_receipt_security_holds'),
+         ('add_funds_chargeback_holds'),
+         ('add_funds_chargeback_facts'),
+         ('manual_receipt_reversals'),
+         ('manual_receipt_outflows'),
+         ('charged_back'),
+         ('unknown'),
+         ('manual')
      )
      SELECT
        to_regclass('public.manual_receipt_facts') IS NOT NULL
@@ -182,17 +262,20 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          AND (SELECT valid FROM column_shape) AS has_columns,
        (SELECT valid FROM constraint_shape) AS has_constraints,
        (SELECT valid FROM trigger_shape) AS has_triggers,
+       (SELECT valid FROM function_shape) AS has_functions,
        to_regclass('public.unclaimed_fund_refund_capacity') IS NOT NULL
-         AND pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true)
-               ILIKE '%manual_receipt_reversals%'
-         AND pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true)
-               ILIKE '%manual_receipt_outflows%' AS has_capacity_view`,
+         AND NOT EXISTS (
+           SELECT 1 FROM required_view_fragments required
+           WHERE pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true)
+                   NOT ILIKE '%' || required.fragment || '%'
+         ) AS has_capacity_view`,
   );
   const shape = rowRecord(result.rows[0]);
   if (
     shape.has_columns !== true ||
     shape.has_constraints !== true ||
     shape.has_triggers !== true ||
+    shape.has_functions !== true ||
     shape.has_capacity_view !== true
   ) {
     throw new SchemaRollbackPreflightError(

@@ -71,20 +71,67 @@ export async function holdPaymentMethodTokenRegistryExtensionGuard(
     );
     held = true;
   } catch (error) {
-    client.release();
+    client.release(error instanceof Error ? error : true);
     throw error;
   }
   return async () => {
     if (!held) return;
     held = false;
     try {
-      await client.query(
-        "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))",
+      const result = await client.query<{ unlocked: boolean }>(
+        "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked",
         [TOKEN_REGISTRY_EXTENSION_GUARD],
       );
-    } finally {
+      if (result.rows[0]?.unlocked !== true) {
+        throw new Error("Payment token registry extension guard was not held by its session");
+      }
       client.release();
+    } catch (error) {
+      client.release(error instanceof Error ? error : true);
+      throw error;
     }
+  };
+}
+
+async function releaseGuardClient(
+  client: DatabaseClient,
+  guard: string,
+): Promise<void> {
+  try {
+    const result = await client.query<{ unlocked: boolean }>(
+      "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked",
+      [guard],
+    );
+    if (result.rows[0]?.unlocked !== true) {
+      throw new Error(`Schema compatibility guard ${guard} was not held by its session`);
+    }
+    client.release();
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+}
+
+export async function holdSchema015RollbackBridgeGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SET lock_timeout = '15s'");
+    await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [
+      SCHEMA_015_016_GUARD,
+    ]);
+    await client.query("RESET lock_timeout");
+    held = true;
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    await releaseGuardClient(client, SCHEMA_015_016_GUARD);
   };
 }
 
@@ -159,33 +206,6 @@ export async function assertSchemaCompatible(
   } finally {
     client.release();
   }
-}
-
-export async function holdSchema015RollbackBridgeGuard(
-  pool: DatabasePool,
-): Promise<() => Promise<void>> {
-  const client = await pool.connect();
-  let held = false;
-  try {
-    await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [
-      SCHEMA_015_016_GUARD,
-    ]);
-    held = true;
-  } catch (error) {
-    client.release();
-    throw error;
-  }
-  return async () => {
-    if (!held) return;
-    held = false;
-    try {
-      await client.query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
-        SCHEMA_015_016_GUARD,
-      ]);
-    } finally {
-      client.release();
-    }
-  };
 }
 
 export async function assert014RollbackSchemaCompatible(

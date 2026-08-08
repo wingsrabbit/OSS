@@ -32,6 +32,7 @@ function fakeDatabase(input: {
               has_columns: valid,
               has_constraints: valid,
               has_triggers: valid,
+              has_functions: valid,
               has_capacity_view: valid,
             },
           ],

@@ -68,6 +68,56 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
+let schemaCompatibilityGuard: pg.PoolClient | null = null;
+let tokenRegistryGuard: pg.PoolClient | null = null;
+
+async function releaseWorkerGuard(
+  client: pg.PoolClient,
+  guard: string,
+): Promise<void> {
+  try {
+    const result = await client.query<{ unlocked: boolean }>(
+      "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked",
+      [guard],
+    );
+    if (result.rows[0]?.unlocked !== true) {
+      throw new Error(`Worker guard ${guard} was not held by its session`);
+    }
+    client.release();
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+}
+
+async function cleanupWorkerResources(): Promise<void> {
+  const errors: unknown[] = [];
+  const releases: Promise<void>[] = [];
+  if (tokenRegistryGuard) {
+    releases.push(
+      releaseWorkerGuard(
+        tokenRegistryGuard,
+        "opensales:payment-method-token-registry-extension",
+      ),
+    );
+    tokenRegistryGuard = null;
+  }
+  if (schemaCompatibilityGuard) {
+    releases.push(releaseWorkerGuard(schemaCompatibilityGuard, SCHEMA_015_016_GUARD));
+    schemaCompatibilityGuard = null;
+  }
+  for (const result of await Promise.allSettled(releases)) {
+    if (result.status === "rejected") errors.push(result.reason);
+  }
+  try {
+    await pool.end();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "OpenSales Worker resource cleanup failed");
+  }
+}
 
 type Job = {
   id: string;
@@ -7319,53 +7369,39 @@ process.on("SIGINT", () => {
   stopping = true;
 });
 
-const schemaCompatibilityGuard = await pool.connect();
+let workerFailure: unknown;
+let cleanupFailure: unknown;
 try {
+  schemaCompatibilityGuard = await pool.connect();
+  await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
   await schemaCompatibilityGuard.query(
     "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
     [SCHEMA_015_016_GUARD],
   );
-  await schemaCompatibilityGuard.query(
-    "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-  );
-  await assert015RollbackBridgeSafe(
-    {
-      query: async (text, values) => schemaCompatibilityGuard.query(text, values),
-    },
-    {
-      enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
-    },
-  );
-  await schemaCompatibilityGuard.query("COMMIT");
-} catch (error) {
-  await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
-  await schemaCompatibilityGuard
-    .query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
-      SCHEMA_015_016_GUARD,
-    ])
-    .catch(() => undefined);
-  schemaCompatibilityGuard.release();
-  await pool.end();
-  throw error;
-}
+  await schemaCompatibilityGuard.query("RESET lock_timeout");
+  try {
+    await schemaCompatibilityGuard.query(
+      "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
+    await assert015RollbackBridgeSafe(
+      {
+        query: async (text, values) => schemaCompatibilityGuard!.query(text, values),
+      },
+      {
+        enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
+      },
+    );
+    await schemaCompatibilityGuard.query("COMMIT");
+  } catch (error) {
+    await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
 
-const tokenRegistryGuard = await pool.connect();
-try {
+  tokenRegistryGuard = await pool.connect();
   await tokenRegistryGuard.query(
     "SELECT pg_advisory_lock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
   );
-} catch (error) {
-  tokenRegistryGuard.release();
-  await schemaCompatibilityGuard
-    .query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
-      SCHEMA_015_016_GUARD,
-    ])
-    .catch(() => undefined);
-  schemaCompatibilityGuard.release();
-  await pool.end();
-  throw error;
-}
-await transaction(async (client) => {
+  await transaction(async (client) => {
   await client.query(
     "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
   );
@@ -7429,12 +7465,12 @@ await transaction(async (client) => {
     storedTokenVersions.rows[0]?.encryption_versions ?? [],
     "encryption",
   );
-});
+  });
 
 console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`);
 let nextRecoveryAt = 0;
 let nextBillingScheduleAt = 0;
-while (!stopping) {
+  while (!stopping) {
   if (Date.now() >= nextBillingScheduleAt) {
     try {
       const scheduled = await ensureScheduledBillingJob(pool);
@@ -7507,18 +7543,23 @@ while (!stopping) {
         },
       );
     }
+    }
+  }
+} catch (error) {
+  workerFailure = error;
+} finally {
+  try {
+    await cleanupWorkerResources();
+  } catch (error) {
+    cleanupFailure = error;
   }
 }
-await tokenRegistryGuard
-  .query(
-    "SELECT pg_advisory_unlock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
-  )
-  .catch(() => undefined);
-tokenRegistryGuard.release();
-await schemaCompatibilityGuard
-  .query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
-    SCHEMA_015_016_GUARD,
-  ])
-  .catch(() => undefined);
-schemaCompatibilityGuard.release();
-await pool.end();
+
+if (workerFailure !== undefined && cleanupFailure !== undefined) {
+  throw new AggregateError(
+    [workerFailure, cleanupFailure],
+    "OpenSales Worker failed and resource cleanup also failed",
+  );
+}
+if (workerFailure !== undefined) throw workerFailure;
+if (cleanupFailure !== undefined) throw cleanupFailure;
