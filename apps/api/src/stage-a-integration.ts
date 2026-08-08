@@ -12094,7 +12094,7 @@ const staleCancellation = await rawCoreRequest(
 assert.equal(staleCancellation.status, 409);
 assert.equal(staleCancellation.body.code, "VERSION_CONFLICT");
 
-const cancellationEffectiveAt = new Date(
+const cancellationAutomationReference = new Date(
   new Date(cancellationActive.service.termEnd).getTime() - 12 * 24 * 60 * 60 * 1_000,
 );
 const cancellationBusinessDateParts = new Intl.DateTimeFormat("en-CA", {
@@ -12102,11 +12102,14 @@ const cancellationBusinessDateParts = new Intl.DateTimeFormat("en-CA", {
   year: "numeric",
   month: "2-digit",
   day: "2-digit",
-}).formatToParts(cancellationEffectiveAt);
+}).formatToParts(cancellationAutomationReference);
 const cancellationBusinessDatePart = (type: "year" | "month" | "day") =>
   cancellationBusinessDateParts.find((part) => part.type === type)?.value;
 const cancellationBusinessDate = `${cancellationBusinessDatePart("year")}-${cancellationBusinessDatePart("month")}-${cancellationBusinessDatePart("day")}`;
 assert.match(cancellationBusinessDate, /^\d{4}-\d{2}-\d{2}$/);
+// Scheduled automation is due at 09:00 Asia/Shanghai. Keep this journey
+// deterministic when the Provider happened to activate the service overnight.
+const cancellationEffectiveAt = new Date(`${cancellationBusinessDate}T01:00:00.000Z`);
 const cancellationBillingRun = await runSignedBillingDay({
   businessDate: cancellationBusinessDate,
   effectiveAt: cancellationEffectiveAt.toISOString(),
