@@ -10,6 +10,7 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
+  holdSchema015RollbackBridgeGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -51,6 +52,7 @@ export async function buildApp(
     bodyLimit: 256 * 1024,
   });
   const pool = providedPool ?? createPool(config);
+  const releaseSchemaRollbackGuard = await holdSchema015RollbackBridgeGuard(pool);
   const releaseTokenRegistryGuard = providedPool
     ? null
     : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
@@ -148,6 +150,7 @@ export async function buildApp(
 
   app.addHook("onClose", async () => {
     if (releaseTokenRegistryGuard) await releaseTokenRegistryGuard();
+    await releaseSchemaRollbackGuard();
     if (!providedPool) await pool.end();
   });
 

@@ -92,6 +92,13 @@ misinterpreted. A structural expansion therefore does not by itself make every
 older image a safe rollback target; only the reviewed bridge image may declare
 that guarded range.
 
+The bridge also holds a shared advisory compatibility lock for the whole API or
+Worker process lifetime. Every write path introduced by the newer schema takes
+the conflicting transaction lock. This closes the race between a successful
+startup preflight and a later business fact that the older application cannot
+interpret. Each bridge covers one exact adjacent pair; bridge settings are not
+treated as a permissive schema-version range.
+
 ### Data recovery
 
 When no compatible image rollback exists, recovery uses a verified backup and

@@ -13,6 +13,10 @@ import {
   fingerprintProviderTokenKey,
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
+import {
+  assert015RollbackBridgeSafe,
+  SCHEMA_015_016_GUARD,
+} from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -28,6 +32,7 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
+    OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "015-to-016"]).optional(),
     PAYMENT_METHOD_TOKEN_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     PAYMENT_METHOD_TOKEN_KEY_VERSION: z.coerce.number().int().positive().optional(),
     PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: z.string().optional(),
@@ -63,17 +68,6 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const tokenRegistryGuard = await pool.connect();
-try {
-  await tokenRegistryGuard.query(
-    "SELECT pg_advisory_lock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
-  );
-} catch (error) {
-  tokenRegistryGuard.release();
-  await pool.end();
-  throw error;
-}
-const REQUIRED_SCHEMA_VERSION = "015_stage_b_saved_payment_auto_renew";
 
 type Job = {
   id: string;
@@ -7325,13 +7319,51 @@ process.on("SIGINT", () => {
   stopping = true;
 });
 
-const schema = await pool.query<{ version: string | null }>(
-  "SELECT max(version) AS version FROM schema_migrations",
-);
-if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
-  throw new Error(
-    `OpenSales schema ${schema.rows[0]?.version ?? "missing"} is incompatible with worker requirement ${REQUIRED_SCHEMA_VERSION}`,
+const schemaCompatibilityGuard = await pool.connect();
+try {
+  await schemaCompatibilityGuard.query(
+    "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
+    [SCHEMA_015_016_GUARD],
   );
+  await schemaCompatibilityGuard.query(
+    "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+  );
+  await assert015RollbackBridgeSafe(
+    {
+      query: async (text, values) => schemaCompatibilityGuard.query(text, values),
+    },
+    {
+      enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
+    },
+  );
+  await schemaCompatibilityGuard.query("COMMIT");
+} catch (error) {
+  await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
+  await schemaCompatibilityGuard
+    .query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
+      SCHEMA_015_016_GUARD,
+    ])
+    .catch(() => undefined);
+  schemaCompatibilityGuard.release();
+  await pool.end();
+  throw error;
+}
+
+const tokenRegistryGuard = await pool.connect();
+try {
+  await tokenRegistryGuard.query(
+    "SELECT pg_advisory_lock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
+  );
+} catch (error) {
+  tokenRegistryGuard.release();
+  await schemaCompatibilityGuard
+    .query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
+      SCHEMA_015_016_GUARD,
+    ])
+    .catch(() => undefined);
+  schemaCompatibilityGuard.release();
+  await pool.end();
+  throw error;
 }
 await transaction(async (client) => {
   await client.query(
@@ -7483,4 +7515,10 @@ await tokenRegistryGuard
   )
   .catch(() => undefined);
 tokenRegistryGuard.release();
+await schemaCompatibilityGuard
+  .query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
+    SCHEMA_015_016_GUARD,
+  ])
+  .catch(() => undefined);
+schemaCompatibilityGuard.release();
 await pool.end();

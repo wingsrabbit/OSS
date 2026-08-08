@@ -13,6 +13,11 @@ import {
   assert014RollbackBridgeSafe,
   type SchemaRollbackPreflightReport,
 } from "@opensales/core/schema-rollback-compatibility";
+import {
+  assert015RollbackBridgeSafe,
+  SCHEMA_015_016_GUARD,
+  type Schema015RollbackPreflightReport,
+} from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
 import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
@@ -133,17 +138,54 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   }
 }
 
-export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> {
-  const result = await pool.query<{ version: string | null }>(
-    `SELECT max(version) AS version
-     FROM schema_migrations`,
-  );
-  const installed = result.rows[0]?.version ?? null;
-  if (installed !== REQUIRED_SCHEMA_VERSION) {
-    throw new Error(
-      `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
+export async function assertSchemaCompatible(
+  pool: DatabasePool,
+  input: Readonly<{ enable016RollbackBridge?: boolean }> = {},
+): Promise<Schema015RollbackPreflightReport> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await assert015RollbackBridgeSafe(
+      {
+        query: async (text, values) => client.query(text, values),
+      },
+      { enable016RollbackBridge: input.enable016RollbackBridge === true },
     );
+    await client.query("COMMIT");
+    return report;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
   }
+}
+
+export async function holdSchema015RollbackBridgeGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [
+      SCHEMA_015_016_GUARD,
+    ]);
+    held = true;
+  } catch (error) {
+    client.release();
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    try {
+      await client.query("SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))", [
+        SCHEMA_015_016_GUARD,
+      ]);
+    } finally {
+      client.release();
+    }
+  };
 }
 
 export async function assert014RollbackSchemaCompatible(
