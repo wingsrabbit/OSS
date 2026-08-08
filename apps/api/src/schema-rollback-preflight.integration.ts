@@ -6,6 +6,7 @@ import {
   SchemaRollbackPreflightError,
 } from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
+import { assertSchemaCompatible } from "./database.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required for rollback preflight integration");
@@ -27,6 +28,10 @@ try {
     "SELECT max(version) AS version FROM schema_migrations",
   );
   assert.equal(original.rows[0]?.version, "014_stage_b_cycle_end_cancellation");
+  await assert.rejects(
+    assertSchemaCompatible(pool),
+    /incompatible.*015_stage_b_saved_payment_auto_renew/i,
+  );
 
   const native = await assert014RollbackBridgeSafe(database, {
     enable015RollbackBridge: false,
