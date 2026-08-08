@@ -143,6 +143,48 @@ export async function requireRecentReauth(
   }
 }
 
+export async function requireRecentReauthLocked(
+  client: DatabaseClient,
+  user: Pick<AuthenticatedUser, "userId" | "sessionId">,
+): Promise<string> {
+  const session = await client.query(
+    `SELECT id
+     FROM sessions
+     WHERE id = $2
+       AND user_id = $1
+       AND revoked_at IS NULL
+       AND expires_at > now()
+     FOR UPDATE`,
+    [user.userId, user.sessionId],
+  );
+  if (session.rowCount !== 1) {
+    throw Object.assign(new Error("Password confirmation is required for this action"), {
+      statusCode: 403,
+      code: "REAUTH_REQUIRED",
+    });
+  }
+  const grant = await client.query<{ id: string }>(
+    `SELECT id
+     FROM reauth_grants
+     WHERE user_id = $1
+       AND session_id = $2
+       AND invalidated_at IS NULL
+       AND expires_at > now()
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [user.userId, user.sessionId],
+  );
+  const grantId = grant.rows[0]?.id;
+  if (!grantId) {
+    throw Object.assign(new Error("Password confirmation is required for this action"), {
+      statusCode: 403,
+      code: "REAUTH_REQUIRED",
+    });
+  }
+  return grantId;
+}
+
 export async function registerAdminRoutes(
   app: FastifyInstance,
   pool: DatabasePool,

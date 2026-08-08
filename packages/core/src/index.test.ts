@@ -39,6 +39,15 @@ test("settled payment cannot be moved backwards by a late event", () => {
   assert.equal(canTransitionPayment("unknown", "succeeded"), true);
 });
 
+test("customer action required is terminal against late Provider outcomes", () => {
+  assert.equal(canTransitionPayment("processing", "requires_action"), true);
+  assert.equal(canTransitionPayment("unknown", "requires_action"), true);
+  assert.equal(canTransitionPayment("requires_action", "succeeded"), false);
+  assert.equal(canTransitionPayment("requires_action", "failed"), false);
+  assert.equal(canTransitionPayment("requires_action", "unknown"), false);
+  assert.equal(canTransitionPayment("requires_action", "requires_action"), true);
+});
+
 test("order payments require the order to remain waiting for payment", () => {
   assert.equal(
     isPaymentBusinessStatePayable({

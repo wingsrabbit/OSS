@@ -15,6 +15,10 @@ export type PaidInvoiceOutcome = {
 export type InvoiceSettlementContext =
   | { kind: "user_command"; userId: string }
   | {
+      kind: "automatic_renewal";
+      authorizationId: string;
+    }
+  | {
       kind: "staff_manual";
       staffUserId: string;
       reason?: string;

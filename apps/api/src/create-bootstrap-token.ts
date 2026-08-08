@@ -3,11 +3,17 @@
 import { open } from "node:fs/promises";
 import { createOpaqueToken, digestToken } from "./auth.js";
 import { loadConfig } from "./config.js";
-import { createPool, runMigrations, transaction } from "./database.js";
+import {
+  bootstrapPaymentMethodTokenKeyrings,
+  createPool,
+  runMigrations,
+  transaction,
+} from "./database.js";
 
 const config = loadConfig();
 const pool = createPool(config);
 await runMigrations(pool);
+await bootstrapPaymentMethodTokenKeyrings(pool, config);
 const outputFile = process.env.BOOTSTRAP_TOKEN_OUTPUT_FILE;
 if (!outputFile) {
   await pool.end();

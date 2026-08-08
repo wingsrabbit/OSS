@@ -4,25 +4,35 @@ import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  assertProviderTokenKeyringCoversVersions,
+  fingerprintProviderTokenKey,
+  fingerprintProviderTokenKeyMaterial,
+  type ProviderTokenKeyring,
+} from "@opensales/core/provider-token-vault";
+import {
   assert014RollbackBridgeSafe,
-  SCHEMA_014,
   type SchemaRollbackPreflightReport,
 } from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
-import type { Config } from "./config.js";
+import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = SCHEMA_014;
+export const REQUIRED_SCHEMA_VERSION = "015_stage_b_saved_payment_auto_renew";
+const TOKEN_REGISTRY_EXTENSION_GUARD =
+  "opensales:payment-method-token-registry-extension";
 
-export function createPool(config: Config): DatabasePool {
+export function createPool(
+  config: Config,
+  applicationName = "opensales-api",
+): DatabasePool {
   return new Pool({
     connectionString: config.DATABASE_URL,
     max: 20,
     statement_timeout: 15_000,
     query_timeout: 20_000,
-    application_name: "opensales-api",
+    application_name: applicationName,
   });
 }
 
@@ -42,6 +52,45 @@ export async function transaction<T>(
   } finally {
     client.release();
   }
+}
+
+export async function holdPaymentMethodTokenRegistryExtensionGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query(
+      "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
+      [TOKEN_REGISTRY_EXTENSION_GUARD],
+    );
+    held = true;
+  } catch (error) {
+    client.release();
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    try {
+      await client.query(
+        "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))",
+        [TOKEN_REGISTRY_EXTENSION_GUARD],
+      );
+    } finally {
+      client.release();
+    }
+  };
+}
+
+export async function tryLockPaymentMethodTokenRegistryExtension(
+  client: DatabaseClient,
+): Promise<boolean> {
+  const result = await client.query<{ locked: boolean }>(
+    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked",
+    [TOKEN_REGISTRY_EXTENSION_GUARD],
+  );
+  return result.rows[0]?.locked === true;
 }
 
 export async function runMigrations(pool: DatabasePool): Promise<void> {
@@ -84,9 +133,22 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   }
 }
 
-export async function assertSchemaCompatible(
+export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> {
+  const result = await pool.query<{ version: string | null }>(
+    `SELECT max(version) AS version
+     FROM schema_migrations`,
+  );
+  const installed = result.rows[0]?.version ?? null;
+  if (installed !== REQUIRED_SCHEMA_VERSION) {
+    throw new Error(
+      `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
+    );
+  }
+}
+
+export async function assert014RollbackSchemaCompatible(
   pool: DatabasePool,
-  input: Readonly<{ enable015RollbackBridge?: boolean }> = {},
+  input: Readonly<{ enable015RollbackBridge: boolean }>,
 ): Promise<SchemaRollbackPreflightReport> {
   const client = await pool.connect();
   try {
@@ -95,7 +157,7 @@ export async function assertSchemaCompatible(
       {
         query: async (text, values) => client.query(text, values),
       },
-      { enable015RollbackBridge: input.enable015RollbackBridge === true },
+      { enable015RollbackBridge: input.enable015RollbackBridge },
     );
     await client.query("COMMIT");
     return report;
@@ -105,4 +167,232 @@ export async function assertSchemaCompatible(
   } finally {
     client.release();
   }
+}
+
+type PaymentMethodTokenKeyTable =
+  | "payment_method_token_encryption_keys"
+  | "payment_method_token_lookup_keys";
+
+async function registerTokenKeyring(
+  client: DatabaseClient,
+  table: PaymentMethodTokenKeyTable,
+  keyring: ProviderTokenKeyring,
+  kind: "encryption" | "lookup",
+): Promise<number[]> {
+  const registeredVersions: number[] = [];
+  for (const [version, key] of keyring.keys) {
+    const materialFingerprint = fingerprintProviderTokenKeyMaterial(key);
+    await client.query(
+      `INSERT INTO payment_method_token_key_materials(
+         material_fingerprint, key_kind, key_version
+       ) VALUES ($1, $2, $3)
+       ON CONFLICT DO NOTHING`,
+      [materialFingerprint, kind, version],
+    );
+    const materialRegistration = await client.query<{
+      key_kind: "encryption" | "lookup";
+      key_version: number;
+    }>(
+      `SELECT key_kind, key_version
+       FROM payment_method_token_key_materials
+       WHERE material_fingerprint = $1
+       FOR SHARE`,
+      [materialFingerprint],
+    );
+    if (
+      materialRegistration.rows[0]?.key_kind !== kind ||
+      materialRegistration.rows[0]?.key_version !== version
+    ) {
+      throw new Error(
+        `Payment method token key material cannot be reused for ${kind} version ${version}`,
+      );
+    }
+    const inserted = await client.query<{ version: number }>(
+      `INSERT INTO ${table}(version, key_fingerprint)
+       VALUES ($1, $2)
+       ON CONFLICT (version) DO NOTHING
+       RETURNING version`,
+      [version, fingerprintProviderTokenKey(key, kind, version)],
+    );
+    if (inserted.rows[0]) registeredVersions.push(inserted.rows[0].version);
+  }
+  return registeredVersions;
+}
+
+async function assertRegisteredTokenKeyring(
+  client: DatabaseClient,
+  table: PaymentMethodTokenKeyTable,
+  keyring: ProviderTokenKeyring,
+  kind: "encryption" | "lookup",
+): Promise<void> {
+  const materials = await client.query<{
+    key_kind: "encryption" | "lookup";
+    key_version: number;
+    material_fingerprint: Buffer;
+  }>(
+    `SELECT key_kind, key_version, material_fingerprint
+     FROM payment_method_token_key_materials
+     WHERE key_kind = $1
+     ORDER BY key_version
+     FOR SHARE`,
+    [kind],
+  );
+  const registered = await client.query<{ version: number; key_fingerprint: Buffer }>(
+    `SELECT version, key_fingerprint FROM ${table} ORDER BY version FOR SHARE`,
+  );
+  if (registered.rowCount === 0) {
+    throw new Error(`Payment method token ${kind} key registry is empty`);
+  }
+  const fingerprints = new Map(
+    registered.rows.map((row) => [row.version, row.key_fingerprint] as const),
+  );
+  const materialFingerprints = new Map(
+    materials.rows.map((row) => [row.key_version, row.material_fingerprint] as const),
+  );
+  for (const [version, key] of keyring.keys) {
+    const fingerprint = fingerprints.get(version);
+    if (!fingerprint) {
+      throw new Error(
+        `Payment method token ${kind} key version ${version} is not registered`,
+      );
+    }
+    if (!fingerprint.equals(fingerprintProviderTokenKey(key, kind, version))) {
+      throw new Error(
+        `Payment method token ${kind} key material does not match registered version ${version}`,
+      );
+    }
+    if (
+      !materialFingerprints
+        .get(version)
+        ?.equals(fingerprintProviderTokenKeyMaterial(key))
+    ) {
+      throw new Error(
+        `Payment method token ${kind} key material registry does not match version ${version}`,
+      );
+    }
+  }
+  const maximumRegisteredVersion = registered.rows.at(-1)?.version ?? 0;
+  if (keyring.activeVersion < maximumRegisteredVersion) {
+    throw new Error(
+      `Payment method token ${kind} active version is older than registered version ${maximumRegisteredVersion}`,
+    );
+  }
+}
+
+async function assertPaymentMethodTokenKeyringsCompatibleWithClient(
+  client: DatabaseClient,
+  config: Config,
+): Promise<void> {
+  const keyrings = paymentMethodTokenKeyrings(config);
+  await assertRegisteredTokenKeyring(
+    client,
+    "payment_method_token_encryption_keys",
+    keyrings.encryption,
+    "encryption",
+  );
+  await assertRegisteredTokenKeyring(
+    client,
+    "payment_method_token_lookup_keys",
+    keyrings.lookup,
+    "lookup",
+  );
+    const stored = await client.query<{
+      encryption_versions: number[] | null;
+      lookup_versions: number[] | null;
+    }>(
+      `SELECT array_agg(DISTINCT encryption_key_version ORDER BY encryption_key_version)
+                AS encryption_versions,
+              array_agg(DISTINCT lookup_key_version ORDER BY lookup_key_version)
+                AS lookup_versions
+       FROM saved_payment_methods`,
+    );
+    assertProviderTokenKeyringCoversVersions(
+      keyrings.encryption,
+      stored.rows[0]?.encryption_versions ?? [],
+      "encryption",
+    );
+    assertProviderTokenKeyringCoversVersions(
+      keyrings.lookup,
+      stored.rows[0]?.lookup_versions ?? [],
+      "lookup",
+    );
+}
+
+export async function bootstrapPaymentMethodTokenKeyrings(
+  pool: DatabasePool,
+  config: Config,
+): Promise<void> {
+  const keyrings = paymentMethodTokenKeyrings(config);
+  await transaction(pool, async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+    );
+    const counts = await client.query<{
+      encryption_count: string;
+      lookup_count: string;
+      material_count: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::text FROM payment_method_token_encryption_keys) AS encryption_count,
+         (SELECT count(*)::text FROM payment_method_token_lookup_keys) AS lookup_count,
+         (SELECT count(*)::text FROM payment_method_token_key_materials) AS material_count`,
+    );
+    const encryptionCount = Number(counts.rows[0]?.encryption_count ?? "0");
+    const lookupCount = Number(counts.rows[0]?.lookup_count ?? "0");
+    const materialCount = Number(counts.rows[0]?.material_count ?? "0");
+    if (
+      (encryptionCount === 0) !== (lookupCount === 0) ||
+      (encryptionCount === 0) !== (materialCount === 0)
+    ) {
+      throw new Error("Payment method token key registries are inconsistent");
+    }
+    if (encryptionCount === 0) {
+      await registerTokenKeyring(
+        client,
+        "payment_method_token_encryption_keys",
+        keyrings.encryption,
+        "encryption",
+      );
+      await registerTokenKeyring(
+        client,
+        "payment_method_token_lookup_keys",
+        keyrings.lookup,
+        "lookup",
+      );
+    }
+    await assertPaymentMethodTokenKeyringsCompatibleWithClient(client, config);
+  });
+}
+
+export async function registerPaymentMethodTokenKeyringsForRotation(
+  client: DatabaseClient,
+  config: Config,
+): Promise<Readonly<{ encryptionVersions: number[]; lookupVersions: number[] }>> {
+  const keyrings = paymentMethodTokenKeyrings(config);
+  const encryptionVersions = await registerTokenKeyring(
+    client,
+    "payment_method_token_encryption_keys",
+    keyrings.encryption,
+    "encryption",
+  );
+  const lookupVersions = await registerTokenKeyring(
+    client,
+    "payment_method_token_lookup_keys",
+    keyrings.lookup,
+    "lookup",
+  );
+  await assertPaymentMethodTokenKeyringsCompatibleWithClient(client, config);
+  return { encryptionVersions, lookupVersions };
+}
+
+export async function assertPaymentMethodTokenKeyringsCompatible(
+  pool: DatabasePool,
+  config: Config,
+): Promise<void> {
+  await transaction(pool, async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+    );
+    await assertPaymentMethodTokenKeyringsCompatibleWithClient(client, config);
+  });
 }

@@ -84,6 +84,8 @@ jobs:
       MOCK_MAIL_PROVIDER_TOKEN: ci-only-mail-token-00000000000000000000
       LAB_MAILBOX_TOKEN: ci-only-mailbox-token-000000000000000000
       PROVIDER_OPERATION_CAPABILITY_SECRET: ci-only-operation-capability-secret-000000
+      PAYMENT_METHOD_TOKEN_KEY: FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU
+      PAYMENT_METHOD_TOKEN_LOOKUP_KEY: FhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhY
       MOCK_PAYMENT_WEBHOOK_SECRET: ci-only-payment-webhook-secret-0000000000
       MOCK_PROVISIONING_WEBHOOK_SECRET: ci-only-provision-webhook-secret-0000000
       MOCK_PROVISION_SCENARIO: timeout_existing
@@ -134,10 +136,61 @@ jobs:
           await client.query('CREATE DATABASE renewal_lifecycle');
           await client.end();"
 
+      - name: Create isolated critical financial test databases
+        shell: bash
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.ADMIN_DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE DATABASE payment_token_rotation');
+          await client.query('CREATE DATABASE schema_rollback');
+          await client.end();"
+
       - name: Run renewal lifecycle PostgreSQL journey
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/renewal_lifecycle
         run: pnpm --filter @opensales/api test:integration:renewal-lifecycle
+
+      - name: Run payment token rotation PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/payment_token_rotation
+        run: pnpm --filter @opensales/api test:integration:payment-method-token-rotation
+
+      - name: Prepare schema 014 rollback database
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-4])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
+      - name: Run schema rollback PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
+          OSS_SCHEMA_ROLLBACK_BRIDGE: "014-to-015"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-preflight
 
       - name: Apply forward migrations and synthetic configuration
         shell: bash
@@ -194,6 +247,8 @@ jobs:
 
       - name: Restart API for isolated browser journey
         shell: bash
+        env:
+          OSS_LOG_LEVEL: error
         run: |
           set -euo pipefail
           read -r api_pid < api.pid
@@ -234,4 +289,24 @@ jobs:
           exit 1
 
       - name: Run browser Stage A journey
-        run: pnpm --filter @opensales/e2e test:e2e
+        shell: bash
+        run: |
+          set +e
+          pnpm --filter @opensales/e2e test:e2e
+          browser_status=$?
+          set -e
+          if [[ "${browser_status}" -ne 0 ]]; then
+            echo "Browser journey failed; redacted API errors follow"
+            # This filter is intentionally limited to synthetic CI diagnostics;
+            # production logging must use an independently reviewed policy.
+            grep '"msg":"request failed"' api-browser.log > request-failures.log || true
+            if ! sed -E \
+              -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[UUID]/g' \
+              -e 's/[A-Za-z0-9._%+-]+@example[.]invalid/[SYNTHETIC_EMAIL]/g' \
+              -e 's/ci-only-[A-Za-z0-9_-]+/[CI_SECRET]/g' \
+              -e 's/[A-Za-z0-9_-]{43}/[KEY_MATERIAL]/g' \
+              request-failures.log | tail -n 50; then
+              echo "Redacted API diagnostics were unavailable"
+            fi
+          fi
+          exit "${browser_status}"

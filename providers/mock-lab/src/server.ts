@@ -20,30 +20,53 @@ const config = z
   })
   .parse(process.env);
 
-const paymentCreateSchema = z.object({
-  operationId: z.uuid(),
-  paymentAttemptId: z.uuid(),
-  callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-  amountMinor: z.string().regex(/^[1-9]\d*$/),
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  scenario: z.enum([
-    "success",
-    "failed",
-    "cancelled",
-    "timeout_success",
-    "duplicate_out_of_order",
-    "definitive_reject",
-    "delayed_definitive_reject",
-    "reconcile_manual",
-    "success_then_reject",
-    "partial_then_reject",
-    "partial_then_timeout",
-    "partial",
-    "wrong_currency",
-    "expired_late",
-    "late_success",
-  ]),
-});
+const paymentCreateSchema = z
+  .object({
+    operationId: z.uuid(),
+    paymentAttemptId: z.uuid(),
+    callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    customerReference: z.uuid().optional(),
+    amountMinor: z.string().regex(/^[1-9]\d*$/),
+    currency: z.string().regex(/^[A-Z]{3}$/),
+    scenario: z.enum([
+      "success",
+      "failed",
+      "cancelled",
+      "timeout_success",
+      "duplicate_out_of_order",
+      "definitive_reject",
+      "delayed_definitive_reject",
+      "reconcile_manual",
+      "success_then_reject",
+      "partial_then_reject",
+      "partial_then_timeout",
+      "partial",
+      "wrong_currency",
+      "expired_late",
+      "late_success",
+      "automatic",
+    ]),
+    savePaymentMethod: z.boolean().default(false),
+    paymentMethodCode: z.enum(["card", "alipay", "usdt"]).optional(),
+    providerPaymentMethodToken: z.string().min(16).max(500).optional(),
+  })
+  .superRefine((body, context) => {
+    if (body.scenario === "automatic" && !body.providerPaymentMethodToken) {
+      context.addIssue({ code: "custom", path: ["providerPaymentMethodToken"], message: "automatic payment requires a saved Provider token" });
+    }
+    if ((body.scenario === "automatic" || body.savePaymentMethod) && !body.customerReference) {
+      context.addIssue({ code: "custom", path: ["customerReference"], message: "saved payment methods require an opaque customer reference" });
+    }
+    if (body.scenario !== "automatic" && body.providerPaymentMethodToken) {
+      context.addIssue({ code: "custom", path: ["providerPaymentMethodToken"], message: "saved Provider token is only accepted for automatic payment" });
+    }
+    if (body.savePaymentMethod && (!body.paymentMethodCode || body.paymentMethodCode === "usdt")) {
+      context.addIssue({ code: "custom", path: ["paymentMethodCode"], message: "this payment method cannot be saved" });
+    }
+    if (body.savePaymentMethod && body.providerPaymentMethodToken) {
+      context.addIssue({ code: "custom", path: ["savePaymentMethod"], message: "automatic payments cannot save another method" });
+    }
+  });
 
 const refundCreateSchema = z.object({
   operationId: z.uuid(),
@@ -124,7 +147,24 @@ await pool.query(`
     callback_capability text NOT NULL,
     occurred_at timestamptz NOT NULL DEFAULT now(),
     create_calls integer NOT NULL DEFAULT 1,
+    query_calls integer NOT NULL DEFAULT 0,
     request_fingerprint text NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS mock_saved_payment_methods (
+    provider_token text PRIMARY KEY,
+    source_payment_attempt_id uuid NOT NULL UNIQUE,
+    customer_reference uuid NOT NULL,
+    payment_method_code text NOT NULL CHECK (payment_method_code IN ('card', 'alipay')),
+    instrument_type text NOT NULL,
+    brand text NOT NULL,
+    last_four text NOT NULL CHECK (last_four ~ '^[0-9]{4}$'),
+    expiry_month integer NOT NULL CHECK (expiry_month BETWEEN 1 AND 12),
+    expiry_year integer NOT NULL CHECK (expiry_year BETWEEN 2020 AND 2200),
+    status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'invalid')),
+    automatic_scenario text NOT NULL DEFAULT 'success'
+      CHECK (automatic_scenario IN ('success', 'failed', 'requires_action', 'timeout_success')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
   );
   CREATE TABLE IF NOT EXISTS mock_refund_operations (
     operation_id uuid PRIMARY KEY,
@@ -219,6 +259,11 @@ await pool.query(`
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
   ALTER TABLE mock_payment_operations
     ADD COLUMN IF NOT EXISTS callback_capability text;
+  ALTER TABLE mock_payment_operations
+    ADD COLUMN IF NOT EXISTS saved_method_token text
+      REFERENCES mock_saved_payment_methods(provider_token);
+  ALTER TABLE mock_payment_operations
+    ADD COLUMN IF NOT EXISTS query_calls integer NOT NULL DEFAULT 0;
   UPDATE mock_payment_operations
   SET callback_capability = 'legacy-disabled'
   WHERE callback_capability IS NULL;
@@ -352,7 +397,12 @@ const app = Fastify({
   logger: {
     level: "info",
     redact: {
-      paths: ["req.headers.authorization", "req.headers.x-oss-signature"],
+      paths: [
+        "req.headers.authorization",
+        "req.headers.x-oss-signature",
+        "req.body.providerPaymentMethodToken",
+        "req.body.savedPaymentMethod.providerToken",
+      ],
       censor: "[REDACTED]",
     },
   },
@@ -462,7 +512,43 @@ app.post("/v1/payments", async (request, reply) => {
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
-  if (body.scenario === "delayed_definitive_reject") {
+  let effectiveScenario:
+    | z.infer<typeof paymentCreateSchema>["scenario"]
+    | "requires_action" = body.scenario;
+  let savedMethodToken: string | null = null;
+  if (body.scenario === "automatic") {
+    const method = await pool.query<{
+      provider_token: string;
+      automatic_scenario: "success" | "failed" | "requires_action" | "timeout_success";
+    }>(
+      `SELECT provider_token, automatic_scenario
+       FROM mock_saved_payment_methods
+       WHERE provider_token = $1 AND customer_reference = $2 AND status = 'active'`,
+      [body.providerPaymentMethodToken, body.customerReference],
+    );
+    const row = method.rows[0];
+    if (!row) return reply.code(403).send({ error: "saved payment method is invalid or belongs to another customer" });
+    savedMethodToken = row.provider_token;
+    effectiveScenario = row.automatic_scenario;
+  } else if (body.savePaymentMethod) {
+    savedMethodToken = `mock-pm-${body.paymentAttemptId}-token`;
+    await pool.query(
+      `INSERT INTO mock_saved_payment_methods(
+         provider_token, source_payment_attempt_id, customer_reference,
+         payment_method_code, instrument_type, brand, last_four,
+         expiry_month, expiry_year
+       ) VALUES ($1, $2, $3, $4, 'card', $5, '4242', 12, 2032)
+       ON CONFLICT (source_payment_attempt_id) DO NOTHING`,
+      [
+        savedMethodToken,
+        body.paymentAttemptId,
+        body.customerReference,
+        body.paymentMethodCode,
+        body.paymentMethodCode === "alipay" ? "Mock Alipay" : "Mock Visa",
+      ],
+    );
+  }
+  if (effectiveScenario === "delayed_definitive_reject") {
     await pool.query(
       `INSERT INTO mock_payment_fault_gates(operation_id, behavior)
        VALUES ($1, 'delayed_definitive_reject')
@@ -484,27 +570,29 @@ app.post("/v1/payments", async (request, reply) => {
     }
     return reply.code(503).send({ error: "synthetic definitive rejection gate timed out" });
   }
-  if (body.scenario === "definitive_reject") {
+  if (effectiveScenario === "definitive_reject") {
     return reply.code(400).send({ error: "synthetic definitive payment rejection" });
   }
   const externalPaymentId = `mock-pay-${body.operationId}`;
   const fingerprint = requestFingerprint("payment.create:v1", body);
   const status =
-    body.scenario === "failed"
+    effectiveScenario === "failed"
       ? "failed"
-      : body.scenario === "cancelled"
+      : effectiveScenario === "cancelled"
         ? "cancelled"
+        : effectiveScenario === "requires_action"
+          ? "requires_action"
         : "succeeded";
   const inserted = await pool.query<{
     external_payment_id: string;
-    status: "succeeded" | "failed" | "cancelled";
+    status: "succeeded" | "failed" | "cancelled" | "requires_action";
     occurred_at: Date;
   }>(
     `INSERT INTO mock_payment_operations(
        operation_id, payment_attempt_id, external_payment_id,
        amount_minor, currency, scenario, status, callback_capability
-       , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       , request_fingerprint, saved_method_token
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (operation_id) DO UPDATE
        SET create_calls = mock_payment_operations.create_calls + 1
        WHERE mock_payment_operations.request_fingerprint = EXCLUDED.request_fingerprint
@@ -515,10 +603,11 @@ app.post("/v1/payments", async (request, reply) => {
       externalPaymentId,
       body.amountMinor,
       body.currency,
-      body.scenario,
+      effectiveScenario,
       status,
       body.callbackCapability,
       fingerprint,
+      savedMethodToken,
     ],
   );
   const operation = inserted.rows[0];
@@ -541,11 +630,23 @@ app.post("/v1/payments", async (request, reply) => {
         : body.amountMinor,
     currency: body.scenario === "wrong_currency" ? "EUR" : body.currency,
     occurredAt:
-      body.scenario === "late_success"
+      effectiveScenario === "late_success"
         ? new Date(operation.occurred_at.getTime() + 31 * 60 * 1_000).toISOString()
         : operation.occurred_at.toISOString(),
+    ...(body.savePaymentMethod && savedMethodToken
+      ? {
+          savedPaymentMethod: {
+            providerToken: savedMethodToken,
+            instrumentType: "card",
+            brand: body.paymentMethodCode === "alipay" ? "Mock Alipay" : "Mock Visa",
+            lastFour: "4242",
+            expiryMonth: 12,
+            expiryYear: 2032,
+          },
+        }
+      : {}),
   };
-  if (body.scenario === "expired_late") {
+  if (effectiveScenario === "expired_late") {
     scheduleCallback(
       "/api/v1/provider-events/payment",
       {
@@ -563,7 +664,7 @@ app.post("/v1/payments", async (request, reply) => {
       60,
       callbackSecret,
     );
-  } else if (body.scenario === "duplicate_out_of_order") {
+  } else if (effectiveScenario === "duplicate_out_of_order") {
     scheduleCallback("/api/v1/provider-events/payment", event, 20, callbackSecret);
     scheduleCallback(
       "/api/v1/provider-events/payment",
@@ -577,32 +678,31 @@ app.post("/v1/payments", async (request, reply) => {
       60,
       callbackSecret,
     );
-  } else if (body.scenario === "success_then_reject") {
+  } else if (effectiveScenario === "success_then_reject") {
     await callback("/api/v1/provider-events/payment", event, callbackSecret);
     return reply.code(400).send({
       error: "synthetic rejection after Provider already reported full payment success",
     });
-  } else if (body.scenario === "partial_then_reject") {
+  } else if (effectiveScenario === "partial_then_reject") {
     await callback("/api/v1/provider-events/payment", event, callbackSecret);
     return reply.code(400).send({
       error: "synthetic rejection after Provider already reported partial funds",
     });
-  } else if (body.scenario === "partial_then_timeout") {
+  } else if (effectiveScenario === "partial_then_timeout") {
     await callback("/api/v1/provider-events/payment", event, callbackSecret);
     await new Promise((resolve) => setTimeout(resolve, 3_000));
-  } else if (body.scenario === "reconcile_manual") {
+  } else if (effectiveScenario === "reconcile_manual") {
     return reply.code(503).send({
       error: "synthetic ambiguous create followed by manual reconciliation",
     });
-  } else {
-    scheduleCallback(
-      "/api/v1/provider-events/payment",
-      event,
-      body.scenario === "timeout_success" ? 3_500 : 20,
-      callbackSecret,
-    );
+  } else if (effectiveScenario !== "timeout_success") {
+    scheduleCallback("/api/v1/provider-events/payment", event, 20, callbackSecret);
   }
-  if (body.scenario === "timeout_success") {
+  if (effectiveScenario === "timeout_success") {
+    // Deliberately do not emit a callback. Core must treat the timed-out POST
+    // as unknown and learn the already-settled result only through GET
+    // reconciliation. This remains deterministic even with a slow Worker or a
+    // large reconciliation delay.
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }
   return reply.code(202).send({
@@ -614,19 +714,36 @@ app.post("/v1/payments", async (request, reply) => {
 
 app.get("/v1/payments/:operationId", async (request, reply) => {
   const params = z.object({ operationId: z.uuid() }).parse(request.params);
+  await pool.query(
+    `UPDATE mock_payment_operations
+     SET query_calls = query_calls + 1
+     WHERE operation_id = $1`,
+    [params.operationId],
+  );
   const result = await pool.query<{
     callback_capability: string;
     external_payment_id: string;
-    status: "succeeded" | "failed" | "cancelled";
+    status: "succeeded" | "failed" | "cancelled" | "requires_action";
     amount_minor: string;
     currency: string;
     scenario: string;
     occurred_at: Date;
+    saved_method_token: string | null;
+    instrument_type: string | null;
+    brand: string | null;
+    last_four: string | null;
+    expiry_month: number | null;
+    expiry_year: number | null;
   }>(
-    `SELECT callback_capability, external_payment_id, status, amount_minor, currency, scenario,
-            occurred_at
-     FROM mock_payment_operations
-     WHERE operation_id = $1`,
+    `SELECT operation.callback_capability, operation.external_payment_id,
+            operation.status, operation.amount_minor, operation.currency,
+            operation.scenario, operation.occurred_at, operation.saved_method_token,
+            saved.instrument_type, saved.brand, saved.last_four,
+            saved.expiry_month, saved.expiry_year
+     FROM mock_payment_operations operation
+     LEFT JOIN mock_saved_payment_methods saved
+       ON saved.provider_token = operation.saved_method_token
+     WHERE operation.operation_id = $1`,
     [params.operationId],
   );
   const row = result.rows[0];
@@ -649,6 +766,73 @@ app.get("/v1/payments/:operationId", async (request, reply) => {
       row.scenario === "late_success"
         ? new Date(row.occurred_at.getTime() + 31 * 60 * 1_000).toISOString()
         : row.occurred_at.toISOString(),
+    ...(row.saved_method_token && row.instrument_type && row.brand && row.last_four
+      ? {
+          savedPaymentMethod: {
+            providerToken: row.saved_method_token,
+            instrumentType: row.instrument_type,
+            brand: row.brand,
+            lastFour: row.last_four,
+            expiryMonth: row.expiry_month,
+            expiryYear: row.expiry_year,
+          },
+        }
+      : {}),
+  };
+});
+
+app.post("/v1/payments/lab-methods/:sourcePaymentAttemptId/scenario", async (request, reply) => {
+  const params = z.object({ sourcePaymentAttemptId: z.uuid() }).parse(request.params);
+  const body = z
+    .object({ scenario: z.enum(["success", "failed", "requires_action", "timeout_success"]) })
+    .strict()
+    .parse(request.body);
+  const updated = await pool.query(
+    `UPDATE mock_saved_payment_methods
+     SET automatic_scenario = $2, updated_at = now()
+     WHERE source_payment_attempt_id = $1`,
+    [params.sourcePaymentAttemptId, body.scenario],
+  );
+  if (updated.rowCount !== 1) return reply.code(404).send({ error: "saved payment method not found" });
+  return { sourcePaymentAttemptId: params.sourcePaymentAttemptId, scenario: body.scenario };
+});
+
+app.get("/v1/payments/lab-methods/:sourcePaymentAttemptId/stats", async (request, reply) => {
+  const params = z.object({ sourcePaymentAttemptId: z.uuid() }).parse(request.params);
+  const result = await pool.query<{
+    source_payment_attempt_id: string;
+    automatic_scenario: string;
+    status: string;
+    operation_id: string | null;
+    operation_status: string | null;
+    create_calls: number | null;
+    query_calls: number | null;
+  }>(
+    `SELECT saved.source_payment_attempt_id, saved.automatic_scenario, saved.status,
+            operation.operation_id, operation.status AS operation_status,
+            operation.create_calls, operation.query_calls
+     FROM mock_saved_payment_methods saved
+     LEFT JOIN mock_payment_operations operation
+       ON operation.saved_method_token = saved.provider_token
+      AND operation.payment_attempt_id <> saved.source_payment_attempt_id
+     WHERE saved.source_payment_attempt_id = $1
+     ORDER BY operation.occurred_at, operation.operation_id`,
+    [params.sourcePaymentAttemptId],
+  );
+  const first = result.rows[0];
+  if (!first) return reply.code(404).send({ error: "saved payment method not found" });
+  return {
+    sourcePaymentAttemptId: first.source_payment_attempt_id,
+    scenario: first.automatic_scenario,
+    status: first.status,
+    automaticOperations: result.rows
+      .filter((row) => row.operation_id)
+      .map((row) => ({
+        operationId: row.operation_id,
+        status: row.operation_status,
+        createCalls: row.create_calls,
+        queryCalls: row.query_calls,
+      })),
   };
 });
 

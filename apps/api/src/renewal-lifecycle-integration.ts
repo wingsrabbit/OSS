@@ -7,16 +7,53 @@ import pg from "pg";
 import { digestToken, passwordHash } from "./auth.js";
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
-import { assertSchemaCompatible, runMigrations, type DatabaseClient } from "./database.js";
+import {
+  assertPaymentMethodTokenKeyringsCompatible,
+  assertSchemaCompatible,
+  bootstrapPaymentMethodTokenKeyrings,
+  runMigrations,
+  type DatabaseClient,
+} from "./database.js";
 import { scheduleResumeAfterRenewalSettlement } from "./delinquency-lifecycle.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 import { providerSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
+import {
+  AUTOMATIC_RENEWAL_CONSENT_VERSION,
+  PAYMENT_METHOD_SAVE_CONSENT_VERSION,
+} from "./routes-payment-methods.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required for renewal lifecycle integration");
+
+function buildIntegrationConfig(sessionCookieName = "oss_renewal_integration_session"): Config {
+  return {
+    DATABASE_URL: databaseUrl!,
+    OSS_ENV: "test",
+    OSS_PUBLIC_URL: "http://127.0.0.1:3000",
+    API_HOST: "127.0.0.1",
+    API_PORT: 3000,
+    GLOBAL_RATE_LIMIT_MAX: 10_000,
+    SESSION_COOKIE_NAME: sessionCookieName,
+    SESSION_TTL_HOURS: 24,
+    VERIFICATION_TTL_MINUTES: 30,
+    WEB_ORIGIN: "http://127.0.0.1:5173",
+    MOCK_MAILBOX_URL: "http://127.0.0.1:4000",
+    LAB_MAILBOX_TOKEN: "manual-action-mailbox-token-0000000000000000",
+    PROVIDER_OPERATION_CAPABILITY_SECRET:
+      "manual-action-capability-secret-0000000000000000",
+    PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 9).toString("base64url"),
+    PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 10).toString("base64url"),
+    MOCK_PAYMENT_WEBHOOK_SECRET: "manual-action-payment-secret-000000000000000000",
+    MOCK_PROVISIONING_WEBHOOK_SECRET:
+      "manual-action-provisioning-secret-0000000000000000",
+    LAB_MAILBOX_ENABLED: false,
+  };
+}
+
+const integrationConfig = buildIntegrationConfig();
 
 const TERM_START = new Date("2001-01-01T01:00:00.000Z");
 const TERM_END = new Date("2001-02-01T01:00:00.000Z");
@@ -420,6 +457,354 @@ async function expectDatabaseRejection(
   await client.query(`RELEASE SAVEPOINT ${savepoint}`);
   assert.ok(caught instanceof Error, `${label} must be rejected by PostgreSQL`);
   assert.match(caught.message, expectedMessage, `${label} must fail for the expected invariant`);
+}
+
+async function proveSavedPaymentAuthorizationGuards(
+  client: DatabaseClient,
+  input: {
+    account: FixtureAccount;
+    service: FixtureService;
+    otherAccount: FixtureAccount;
+    otherService: FixtureService;
+  },
+): Promise<void> {
+  const namespace = randomBytes(6).toString("hex");
+  const paymentMethodCode = `saved_card_${namespace}`;
+  const providerInstallationId = `saved-payment-provider-${namespace}`;
+  const savedPaymentMethodId = randomUUID();
+
+  await client.query(
+    `INSERT INTO provider_installation_capabilities(
+       provider_installation_id, provider_type, enabled, capabilities
+     ) VALUES (
+       $1, 'payment', true,
+       '["payment_create","payment_reconcile","payment_method_setup","payment_off_session"]'::jsonb
+     )`,
+    [providerInstallationId],
+  );
+  await client.query(
+    `INSERT INTO payment_methods(
+       code, display_name, provider_installation_id, fee_basis_points,
+       saved_method_enabled, automatic_renewal_enabled
+     ) VALUES ($1, '{"en":"Synthetic saved card"}'::jsonb, $2, 350, true, true)`,
+    [paymentMethodCode, providerInstallationId],
+  );
+  await client.query(
+    `INSERT INTO saved_payment_methods(
+       id, client_account_id, provider_installation_id, payment_method_code,
+       provider_token_ciphertext, provider_token_digest, instrument_type,
+       brand, last_four, expiry_month, expiry_year, is_default,
+       save_consent_version, saved_by_user_id
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, 'card',
+       'Synthetic Card', '4242', 12, 2099, false,
+       'saved-method-consent-v1', $7
+     )`,
+    [
+      savedPaymentMethodId,
+      input.account.clientAccountId,
+      providerInstallationId,
+      paymentMethodCode,
+      `integration-only-ciphertext-${"x".repeat(64)}`,
+      randomBytes(32),
+      input.account.userId,
+    ],
+  );
+  await client.query(
+    `UPDATE services
+     SET automatic_renewal_consent_generation = 1,
+         automatic_renewal_decision_generation = 1,
+         version = version + 1
+     WHERE id = $1`,
+    [input.service.serviceId],
+  );
+  await expectDatabaseRejection(
+    client,
+    "payment_automatic_consent_cross_account_service",
+    /payment automatic-renewal consent ownership or generation is invalid/i,
+    () =>
+      client.query(
+        `INSERT INTO payment_attempts(
+           client_account_id, invoice_id, provider_installation_id,
+           status, amount_minor, currency, scenario, idempotency_key,
+           request_fingerprint, save_payment_method_requested, save_consent_version,
+           automatic_renewal_requested, automatic_renewal_consent_version,
+           automatic_renewal_service_id, automatic_renewal_decision_generation
+         ) VALUES (
+           $1, $2, $3, 'created', 1, 'USD', 'success', $4, $5,
+           true, 'saved-method-consent-v1', true, 'automatic-renewal-consent-v1',
+           $6, 1
+         )`,
+        [
+          input.otherAccount.clientAccountId,
+          input.otherService.initialInvoiceId,
+          providerInstallationId,
+          `cross-account-auto-consent:${randomUUID()}`,
+          "d".repeat(64),
+          input.service.serviceId,
+        ],
+      ),
+  );
+
+  await expectDatabaseRejection(
+    client,
+    "saved_payment_provider_binding",
+    /does not support saved Provider tokens/i,
+    () =>
+      client.query(
+        `INSERT INTO saved_payment_methods(
+           client_account_id, provider_installation_id, payment_method_code,
+           provider_token_ciphertext, provider_token_digest, instrument_type,
+           brand, last_four, expiry_month, expiry_year,
+           save_consent_version, saved_by_user_id
+         ) VALUES (
+           $1, $2, $3, $4, $5, 'card',
+           'Synthetic Card', '5252', 12, 2099,
+           'saved-method-consent-v1', $6
+         )`,
+        [
+          input.account.clientAccountId,
+          `${providerInstallationId}-forged`,
+          paymentMethodCode,
+          `integration-only-ciphertext-${"y".repeat(64)}`,
+          randomBytes(32),
+          input.account.userId,
+        ],
+      ),
+  );
+  await expectDatabaseRejection(
+    client,
+    "automatic_renewal_generation_monotonic",
+    /automatic-renewal generations cannot move backward/i,
+    () =>
+      client.query(
+        `UPDATE services
+         SET automatic_renewal_consent_generation = 0,
+             automatic_renewal_decision_generation = 0,
+             version = version + 1
+         WHERE id = $1`,
+        [input.service.serviceId],
+      ),
+  );
+
+  await expectDatabaseRejection(
+    client,
+    "automatic_renewal_cross_account_binding",
+    /automatic renewal ownership or payment method capability is invalid/i,
+    () =>
+      client.query(
+        `INSERT INTO automatic_renewal_authorizations(
+           service_id, client_account_id, saved_payment_method_id,
+           consent_version, consent_generation, granted_by_user_id
+         ) VALUES ($1, $2, $3, 'automatic-renewal-consent-v1', 1, $4)`,
+        [
+          input.otherService.serviceId,
+          input.otherAccount.clientAccountId,
+          savedPaymentMethodId,
+          input.otherAccount.userId,
+        ],
+      ),
+  );
+
+  const authorization = await client.query<{ id: string }>(
+    `INSERT INTO automatic_renewal_authorizations(
+       service_id, client_account_id, saved_payment_method_id,
+       consent_version, consent_generation, granted_by_user_id
+     ) VALUES ($1, $2, $3, 'automatic-renewal-consent-v1', 1, $4)
+     RETURNING id`,
+    [
+      input.service.serviceId,
+      input.account.clientAccountId,
+      savedPaymentMethodId,
+      input.account.userId,
+    ],
+  );
+  assert.ok(authorization.rows[0]?.id);
+  await expectDatabaseRejection(
+    client,
+    "automatic_renewal_one_active_authorization",
+    /duplicate key/i,
+    () =>
+      client.query(
+        `INSERT INTO automatic_renewal_authorizations(
+           service_id, client_account_id, saved_payment_method_id,
+           consent_version, consent_generation, granted_by_user_id
+         ) VALUES ($1, $2, $3, 'automatic-renewal-consent-v1', 1, $4)`,
+        [
+          input.service.serviceId,
+          input.account.clientAccountId,
+          savedPaymentMethodId,
+          input.account.userId,
+        ],
+      ),
+  );
+
+  await client.query(
+    `UPDATE payment_methods
+     SET automatic_renewal_enabled = false
+     WHERE code = $1`,
+    [paymentMethodCode],
+  );
+  await client.query(
+    `UPDATE automatic_renewal_authorizations
+     SET status = 'revoked', revoked_by_user_id = $2, revoked_at = now(),
+         revocation_reason = 'synthetic capability-disabled revocation',
+         updated_at = now(), version = version + 1
+     WHERE id = $1`,
+    [authorization.rows[0]!.id, input.account.userId],
+  );
+  await client.query(
+    `UPDATE payment_methods
+     SET automatic_renewal_enabled = true
+     WHERE code = $1`,
+    [paymentMethodCode],
+  );
+  const revokedAfterReenable = await client.query<{ status: string }>(
+    `SELECT status FROM automatic_renewal_authorizations WHERE id = $1`,
+    [authorization.rows[0]!.id],
+  );
+  assert.equal(
+    revokedAfterReenable.rows[0]?.status,
+    "revoked",
+    "disabling a method must not block revocation or revive consent when re-enabled",
+  );
+
+  await client.query(
+    `UPDATE services
+     SET automatic_renewal_consent_generation = 2,
+         automatic_renewal_decision_generation = 2,
+         version = version + 1
+     WHERE id = $1`,
+    [input.service.serviceId],
+  );
+  await expectDatabaseRejection(
+    client,
+    "automatic_renewal_stale_consent_generation",
+    /automatic renewal ownership or payment method capability is invalid/i,
+    () =>
+      client.query(
+        `INSERT INTO automatic_renewal_authorizations(
+           service_id, client_account_id, saved_payment_method_id,
+           consent_version, consent_generation, granted_by_user_id
+         ) VALUES ($1, $2, $3, 'automatic-renewal-consent-v1', 1, $4)`,
+        [
+          input.service.serviceId,
+          input.account.clientAccountId,
+          savedPaymentMethodId,
+          input.account.userId,
+        ],
+      ),
+  );
+
+  const consentEventId = randomUUID();
+  const consentIdempotencyKey = `saved-method-consent:${randomUUID()}`;
+  await client.query(
+    `INSERT INTO payment_consent_events(
+       id, client_account_id, saved_payment_method_id, event_type,
+       consent_version, actor_type, actor_id, reason,
+       idempotency_key, request_fingerprint, result
+     ) VALUES (
+       $1, $2, $3, 'method_saved',
+       'saved-method-consent-v1', 'user', $4, 'Synthetic explicit save consent',
+       $5, $6, '{"saved":true}'::jsonb
+     )`,
+    [
+      consentEventId,
+      input.account.clientAccountId,
+      savedPaymentMethodId,
+      input.account.userId,
+      consentIdempotencyKey,
+      "a".repeat(64),
+    ],
+  );
+  await expectDatabaseRejection(client, "payment_consent_idempotency", /duplicate key/i, () =>
+    client.query(
+      `INSERT INTO payment_consent_events(
+         client_account_id, saved_payment_method_id, event_type,
+         consent_version, actor_type, actor_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, $2, 'method_saved',
+         'different-consent-version', 'user', $3, 'Conflicting synthetic replay',
+         $4, $5, '{"saved":false}'::jsonb
+       )`,
+      [
+        input.account.clientAccountId,
+        savedPaymentMethodId,
+        input.account.userId,
+        consentIdempotencyKey,
+        "b".repeat(64),
+      ],
+    ),
+  );
+  await expectDatabaseRejection(client, "payment_consent_append_only", /append-only/i, () =>
+    client.query("UPDATE payment_consent_events SET reason = 'forged' WHERE id = $1", [
+      consentEventId,
+    ]),
+  );
+
+  const defaultAttemptId = randomUUID();
+  await client.query(
+    `INSERT INTO payment_attempts(
+       id, client_account_id, invoice_id, provider_installation_id,
+       status, amount_minor, currency, scenario, idempotency_key,
+       request_fingerprint
+     ) VALUES ($1, $2, $3, $4, 'created', 1, 'USD', 'success', $5, $6)`,
+    [
+      defaultAttemptId,
+      input.account.clientAccountId,
+      input.service.initialInvoiceId,
+      providerInstallationId,
+      `saved-payment-defaults:${randomUUID()}`,
+      "c".repeat(64),
+    ],
+  );
+  const defaultConsent = await client.query<{
+    save_payment_method_requested: boolean;
+    save_consent_version: string | null;
+    automatic_renewal_requested: boolean;
+    automatic_renewal_consent_version: string | null;
+    automatic_renewal_decision_generation: string | null;
+  }>(
+    `SELECT save_payment_method_requested, save_consent_version,
+            automatic_renewal_requested, automatic_renewal_consent_version,
+            automatic_renewal_decision_generation::text
+     FROM payment_attempts WHERE id = $1`,
+    [defaultAttemptId],
+  );
+  assert.deepEqual(defaultConsent.rows[0], {
+    save_payment_method_requested: false,
+    save_consent_version: null,
+    automatic_renewal_requested: false,
+    automatic_renewal_consent_version: null,
+    automatic_renewal_decision_generation: null,
+  });
+  await expectDatabaseRejection(
+    client,
+    "automatic_renewal_requires_explicit_save_consent",
+    /payment_attempts_automatic_consent_check/i,
+    () =>
+      client.query(
+        `INSERT INTO payment_attempts(
+           client_account_id, invoice_id, provider_installation_id,
+           status, amount_minor, currency, scenario, idempotency_key,
+           request_fingerprint, automatic_renewal_requested,
+           automatic_renewal_consent_version, automatic_renewal_service_id,
+           automatic_renewal_decision_generation
+         ) VALUES (
+           $1, $2, $3, 'created', 1, 'USD', 'success', $4,
+           $5, true, 'automatic-renewal-consent-v1', $6, 2
+         )`,
+        [
+          input.account.clientAccountId,
+          input.service.initialInvoiceId,
+          providerInstallationId,
+          `automatic-without-save:${randomUUID()}`,
+          "d".repeat(64),
+          input.service.serviceId,
+        ],
+      ),
+  );
 }
 
 async function createFixtureProduct(
@@ -1381,26 +1766,7 @@ async function proveManualSuspensionApi(pool: pg.Pool): Promise<void> {
     setup.release();
   }
 
-  const config: Config = {
-    DATABASE_URL: databaseUrl!,
-    OSS_ENV: "test",
-    OSS_PUBLIC_URL: "http://127.0.0.1:3000",
-    API_HOST: "127.0.0.1",
-    API_PORT: 3000,
-    GLOBAL_RATE_LIMIT_MAX: 10_000,
-    SESSION_COOKIE_NAME: "oss_manual_action_session",
-    SESSION_TTL_HOURS: 24,
-    VERIFICATION_TTL_MINUTES: 30,
-    WEB_ORIGIN: "http://127.0.0.1:5173",
-    MOCK_MAILBOX_URL: "http://127.0.0.1:4000",
-    LAB_MAILBOX_TOKEN: "manual-action-mailbox-token-0000000000000000",
-    PROVIDER_OPERATION_CAPABILITY_SECRET:
-      "manual-action-capability-secret-0000000000000000",
-    MOCK_PAYMENT_WEBHOOK_SECRET: "manual-action-payment-secret-000000000000000000",
-    MOCK_PROVISIONING_WEBHOOK_SECRET:
-      "manual-action-provisioning-secret-0000000000000000",
-    LAB_MAILBOX_ENABLED: false,
-  };
+  const config = buildIntegrationConfig("oss_manual_action_session");
   const { app } = await buildApp(config, pool);
   await app.ready();
   const request = async (
@@ -1953,6 +2319,962 @@ async function proveManualSuspensionApi(pool: pg.Pool): Promise<void> {
   }
 }
 
+async function provePaymentSettingsDecisionConflicts(pool: pg.Pool): Promise<void> {
+  const setup = await pool.connect();
+  const namespace = randomUUID();
+  const groupId = `payment-settings-group-${namespace}`;
+  const productId = `payment-settings-product-${namespace}`;
+  const ownerSessionToken = randomBytes(32).toString("base64url");
+  const billingSessionToken = randomBytes(32).toString("base64url");
+  const ownerPassword = `Synthetic-Owner-${namespace}!`;
+  const billingPassword = `Synthetic-Billing-${namespace}!`;
+  let owner!: FixtureAccount;
+  let billingUserId = "";
+  let service!: FixtureService;
+  let callbackService!: FixtureService;
+  let renewalInvoiceId = "";
+  let callbackRenewalInvoiceId = "";
+  let methodAId = "";
+  let methodCId = "";
+  let authorizationAId = "";
+  let callbackAuthorizationAId = "";
+  try {
+    await setup.query("BEGIN");
+    await setup.query(
+      `INSERT INTO product_groups(id, sort_order, names)
+       VALUES ($1, 9996, '{"en":"Payment Settings Integration"}'::jsonb)`,
+      [groupId],
+    );
+    await createFixtureProduct(setup, {
+      groupId,
+      productId,
+      label: "Payment Settings Concurrency Product",
+      overdueAction: "none",
+    });
+    owner = await createFixtureAccount(setup, "payment-settings-owner");
+    const ownerHash = await passwordHash(ownerPassword);
+    await setup.query("UPDATE users SET password_hash = $2 WHERE id = $1", [
+      owner.userId,
+      ownerHash,
+    ]);
+    const billingUser = await setup.query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, locale, email_verified_at)
+       VALUES ($1, $2, 'en', now())
+       RETURNING id`,
+      [`billing-${namespace}@example.invalid`, await passwordHash(billingPassword)],
+    );
+    billingUserId = billingUser.rows[0]?.id ?? "";
+    assert.ok(billingUserId);
+    await setup.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES ($1, $2, 'billing', '["billing.read","billing.write"]'::jsonb)`,
+      [owner.clientAccountId, billingUserId],
+    );
+    const ownerSession = await setup.query<{ id: string }>(
+      `INSERT INTO sessions(user_id, token_digest, expires_at)
+       VALUES ($1, $2, now() + interval '1 hour') RETURNING id`,
+      [owner.userId, digestToken(ownerSessionToken)],
+    );
+    const billingSession = await setup.query<{ id: string }>(
+      `INSERT INTO sessions(user_id, token_digest, expires_at)
+       VALUES ($1, $2, now() + interval '1 hour') RETURNING id`,
+      [billingUserId, digestToken(billingSessionToken)],
+    );
+    await setup.query(
+      `INSERT INTO reauth_grants(user_id, session_id, expires_at)
+       VALUES
+         ($1, $2, now() + interval '15 minutes'),
+         ($3, $4, now() + interval '15 minutes')`,
+      [
+        owner.userId,
+        ownerSession.rows[0]!.id,
+        billingUserId,
+        billingSession.rows[0]!.id,
+      ],
+    );
+    service = await createFixtureService(setup, owner, {
+      label: "Payment Settings Service",
+      productId,
+      recurringMinor: 1_000n,
+      termStart: new Date("2012-01-01T01:00:00.000Z"),
+      termEnd: new Date("2012-02-01T01:00:00.000Z"),
+    });
+    callbackService = await createFixtureService(setup, owner, {
+      label: "Payment Callback Reconciliation Service",
+      productId,
+      recurringMinor: 1_500n,
+      termStart: new Date("2013-01-01T01:00:00.000Z"),
+      termEnd: new Date("2013-02-01T01:00:00.000Z"),
+    });
+    const automationRun = await setup.query<{ id: string }>(
+      `INSERT INTO billing_automation_runs(
+         policy_id, business_date, effective_at, requested_by_user_id,
+         reason, invoices_created, reminders_created
+       ) VALUES (
+         'default', '2012-01-18', '2012-01-18T01:00:00.000Z', $1,
+         'Synthetic payment settings decision conflict fixture', 1, 0
+       ) RETURNING id`,
+      [owner.userId],
+    );
+    const renewalInvoice = await setup.query<{ id: string }>(
+      `INSERT INTO invoices(client_account_id, currency, total_minor, due_at)
+       VALUES ($1, 'USD', 1000, '2012-02-01T01:00:00.000Z')
+       RETURNING id`,
+      [owner.clientAccountId],
+    );
+    renewalInvoiceId = renewalInvoice.rows[0]?.id ?? "";
+    assert.ok(renewalInvoiceId);
+    const callbackRenewalInvoice = await setup.query<{ id: string }>(
+      `INSERT INTO invoices(client_account_id, currency, total_minor, due_at)
+       VALUES ($1, 'USD', 1500, '2013-02-01T01:00:00.000Z')
+       RETURNING id`,
+      [owner.clientAccountId],
+    );
+    callbackRenewalInvoiceId = callbackRenewalInvoice.rows[0]?.id ?? "";
+    assert.ok(callbackRenewalInvoiceId);
+    await setup.query(
+      `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+       VALUES
+         ($1, 'recurring', 'Synthetic renewal for payment settings', 1000),
+         ($2, 'recurring', 'Synthetic renewal for callback reconciliation', 1500)`,
+      [renewalInvoiceId, callbackRenewalInvoiceId],
+    );
+    await setup.query(
+      `INSERT INTO service_renewals(
+         service_id, invoice_id, automation_run_id, period_start, period_end,
+         recurring_minor, currency, price_snapshot
+       ) VALUES (
+         $1, $2, $3, '2012-02-01T01:00:00.000Z', '2012-03-01T01:00:00.000Z',
+         1000, 'USD', $4
+       )`,
+      [
+        service.serviceId,
+        renewalInvoiceId,
+        automationRun.rows[0]!.id,
+        {
+          currency: "USD",
+          billingCycle: "monthly",
+          productId,
+          productName: "Payment Settings Concurrency Product",
+          recurringSubtotalMinor: "1000",
+        },
+      ],
+    );
+    await setup.query(
+      `INSERT INTO service_renewals(
+         service_id, invoice_id, automation_run_id, period_start, period_end,
+         recurring_minor, currency, price_snapshot
+       ) VALUES (
+         $1, $2, $3, '2013-02-01T01:00:00.000Z', '2013-03-01T01:00:00.000Z',
+         1500, 'USD', $4
+       )`,
+      [
+        callbackService.serviceId,
+        callbackRenewalInvoiceId,
+        automationRun.rows[0]!.id,
+        {
+          currency: "USD",
+          billingCycle: "monthly",
+          productId,
+          productName: "Payment Callback Reconciliation Product",
+          recurringSubtotalMinor: "1500",
+        },
+      ],
+    );
+    await setup.query(
+      `INSERT INTO provider_installation_capabilities(
+         provider_installation_id, provider_type, enabled, capabilities
+       ) VALUES (
+         'mock-payment-v1', 'payment', true,
+         '["payment_create","payment_reconcile","payment_method_setup","payment_off_session"]'::jsonb
+       )
+       ON CONFLICT (provider_installation_id) DO UPDATE SET
+         provider_type = EXCLUDED.provider_type,
+         enabled = EXCLUDED.enabled,
+         capabilities = EXCLUDED.capabilities`,
+    );
+    await setup.query(
+      `INSERT INTO payment_methods(
+         code, display_name, provider_installation_id, fee_basis_points,
+         enabled, saved_method_enabled, automatic_renewal_enabled
+       ) VALUES (
+         'card', '{"en":"Card (Mock)"}'::jsonb, 'mock-payment-v1', 350,
+         true, true, true
+       )
+       ON CONFLICT (code) DO UPDATE SET
+         provider_installation_id = EXCLUDED.provider_installation_id,
+         enabled = true, saved_method_enabled = true,
+         automatic_renewal_enabled = true`,
+    );
+    const savedMethods = await setup.query<{ id: string; last_four: string }>(
+      `INSERT INTO saved_payment_methods(
+         client_account_id, provider_installation_id, payment_method_code,
+         provider_token_ciphertext, provider_token_digest, instrument_type,
+         brand, last_four, expiry_month, expiry_year, is_default,
+         save_consent_version, saved_by_user_id
+       ) VALUES
+         ($1, 'mock-payment-v1', 'card', $2, $3, 'card', 'Mock A', '1111', 12, 2099,
+          true, $4, $5),
+         ($1, 'mock-payment-v1', 'card', $6, $7, 'card', 'Mock C', '3333', 12, 2099,
+          false, $4, $5)
+       RETURNING id, last_four`,
+      [
+        owner.clientAccountId,
+        `integration-only-ciphertext-${"a".repeat(64)}`,
+        randomBytes(32),
+        PAYMENT_METHOD_SAVE_CONSENT_VERSION,
+        owner.userId,
+        `integration-only-ciphertext-${"c".repeat(64)}`,
+        randomBytes(32),
+      ],
+    );
+    methodAId = savedMethods.rows.find((row) => row.last_four === "1111")?.id ?? "";
+    methodCId = savedMethods.rows.find((row) => row.last_four === "3333")?.id ?? "";
+    assert.ok(methodAId && methodCId);
+    await setup.query(
+      `UPDATE services
+       SET automatic_renewal_consent_generation = 1,
+           automatic_renewal_decision_generation = 1,
+           version = version + 1
+       WHERE id = ANY($1::uuid[])`,
+      [[service.serviceId, callbackService.serviceId]],
+    );
+    const authorizations = await setup.query<{ id: string; service_id: string }>(
+      `INSERT INTO automatic_renewal_authorizations(
+         service_id, client_account_id, saved_payment_method_id,
+         consent_version, consent_generation, granted_by_user_id
+       ) VALUES
+         ($1, $3, $4, $5, 1, $6),
+         ($2, $3, $4, $5, 1, $6)
+       RETURNING id, service_id`,
+      [
+        service.serviceId,
+        callbackService.serviceId,
+        owner.clientAccountId,
+        methodAId,
+        AUTOMATIC_RENEWAL_CONSENT_VERSION,
+        owner.userId,
+      ],
+    );
+    authorizationAId =
+      authorizations.rows.find((row) => row.service_id === service.serviceId)?.id ?? "";
+    callbackAuthorizationAId =
+      authorizations.rows.find((row) => row.service_id === callbackService.serviceId)?.id ?? "";
+    assert.ok(authorizationAId && callbackAuthorizationAId);
+    await setup.query("COMMIT");
+  } catch (error) {
+    await setup.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    setup.release();
+  }
+
+  const config = buildIntegrationConfig("oss_payment_settings_integration");
+  const { app } = await buildApp(config, pool);
+  await app.ready();
+  const request = async (
+    sessionToken: string,
+    path: string,
+    input: { method?: string; body?: Record<string, unknown> } = {},
+  ) => {
+    const response = await app.inject({
+      method: input.method ?? "GET",
+      url: path,
+      headers: { cookie: `${config.SESSION_COOKIE_NAME}=${sessionToken}` },
+      ...(input.body ? { payload: input.body } : {}),
+    });
+    return {
+      statusCode: response.statusCode,
+      body: response.json() as Record<string, any>,
+    };
+  };
+  try {
+    const staleSettings = await request(
+      billingSessionToken,
+      "/api/v1/billing/payment-settings",
+    );
+    assert.equal(staleSettings.statusCode, 200);
+    assert.equal(
+      staleSettings.body.serviceDecisions.find(
+        (row: { serviceId: string }) => row.serviceId === service.serviceId,
+      )?.decisionGeneration,
+      "1",
+    );
+    const quote = await request(
+      ownerSessionToken,
+      `/api/v1/invoices/${renewalInvoiceId}/payment-quotes`,
+      { method: "POST", body: { paymentMethod: "card", applyCredit: false } },
+    );
+    assert.equal(quote.statusCode, 201);
+    const pendingPayment = await request(
+      ownerSessionToken,
+      `/api/v1/invoices/${renewalInvoiceId}/payments`,
+      {
+        method: "POST",
+        body: {
+          quoteId: quote.body.quoteId,
+          scenario: "success",
+          savePaymentMethod: true,
+          saveConsentVersion: PAYMENT_METHOD_SAVE_CONSENT_VERSION,
+          enableAutomaticRenewal: true,
+          automaticRenewalConsentVersion: AUTOMATIC_RENEWAL_CONSENT_VERSION,
+          idempotencyKey: `pending-payment-${namespace}`,
+        },
+      },
+    );
+    assert.equal(pendingPayment.statusCode, 202);
+    const currentSettings = await request(
+      ownerSessionToken,
+      "/api/v1/billing/payment-settings",
+    );
+    const pending = currentSettings.body.pendingAutomaticRenewals[0] as {
+      paymentAttemptId: string;
+      decisionGeneration: string;
+    };
+    assert.equal(pending.decisionGeneration, "2");
+
+    const callbackQuote = await request(
+      ownerSessionToken,
+      `/api/v1/invoices/${callbackRenewalInvoiceId}/payment-quotes`,
+      { method: "POST", body: { paymentMethod: "card", applyCredit: false } },
+    );
+    assert.equal(callbackQuote.statusCode, 201);
+    const callbackPayment = await request(
+      ownerSessionToken,
+      `/api/v1/invoices/${callbackRenewalInvoiceId}/payments`,
+      {
+        method: "POST",
+        body: {
+          quoteId: callbackQuote.body.quoteId,
+          scenario: "timeout_success",
+          savePaymentMethod: true,
+          saveConsentVersion: PAYMENT_METHOD_SAVE_CONSENT_VERSION,
+          enableAutomaticRenewal: true,
+          automaticRenewalConsentVersion: AUTOMATIC_RENEWAL_CONSENT_VERSION,
+          idempotencyKey: `callback-payment-${namespace}`,
+        },
+      },
+    );
+    assert.equal(callbackPayment.statusCode, 202);
+    const callbackAttemptId = String(callbackPayment.body.paymentAttemptId);
+    const callbackPointer = await pool.query<{
+      operation_id: string;
+      amount_minor: string;
+      currency: string;
+      command_id: string;
+    }>(
+      `SELECT operation.id AS operation_id,
+              attempt.amount_minor::text,
+              attempt.currency,
+              command.id AS command_id
+       FROM payment_attempts attempt
+       JOIN provider_operations operation
+         ON operation.subject_type = 'payment'
+        AND operation.subject_id = attempt.id
+        AND operation.kind = 'payment_create'
+       JOIN invoice_payment_commands command
+         ON command.payment_attempt_id = attempt.id
+       WHERE attempt.id = $1`,
+      [callbackAttemptId],
+    );
+    const callback = callbackPointer.rows[0];
+    assert.ok(callback);
+    await pool.query(
+      `UPDATE durable_jobs
+       SET status = 'completed', locked_at = NULL, locked_by = NULL, updated_at = now()
+       WHERE job_type = 'payment.start' AND unique_key = $1`,
+      [`payment:${callbackAttemptId}`],
+    );
+    await pool.query(
+      `UPDATE payment_attempts
+       SET status = 'processing', updated_at = now(), version = version + 1
+       WHERE id = $1`,
+      [callbackAttemptId],
+    );
+    await pool.query(
+      `UPDATE provider_operations
+       SET status = 'running', attempt_count = 1, updated_at = now()
+       WHERE id = $1`,
+      [callback.operation_id],
+    );
+    await pool.query(
+      `INSERT INTO durable_jobs(
+         job_type, unique_key, payload, status, attempts, locked_at, locked_by
+       ) VALUES (
+         'payment.reconcile', $1, $2, 'running', 1, now(),
+         'integration-live-payment-reconcile'
+       )`,
+      [
+        `payment:${callbackAttemptId}`,
+        {
+          paymentAttemptId: callbackAttemptId,
+          providerOperationId: callback.operation_id,
+          operationId: callback.operation_id,
+        },
+      ],
+    );
+    const callbackCapability = providerOperationCapability(
+      config.PROVIDER_OPERATION_CAPABILITY_SECRET,
+      "mock-payment-v1",
+      callback.operation_id,
+    );
+    const externalPaymentId = `callback-reconcile-${namespace}`;
+    const submitPaymentCallback = async (body: {
+      eventId: string;
+      status:
+        | "processing"
+        | "succeeded"
+        | "failed"
+        | "cancelled"
+        | "expired"
+        | "requires_action";
+      occurredAt: string;
+    }) => {
+      const payload = {
+        eventId: body.eventId,
+        providerOperationId: callback.operation_id,
+        paymentAttemptId: callbackAttemptId,
+        callbackCapability,
+        externalPaymentId,
+        status: body.status,
+        amountMinor: callback.amount_minor,
+        currency: callback.currency,
+        occurredAt: body.occurredAt,
+      };
+      const timestamp = Date.now().toString();
+      return app.inject({
+        method: "POST",
+        url: "/api/v1/provider-events/payment",
+        headers: {
+          "x-oss-timestamp": timestamp,
+          "x-oss-signature": providerSignature(
+            config.MOCK_PAYMENT_WEBHOOK_SECRET,
+            timestamp,
+            payload,
+          ),
+        },
+        payload,
+      });
+    };
+    const futureFact = await submitPaymentCallback({
+      eventId: `future-payment-${namespace}`,
+      status: "succeeded",
+      occurredAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    });
+    assert.equal(futureFact.statusCode, 202);
+    assert.deepEqual(futureFact.json(), {
+      accepted: true,
+      status: "unknown",
+      reconciliationRequired: true,
+    });
+    const futureState = await pool.query<{
+      attempt_status: string;
+      operation_status: string;
+      command_status: string;
+      job_status: string;
+      locked_by: string | null;
+      locked_at: Date | null;
+    }>(
+      `SELECT attempt.status AS attempt_status,
+              operation.status AS operation_status,
+              command.status AS command_status,
+              job.status AS job_status,
+              job.locked_by,
+              job.locked_at
+       FROM payment_attempts attempt
+       JOIN provider_operations operation ON operation.id = $2
+       JOIN invoice_payment_commands command ON command.id = $3
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.reconcile' AND job.unique_key = $4
+       WHERE attempt.id = $1`,
+      [
+        callbackAttemptId,
+        callback.operation_id,
+        callback.command_id,
+        `payment:${callbackAttemptId}`,
+      ],
+    );
+    assert.equal(futureState.rows[0]?.attempt_status, "unknown");
+    assert.equal(futureState.rows[0]?.operation_status, "unknown");
+    assert.equal(futureState.rows[0]?.command_status, "unknown");
+    assert.equal(futureState.rows[0]?.job_status, "running");
+    assert.equal(
+      futureState.rows[0]?.locked_by,
+      "integration-live-payment-reconcile",
+    );
+    assert.ok(futureState.rows[0]?.locked_at);
+
+    const releasedToManual = await pool.query(
+      `UPDATE durable_jobs
+       SET status = 'manual', locked_at = NULL, locked_by = NULL,
+           last_error = 'Synthetic query-only review', updated_at = now()
+       WHERE job_type = 'payment.reconcile'
+         AND unique_key = $1
+         AND status = 'running'`,
+      [`payment:${callbackAttemptId}`],
+    );
+    assert.equal(releasedToManual.rowCount, 1);
+    const actionRequiredAt = new Date();
+    const actionRequired = await submitPaymentCallback({
+      eventId: `requires-action-${namespace}`,
+      status: "requires_action",
+      occurredAt: actionRequiredAt.toISOString(),
+    });
+    assert.equal(actionRequired.statusCode, 202);
+    assert.deepEqual(actionRequired.json(), {
+      accepted: true,
+      status: "requires_action",
+    });
+    const completedManualJob = await pool.query<{
+      status: string;
+      locked_by: string | null;
+      locked_at: Date | null;
+      last_error: string | null;
+    }>(
+      `SELECT status, locked_by, locked_at, last_error
+       FROM durable_jobs
+       WHERE job_type = 'payment.reconcile' AND unique_key = $1`,
+      [`payment:${callbackAttemptId}`],
+    );
+    assert.deepEqual(completedManualJob.rows[0], {
+      status: "completed",
+      locked_by: null,
+      locked_at: null,
+      last_error: null,
+    });
+
+    const rearmedLease = await pool.query(
+      `UPDATE durable_jobs
+       SET status = 'running', attempts = attempts + 1,
+           locked_at = now(), locked_by = 'integration-late-success-reconcile',
+           updated_at = now()
+       WHERE job_type = 'payment.reconcile'
+         AND unique_key = $1
+         AND status = 'completed'`,
+      [`payment:${callbackAttemptId}`],
+    );
+    assert.equal(rearmedLease.rowCount, 1);
+    const lateSuccessBody = {
+      eventId: `late-success-${namespace}`,
+      status: "succeeded" as const,
+      occurredAt: new Date(actionRequiredAt.getTime() + 1_000).toISOString(),
+    };
+    const lateSuccess = await submitPaymentCallback(lateSuccessBody);
+    assert.equal(lateSuccess.statusCode, 202);
+    assert.equal(lateSuccess.json().status, "unclaimed");
+    assert.ok(lateSuccess.json().receiptId);
+    const lateSuccessState = await pool.query<{
+      attempt_status: string;
+      command_status: string;
+      job_status: string;
+      locked_by: string | null;
+      receipt_count: string;
+      receipt_disposition: string;
+      receipt_allocated_minor: string;
+      allocations: string;
+      fee_charges: string;
+      invoice_status: string;
+      invoice_total_minor: string;
+      service_status: string;
+      term_start: Date;
+      term_end: Date;
+      decision_generation: string;
+      consent_generation: string;
+      active_authorization_id: string;
+      saved_method_count: string;
+      created_authorization_id: string | null;
+      created_saved_method_id: string | null;
+      ledger_debit_minor: string;
+      ledger_credit_minor: string;
+    }>(
+      `SELECT attempt.status AS attempt_status,
+              command.status AS command_status,
+              job.status AS job_status,
+              job.locked_by,
+              (SELECT count(*)::text
+                 FROM fund_receipts receipt
+                WHERE receipt.reported_payment_attempt_id = attempt.id) AS receipt_count,
+              receipt.disposition AS receipt_disposition,
+              receipt.allocated_minor::text AS receipt_allocated_minor,
+              (SELECT count(*)::text
+                 FROM payment_allocations allocation
+                WHERE allocation.payment_attempt_id = attempt.id) AS allocations,
+              (SELECT count(*)::text
+                 FROM invoice_fee_charges fee
+                WHERE fee.payment_attempt_id = attempt.id) AS fee_charges,
+              CASE
+                WHEN allocation_total.allocated_minor >= invoice.total_minor THEN 'paid'
+                WHEN allocation_total.allocated_minor > 0 THEN 'partially_paid'
+                ELSE 'unpaid'
+              END AS invoice_status,
+              invoice.total_minor::text AS invoice_total_minor,
+              service.status AS service_status,
+              service.term_start,
+              service.term_end,
+              service.automatic_renewal_decision_generation::text AS decision_generation,
+              service.automatic_renewal_consent_generation::text AS consent_generation,
+              renewal_authorization.id AS active_authorization_id,
+              (SELECT count(*)::text
+                 FROM saved_payment_methods saved
+                WHERE saved.client_account_id = attempt.client_account_id) AS saved_method_count,
+              attempt.created_automatic_renewal_authorization_id AS created_authorization_id,
+              attempt.saved_payment_method_id AS created_saved_method_id,
+              coalesce(sum(line.debit_minor), 0)::text AS ledger_debit_minor,
+              coalesce(sum(line.credit_minor), 0)::text AS ledger_credit_minor
+       FROM payment_attempts attempt
+       JOIN invoice_payment_commands command ON command.id = $2
+       JOIN invoices invoice ON invoice.id = attempt.invoice_id
+       JOIN invoice_allocation_totals allocation_total
+         ON allocation_total.invoice_id = invoice.id
+       JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+       JOIN services service ON service.id = renewal.service_id
+       JOIN automatic_renewal_authorizations renewal_authorization
+         ON renewal_authorization.service_id = service.id
+        AND renewal_authorization.status = 'active'
+       JOIN fund_receipts receipt
+         ON receipt.reported_payment_attempt_id = attempt.id
+       JOIN ledger_journals journal
+         ON journal.source_type = 'fund_receipt'
+        AND journal.source_id = receipt.id
+       JOIN ledger_lines line ON line.journal_id = journal.id
+       JOIN durable_jobs job
+         ON job.job_type = 'payment.reconcile' AND job.unique_key = $3
+       WHERE attempt.id = $1
+       GROUP BY attempt.id, command.status, job.status, job.locked_by,
+                receipt.id, invoice.id, allocation_total.allocated_minor,
+                service.id, renewal_authorization.id`,
+      [callbackAttemptId, callback.command_id, `payment:${callbackAttemptId}`],
+    );
+    const late = lateSuccessState.rows[0];
+    assert.ok(late);
+    assert.deepEqual(
+      {
+        attemptStatus: late.attempt_status,
+        commandStatus: late.command_status,
+        jobStatus: late.job_status,
+        lockedBy: late.locked_by,
+        receipts: late.receipt_count,
+        receiptDisposition: late.receipt_disposition,
+        receiptAllocatedMinor: late.receipt_allocated_minor,
+        allocations: late.allocations,
+        feeCharges: late.fee_charges,
+        invoiceStatus: late.invoice_status,
+        invoiceTotalMinor: late.invoice_total_minor,
+        serviceStatus: late.service_status,
+        termStart: late.term_start.toISOString(),
+        termEnd: late.term_end.toISOString(),
+        decisionGeneration: late.decision_generation,
+        consentGeneration: late.consent_generation,
+        activeAuthorizationId: late.active_authorization_id,
+        savedMethodCount: late.saved_method_count,
+        createdAuthorizationId: late.created_authorization_id,
+        createdSavedMethodId: late.created_saved_method_id,
+        ledgerDebitMinor: late.ledger_debit_minor,
+        ledgerCreditMinor: late.ledger_credit_minor,
+      },
+      {
+        attemptStatus: "requires_action",
+        commandStatus: "manual",
+        jobStatus: "running",
+        lockedBy: "integration-late-success-reconcile",
+        receipts: "1",
+        receiptDisposition: "unclaimed",
+        receiptAllocatedMinor: "0",
+        allocations: "0",
+        feeCharges: "0",
+        invoiceStatus: "unpaid",
+        invoiceTotalMinor: "1500",
+        serviceStatus: "active",
+        termStart: "2013-01-01T01:00:00.000Z",
+        termEnd: "2013-02-01T01:00:00.000Z",
+        decisionGeneration: "2",
+        consentGeneration: "1",
+        activeAuthorizationId: callbackAuthorizationAId,
+        savedMethodCount: "2",
+        createdAuthorizationId: null,
+        createdSavedMethodId: null,
+        ledgerDebitMinor: callback.amount_minor,
+        ledgerCreditMinor: callback.amount_minor,
+      },
+    );
+    const duplicateLateSuccess = await submitPaymentCallback(lateSuccessBody);
+    assert.equal(duplicateLateSuccess.statusCode, 200);
+    assert.equal(duplicateLateSuccess.json().duplicate, true);
+    const duplicateFacts = await pool.query<{
+      receipts: string;
+      receipt_journals: string;
+      consent_events: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::text FROM fund_receipts
+           WHERE reported_payment_attempt_id = $1) AS receipts,
+         (SELECT count(*)::text
+            FROM ledger_journals journal
+            JOIN fund_receipts receipt ON receipt.id = journal.source_id
+           WHERE journal.source_type = 'fund_receipt'
+             AND receipt.reported_payment_attempt_id = $1) AS receipt_journals,
+         (SELECT count(*)::text FROM payment_consent_events
+           WHERE metadata->>'paymentAttemptId' = $1::text) AS consent_events`,
+      [callbackAttemptId],
+    );
+    assert.deepEqual(duplicateFacts.rows[0], {
+      receipts: "1",
+      receipt_journals: "1",
+      consent_events: "0",
+    });
+    const workerCompletedLease = await pool.query(
+      `UPDATE durable_jobs
+       SET status = 'completed', locked_at = NULL, locked_by = NULL,
+           last_error = NULL, updated_at = now()
+       WHERE job_type = 'payment.reconcile'
+         AND unique_key = $1
+         AND status = 'running'
+         AND locked_by = 'integration-late-success-reconcile'`,
+      [`payment:${callbackAttemptId}`],
+    );
+    assert.equal(workerCompletedLease.rowCount, 1);
+
+    const staleReplacement = await request(
+      billingSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal`,
+      {
+        method: "POST",
+        body: {
+          savedPaymentMethodId: methodCId,
+          consentVersion: AUTOMATIC_RENEWAL_CONSENT_VERSION,
+          expectedAuthorizationId: authorizationAId,
+          expectedAuthorizationVersion: 1,
+          expectedDecisionGeneration: "1",
+          idempotencyKey: `stale-replacement-${namespace}`,
+        },
+      },
+    );
+    assert.equal(staleReplacement.statusCode, 409);
+    const blockedRemoval = await request(
+      billingSessionToken,
+      `/api/v1/billing/payment-methods/${methodAId}/remove`,
+      {
+        method: "POST",
+        body: { expectedVersion: 1, idempotencyKey: `blocked-remove-${namespace}` },
+      },
+    );
+    assert.equal(blockedRemoval.statusCode, 409);
+    assert.equal(blockedRemoval.body.code, "PENDING_AUTOMATIC_RENEWAL_DECISION");
+    const unchanged = await pool.query<{
+      decision_generation: string;
+      consent_generation: string;
+      method_status: string;
+      authorization_status: string;
+    }>(
+      `SELECT service.automatic_renewal_decision_generation::text AS decision_generation,
+              service.automatic_renewal_consent_generation::text AS consent_generation,
+              method.status AS method_status,
+              renewal_authorization.status AS authorization_status
+       FROM services service
+       JOIN saved_payment_methods method ON method.id = $2
+       JOIN automatic_renewal_authorizations renewal_authorization
+         ON renewal_authorization.id = $3
+       WHERE service.id = $1`,
+      [service.serviceId, methodAId, authorizationAId],
+    );
+    assert.deepEqual(unchanged.rows[0], {
+      decision_generation: "2",
+      consent_generation: "1",
+      method_status: "active",
+      authorization_status: "active",
+    });
+
+    const oversized = await request(
+      ownerSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal/pending-consent/withdraw`,
+      {
+        method: "POST",
+        body: {
+          expectedPaymentAttemptId: pending.paymentAttemptId,
+          expectedDecisionGeneration: "9999999999999999999",
+          reason: "Synthetic oversized stale generation",
+          idempotencyKey: `oversized-generation-${namespace}`,
+        },
+      },
+    );
+    assert.equal(oversized.statusCode, 400);
+    for (const [caseName, invalidGeneration] of [
+      ["alphabetic", "abc"],
+      ["negative", "-1"],
+      ["object", { forged: "2" }],
+    ] as const) {
+      const malformed = await request(
+        ownerSessionToken,
+        `/api/v1/services/${service.serviceId}/automatic-renewal/pending-consent/withdraw`,
+        {
+          method: "POST",
+          body: {
+            expectedPaymentAttemptId: pending.paymentAttemptId,
+            expectedDecisionGeneration: invalidGeneration,
+            reason: `Synthetic malformed ${caseName} generation`,
+            idempotencyKey: `malformed-generation-${caseName}-${namespace}`,
+          },
+        },
+      );
+      assert.equal(
+        malformed.statusCode,
+        400,
+        `${caseName} decision generation must be rejected without throwing`,
+      );
+    }
+    const withdrawBody = {
+      expectedPaymentAttemptId: pending.paymentAttemptId,
+      expectedDecisionGeneration: "2",
+      reason: "Synthetic owner withdrew pending consent",
+      idempotencyKey: `withdraw-pending-${namespace}`,
+    };
+    const withdrawn = await request(
+      ownerSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal/pending-consent/withdraw`,
+      { method: "POST", body: withdrawBody },
+    );
+    assert.equal(withdrawn.statusCode, 200);
+    const withdrawnReplay = await request(
+      ownerSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal/pending-consent/withdraw`,
+      { method: "POST", body: withdrawBody },
+    );
+    assert.equal(withdrawnReplay.statusCode, 200);
+    assert.equal(withdrawnReplay.body.replayed, true);
+
+    const staleAfterWithdraw = await request(
+      billingSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal`,
+      {
+        method: "POST",
+        body: {
+          savedPaymentMethodId: methodCId,
+          consentVersion: AUTOMATIC_RENEWAL_CONSENT_VERSION,
+          expectedAuthorizationId: authorizationAId,
+          expectedAuthorizationVersion: 1,
+          expectedDecisionGeneration: "2",
+          idempotencyKey: `stale-after-withdraw-${namespace}`,
+        },
+      },
+    );
+    assert.equal(staleAfterWithdraw.statusCode, 409);
+    const refreshed = await request(
+      billingSessionToken,
+      "/api/v1/billing/payment-settings",
+    );
+    const refreshedDecision = refreshed.body.serviceDecisions.find(
+      (row: { serviceId: string }) => row.serviceId === service.serviceId,
+    )?.decisionGeneration;
+    assert.equal(refreshedDecision, "3");
+    const deadlocksBefore = await pool.query<{ deadlocks: string }>(
+      `SELECT deadlocks::text
+       FROM pg_stat_database
+       WHERE datname = current_database()`,
+    );
+    const serviceGate = await pool.connect();
+    let replaced!: Awaited<ReturnType<typeof request>>;
+    try {
+      await serviceGate.query("BEGIN");
+      await serviceGate.query("SET LOCAL lock_timeout = '1s'");
+      await serviceGate.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        service.serviceId,
+      ]);
+      const replacementPromise = request(
+        billingSessionToken,
+        `/api/v1/services/${service.serviceId}/automatic-renewal`,
+        {
+          method: "POST",
+          body: {
+            savedPaymentMethodId: methodCId,
+            consentVersion: AUTOMATIC_RENEWAL_CONSENT_VERSION,
+            expectedAuthorizationId: authorizationAId,
+            expectedAuthorizationVersion: 1,
+            expectedDecisionGeneration: refreshedDecision,
+            idempotencyKey: `confirmed-replacement-${namespace}`,
+          },
+        },
+      );
+      let observedServiceLockWait = false;
+      for (let poll = 0; poll < 100 && !observedServiceLockWait; poll += 1) {
+        const waiting = await pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%FROM services WHERE id = $1 AND client_account_id = $2 FOR UPDATE%'`,
+        );
+        observedServiceLockWait = waiting.rows[0]?.count !== "0";
+        if (!observedServiceLockWait) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      assert.equal(
+        observedServiceLockWait,
+        true,
+        "real HTTP replacement must be observed waiting on the held Service row",
+      );
+      await serviceGate.query(
+        "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+        [owner.clientAccountId],
+      );
+      await serviceGate.query("COMMIT");
+      replaced = await replacementPromise;
+    } catch (error) {
+      await serviceGate.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      serviceGate.release();
+    }
+    assert.equal(replaced.statusCode, 200);
+    const deadlocksAfter = await pool.query<{ deadlocks: string }>(
+      `SELECT deadlocks::text
+       FROM pg_stat_database
+       WHERE datname = current_database()`,
+    );
+    assert.equal(deadlocksAfter.rows[0]?.deadlocks, deadlocksBefore.rows[0]?.deadlocks);
+    const staleRevoke = await request(
+      billingSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal/revoke`,
+      {
+        method: "POST",
+        body: {
+          expectedAuthorizationId: replaced.body.authorizationId,
+          expectedVersion: replaced.body.version,
+          expectedDecisionGeneration: "3",
+          reason: "Synthetic stale revoke",
+          idempotencyKey: `stale-revoke-${namespace}`,
+        },
+      },
+    );
+    assert.equal(staleRevoke.statusCode, 409);
+    const finalSettings = await request(
+      billingSessionToken,
+      "/api/v1/billing/payment-settings",
+    );
+    const finalDecision = finalSettings.body.serviceDecisions.find(
+      (row: { serviceId: string }) => row.serviceId === service.serviceId,
+    )?.decisionGeneration;
+    assert.equal(finalDecision, "4");
+    const revoked = await request(
+      billingSessionToken,
+      `/api/v1/services/${service.serviceId}/automatic-renewal/revoke`,
+      {
+        method: "POST",
+        body: {
+          expectedAuthorizationId: replaced.body.authorizationId,
+          expectedVersion: replaced.body.version,
+          expectedDecisionGeneration: finalDecision,
+          reason: "Synthetic confirmed revoke",
+          idempotencyKey: `confirmed-revoke-${namespace}`,
+        },
+      },
+    );
+    assert.equal(revoked.statusCode, 200);
+  } finally {
+    await app.close();
+  }
+}
+
 async function proveConcurrentBillingDay(pool: pg.Pool): Promise<{ runId: string }> {
   const setup = await pool.connect();
   const namespace = randomUUID();
@@ -2120,6 +3442,8 @@ async function proveScheduledBillingDay(pool: pg.Pool): Promise<{ runId: string 
 const pool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
 await runMigrations(pool);
 await assertSchemaCompatible(pool);
+await bootstrapPaymentMethodTokenKeyrings(pool, integrationConfig);
+await assertPaymentMethodTokenKeyringsCompatible(pool, integrationConfig);
 const client = await pool.connect();
 
 try {
@@ -2208,6 +3532,13 @@ try {
     recurringMinor: 600n,
     termStart: "2001-01-01T01:00:00.654321Z",
     termEnd: "2001-02-01T01:00:00.654321Z",
+  });
+
+  await proveSavedPaymentAuthorizationGuards(client, {
+    account: guardAccount,
+    service: guardService,
+    otherAccount: mainAccount,
+    otherService: mainService,
   });
 
   await grantFixtureCredit(client, partialAccount, 400n);
@@ -2848,6 +4179,26 @@ try {
         colocation: "manual suspend and restore",
         automaticProviderTakeover: "terminal or unknown evidence retained without Provider POST",
         authorization: "permission, fixed-window reauth, version and idempotency enforced",
+      },
+      null,
+      2,
+    ),
+  );
+  await provePaymentSettingsDecisionConflicts(pool);
+  console.log(
+    JSON.stringify(
+      {
+        result: "two-user payment-settings decision conflict journey passed",
+        staleReplacement: "409 without invalidating pending consent",
+        pendingMethodRemoval: "409 without revoking active authorization",
+        pendingWithdrawal: "bounded generation, exact replay and ABA conflict enforced",
+        confirmedReplacementAndRevoke: "fresh decision generation required",
+        lockOrder: "real HTTP waited on Service while Service-first transaction locked Account; no deadlock",
+        futureProviderTime: "query-only reconciliation retained the running Worker lease",
+        terminalCallback: "completed the released manual reconciliation job",
+        lateSuccessAfterActionRequired:
+          "one balanced unclaimed receipt; invoice, service term and prior authorization unchanged",
+        duplicateLateSuccess: "no duplicate receipt, journal, allocation or consent",
       },
       null,
       2,

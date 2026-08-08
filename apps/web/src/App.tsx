@@ -52,7 +52,7 @@ type Legal = {
   documents: Record<"terms" | "aup" | "privacy", { version: string; title: string; body: string }>;
 };
 type OrderDetail = {
-  order: { id: string; status: string; price: { productName: string } };
+  order: { id: string; status: string; price: { productName: string; billingCycle: string } };
   invoice: {
     id: string;
     currency: string;
@@ -327,6 +327,8 @@ type BillingSummary = {
     name: string;
     feeBasisPoints: number;
     addFundsEnabled: boolean;
+    savedMethodEnabled: boolean;
+    automaticRenewalEnabled: boolean;
   }>;
   addFunds: {
     enabled: boolean;
@@ -335,6 +337,49 @@ type BillingSummary = {
     maximumMinor: string;
     balanceCapMinor: string;
   };
+};
+type PaymentSettings = {
+  defaults: { savePaymentMethod: false; automaticRenewal: false };
+  consentVersions: { savePaymentMethod: string; automaticRenewal: string };
+  methods: Array<{
+    id: string;
+    paymentMethod: string;
+    instrumentType: string;
+    brand: string;
+    lastFour: string;
+    expiryMonth: number | null;
+    expiryYear: number | null;
+    status: "active" | "invalid";
+    default: boolean;
+    consentVersion: string;
+    savedAt: string;
+    version: number;
+  }>;
+  automaticRenewals: Array<{
+    id: string;
+    serviceId: string;
+    productName: string;
+    savedPaymentMethodId: string;
+    status: "active" | "revoked";
+    consentVersion: string;
+    grantedAt: string;
+    revokedAt: string | null;
+    latestAutomaticPaymentStatus: string | null;
+    version: number;
+  }>;
+  pendingAutomaticRenewals: Array<{
+    paymentAttemptId: string;
+    serviceId: string;
+    productName: string;
+    paymentStatus: "created" | "processing" | "unknown";
+    consentVersion: string;
+    decisionGeneration: string;
+    requestedAt: string;
+  }>;
+  serviceDecisions: Array<{
+    serviceId: string;
+    decisionGeneration: string;
+  }>;
 };
 type RenewalReminder = {
   kind: "renewal_created" | "pre_due" | "overdue_first";
@@ -409,6 +454,13 @@ type RenewalItem = {
     deferralCount: string;
     latestDeferredAt: string | null;
   };
+  automaticPayment: {
+    status: "processing" | "unknown" | "succeeded" | "failed" | "requires_action" | "blocked";
+    attemptCount: number;
+    maxAttempts: number;
+    lastError: string | null;
+    customerActionRequired: boolean;
+  } | null;
 };
 type AdminRenewalItem = RenewalItem & {
   clientAccountId: string;
@@ -524,6 +576,17 @@ const words = {
   },
 } as const;
 
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -538,7 +601,11 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
       error?: string;
       code?: string;
     };
-    throw new Error(errorBody.error ?? `Request failed (${response.status})`);
+    throw new ApiError(
+      errorBody.error ?? `Request failed (${response.status})`,
+      response.status,
+      errorBody.code,
+    );
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
@@ -591,6 +658,15 @@ export function App() {
   const [paymentScenario, setPaymentScenario] = useState("success");
   const [paymentMethod, setPaymentMethod] = useState("card");
   const [applyCredit, setApplyCredit] = useState(true);
+  const [savePaymentMethod, setSavePaymentMethod] = useState(false);
+  const [enableAutomaticRenewal, setEnableAutomaticRenewal] = useState(false);
+  const [paymentSettings, setPaymentSettings] = useState<PaymentSettings | null>(null);
+  const [paymentSettingsPassword, setPaymentSettingsPassword] = useState("");
+  const [paymentSettingsReauthExpiresAt, setPaymentSettingsReauthExpiresAt] = useState<number | null>(
+    null,
+  );
+  const [paymentSettingsPending, setPaymentSettingsPending] = useState(false);
+  const paymentSettingsIntentKeys = useRef(new Map<string, string>());
   const [cancellationReason, setCancellationReason] = useState("");
   const [cancellationPending, setCancellationPending] = useState(false);
   const cancellationIntentKeys = useRef(new Map<string, string>());
@@ -683,12 +759,18 @@ export function App() {
   >(new Set());
   const [bootstrapToken, setBootstrapToken] = useState("");
   const text = words[locale];
+  const paymentSettingsReauthActive =
+    paymentSettingsReauthExpiresAt !== null && paymentSettingsReauthExpiresAt > Date.now();
+  const paymentSettingsReauthReady =
+    paymentSettingsReauthActive || paymentSettingsPassword.length > 0;
 
   const refreshMe = useCallback(async () => {
     try {
       setMe(await api<Me>("/api/v1/auth/me"));
     } catch {
       setMe(null);
+      setPaymentSettingsReauthExpiresAt(null);
+      setPaymentSettingsPassword("");
     }
   }, []);
 
@@ -713,6 +795,16 @@ export function App() {
     }
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
   }, [me]);
+
+  const refreshPaymentSettings = useCallback(async () => {
+    if (me?.verification.email !== "passed") {
+      setPaymentSettings(null);
+      return;
+    }
+    setPaymentSettings(
+      await api<PaymentSettings>("/api/v1/billing/payment-settings"),
+    );
+  }, [me?.clientAccountId, me?.verification.email]);
 
   const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
     if (!me?.eligible) {
@@ -765,6 +857,22 @@ export function App() {
   useEffect(() => {
     void refreshBilling().catch(() => undefined);
   }, [refreshBilling]);
+
+  useEffect(() => {
+    void refreshPaymentSettings().catch(() => undefined);
+  }, [refreshPaymentSettings]);
+
+  useEffect(() => {
+    const selectedMethod = billing?.paymentMethods.find(
+      (method) => method.code === paymentMethod,
+    );
+    if (!selectedMethod?.savedMethodEnabled) {
+      setSavePaymentMethod(false);
+      setEnableAutomaticRenewal(false);
+    } else if (!selectedMethod.automaticRenewalEnabled || !savePaymentMethod) {
+      setEnableAutomaticRenewal(false);
+    }
+  }, [billing?.paymentMethods, paymentMethod, savePaymentMethod]);
 
   useEffect(() => {
     void refreshRenewals().catch(() => undefined);
@@ -908,11 +1016,16 @@ export function App() {
     }
     const timer = window.setInterval(() => {
       void api<OrderDetail>(`/api/v1/orders/${order.order.id}`)
-        .then(setOrder)
+        .then(async (detail) => {
+          setOrder(detail);
+          if (detail.invoice.status === "paid") {
+            await Promise.all([refreshBilling(), refreshPaymentSettings()]);
+          }
+        })
         .catch(() => undefined);
     }, 1_000);
     return () => window.clearInterval(timer);
-  }, [order]);
+  }, [order, refreshBilling, refreshPaymentSettings]);
 
   const refreshManualItems = useCallback(async () => {
     if (!me?.staff) {
@@ -1106,6 +1219,8 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
       });
+      setPaymentSettingsReauthExpiresAt(null);
+      setPaymentSettingsPassword("");
       await refreshMe();
       setNotice("Signed in.");
     } catch (caught) {
@@ -1140,6 +1255,9 @@ export function App() {
     if (!order) return;
     setError("");
     try {
+      if (savePaymentMethod || enableAutomaticRenewal) {
+        await ensurePaymentSettingsReauth();
+      }
       const quote =
         paymentQuote ??
         (await api<PaymentQuote>(`/api/v1/invoices/${order.invoice.id}/payment-quotes`, {
@@ -1151,14 +1269,190 @@ export function App() {
         body: JSON.stringify({
           quoteId: quote.quoteId,
           scenario: paymentScenario,
+          savePaymentMethod,
+          ...(savePaymentMethod && paymentSettings
+            ? { saveConsentVersion: paymentSettings.consentVersions.savePaymentMethod }
+            : {}),
+          enableAutomaticRenewal,
+          ...(enableAutomaticRenewal && paymentSettings
+            ? {
+                automaticRenewalConsentVersion:
+                  paymentSettings.consentVersions.automaticRenewal,
+              }
+            : {}),
           idempotencyKey: newIdempotencyKey(),
         }),
       });
       setOrder(await api<OrderDetail>(`/api/v1/orders/${order.order.id}`));
       await refreshBilling();
+      await refreshPaymentSettings();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Payment could not start");
     }
+  }
+
+  async function ensurePaymentSettingsReauth(): Promise<void> {
+    if (paymentSettingsReauthExpiresAt && paymentSettingsReauthExpiresAt > Date.now()) return;
+    if (paymentSettingsReauthExpiresAt) setPaymentSettingsReauthExpiresAt(null);
+    if (paymentSettingsPassword.length === 0) {
+      throw new Error("Re-enter your password before changing payment settings");
+    }
+    const grant = await api<{ expiresAt: string; fixedWindowMinutes: number }>(
+      "/api/v1/auth/reauth",
+      {
+        method: "POST",
+        body: JSON.stringify({ password: paymentSettingsPassword }),
+      },
+    );
+    setPaymentSettingsReauthExpiresAt(Date.parse(grant.expiresAt));
+    setPaymentSettingsPassword("");
+  }
+
+  async function mutatePaymentSettings<Result extends Record<string, unknown>>(
+    identity: string,
+    path: string,
+    payload: Record<string, unknown>,
+    successMessage: string | ((result: Result) => string),
+  ) {
+    if (paymentSettingsPending || !paymentSettingsReauthReady) return;
+    let idempotencyKey = paymentSettingsIntentKeys.current.get(identity);
+    if (!idempotencyKey) {
+      idempotencyKey = newIdempotencyKey();
+      paymentSettingsIntentKeys.current.set(identity, idempotencyKey);
+    }
+    setPaymentSettingsPending(true);
+    setError("");
+    try {
+      await ensurePaymentSettingsReauth();
+      const result = await api<Result>(path, {
+        method: "POST",
+        body: JSON.stringify({ ...payload, idempotencyKey }),
+      });
+      paymentSettingsIntentKeys.current.delete(identity);
+      setNotice(
+        typeof successMessage === "function" ? successMessage(result) : successMessage,
+      );
+      await Promise.all([refreshPaymentSettings(), refreshRenewals()]);
+    } catch (caught) {
+      if (
+        caught instanceof ApiError &&
+        caught.status === 409 &&
+        (caught.code === "VERSION_CONFLICT" ||
+          caught.code === "PENDING_AUTOMATIC_RENEWAL_DECISION")
+      ) {
+        paymentSettingsIntentKeys.current.delete(identity);
+        await Promise.allSettled([refreshPaymentSettings(), refreshRenewals()]);
+      }
+      setError(caught instanceof Error ? caught.message : "Payment setting could not be changed");
+    } finally {
+      setPaymentSettingsPending(false);
+    }
+  }
+
+  function makePaymentMethodDefault(method: PaymentSettings["methods"][number]) {
+    const identity = `default:${method.id}:${method.version}`;
+    return mutatePaymentSettings<Record<string, unknown>>(
+      identity,
+      `/api/v1/billing/payment-methods/${method.id}/default`,
+      { expectedVersion: method.version },
+      `${method.brand} ending ${method.lastFour} is now the default. Automatic-renewal permissions were not changed.`,
+    );
+  }
+
+  function removeSavedPaymentMethod(method: PaymentSettings["methods"][number]) {
+    const identity = `remove:${method.id}:${method.version}`;
+    return mutatePaymentSettings<{
+      inflightAutomaticPaymentsRequiringReconciliation: number;
+    }>(
+      identity,
+      `/api/v1/billing/payment-methods/${method.id}/remove`,
+      { expectedVersion: method.version },
+      (result) =>
+        result.inflightAutomaticPaymentsRequiringReconciliation > 0
+          ? `${method.brand} ending ${method.lastFour} was removed and new automatic charges were stopped. ${result.inflightAutomaticPaymentsRequiringReconciliation} already-dispatched payment is still being reconciled and may still settle; it will not be sent a second time.`
+          : `${method.brand} ending ${method.lastFour} was removed. Its service-level automatic-renewal authorizations were revoked.`,
+    );
+  }
+
+  function enableServiceAutomaticRenewal(method: PaymentSettings["methods"][number]) {
+    if (!order || !paymentSettings) return Promise.resolve();
+    const decision = paymentSettings.serviceDecisions.find(
+      (service) => service.serviceId === order.service.id,
+    );
+    if (!decision) {
+      setError("Automatic-renewal state changed; refresh and confirm again");
+      return Promise.resolve();
+    }
+    const current = paymentSettings.automaticRenewals.find(
+      (authorization) =>
+        authorization.serviceId === order.service.id && authorization.status === "active",
+    );
+    const identity =
+      `auto-enable:${order.service.id}:${method.id}:${current?.version ?? "none"}:` +
+      decision.decisionGeneration;
+    return mutatePaymentSettings<Record<string, unknown>>(
+      identity,
+      `/api/v1/services/${order.service.id}/automatic-renewal`,
+      {
+        savedPaymentMethodId: method.id,
+        consentVersion: paymentSettings.consentVersions.automaticRenewal,
+        expectedAuthorizationId: current?.id ?? null,
+        expectedAuthorizationVersion: current?.version ?? null,
+        expectedDecisionGeneration: decision.decisionGeneration,
+      },
+      `Automatic renewal is enabled for ${order.order.price.productName} using ${method.brand} ending ${method.lastFour}.`,
+    );
+  }
+
+  function revokeServiceAutomaticRenewal(
+    authorization: PaymentSettings["automaticRenewals"][number],
+  ) {
+    const decision = paymentSettings?.serviceDecisions.find(
+      (service) => service.serviceId === authorization.serviceId,
+    );
+    if (!decision) {
+      setError("Automatic-renewal state changed; refresh and confirm again");
+      return Promise.resolve();
+    }
+    const identity =
+      `auto-revoke:${authorization.id}:${authorization.version}:` +
+      decision.decisionGeneration;
+    return mutatePaymentSettings<{
+      inflightAutomaticPaymentsRequiringReconciliation: number;
+    }>(
+      identity,
+      `/api/v1/services/${authorization.serviceId}/automatic-renewal/revoke`,
+      {
+        expectedAuthorizationId: authorization.id,
+        expectedVersion: authorization.version,
+        expectedDecisionGeneration: decision.decisionGeneration,
+        reason: "Customer revoked automatic renewal",
+      },
+      (result) =>
+        result.inflightAutomaticPaymentsRequiringReconciliation > 0
+          ? `Automatic renewal was revoked for ${authorization.productName} and no new charge will be sent. ${result.inflightAutomaticPaymentsRequiringReconciliation} already-dispatched payment is still being reconciled and may still settle; it will not be sent a second time.`
+          : `Automatic renewal was revoked for ${authorization.productName}. No automatic payment was already in flight.`,
+    );
+  }
+
+  function revokePendingAutomaticRenewal(
+    pending: PaymentSettings["pendingAutomaticRenewals"][number],
+  ) {
+    const identity =
+      `auto-withdraw-pending:${pending.serviceId}:${pending.paymentAttemptId}:` +
+      pending.decisionGeneration;
+    return mutatePaymentSettings<{
+      pendingConsentRevoked: boolean;
+    }>(
+      identity,
+      `/api/v1/services/${pending.serviceId}/automatic-renewal/pending-consent/withdraw`,
+      {
+        expectedPaymentAttemptId: pending.paymentAttemptId,
+        expectedDecisionGeneration: pending.decisionGeneration,
+        reason: "Customer withdrew pending automatic-renewal consent",
+      },
+      `Pending automatic-renewal consent was withdrawn for ${pending.productName}. The invoice payment may still settle, but it cannot enable future off-session charges.`,
+    );
   }
 
   async function scheduleServiceCancellation() {
@@ -2296,6 +2590,164 @@ export function App() {
             </section>
           )}
 
+        {me?.eligible && paymentSettings && (
+          <section className="order-panel" aria-label="Payment methods and automatic renewal">
+            <div>
+              <p className="eyebrow">Customer billing · payment permissions</p>
+              <h2>Payment methods & automatic renewal</h2>
+              <p className="muted">
+                Saving a Provider token, choosing a default, and authorizing a service for automatic
+                renewal are separate choices. All are off until you explicitly enable them. An
+                authorized service is charged when its renewal invoice is created (normally 14 days
+                before term end), including the displayed payment-method fee, with at most one
+                background attempt; customer action or failure stops background charging.
+              </p>
+            </div>
+            {paymentSettingsReauthActive ? (
+              <p className="muted" data-testid="payment-settings-reauth-active">
+                Password confirmed until {new Date(paymentSettingsReauthExpiresAt!).toLocaleTimeString()}.
+                This fixed window does not extend when you make another change.
+              </p>
+            ) : (
+              <label>
+                Confirm your password for payment-setting changes (fixed 15-minute window)
+                <input
+                  data-testid="payment-settings-password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={paymentSettingsPassword}
+                  onChange={(event) => setPaymentSettingsPassword(event.target.value)}
+                />
+              </label>
+            )}
+            {paymentSettings.methods.length === 0 ? (
+              <p className="muted" data-testid="no-saved-payment-methods">
+                No saved payment method. Paying an invoice does not save one unless the separate
+                checkbox is selected.
+              </p>
+            ) : (
+              <div className="manual-list" data-testid="saved-payment-method-list">
+                {paymentSettings.methods.map((method) => {
+                  const activeAuthorization = paymentSettings.automaticRenewals.find(
+                    (authorization) =>
+                      authorization.serviceId === order?.service.id &&
+                      authorization.status === "active",
+                  );
+                  const canAuthorizeCurrentService = Boolean(
+                    order &&
+                      ["active", "suspended"].includes(order.service.status) &&
+                      order.order.price.billingCycle !== "one_time" &&
+                      !order.service.cancellation &&
+                      method.status === "active",
+                  );
+                  return (
+                    <article className="manual-item" key={method.id} data-testid="saved-payment-method">
+                      <strong>
+                        {method.brand} · {method.instrumentType} ending {method.lastFour}
+                        {method.default ? " · default" : ""}
+                      </strong>
+                      <span>
+                        Expires {method.expiryMonth ?? "—"}/{method.expiryYear ?? "—"} · status {method.status}
+                      </span>
+                      <span>
+                        Saved with consent {method.consentVersion} at {new Date(method.savedAt).toLocaleString()}
+                      </span>
+                      <div className="fund-actions">
+                        {!method.default && (
+                          <button
+                            disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                            onClick={() => void makePaymentMethodDefault(method)}
+                          >
+                            Set as default only
+                          </button>
+                        )}
+                        <button
+                          disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                          onClick={() => void removeSavedPaymentMethod(method)}
+                        >
+                          Remove and revoke linked automatic renewals
+                        </button>
+                        {canAuthorizeCurrentService &&
+                          activeAuthorization?.savedPaymentMethodId !== method.id && (
+                            <button
+                              className="primary"
+                              disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                              onClick={() => void enableServiceAutomaticRenewal(method)}
+                            >
+                              {activeAuthorization
+                                ? "Replace this service’s automatic-renewal method"
+                                : "Enable automatic renewal for current service"}
+                            </button>
+                          )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+            {paymentSettings.pendingAutomaticRenewals.length > 0 && (
+              <div className="manual-list" data-testid="pending-automatic-renewal-consents">
+                {paymentSettings.pendingAutomaticRenewals.map((pending) => (
+                  <article className="manual-item" key={pending.paymentAttemptId}>
+                    <strong>{pending.productName} · automatic-renewal consent pending</strong>
+                    <span>
+                      Payment {pending.paymentStatus} · consent {pending.consentVersion} · requested {" "}
+                      {new Date(pending.requestedAt).toLocaleString()}
+                    </span>
+                    <span>
+                      Withdrawing this consent does not cancel the invoice payment; it only prevents a
+                      late payment result from enabling future off-session charges.
+                    </span>
+                    <button
+                      disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                      onClick={() => void revokePendingAutomaticRenewal(pending)}
+                    >
+                      Withdraw pending automatic-renewal consent
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+            <div data-testid="automatic-renewal-authorizations">
+              {paymentSettings.automaticRenewals
+                .filter(
+                  (authorization) =>
+                    authorization.status === "active" ||
+                    authorization.latestAutomaticPaymentStatus !== null,
+                )
+                .map((authorization) => (
+                  <article className="manual-item" key={authorization.id}>
+                    <strong>
+                      {authorization.productName} · automatic renewal {authorization.status}
+                    </strong>
+                    <span>
+                      Consent {authorization.consentVersion} · granted {new Date(authorization.grantedAt).toLocaleString()}
+                    </span>
+                    {authorization.latestAutomaticPaymentStatus && (
+                      <span>
+                        Latest automatic payment: {authorization.latestAutomaticPaymentStatus}
+                        {authorization.status === "revoked" &&
+                        ["processing", "unknown"].includes(
+                          authorization.latestAutomaticPaymentStatus,
+                        )
+                          ? " — already dispatched and still reconciling; it may still settle"
+                          : ""}
+                      </span>
+                    )}
+                    {authorization.status === "active" && (
+                      <button
+                        disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                        onClick={() => void revokeServiceAutomaticRenewal(authorization)}
+                      >
+                        Revoke automatic renewal
+                      </button>
+                    )}
+                  </article>
+                ))}
+            </div>
+          </section>
+        )}
+
         {me?.eligible && renewals.length > 0 && (
           <section className="order-panel" aria-label="Service renewals">
             <div>
@@ -2355,6 +2807,19 @@ export function App() {
                       <span className="notice" data-testid="renewal-payment-reconciliation-hold">
                         Payment result is still being reconciled. No new Late Fee or suspension is
                         applied while the result remains unknown.
+                      </span>
+                    )}
+                    {renewal.automaticPayment && (
+                      <span
+                        className={renewal.automaticPayment.customerActionRequired ? "notice" : undefined}
+                        data-testid="renewal-automatic-payment-status"
+                      >
+                        Automatic payment {renewal.automaticPayment.status} · attempt {renewal.automaticPayment.attemptCount}/{renewal.automaticPayment.maxAttempts}
+                        {renewal.automaticPayment.customerActionRequired
+                          ? " · customer confirmation is required; background retries stopped. Pay this renewal manually below."
+                          : renewal.automaticPayment.lastError
+                            ? ` · ${renewal.automaticPayment.lastError}`
+                            : ""}
                       </span>
                     )}
                     {renewal.delinquency && (
@@ -2719,6 +3184,14 @@ export function App() {
                           <span data-testid="admin-renewal-payment-reconciliation-hold">
                             Delinquency deferred for unresolved payment result · recorded holds {" "}
                             {renewal.paymentReconciliationHold.deferralCount}
+                          </span>
+                        )}
+                        {renewal.automaticPayment && (
+                          <span data-testid="admin-renewal-automatic-payment-status">
+                            Automatic payment {renewal.automaticPayment.status} · attempt {renewal.automaticPayment.attemptCount}/{renewal.automaticPayment.maxAttempts}
+                            {renewal.automaticPayment.lastError
+                              ? ` · ${renewal.automaticPayment.lastError}`
+                              : ""}
                           </span>
                         )}
                         {renewal.delinquency && (
@@ -3692,6 +4165,50 @@ export function App() {
                   />
                   Apply available Credit ({usd(billing?.creditBalanceMinor ?? "0")})
                 </label>
+                <label>
+                  <input
+                    data-testid="save-payment-method-consent"
+                    type="checkbox"
+                    checked={savePaymentMethod}
+                    disabled={
+                      !paymentSettings ||
+                      !billing?.paymentMethods.find((method) => method.code === paymentMethod)
+                        ?.savedMethodEnabled
+                    }
+                    onChange={(event) => setSavePaymentMethod(event.target.checked)}
+                  />
+                  Save only the Provider token and safe card summary. Default is off; no card number or CVV is stored.
+                </label>
+                <label>
+                  <input
+                    data-testid="enable-auto-renew-consent"
+                    type="checkbox"
+                    checked={enableAutomaticRenewal}
+                    disabled={
+                      !savePaymentMethod ||
+                      order.order.price.billingCycle === "one_time" ||
+                      !billing?.paymentMethods.find((method) => method.code === paymentMethod)
+                        ?.automaticRenewalEnabled
+                    }
+                    onChange={(event) => setEnableAutomaticRenewal(event.target.checked)}
+                  />
+                  Separately allow one background payment attempt when each renewal invoice is
+                  created (normally 14 days before term end). The selected method fee is added to
+                  that invoice; customer action or failure stops retries. Default is off and this
+                  permission can be revoked.
+                </label>
+                {(savePaymentMethod || enableAutomaticRenewal) && !paymentSettingsReauthActive && (
+                  <label>
+                    Re-enter password to approve these payment-setting changes
+                    <input
+                      data-testid="checkout-payment-settings-password"
+                      type="password"
+                      autoComplete="current-password"
+                      value={paymentSettingsPassword}
+                      onChange={(event) => setPaymentSettingsPassword(event.target.value)}
+                    />
+                  </label>
+                )}
                 <select
                   value={paymentScenario}
                   onChange={(event) => setPaymentScenario(event.target.value)}
@@ -3712,7 +4229,12 @@ export function App() {
                 )}
                 <button
                   className="primary"
-                  disabled={!me?.eligible || !paymentQuote}
+                  disabled={
+                    !me?.eligible ||
+                    !paymentQuote ||
+                    ((savePaymentMethod || enableAutomaticRenewal) &&
+                      !paymentSettingsReauthReady)
+                  }
                   onClick={startPayment}
                 >
                   {text.pay}

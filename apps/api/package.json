@@ -9,11 +9,13 @@
     "create-bootstrap-token": "tsx src/create-bootstrap-token.ts",
     "dev": "tsx watch src/server.ts",
     "migrate": "tsx src/migrate.ts",
+    "rotate:payment-method-token-keys": "tsx src/rotate-payment-method-token-keys.ts",
     "rollback:preflight": "tsx src/schema-rollback-preflight.ts",
     "seed:termrat": "tsx src/seed-termrat.ts",
     "start": "node dist/server.js",
     "test": "node --test dist/**/*.test.js",
     "test:integration:renewal-lifecycle": "node dist/renewal-lifecycle-integration.js",
+    "test:integration:payment-method-token-rotation": "node dist/payment-method-token-rotation.integration.js",
     "test:integration:schema-rollback-preflight": "node dist/schema-rollback-preflight.integration.js",
     "test:integration:stage-a": "node dist/stage-a-integration.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
