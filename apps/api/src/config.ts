@@ -27,6 +27,7 @@ const schema = z.object({
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: z.coerce.number().int().positive().optional(),
   PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: z.string().optional(),
+  OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "014-to-015"]).optional(),
   MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
   MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
   LAB_MAILBOX_ENABLED: z

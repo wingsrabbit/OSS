@@ -9,6 +9,10 @@ import {
   fingerprintProviderTokenKeyMaterial,
   type ProviderTokenKeyring,
 } from "@opensales/core/provider-token-vault";
+import {
+  assert014RollbackBridgeSafe,
+  type SchemaRollbackPreflightReport,
+} from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
 import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
@@ -139,6 +143,29 @@ export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> 
     throw new Error(
       `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
     );
+  }
+}
+
+export async function assert014RollbackSchemaCompatible(
+  pool: DatabasePool,
+  input: Readonly<{ enable015RollbackBridge: boolean }>,
+): Promise<SchemaRollbackPreflightReport> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await assert014RollbackBridgeSafe(
+      {
+        query: async (text, values) => client.query(text, values),
+      },
+      { enable015RollbackBridge: input.enable015RollbackBridge },
+    );
+    await client.query("COMMIT");
+    return report;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
   }
 }
 

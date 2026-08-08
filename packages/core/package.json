@@ -16,6 +16,10 @@
     "./provider-token-vault": {
       "types": "./dist/provider-token-vault.d.ts",
       "default": "./dist/provider-token-vault.js"
+    },
+    "./schema-rollback-compatibility": {
+      "types": "./dist/schema-rollback-compatibility.d.ts",
+      "default": "./dist/schema-rollback-compatibility.js"
     }
   },
   "scripts": {
