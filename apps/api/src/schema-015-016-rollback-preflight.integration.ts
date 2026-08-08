@@ -48,6 +48,12 @@ try {
       /blocked by a running compatibility-bridge API or Worker/,
     );
     await contender.query("SET lock_timeout = '200ms'");
+    await contender.query(
+      "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
+    );
+    await contender.query(
+      "SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0))",
+    );
     await assert.rejects(
       contender.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
         SCHEMA_015_016_GUARD,

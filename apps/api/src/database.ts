@@ -147,10 +147,15 @@ export async function tryLockPaymentMethodTokenRegistryExtension(
 
 export async function runMigrations(pool: DatabasePool): Promise<void> {
   const client = await pool.connect();
+  let migrationLockHeld = false;
+  let compatibilityLockHeld = false;
+  let failed = false;
+  let failure: unknown;
   try {
     await client.query(
       "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
     );
+    migrationLockHeld = true;
     const compatibilityGuard = await client.query<{ locked: boolean }>(
       "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
       [SCHEMA_015_016_GUARD],
@@ -160,6 +165,7 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
         "Schema migration is blocked by a running compatibility-bridge API or Worker; stop every application process before migrating",
       );
     }
+    compatibilityLockHeld = true;
     await client.query(
       "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
@@ -186,16 +192,45 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
         throw error;
       }
     }
-  } finally {
-    await client
-      .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
-        SCHEMA_015_016_GUARD,
-      ])
-      .catch(() => undefined);
-    await client
-      .query("SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0))")
-      .catch(() => undefined);
-    client.release();
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+
+  const cleanupErrors: unknown[] = [];
+  let discardClient = false;
+  const unlock = async (query: string, values?: unknown[]): Promise<void> => {
+    try {
+      const result = await client.query<{ unlocked: boolean }>(query, values);
+      if (result.rows[0]?.unlocked !== true) {
+        throw new Error("Database migration advisory lock was not held by its session");
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+      discardClient = true;
+    }
+  };
+  if (compatibilityLockHeld) {
+    await unlock("SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked", [
+      SCHEMA_015_016_GUARD,
+    ]);
+  }
+  if (migrationLockHeld) {
+    await unlock(
+      "SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0)) AS unlocked",
+    );
+  }
+  client.release(discardClient ? true : undefined);
+
+  if (failed && cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [failure, ...cleanupErrors],
+      "Schema migration failed and advisory-lock cleanup also failed",
+    );
+  }
+  if (failed) throw failure;
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Schema migration advisory-lock cleanup failed");
   }
 }
 
