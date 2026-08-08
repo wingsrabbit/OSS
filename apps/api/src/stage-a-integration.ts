@@ -12852,6 +12852,7 @@ async function createCancellationPolicyFixture(input: {
   productName: string;
   fulfillmentMode: "quote" | "manual";
   billingCycle: "monthly" | "one_time";
+  recurringMinor: bigint;
   withBinding: boolean;
 }): Promise<string> {
   const orderId = randomUUID();
@@ -12862,11 +12863,22 @@ async function createCancellationPolicyFixture(input: {
     productName: input.productName,
     fulfillmentMode: input.fulfillmentMode,
     billingCycle: input.billingCycle,
-    components: [],
+    components:
+      input.recurringMinor > 0n
+        ? [
+            {
+              code: "synthetic-configured-recurring-service",
+              label: `${input.productName} configured recurring service`,
+              quantity: 1,
+              oneTimeMinor: "0",
+              recurringMinor: input.recurringMinor.toString(),
+            },
+          ]
+        : [],
     oneTimeSubtotalMinor: "0",
     setupMinor: "0",
-    recurringSubtotalMinor: "0",
-    invoiceTotalMinor: "0",
+    recurringSubtotalMinor: input.recurringMinor.toString(),
+    invoiceTotalMinor: input.recurringMinor.toString(),
   };
   const client = await corePool.connect();
   try {
@@ -12876,12 +12888,13 @@ async function createCancellationPolicyFixture(input: {
          id, client_account_id, submitted_by_user_id, status, currency,
          price_snapshot, one_time_minor, setup_minor, recurring_minor,
          total_minor, idempotency_key, request_fingerprint
-       ) VALUES ($1, $2, $3, 'completed', 'USD', $4, 0, 0, 0, 0, $5, $6)`,
+       ) VALUES ($1, $2, $3, 'completed', 'USD', $4, 0, 0, $5, $5, $6, $7)`,
       [
         orderId,
         cancellationIdentityRow!.client_account_id,
         cancellationIdentityRow!.user_id,
         snapshot,
+        input.recurringMinor.toString(),
         `synthetic-policy-order:${randomUUID()}`,
         `synthetic-policy-order-fingerprint:${randomUUID()}`,
       ],
@@ -12957,6 +12970,7 @@ const colocationCancellationServiceId = await createCancellationPolicyFixture({
   productName: "Synthetic authenticated-ticket Colocation",
   fulfillmentMode: "quote",
   billingCycle: "monthly",
+  recurringMinor: 25_000n,
   withBinding: true,
 });
 const colocationCancellationAttempt = await rawCoreRequest(
@@ -12996,6 +13010,7 @@ const remoteHandsCancellationServiceId = await createCancellationPolicyFixture({
   productName: "Synthetic one-time Remote Hands",
   fulfillmentMode: "manual",
   billingCycle: "one_time",
+  recurringMinor: 0n,
   withBinding: false,
 });
 const remoteHandsPolicy = await corePool.query<{
@@ -13434,6 +13449,20 @@ const endedCancellationFacts = await corePool.query<{ requests: string; jobs: st
 );
 assert.deepEqual(endedCancellationFacts.rows[0], { requests: "0", jobs: "0" });
 cookie = staffCookie;
+
+const invalidActiveRecurringSnapshots = await corePool.query<{ count: string }>(
+  `SELECT count(*)::text AS count
+   FROM services service
+   JOIN order_items item ON item.id = service.order_item_id
+   WHERE service.status = 'active'
+     AND service.billing_cycle <> 'one_time'
+     AND COALESCE(item.price_snapshot->>'recurringSubtotalMinor', '') !~ '^[1-9][0-9]*$'`,
+);
+assert.equal(
+  invalidActiveRecurringSnapshots.rows[0]?.count,
+  "0",
+  "every active recurring service fixture must retain a positive historical recurring price",
+);
 
 const unbalancedJournals = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count
