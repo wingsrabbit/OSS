@@ -153,7 +153,8 @@ jobs:
           node providers/mock-lab/dist/server.js > provider.log 2>&1 &
           node apps/api/dist/server.js > api.log 2>&1 &
           echo "$!" > api.pid
-          node apps/worker/dist/worker.js > worker.log 2>&1 &
+          MOCK_RESOURCE_ACTION_SCENARIO=timeout_success node apps/worker/dist/worker.js > worker.log 2>&1 &
+          echo "$!" > worker.pid
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
                curl --fail --silent http://127.0.0.1:4000/health/ready >/dev/null; then
@@ -165,7 +166,28 @@ jobs:
           exit 1
 
       - name: Run PostgreSQL Stage A journey
+        env:
+          EXPECT_RESOURCE_ACTION_SCENARIO: timeout_success
         run: pnpm --filter @opensales/api test:integration:stage-a
+
+      - name: Restart Worker for isolated browser journey
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r worker_pid < worker.pid
+          kill "${worker_pid}"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "${worker_pid}" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            echo "Worker process did not stop cleanly"
+            exit 1
+          fi
+          node apps/worker/dist/worker.js > worker-browser.log 2>&1 &
+          echo "$!" > worker.pid
 
       - name: Install pinned Chromium runtime
         run: pnpm --filter @opensales/e2e exec playwright install --with-deps chromium
