@@ -78,7 +78,7 @@ async function releaseWorkerGuard(
 ): Promise<void> {
   try {
     const result = await client.query<{ unlocked: boolean }>(
-      "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked",
+      "SELECT pg_catalog.pg_advisory_unlock_shared(pg_catalog.hashtextextended($1, 0)) AS unlocked",
       [guard],
     );
     if (result.rows[0]?.unlocked !== true) {
@@ -7376,7 +7376,7 @@ try {
   schemaCompatibilityGuard = await pool.connect();
   await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
   await schemaCompatibilityGuard.query(
-    "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
+    "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
     [SCHEMA_015_016_GUARD],
   );
   await schemaCompatibilityGuard.query("RESET lock_timeout");
@@ -7401,11 +7401,11 @@ try {
 
   tokenRegistryGuard = await pool.connect();
   await tokenRegistryGuard.query(
-    "SELECT pg_advisory_lock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
+    "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended('opensales:payment-method-token-registry-extension', 0))",
   );
   await transaction(async (client) => {
   await client.query(
-    "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+    "SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended('opensales:payment-method-token-rewrap', 0))",
   );
   const registered = await client.query<{ version: number; key_fingerprint: Buffer }>(
     `SELECT version, key_fingerprint

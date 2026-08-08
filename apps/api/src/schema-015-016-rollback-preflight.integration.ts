@@ -30,6 +30,7 @@ const client = await pool.connect();
 const database = {
   query: async (text: string, values?: unknown[]) => client.query(text, values),
 };
+let publicHashShadowCreated = false;
 
 try {
   const installed = await client.query<{ version: string | null }>(
@@ -39,6 +40,12 @@ try {
   const native = await assertSchemaCompatible(pool);
   assert.equal(native.mode, "native");
 
+  await client.query(`
+    CREATE FUNCTION public.hashtextextended(text, bigint)
+    RETURNS bigint LANGUAGE sql IMMUTABLE
+    AS 'SELECT 0::bigint'
+  `);
+  publicHashShadowCreated = true;
   const releaseGuard = await holdSchema015RollbackBridgeGuard(pool);
   const contender = new pg.Client({ connectionString: databaseUrl });
   await contender.connect();
@@ -49,15 +56,18 @@ try {
     );
     await contender.query("SET lock_timeout = '200ms'");
     await contender.query(
-      "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
+      "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('opensales:schema-migrations', 0))",
     );
     await contender.query(
-      "SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0))",
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('opensales:schema-migrations', 0))",
     );
     await assert.rejects(
-      contender.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
-        SCHEMA_015_016_GUARD,
-      ]),
+      contender.query(
+        "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended($1, 0))",
+        [
+          SCHEMA_015_016_GUARD,
+        ],
+      ),
       (error: unknown) =>
         typeof error === "object" &&
         error !== null &&
@@ -66,14 +76,19 @@ try {
     );
     await releaseGuard();
     await contender.query("SET lock_timeout = '2s'");
-    await contender.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
-      SCHEMA_015_016_GUARD,
-    ]);
-    await contender.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
-      SCHEMA_015_016_GUARD,
-    ]);
+    await contender.query(
+      "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_015_016_GUARD],
+    );
+    await contender.query(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_015_016_GUARD],
+    );
   } finally {
+    await releaseGuard();
     await contender.end();
+    await client.query("DROP FUNCTION public.hashtextextended(text, bigint)");
+    publicHashShadowCreated = false;
   }
 
   await client.query("BEGIN");
@@ -181,8 +196,8 @@ try {
     CREATE FUNCTION opensales_manual_receipt_write_guard()
     RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
-      PERFORM pg_advisory_xact_lock(
-        hashtextextended('opensales:schema-015-016-rollback-bridge', 0)
+      PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended('opensales:schema-015-016-rollback-bridge', 0)
       );
       RETURN NEW;
     END $$;
@@ -223,8 +238,8 @@ try {
           AND (row_data->>'reported_manual_receipt_id' IS NOT NULL
             OR row_data->>'disposition' = 'reversed'));
       IF is_manual THEN
-        PERFORM pg_advisory_xact_lock(
-          hashtextextended('opensales:schema-015-016-rollback-bridge', 0)
+        PERFORM pg_catalog.pg_advisory_xact_lock(
+          pg_catalog.hashtextextended('opensales:schema-015-016-rollback-bridge', 0)
         );
       END IF;
       RETURN NEW;
@@ -849,6 +864,7 @@ try {
       schema015Native: true,
       schema016RequiresOptIn: true,
       shadowSchemaRejected: true,
+      publicFunctionShadowRejected: true,
       incompleteSchema016Rejected: true,
       emptySchema016Accepted: true,
       disabledTriggerRejected: true,
@@ -871,6 +887,11 @@ try {
   await client.query("ROLLBACK").catch(() => undefined);
   throw error;
 } finally {
+  if (publicHashShadowCreated) {
+    await client
+      .query("DROP FUNCTION IF EXISTS public.hashtextextended(text, bigint)")
+      .catch(() => undefined);
+  }
   client.release();
   await pool.end();
 }

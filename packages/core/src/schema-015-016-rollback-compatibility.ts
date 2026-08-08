@@ -11,7 +11,7 @@ export const SCHEMA_016 = "016_stage_b_manual_receipts" as const;
 export const SCHEMA_015_016_GUARD =
   "opensales:schema-015-016-rollback-bridge" as const;
 export const SCHEMA_016_CATALOG_DIGEST =
-  "7a8cc81b8e69d55c9e450fea7d5feb6262f13e188ff694877110cb63c488b635" as const;
+  "1d2d65ad265a749cb2ff7ce5074a820130d2ef5675b53c5c37dd85e1dfd54ce6" as const;
 
 export type Schema015RollbackPreflightReport = Readonly<{
   installedSchemaVersion: string;

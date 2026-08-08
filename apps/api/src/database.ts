@@ -67,7 +67,7 @@ export async function holdPaymentMethodTokenRegistryExtensionGuard(
   let held = false;
   try {
     await client.query(
-      "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
       [TOKEN_REGISTRY_EXTENSION_GUARD],
     );
     held = true;
@@ -80,7 +80,7 @@ export async function holdPaymentMethodTokenRegistryExtensionGuard(
     held = false;
     try {
       const result = await client.query<{ unlocked: boolean }>(
-        "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked",
+        "SELECT pg_catalog.pg_advisory_unlock_shared(pg_catalog.hashtextextended($1, 0)) AS unlocked",
         [TOKEN_REGISTRY_EXTENSION_GUARD],
       );
       if (result.rows[0]?.unlocked !== true) {
@@ -100,7 +100,7 @@ async function releaseGuardClient(
 ): Promise<void> {
   try {
     const result = await client.query<{ unlocked: boolean }>(
-      "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS unlocked",
+      "SELECT pg_catalog.pg_advisory_unlock_shared(pg_catalog.hashtextextended($1, 0)) AS unlocked",
       [guard],
     );
     if (result.rows[0]?.unlocked !== true) {
@@ -120,9 +120,10 @@ export async function holdSchema015RollbackBridgeGuard(
   let held = false;
   try {
     await client.query("SET lock_timeout = '15s'");
-    await client.query("SELECT pg_advisory_lock_shared(hashtextextended($1, 0))", [
-      SCHEMA_015_016_GUARD,
-    ]);
+    await client.query(
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_015_016_GUARD],
+    );
     await client.query("RESET lock_timeout");
     held = true;
   } catch (error) {
@@ -140,7 +141,7 @@ export async function tryLockPaymentMethodTokenRegistryExtension(
   client: DatabaseClient,
 ): Promise<boolean> {
   const result = await client.query<{ locked: boolean }>(
-    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked",
+    "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
     [TOKEN_REGISTRY_EXTENSION_GUARD],
   );
   return result.rows[0]?.locked === true;
@@ -153,13 +154,13 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   let failed = false;
   let failure: unknown;
   try {
-    await client.query("SET search_path TO public, pg_catalog");
+    await client.query("SET search_path TO public");
     await client.query(
-      "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
+      "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('opensales:schema-migrations', 0))",
     );
     migrationLockHeld = true;
     const compatibilityGuard = await client.query<{ locked: boolean }>(
-      "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+      "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
       [SCHEMA_015_016_GUARD],
     );
     if (compatibilityGuard.rows[0]?.locked !== true) {
@@ -221,13 +222,14 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
     }
   };
   if (compatibilityLockHeld) {
-    await unlock("SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked", [
-      SCHEMA_015_016_GUARD,
-    ]);
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [SCHEMA_015_016_GUARD],
+    );
   }
   if (migrationLockHeld) {
     await unlock(
-      "SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0)) AS unlocked",
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('opensales:schema-migrations', 0)) AS unlocked",
     );
   }
   client.release(discardClient ? true : undefined);
@@ -448,7 +450,7 @@ export async function bootstrapPaymentMethodTokenKeyrings(
   const keyrings = paymentMethodTokenKeyrings(config);
   await transaction(pool, async (client) => {
     await client.query(
-      "SELECT pg_advisory_xact_lock(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+      "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('opensales:payment-method-token-rewrap', 0))",
     );
     const counts = await client.query<{
       encryption_count: string;
@@ -514,7 +516,7 @@ export async function assertPaymentMethodTokenKeyringsCompatible(
 ): Promise<void> {
   await transaction(pool, async (client) => {
     await client.query(
-      "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+      "SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended('opensales:payment-method-token-rewrap', 0))",
     );
     await assertPaymentMethodTokenKeyringsCompatibleWithClient(client, config);
   });
