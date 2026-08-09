@@ -118,15 +118,16 @@ ALTER TABLE public.manual_receipt_outflows
   ADD COLUMN report_id uuid NOT NULL UNIQUE
     REFERENCES public.manual_receipt_outflow_reports(id),
   ADD COLUMN client_account_id uuid NOT NULL REFERENCES public.client_accounts(id),
-  ADD COLUMN source_context text NOT NULL CHECK (
-    source_context IN ('unclaimed_funds', 'allocated_invoice', 'converted_credit')
-  ),
+  ADD COLUMN source_context text NOT NULL,
   ADD COLUMN fund_receipt_resolution_id uuid
     REFERENCES public.fund_receipt_resolutions(id),
   ADD COLUMN occurred_at timestamptz NOT NULL,
   ADD COLUMN actor_session_id uuid NOT NULL REFERENCES public.sessions(id),
   ADD COLUMN reauth_grant_id uuid NOT NULL REFERENCES public.reauth_grants(id),
-  ADD CONSTRAINT manual_receipt_outflows_source_context_check CHECK (
+  ADD CONSTRAINT manual_receipt_outflows_source_context_value_check CHECK (
+    source_context IN ('unclaimed_funds', 'allocated_invoice', 'converted_credit')
+  ),
+  ADD CONSTRAINT manual_receipt_outflows_source_binding_check CHECK (
     (source_context = 'unclaimed_funds' AND fund_receipt_resolution_id IS NULL)
     OR
     (source_context IN ('allocated_invoice', 'converted_credit')
