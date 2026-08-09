@@ -73,7 +73,11 @@ export async function claimSchema016Job<T extends pg.QueryResultRow>(
          updated_at = now()
      FROM candidate
      WHERE job.id = candidate.id
-     RETURNING job.id, job.job_type, job.unique_key, job.payload, job.attempts`,
+     RETURNING job.id, job.job_type, job.unique_key, job.payload,
+               job.payload::text AS payload_snapshot,
+               job.attempts,
+               EXTRACT(epoch FROM job.locked_at)::numeric::text AS locked_at_epoch,
+               job.locked_by`,
     [workerId, [...SCHEMA_016_SUPPORTED_JOB_TYPES]],
   );
   return result.rows[0] ?? null;
@@ -146,6 +150,41 @@ export async function lockSchema016StaleJob<T extends pg.QueryResultRow>(
       candidate.payload_snapshot,
       candidate.locked_at_epoch,
       candidate.locked_by,
+      [...SCHEMA_016_SUPPORTED_JOB_TYPES],
+    ],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function lockSchema016ActiveJob<T extends pg.QueryResultRow>(
+  client: Pick<pg.PoolClient, "query">,
+  job: StaleJobIdentity,
+): Promise<T | null> {
+  const result = await client.query<T>(
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
+     FROM public.durable_jobs
+     WHERE id = $1
+       AND status = 'running'
+       AND attempts = $2
+       AND job_type = $3
+       AND unique_key = $4
+       AND payload::text = $5
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $6
+       AND locked_by IS NOT DISTINCT FROM $7
+       AND job_type = ANY($8::text[])
+     FOR UPDATE`,
+    [
+      job.id,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+      job.locked_by,
       [...SCHEMA_016_SUPPORTED_JOB_TYPES],
     ],
   );

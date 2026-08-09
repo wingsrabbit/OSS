@@ -25,6 +25,7 @@ import {
   claimSchema016Job,
   findSchema016GenericRecoveryCandidates,
   isSchema016GenericRecoveryJobType,
+  lockSchema016ActiveJob,
   lockSchema016StaleJob,
 } from "./job-claim.js";
 
@@ -134,14 +135,13 @@ type Job = {
   job_type: string;
   unique_key: string;
   payload: Record<string, string>;
-  attempts: number;
-};
-
-type StaleJob = Job & {
   payload_snapshot: string;
+  attempts: number;
   locked_at_epoch: string;
   locked_by: string | null;
 };
+
+type StaleJob = Job;
 
 type DatabaseClient = pg.PoolClient;
 
@@ -174,17 +174,10 @@ async function lockProviderOperation(client: DatabaseClient, operationId: string
 }
 
 async function assertJobLeaseWithClient(client: DatabaseClient, job: Job): Promise<void> {
-  const result = await client.query(
-    `SELECT id
-     FROM durable_jobs
-     WHERE id = $1
-       AND status = 'running'
-       AND locked_by = $2
-       AND attempts = $3
-     FOR UPDATE`,
-    [job.id, config.WORKER_ID, job.attempts],
-  );
-  if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
+  const locked = await lockSchema016ActiveJob<Job>(client, job);
+  if (!locked || locked.locked_by !== config.WORKER_ID) {
+    throw new LostJobLeaseError(job.id);
+  }
 }
 
 function reconcileDelaySeconds(attempts: number): number {
@@ -203,8 +196,20 @@ async function completeJobWithClient(client: DatabaseClient, job: Job): Promise<
        AND status = 'running'
        AND locked_by = $2
        AND attempts = $3
+       AND job_type = $4
+       AND unique_key = $5
+       AND payload::text = $6
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $7
      RETURNING id`,
-    [job.id, config.WORKER_ID, job.attempts],
+    [
+      job.id,
+      config.WORKER_ID,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+    ],
   );
   if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
@@ -222,8 +227,21 @@ async function manualJobWithClient(
        AND status = 'running'
        AND locked_by = $3
        AND attempts = $4
+       AND job_type = $5
+       AND unique_key = $6
+       AND payload::text = $7
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $8
      RETURNING id`,
-    [job.id, reason.slice(0, 1_000), config.WORKER_ID, job.attempts],
+    [
+      job.id,
+      reason.slice(0, 1_000),
+      config.WORKER_ID,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+    ],
   );
   if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
@@ -712,8 +730,20 @@ async function completeJob(job: Job): Promise<void> {
        AND status = 'running'
        AND locked_by = $2
        AND attempts = $3
+       AND job_type = $4
+       AND unique_key = $5
+       AND payload::text = $6
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $7
      RETURNING id`,
-    [job.id, config.WORKER_ID, job.attempts],
+    [
+      job.id,
+      config.WORKER_ID,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+    ],
   );
   if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
@@ -736,7 +766,11 @@ async function failJob(job: Job, error: unknown): Promise<void> {
      WHERE id = $1
        AND status = 'running'
        AND locked_by = $5
-       AND attempts = $6`,
+       AND attempts = $6
+       AND job_type = $7
+       AND unique_key = $8
+       AND payload::text = $9
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $10`,
     [
       job.id,
       manual ? "manual" : "pending",
@@ -744,6 +778,10 @@ async function failJob(job: Job, error: unknown): Promise<void> {
       message,
       config.WORKER_ID,
       job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
     ],
   );
   if (result.rowCount !== 1) {

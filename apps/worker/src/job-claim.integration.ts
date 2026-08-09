@@ -6,6 +6,7 @@ import pg from "pg";
 import {
   claimSchema016Job,
   findSchema016GenericRecoveryCandidates,
+  lockSchema016ActiveJob,
   lockSchema016StaleJob,
 } from "./job-claim.js";
 
@@ -14,14 +15,13 @@ type ClaimedJob = pg.QueryResultRow & {
   job_type: string;
   unique_key: string;
   payload: Record<string, unknown>;
-  attempts: number;
-};
-
-type StaleJob = ClaimedJob & {
   payload_snapshot: string;
+  attempts: number;
   locked_at_epoch: string;
   locked_by: string | null;
 };
+
+type StaleJob = ClaimedJob;
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
@@ -113,9 +113,69 @@ try {
     pool,
     "schema-016-boundary-integration",
   );
-  assert.equal(claimed?.job_type, "notification.send");
-  assert.equal(claimed?.unique_key, knownKey);
-  assert.equal(claimed?.attempts, 1);
+  assert.ok(claimed);
+  assert.equal(claimed.job_type, "notification.send");
+  assert.equal(claimed.unique_key, knownKey);
+  assert.equal(claimed.attempts, 1);
+  assert.equal(claimed.locked_by, "schema-016-boundary-integration");
+  assert.ok(claimed.locked_at_epoch);
+
+  const activeClient = await pool.connect();
+  try {
+    await activeClient.query("BEGIN");
+    const unchangedActive = await lockSchema016ActiveJob<ClaimedJob>(
+      activeClient,
+      claimed,
+    );
+    assert.equal(unchangedActive?.id, claimed.id);
+    await activeClient.query("ROLLBACK");
+  } catch (error) {
+    await activeClient.query("ROLLBACK");
+    throw error;
+  } finally {
+    activeClient.release();
+  }
+
+  await pool.query(
+    `UPDATE public.durable_jobs
+     SET job_type = 'schema017.reconciliation',
+         payload = $2::jsonb
+     WHERE id = $1`,
+    [
+      claimed.id,
+      JSON.stringify({ marker: "future-017-active-swap", externalFactId: randomUUID() }),
+    ],
+  );
+  const activeSwapBefore = await pool.query(
+    `SELECT status, job_type, unique_key, attempts, payload, available_at,
+            locked_at, locked_by, last_error, created_at, updated_at
+     FROM public.durable_jobs
+     WHERE id = $1`,
+    [claimed.id],
+  );
+  const rejectedActiveClient = await pool.connect();
+  try {
+    await rejectedActiveClient.query("BEGIN");
+    const swappedActive = await lockSchema016ActiveJob<ClaimedJob>(
+      rejectedActiveClient,
+      claimed,
+    );
+    assert.equal(swappedActive, null);
+    await rejectedActiveClient.query("ROLLBACK");
+  } catch (error) {
+    await rejectedActiveClient.query("ROLLBACK");
+    throw error;
+  } finally {
+    rejectedActiveClient.release();
+  }
+  const activeSwapAfter = await pool.query(
+    `SELECT status, job_type, unique_key, attempts, payload, available_at,
+            locked_at, locked_by, last_error, created_at, updated_at
+     FROM public.durable_jobs
+     WHERE id = $1`,
+    [claimed.id],
+  );
+  assert.deepEqual(activeSwapAfter.rows, activeSwapBefore.rows);
 
   const next = await claimSchema016Job<ClaimedJob>(
     pool,
@@ -220,6 +280,8 @@ try {
     JSON.stringify({
       journey: "schema-016-worker-job-boundary",
       knownJobClaimed: true,
+      unchangedActiveLeaseLocks: true,
+      activeCandidateSwapRejected: true,
       unknownPendingJobUntouched: true,
       unknownStaleRunningJobUntouched: true,
       unchangedKnownStaleJobLocks: true,
