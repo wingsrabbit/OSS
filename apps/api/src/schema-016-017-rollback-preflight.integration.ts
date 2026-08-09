@@ -163,6 +163,7 @@ test("manual outflow authorization requires both manual-receipt and refund permi
   const staffUserId = randomUUID();
   const sessionId = randomUUID();
   const reauthId = randomUUID();
+  const authorizedReauthId = randomUUID();
   try {
     await client.query("BEGIN");
     await client.query(
@@ -186,12 +187,12 @@ test("manual outflow authorization requires both manual-receipt and refund permi
        VALUES ($1, ARRAY['Billing'], $2::jsonb)`,
       [staffUserId, JSON.stringify(["billing.manual_receipt_manage"])],
     );
-    const authorized = async (): Promise<boolean> => {
+    const authorized = async (grantId = reauthId): Promise<boolean> => {
       const result = await client.query<{ authorized: boolean }>(
         `SELECT public.opensales_validate_manual_receipt_outflow_authorization(
            $1, $2, $3
          ) AS authorized`,
-        [staffUserId, sessionId, reauthId],
+        [staffUserId, sessionId, grantId],
       );
       return result.rows[0]?.authorized === true;
     };
@@ -208,12 +209,18 @@ test("manual outflow authorization requires both manual-receipt and refund permi
         JSON.stringify(["billing.manual_receipt_manage", "billing.refund_manage"]),
       ],
     );
-    assert.equal(await authorized(), true);
+    await client.query(
+      `INSERT INTO public.reauth_grants(
+         id, user_id, session_id, created_at, expires_at
+       ) VALUES ($1, $2, $3, pg_catalog.now(), pg_catalog.now() + interval '15 minutes')`,
+      [authorizedReauthId, staffUserId, sessionId],
+    );
+    assert.equal(await authorized(authorizedReauthId), true);
     await client.query(
       "UPDATE public.staff_members SET permissions = '[]'::jsonb WHERE user_id = $1",
       [staffUserId],
     );
-    assert.equal(await authorized(), false);
+    assert.equal(await authorized(authorizedReauthId), false);
   } finally {
     await client.query("ROLLBACK").catch(() => undefined);
     client.release();
@@ -909,7 +916,6 @@ test("an allocated-invoice outflow is a refund and never reopens the paid invoic
   const outflowId = randomUUID();
   const amountMinor = 500;
   const receivedAt = new Date(Date.now() - 120_000).toISOString();
-  const occurredAt = new Date().toISOString();
   try {
     await client.query("BEGIN");
     await client.query(
@@ -1108,6 +1114,7 @@ test("an allocated-invoice outflow is a refund and never reopens the paid invoic
       fund_allocation_minor: amountMinor.toString(),
     });
 
+    const occurredAt = new Date().toISOString();
     const outflowResult = { outflowId, amountMinor: amountMinor.toString(), currency: "USD" };
     const outflowKey = `schema-017-invoice-refund-${reportId}`;
     const outflowFingerprint = `schema-017-invoice-refund-fingerprint-${reportId}`;

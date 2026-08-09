@@ -1314,31 +1314,33 @@ CREATE FUNCTION public.opensales_assert_manual_receipt_outflow_marker_bound()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  row_data jsonb := pg_catalog.to_jsonb(NEW);
 BEGIN
   IF TG_TABLE_NAME = 'ledger_journals'
-     AND NEW.source_type = 'manual_receipt_outflow'
+     AND row_data->>'source_type' = 'manual_receipt_outflow'
      AND NOT EXISTS (
        SELECT 1 FROM public.manual_receipt_outflows outflow
-       WHERE outflow.id = NEW.source_id
+       WHERE outflow.id::text = row_data->>'source_id'
      ) THEN
     RAISE EXCEPTION 'manual receipt outflow journal has no immutable outflow fact';
   END IF;
 
   IF TG_TABLE_NAME = 'credit_transactions'
-     AND (NEW.kind = 'manual_receipt_outflow'
-       OR NEW.source_type = 'manual_receipt_credit_outflow_effect')
+     AND (row_data->>'kind' = 'manual_receipt_outflow'
+       OR row_data->>'source_type' = 'manual_receipt_credit_outflow_effect')
      AND NOT EXISTS (
        SELECT 1 FROM public.manual_receipt_credit_outflow_effects effect
-       WHERE effect.id = NEW.source_id
+       WHERE effect.id::text = row_data->>'source_id'
      ) THEN
     RAISE EXCEPTION 'manual receipt outflow Credit marker has no immutable effect';
   END IF;
 
   IF TG_TABLE_NAME = 'client_account_debt_transactions'
-     AND NEW.source_type = 'manual_receipt_credit_outflow_effect'
+     AND row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
      AND NOT EXISTS (
        SELECT 1 FROM public.manual_receipt_credit_outflow_effects effect
-       WHERE effect.id = NEW.source_id
+       WHERE effect.id::text = row_data->>'source_id'
      ) THEN
     RAISE EXCEPTION 'manual receipt outflow debt marker has no immutable effect';
   END IF;
