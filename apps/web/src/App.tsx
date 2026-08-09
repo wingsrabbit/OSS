@@ -184,6 +184,12 @@ type ManualReceiptItem = {
   capacityFrozen: boolean;
   currency: "USD";
   disposition: string;
+  reversal: {
+    reversalId: string;
+    actorId: string;
+    reason: string;
+    createdAt: string;
+  } | null;
   actorId: string;
   reason: string;
   createdAt: string;
@@ -201,6 +207,20 @@ type ManualReceiptOutcome = {
   disposition: "unclaimed";
   allocatedMinor: "0";
   providerUsed: false;
+  replayed: boolean;
+};
+type ManualReceiptReversalOutcome = {
+  reversalId: string;
+  manualReceiptId: string;
+  fundReceiptId: string;
+  clientAccountId: string;
+  grossAmountMinor: string;
+  feeMinor: string;
+  netAmountMinor: string;
+  currency: "USD";
+  disposition: "reversed";
+  providerUsed: false;
+  cashOutflow: false;
   replayed: boolean;
 };
 type RefundCandidate = {
@@ -694,6 +714,19 @@ async function manualReceiptIntentStorageKey(requestIdentity: string): Promise<s
   return `opensales:manual-receipt-intent:${fingerprint}`;
 }
 
+async function manualReceiptReversalIntentStorageKey(
+  requestIdentity: string,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(requestIdentity),
+  );
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `opensales:manual-receipt-reversal-intent:${fingerprint}`;
+}
+
 function defaultManualReceiptTime(): string {
   const instant = new Date(Date.now() - 60_000);
   const localWallClock = new Date(
@@ -705,6 +738,16 @@ function defaultManualReceiptTime(): string {
 function looksLikeUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
     value.trim(),
+  );
+}
+
+function manualReceiptIsUntouched(receipt: ManualReceiptItem): boolean {
+  return (
+    receipt.reversal === null &&
+    receipt.disposition === "unclaimed" &&
+    receipt.allocatedMinor === "0" &&
+    !receipt.capacityFrozen &&
+    receipt.availableMinor === receipt.grossAmountMinor
   );
 }
 
@@ -783,6 +826,16 @@ export function App() {
   const [manualReceiptOutcome, setManualReceiptOutcome] =
     useState<ManualReceiptOutcome | null>(null);
   const manualReceiptIntentKeys = useRef(new Map<string, string>());
+  const [manualReceiptReversalTargetId, setManualReceiptReversalTargetId] = useState<
+    string | null
+  >(null);
+  const [manualReceiptReversalReason, setManualReceiptReversalReason] = useState("");
+  const [manualReceiptReversalPendingId, setManualReceiptReversalPendingId] = useState<
+    string | null
+  >(null);
+  const [manualReceiptReversalOutcome, setManualReceiptReversalOutcome] =
+    useState<ManualReceiptReversalOutcome | null>(null);
+  const manualReceiptReversalIntentKeys = useRef(new Map<string, string>());
   const manualReceiptDefaultedForUser = useRef<string | null>(null);
   const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
@@ -955,6 +1008,9 @@ export function App() {
       setManualReceiptHistory([]);
       setManualReceiptTarget(null);
       setManualReceiptOutcome(null);
+      setManualReceiptReversalTargetId(null);
+      setManualReceiptReversalReason("");
+      setManualReceiptReversalOutcome(null);
       return;
     }
     if (manualReceiptDefaultedForUser.current === me.id) return;
@@ -964,6 +1020,9 @@ export function App() {
     setManualReceiptHistory([]);
     setManualReceiptTarget(null);
     setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalOutcome(null);
   }, [me]);
 
   useEffect(() => {
@@ -2033,6 +2092,95 @@ export function App() {
       setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
     } finally {
       setManualReceiptPending(false);
+    }
+  }
+
+  async function reverseManualReceipt(receipt: ManualReceiptItem) {
+    const clientAccountId = manualReceiptTarget?.id;
+    if (
+      !me?.staff ||
+      !clientAccountId ||
+      manualReceiptReversalPendingId !== null ||
+      manualReceiptReversalTargetId !== receipt.manualReceiptId ||
+      !manualReceiptIsUntouched(receipt) ||
+      manualReceiptReversalReason.trim().length < 10 ||
+      manualReceiptReversalReason.trim().length > 1_000 ||
+      adminPassword.length === 0
+    ) {
+      return;
+    }
+    const payload = {
+      expectedFundReceiptId: receipt.fundReceiptId,
+      expectedGrossAmountMinor: receipt.grossAmountMinor,
+      reason: manualReceiptReversalReason.trim(),
+    };
+    const requestIdentity = JSON.stringify({
+      clientAccountId,
+      manualReceiptId: receipt.manualReceiptId,
+      ...payload,
+    });
+    setError("");
+    setManualReceiptReversalPendingId(receipt.manualReceiptId);
+    try {
+      const storageKey = await manualReceiptReversalIntentStorageKey(requestIdentity);
+      let storedKey: string | null = null;
+      try {
+        storedKey = window.localStorage.getItem(storageKey);
+      } catch {
+        storedKey = null;
+      }
+      const idempotencyKey =
+        manualReceiptReversalIntentKeys.current.get(requestIdentity) ??
+        storedKey ??
+        newIdempotencyKey();
+      manualReceiptReversalIntentKeys.current.set(requestIdentity, idempotencyKey);
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The in-memory key still protects a retry in this page.
+      }
+
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const outcome = await api<ManualReceiptReversalOutcome>(
+        `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/reversal`,
+        {
+          method: "POST",
+          body: JSON.stringify({ ...payload, idempotencyKey }),
+        },
+      );
+      manualReceiptReversalIntentKeys.current.delete(requestIdentity);
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // Core's successful response is authoritative.
+      }
+      setManualReceiptReversalOutcome(outcome);
+      setManualReceiptReversalTargetId(null);
+      setManualReceiptReversalReason("");
+      const [historyRefresh, unclaimedRefresh] = await Promise.allSettled([
+        fetchManualReceiptHistory(clientAccountId),
+        refreshUnclaimedFunds(),
+      ]);
+      if (historyRefresh.status === "fulfilled") {
+        setManualReceiptTarget(historyRefresh.value.clientAccount);
+        setManualReceiptHistory(historyRefresh.value.items);
+      }
+      setNotice(
+        outcome.replayed
+          ? "This exact reversal was replayed safely; no second journal or money change was created."
+          : "Mistaken manual receipt reversed with a separate balanced journal. The original fact remains immutable and no money was sent.",
+      );
+      if (historyRefresh.status === "rejected" || unclaimedRefresh.status === "rejected") {
+        setError("The reversal was saved, but one of the administrator lists could not be refreshed.");
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Manual receipt could not be reversed");
+    } finally {
+      setManualReceiptReversalPendingId(null);
     }
   }
 
@@ -3768,13 +3916,18 @@ export function App() {
                   <span>Client Account ID</span>
                   <input
                     aria-label="Manual receipt Client Account ID"
-                    disabled={manualReceiptPending}
+                    disabled={
+                      manualReceiptPending || manualReceiptReversalPendingId !== null
+                    }
                     value={manualReceiptClientAccountId}
                     onChange={(event) => {
                       setManualReceiptClientAccountId(event.target.value);
                       setManualReceiptHistory([]);
                       setManualReceiptTarget(null);
                       setManualReceiptOutcome(null);
+                      setManualReceiptReversalTargetId(null);
+                      setManualReceiptReversalReason("");
+                      setManualReceiptReversalOutcome(null);
                     }}
                     placeholder="Client Account UUID"
                   />
@@ -3783,7 +3936,9 @@ export function App() {
                   <span>Receipt reference</span>
                   <input
                     aria-label="Manual receipt reference"
-                    disabled={manualReceiptPending}
+                    disabled={
+                      manualReceiptPending || manualReceiptReversalPendingId !== null
+                    }
                     value={manualReceiptReference}
                     onChange={(event) => setManualReceiptReference(event.target.value)}
                     maxLength={200}
@@ -3795,7 +3950,9 @@ export function App() {
                   <input
                     aria-label="Manual receipt received at"
                     type="datetime-local"
-                    disabled={manualReceiptPending}
+                    disabled={
+                      manualReceiptPending || manualReceiptReversalPendingId !== null
+                    }
                     value={manualReceiptReceivedAt}
                     onChange={(event) => setManualReceiptReceivedAt(event.target.value)}
                   />
@@ -3805,7 +3962,9 @@ export function App() {
                   <input
                     aria-label="Manual receipt gross amount in cents"
                     inputMode="numeric"
-                    disabled={manualReceiptPending}
+                    disabled={
+                      manualReceiptPending || manualReceiptReversalPendingId !== null
+                    }
                     maxLength={19}
                     value={manualReceiptGrossMinor}
                     onChange={(event) => setManualReceiptGrossMinor(event.target.value)}
@@ -3816,7 +3975,9 @@ export function App() {
                   <input
                     aria-label="Manual receipt fee in cents"
                     inputMode="numeric"
-                    disabled={manualReceiptPending}
+                    disabled={
+                      manualReceiptPending || manualReceiptReversalPendingId !== null
+                    }
                     maxLength={19}
                     value={manualReceiptFeeMinor}
                     onChange={(event) => setManualReceiptFeeMinor(event.target.value)}
@@ -3826,7 +3987,9 @@ export function App() {
                   <span>Reason and independent evidence</span>
                   <textarea
                     aria-label="Manual receipt reason"
-                    disabled={manualReceiptPending}
+                    disabled={
+                      manualReceiptPending || manualReceiptReversalPendingId !== null
+                    }
                     value={manualReceiptReason}
                     onChange={(event) => setManualReceiptReason(event.target.value)}
                     maxLength={1_000}
@@ -3856,13 +4019,21 @@ export function App() {
               <div className="fund-actions">
                 <button
                   className="primary"
-                  disabled={manualReceiptPending || !manualReceiptFormReady}
+                  disabled={
+                    manualReceiptPending ||
+                    manualReceiptReversalPendingId !== null ||
+                    !manualReceiptFormReady
+                  }
                   onClick={() => void recordManualReceipt()}
                 >
                   {manualReceiptPending ? "Recording…" : "Record manual receipt"}
                 </button>
                 <button
-                  disabled={manualReceiptPending || !looksLikeUuid(manualReceiptClientAccountId)}
+                  disabled={
+                    manualReceiptPending ||
+                    manualReceiptReversalPendingId !== null ||
+                    !looksLikeUuid(manualReceiptClientAccountId)
+                  }
                   onClick={() => void loadManualReceiptHistory()}
                 >
                   Verify account &amp; load history
@@ -3893,30 +4064,140 @@ export function App() {
                   </div>
                 </article>
               )}
+              {manualReceiptReversalOutcome && (
+                <article
+                  className="manual-item"
+                  data-testid="manual-receipt-reversal-outcome"
+                  data-reversal-id={manualReceiptReversalOutcome.reversalId}
+                >
+                  <div>
+                    <strong>
+                      Reversal · {usd(manualReceiptReversalOutcome.grossAmountMinor)}
+                      {manualReceiptReversalOutcome.replayed
+                        ? " · replayed safely"
+                        : " · recorded"}
+                    </strong>
+                    <span>
+                      Liability removed {usd(manualReceiptReversalOutcome.grossAmountMinor)} ·
+                      cash correction {usd(manualReceiptReversalOutcome.netAmountMinor)} · fee
+                      correction {usd(manualReceiptReversalOutcome.feeMinor)}
+                    </span>
+                    <span>
+                      Original receipt remains immutable. This correction sent no money, called no
+                      Provider, and changed no Invoice, Credit, or Service.
+                    </span>
+                    <span className="mono">
+                      reversal {manualReceiptReversalOutcome.reversalId} · receipt {" "}
+                      {manualReceiptReversalOutcome.manualReceiptId}
+                    </span>
+                  </div>
+                </article>
+              )}
               {manualReceiptHistory.length > 0 && (
                 <div data-testid="manual-receipt-history">
-                  {manualReceiptHistory.map((receipt) => (
-                    <article
-                      className="manual-item"
-                      data-testid="manual-receipt-history-item"
-                      data-manual-receipt-id={receipt.manualReceiptId}
-                      data-received-at={receipt.receivedAt}
-                      key={receipt.manualReceiptId}
-                    >
-                      <div>
-                        <strong>
-                          {receipt.reference} · {usd(receipt.grossAmountMinor)} gross
-                        </strong>
-                        <span>
-                          Fee {usd(receipt.feeMinor)} · net {usd(receipt.netAmountMinor)} · available {usd(receipt.availableMinor)}
-                        </span>
-                        <span>
-                          Received {new Date(receipt.receivedAt).toLocaleString()} · {receipt.disposition}
-                        </span>
-                        <span>{receipt.reason}</span>
-                      </div>
-                    </article>
-                  ))}
+                  {manualReceiptHistory.map((receipt) => {
+                    const reviewingReversal =
+                      manualReceiptReversalTargetId === receipt.manualReceiptId;
+                    return (
+                      <article
+                        className="manual-item manual-receipt-history-item"
+                        data-testid="manual-receipt-history-item"
+                        data-manual-receipt-id={receipt.manualReceiptId}
+                        data-received-at={receipt.receivedAt}
+                        data-disposition={receipt.disposition}
+                        key={receipt.manualReceiptId}
+                      >
+                        <div>
+                          <strong>
+                            {receipt.reference} · {usd(receipt.grossAmountMinor)} gross
+                          </strong>
+                          <span>
+                            Fee {usd(receipt.feeMinor)} · net {usd(receipt.netAmountMinor)} ·
+                            available {usd(receipt.availableMinor)}
+                          </span>
+                          <span>
+                            Received {new Date(receipt.receivedAt).toLocaleString()} · {" "}
+                            {receipt.disposition}
+                          </span>
+                          <span>{receipt.reason}</span>
+                          {receipt.reversal && (
+                            <span data-testid="manual-receipt-reversal">
+                              Reversed {new Date(receipt.reversal.createdAt).toLocaleString()} · {" "}
+                              {receipt.reversal.reason} · reversal {receipt.reversal.reversalId}
+                            </span>
+                          )}
+                          {!receipt.reversal && !manualReceiptIsUntouched(receipt) && (
+                            <span>
+                              Reversal unavailable: this money was allocated, returned, frozen, or
+                              otherwise changed. Use an explicit compensating workflow.
+                            </span>
+                          )}
+                        </div>
+                        {manualReceiptIsUntouched(receipt) && !reviewingReversal && (
+                          <button
+                            disabled={manualReceiptReversalPendingId !== null}
+                            onClick={() => {
+                              setManualReceiptReversalTargetId(receipt.manualReceiptId);
+                              setManualReceiptReversalReason("");
+                              setManualReceiptReversalOutcome(null);
+                            }}
+                          >
+                            Review reversal
+                          </button>
+                        )}
+                        {manualReceiptIsUntouched(receipt) && reviewingReversal && (
+                          <div
+                            className="manual-receipt-reversal-review"
+                            aria-label="Manual receipt reversal review"
+                          >
+                            <p className="notice" data-testid="manual-receipt-reversal-impact">
+                              Append-only correction: Dr unclaimed liability {" "}
+                              {usd(receipt.grossAmountMinor)}; Cr cash {usd(receipt.netAmountMinor)};
+                              Cr fee expense {usd(receipt.feeMinor)}. The original fact stays. This is
+                              not a refund and sends no money.
+                            </p>
+                            <label>
+                              <span>Why the entire receipt was entered incorrectly</span>
+                              <textarea
+                                aria-label="Manual receipt reversal reason"
+                                disabled={manualReceiptReversalPendingId !== null}
+                                value={manualReceiptReversalReason}
+                                onChange={(event) =>
+                                  setManualReceiptReversalReason(event.target.value)
+                                }
+                                maxLength={1_000}
+                                placeholder="Independent evidence proving the original receipt fact was mistaken (10+ characters)"
+                              />
+                            </label>
+                            <div className="fund-actions">
+                              <button
+                                className="danger"
+                                disabled={
+                                  manualReceiptReversalPendingId !== null ||
+                                  manualReceiptReversalReason.trim().length < 10 ||
+                                  adminPassword.length === 0
+                                }
+                                onClick={() => void reverseManualReceipt(receipt)}
+                              >
+                                {manualReceiptReversalPendingId === receipt.manualReceiptId
+                                  ? "Reversing…"
+                                  : "Reverse incorrect receipt"}
+                              </button>
+                              <button
+                                disabled={manualReceiptReversalPendingId !== null}
+                                onClick={() => {
+                                  setManualReceiptReversalTargetId(null);
+                                  setManualReceiptReversalReason("");
+                                }}
+                              >
+                                Cancel reversal review
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
                 </div>
               )}
             </div>

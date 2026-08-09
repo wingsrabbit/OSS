@@ -340,9 +340,392 @@ try {
   const fullFeeResult = responseJson<{
     manualReceiptId: string;
     fundReceiptId: string;
+    grossAmountMinor: string;
+    feeMinor: string;
     netAmountMinor: string;
   }>(fullFee);
   assert.equal(fullFeeResult.netAmountMinor, "0");
+
+  const reversalUrl = `${url}/${fullFeeResult.manualReceiptId}/reversal`;
+  const reversalBody = {
+    expectedFundReceiptId: fullFeeResult.fundReceiptId,
+    expectedGrossAmountMinor: fullFeeResult.grossAmountMinor,
+    reason: "Synthetic billing review confirms this untouched receipt was entered by mistake",
+    idempotencyKey: `reversal-${namespace}`,
+  };
+  const reversalWithoutFundsPermission = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: reversalBody,
+  });
+  assert.equal(reversalWithoutFundsPermission.statusCode, 403);
+  await pool.query(
+    `UPDATE staff_members
+     SET permissions = '["billing.manual_receipt_manage", "billing.unclaimed_manage"]'::jsonb,
+         updated_at = now()
+     WHERE user_id = $1`,
+    [userId],
+  );
+  await pool.query(
+    `UPDATE reauth_grants
+     SET invalidated_at = now()
+     WHERE user_id = $1 AND session_id = $2 AND invalidated_at IS NULL`,
+    [userId, sessionId],
+  );
+  const reversalWithoutReauth = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: reversalBody,
+  });
+  assert.equal(reversalWithoutReauth.statusCode, 403);
+  assert.equal(
+    responseJson<{ code: string }>(reversalWithoutReauth).code,
+    "REAUTH_REQUIRED",
+  );
+  await pool.query(
+    `INSERT INTO reauth_grants(user_id, session_id, expires_at)
+     VALUES ($1, $2, now() + interval '15 minutes')`,
+    [userId, sessionId],
+  );
+  const crossAccountReversal = await app.inject({
+    method: "POST",
+    url: `/api/v1/admin/client-accounts/${staffAccountId}/manual-receipts/${fullFeeResult.manualReceiptId}/reversal`,
+    headers: { cookie },
+    payload: {
+      ...reversalBody,
+      idempotencyKey: `reversal-cross-account-${namespace}`,
+    },
+  });
+  assert.equal(crossAccountReversal.statusCode, 404);
+  const staleReversal = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: { ...reversalBody, expectedGrossAmountMinor: "251" },
+  });
+  assert.equal(staleReversal.statusCode, 409, staleReversal.body);
+  assert.equal(
+    responseJson<{ code: string }>(staleReversal).code,
+    "MANUAL_RECEIPT_STALE",
+  );
+  const reversed = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: reversalBody,
+  });
+  assert.equal(reversed.statusCode, 201, reversed.body);
+  const reversal = responseJson<{
+    reversalId: string;
+    manualReceiptId: string;
+    fundReceiptId: string;
+    grossAmountMinor: string;
+    feeMinor: string;
+    netAmountMinor: string;
+    disposition: string;
+    providerUsed: boolean;
+    cashOutflow: boolean;
+    replayed: boolean;
+  }>(reversed);
+  assert.deepEqual(
+    {
+      manualReceiptId: reversal.manualReceiptId,
+      fundReceiptId: reversal.fundReceiptId,
+      grossAmountMinor: reversal.grossAmountMinor,
+      feeMinor: reversal.feeMinor,
+      netAmountMinor: reversal.netAmountMinor,
+      disposition: reversal.disposition,
+      providerUsed: reversal.providerUsed,
+      cashOutflow: reversal.cashOutflow,
+      replayed: reversal.replayed,
+    },
+    {
+      manualReceiptId: fullFeeResult.manualReceiptId,
+      fundReceiptId: fullFeeResult.fundReceiptId,
+      grossAmountMinor: "250",
+      feeMinor: "250",
+      netAmountMinor: "0",
+      disposition: "reversed",
+      providerUsed: false,
+      cashOutflow: false,
+      replayed: false,
+    },
+  );
+  const reversalFinancial = await pool.query<{
+    fact_count: string;
+    reversal_count: string;
+    disposition: string;
+    debit_minor: string;
+    credit_minor: string;
+    liability_debit: string;
+    cash_credit: string;
+    fee_credit: string;
+    sealed: boolean;
+    audit_count: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM manual_receipt_facts WHERE id = $1) AS fact_count,
+       (SELECT count(*)::text FROM manual_receipt_reversals WHERE id = $2)
+         AS reversal_count,
+       receipt.disposition,
+       sum(line.debit_minor)::text AS debit_minor,
+       sum(line.credit_minor)::text AS credit_minor,
+       COALESCE(sum(line.debit_minor) FILTER (
+         WHERE line.account_code = 'unclaimed_funds_liability'), 0)::text
+           AS liability_debit,
+       COALESCE(sum(line.credit_minor) FILTER (
+         WHERE line.account_code = 'cash_clearing'), 0)::text AS cash_credit,
+       COALESCE(sum(line.credit_minor) FILTER (
+         WHERE line.account_code = 'payment_processing_expense'), 0)::text AS fee_credit,
+       journal.sealed_at IS NOT NULL AS sealed,
+       (SELECT count(*)::text FROM audit_events
+        WHERE action = 'billing.manual_receipt_reversed' AND target_id = $1::text)
+          AS audit_count
+     FROM fund_receipts receipt
+     JOIN ledger_journals journal
+       ON journal.source_type = 'manual_receipt_reversal'
+      AND journal.source_id = $2
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE receipt.id = $3
+     GROUP BY receipt.id, journal.id`,
+    [fullFeeResult.manualReceiptId, reversal.reversalId, fullFeeResult.fundReceiptId],
+  );
+  assert.deepEqual(reversalFinancial.rows[0], {
+    fact_count: "1",
+    reversal_count: "1",
+    disposition: "reversed",
+    debit_minor: "250",
+    credit_minor: "250",
+    liability_debit: "250",
+    cash_credit: "0",
+    fee_credit: "250",
+    sealed: true,
+    audit_count: "1",
+  });
+  const reversalReplay = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: reversalBody,
+  });
+  assert.equal(reversalReplay.statusCode, 200, reversalReplay.body);
+  assert.equal(responseJson<{ replayed: boolean }>(reversalReplay).replayed, true);
+  assert.equal(
+    responseJson<{ reversalId: string }>(reversalReplay).reversalId,
+    reversal.reversalId,
+  );
+  const reversalIdempotencyConflict = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: { ...reversalBody, reason: `${reversalBody.reason} with changed intent` },
+  });
+  assert.equal(reversalIdempotencyConflict.statusCode, 409);
+  assert.equal(
+    responseJson<{ code: string }>(reversalIdempotencyConflict).code,
+    "IDEMPOTENCY_CONFLICT",
+  );
+  const secondReversal = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: { ...reversalBody, idempotencyKey: `reversal-second-${namespace}` },
+  });
+  assert.equal(secondReversal.statusCode, 409);
+  assert.equal(
+    responseJson<{ code: string }>(secondReversal).code,
+    "MANUAL_RECEIPT_ALREADY_REVERSED",
+  );
+
+  const concurrentReversalReceiptResponse = await app.inject({
+    method: "POST",
+    url,
+    headers: { cookie },
+    payload: {
+      ...firstBody,
+      reference: `REVERSAL-CONCURRENT-${namespace}`,
+      grossAmountMinor: "425",
+      feeMinor: "25",
+      reason: "Synthetic untouched receipt used to prove concurrent reversals serialize",
+      idempotencyKey: `reversal-concurrent-receipt-${namespace}`,
+    },
+  });
+  assert.equal(
+    concurrentReversalReceiptResponse.statusCode,
+    201,
+    concurrentReversalReceiptResponse.body,
+  );
+  const concurrentReversalReceipt = responseJson<{
+    manualReceiptId: string;
+    fundReceiptId: string;
+    grossAmountMinor: string;
+  }>(concurrentReversalReceiptResponse);
+  const concurrentReversalUrl =
+    `${url}/${concurrentReversalReceipt.manualReceiptId}/reversal`;
+  const concurrentReversalBase = {
+    expectedFundReceiptId: concurrentReversalReceipt.fundReceiptId,
+    expectedGrossAmountMinor: concurrentReversalReceipt.grossAmountMinor,
+  };
+  const concurrentReversals = await Promise.all([
+    app.inject({
+      method: "POST",
+      url: concurrentReversalUrl,
+      headers: { cookie },
+      payload: {
+        ...concurrentReversalBase,
+        reason: "Synthetic billing operator A reverses the same untouched receipt",
+        idempotencyKey: `reversal-concurrent-a-${namespace}`,
+      },
+    }),
+    app.inject({
+      method: "POST",
+      url: concurrentReversalUrl,
+      headers: { cookie },
+      payload: {
+        ...concurrentReversalBase,
+        reason: "Synthetic billing operator B reverses the same untouched receipt",
+        idempotencyKey: `reversal-concurrent-b-${namespace}`,
+      },
+    }),
+  ]);
+  assert.deepEqual(
+    concurrentReversals.map((response) => response.statusCode).sort(),
+    [201, 409],
+    concurrentReversals.map((response) => response.body).join("\n"),
+  );
+  const rejectedConcurrentReversal = concurrentReversals.find(
+    (response) => response.statusCode === 409,
+  );
+  assert.equal(
+    responseJson<{ code: string }>(rejectedConcurrentReversal!).code,
+    "MANUAL_RECEIPT_ALREADY_REVERSED",
+  );
+  const concurrentReversalFacts = await pool.query<{
+    reversal_count: string;
+    journal_count: string;
+    audit_count: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM manual_receipt_reversals
+        WHERE manual_receipt_id = $1) AS reversal_count,
+       (SELECT count(*)::text FROM ledger_journals journal
+        JOIN manual_receipt_reversals reversal ON reversal.id = journal.source_id
+        WHERE reversal.manual_receipt_id = $1
+          AND journal.source_type = 'manual_receipt_reversal') AS journal_count,
+       (SELECT count(*)::text FROM audit_events
+        WHERE action = 'billing.manual_receipt_reversed'
+          AND target_id = $1::text) AS audit_count`,
+    [concurrentReversalReceipt.manualReceiptId],
+  );
+  assert.deepEqual(concurrentReversalFacts.rows[0], {
+    reversal_count: "1",
+    journal_count: "1",
+    audit_count: "1",
+  });
+
+  await pool.query(
+    `INSERT INTO add_funds_policies(
+       currency, enabled, min_principal_minor, max_principal_minor, balance_cap_minor
+     ) VALUES ('USD', true, 1, 1000000, 1000000)
+     ON CONFLICT (currency) DO UPDATE SET
+       enabled = EXCLUDED.enabled,
+       min_principal_minor = EXCLUDED.min_principal_minor,
+       max_principal_minor = EXCLUDED.max_principal_minor,
+       balance_cap_minor = EXCLUDED.balance_cap_minor,
+       updated_at = now()`,
+  );
+  const raceBody = {
+    ...firstBody,
+    reference: `REVERSAL-RACE-${namespace}`,
+    grossAmountMinor: "700",
+    feeMinor: "0",
+    reason: "Synthetic untouched receipt used to prove reversal and Credit allocation serialize",
+    idempotencyKey: `reversal-race-receipt-${namespace}`,
+  };
+  const raceCreated = await app.inject({
+    method: "POST",
+    url,
+    headers: { cookie },
+    payload: raceBody,
+  });
+  assert.equal(raceCreated.statusCode, 201, raceCreated.body);
+  const raceReceipt = responseJson<{
+    manualReceiptId: string;
+    fundReceiptId: string;
+    grossAmountMinor: string;
+  }>(raceCreated);
+  const [raceReversal, raceResolution] = await Promise.all([
+    app.inject({
+      method: "POST",
+      url: `${url}/${raceReceipt.manualReceiptId}/reversal`,
+      headers: { cookie },
+      payload: {
+        expectedFundReceiptId: raceReceipt.fundReceiptId,
+        expectedGrossAmountMinor: raceReceipt.grossAmountMinor,
+        reason: "Synthetic billing staff reverses the untouched receipt in the concurrency race",
+        idempotencyKey: `reversal-race-reversal-${namespace}`,
+      },
+    }),
+    app.inject({
+      method: "POST",
+      url: `/api/v1/admin/funds/${raceReceipt.fundReceiptId}/resolutions`,
+      headers: { cookie },
+      payload: {
+        action: "convert_to_credit",
+        amountMinor: raceReceipt.grossAmountMinor,
+        invoiceId: null,
+        reason: "Synthetic billing staff converts the same funds in the concurrency race",
+        idempotencyKey: `reversal-race-resolution-${namespace}`,
+      },
+    }),
+  ]);
+  assert.deepEqual(
+    [raceReversal.statusCode, raceResolution.statusCode].sort(),
+    [201, 409],
+    `${raceReversal.body}\n${raceResolution.body}`,
+  );
+  const raceFacts = await pool.query<{
+    reversal_count: string;
+    resolution_count: string;
+    disposition: string;
+    allocated_minor: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM manual_receipt_reversals
+        WHERE manual_receipt_id = $1) AS reversal_count,
+       (SELECT count(*)::text FROM fund_receipt_resolutions
+        WHERE fund_receipt_id = $2) AS resolution_count,
+       receipt.disposition,
+       receipt.allocated_minor::text
+     FROM fund_receipts receipt
+     WHERE receipt.id = $2`,
+    [raceReceipt.manualReceiptId, raceReceipt.fundReceiptId],
+  );
+  assert.equal(
+    BigInt(raceFacts.rows[0]?.reversal_count ?? "0") +
+      BigInt(raceFacts.rows[0]?.resolution_count ?? "0"),
+    1n,
+  );
+  if (raceReversal.statusCode === 201) {
+    assert.deepEqual(
+      {
+        disposition: raceFacts.rows[0]?.disposition,
+        allocatedMinor: raceFacts.rows[0]?.allocated_minor,
+      },
+      { disposition: "reversed", allocatedMinor: "0" },
+    );
+  } else {
+    assert.deepEqual(
+      {
+        disposition: raceFacts.rows[0]?.disposition,
+        allocatedMinor: raceFacts.rows[0]?.allocated_minor,
+      },
+      { disposition: "allocated", allocatedMinor: "700" },
+    );
+  }
+  const explicitResolutionCreditDelta = raceResolution.statusCode === 201 ? 1n : 0n;
 
   await assert.rejects(
     pool.query(
@@ -435,23 +818,17 @@ try {
   const listed = await app.inject({ method: "GET", url, headers: { cookie } });
   assert.equal(listed.statusCode, 200, listed.body);
   assert.equal(
-    responseJson<{ items: Array<{ manualReceiptId: string }> }>(listed).items.some(
-      (item) => item.manualReceiptId === first.manualReceiptId,
+    responseJson<{
+      items: Array<{
+        manualReceiptId: string;
+        reversal: { reversalId: string } | null;
+      }>;
+    }>(listed).items.some(
+      (item) =>
+        item.manualReceiptId === fullFeeResult.manualReceiptId &&
+        item.reversal?.reversalId === reversal.reversalId,
     ),
     true,
-  );
-  const unclaimed = await app.inject({
-    method: "GET",
-    url: "/api/v1/admin/funds/unclaimed",
-    headers: { cookie },
-  });
-  assert.equal(unclaimed.statusCode, 403);
-  await pool.query(
-    `UPDATE staff_members
-     SET permissions = '["billing.manual_receipt_manage", "billing.unclaimed_manage"]'::jsonb,
-         updated_at = now()
-     WHERE user_id = $1`,
-    [userId],
   );
   const visibleUnclaimed = await app.inject({
     method: "GET",
@@ -473,6 +850,12 @@ try {
     manualReceiptId: first.manualReceiptId,
     providerInstallationId: null,
   });
+  assert.equal(
+    responseJson<{ items: Array<{ receiptId: string }> }>(visibleUnclaimed).items.some(
+      (item) => item.receiptId === fullFeeResult.fundReceiptId,
+    ),
+    false,
+  );
 
   await pool.query(
     `UPDATE staff_members
@@ -491,6 +874,13 @@ try {
     },
   });
   assert.equal(permissionRevoked.statusCode, 403);
+  const reversalReplayAfterPermissionRevocation = await app.inject({
+    method: "POST",
+    url: reversalUrl,
+    headers: { cookie },
+    payload: reversalBody,
+  });
+  assert.equal(reversalReplayAfterPermissionRevocation.statusCode, 403);
 
   const effects = await pool.query<{
     invoices: string;
@@ -517,7 +907,8 @@ try {
   assert.equal(effects.rows[0]?.services, baseline.rows[0]?.services);
   assert.equal(
     effects.rows[0]?.credit_transactions,
-    baseline.rows[0]?.credit_transactions,
+    (BigInt(baseline.rows[0]?.credit_transactions ?? "0") +
+      explicitResolutionCreditDelta).toString(),
   );
   assert.equal(
     effects.rows[0]?.provider_operations,
@@ -539,6 +930,16 @@ try {
     `${JSON.stringify({
       schema016Native: true,
       manualReceiptRecorded: true,
+      mistakenManualReceiptReversed: true,
+      reversalRequiresBothPermissions: true,
+      reversalRequiresFreshReauth: true,
+      crossAccountReversalRejected: true,
+      reversalReplayRechecksPermission: true,
+      reversalStaleReviewRejected: true,
+      reversalReplaySafe: true,
+      concurrentReversalsCreateOneDecision: true,
+      reversalResolutionRaceCreatesOneDecision: true,
+      reversedReceiptRemovedFromUnclaimedQueue: true,
       fixedWindowReauthRequired: true,
       permissionRevocationEnforced: true,
       idempotencyReplaySafe: true,

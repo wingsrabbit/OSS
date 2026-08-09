@@ -60,6 +60,12 @@ const manualReceiptSchema = z.object({
   reason: z.string().trim().min(10).max(1_000),
   idempotencyKey: z.string().min(8).max(128),
 });
+const manualReceiptReversalSchema = z.object({
+  expectedFundReceiptId: canonicalUuid,
+  expectedGrossAmountMinor: z.string().regex(/^[1-9]\d*$/),
+  reason: z.string().trim().min(10).max(1_000),
+  idempotencyKey: z.string().min(8).max(128),
+});
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 
 export async function requireStaffPermission(
@@ -230,6 +236,10 @@ export async function registerAdminRoutes(
         disposition: string;
         available_minor: string;
         capacity_frozen: boolean;
+        reversal_id: string | null;
+        reversal_actor_id: string | null;
+        reversal_reason: string | null;
+        reversed_at: Date | null;
       }>(
         `SELECT
            fact.id,
@@ -245,11 +255,17 @@ export async function registerAdminRoutes(
            receipt.allocated_minor::text,
            receipt.disposition,
            capacity.available_minor::text,
-           capacity.capacity_frozen
+           capacity.capacity_frozen,
+           reversal.id AS reversal_id,
+           reversal.actor_id AS reversal_actor_id,
+           reversal.reason AS reversal_reason,
+           reversal.created_at AS reversed_at
          FROM manual_receipt_facts fact
          JOIN fund_receipts receipt ON receipt.reported_manual_receipt_id = fact.id
          JOIN unclaimed_fund_refund_capacity capacity
            ON capacity.fund_receipt_id = receipt.id
+         LEFT JOIN manual_receipt_reversals reversal
+           ON reversal.manual_receipt_id = fact.id
          WHERE fact.client_account_id = $1
          ORDER BY fact.received_at DESC, fact.id DESC`,
         [params.clientAccountId],
@@ -257,25 +273,41 @@ export async function registerAdminRoutes(
       return {
         warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
         clientAccount: target,
-        items: receipts.rows.map((row) => ({
-          manualReceiptId: row.id,
-          fundReceiptId: row.fund_receipt_id,
-          reference: row.reference,
-          receivedAt: row.received_at.toISOString(),
-          grossAmountMinor: row.gross_amount_minor,
-          feeMinor: row.fee_minor,
-          netAmountMinor: (
-            BigInt(row.gross_amount_minor) - BigInt(row.fee_minor)
-          ).toString(),
-          allocatedMinor: row.allocated_minor,
-          availableMinor: row.available_minor,
-          capacityFrozen: row.capacity_frozen,
-          currency: row.currency,
-          disposition: row.disposition,
-          actorId: row.actor_id,
-          reason: row.reason,
-          createdAt: row.created_at.toISOString(),
-        })),
+        items: receipts.rows.map((row) => {
+          if (
+            row.reversal_id &&
+            (!row.reversal_actor_id || !row.reversal_reason || !row.reversed_at)
+          ) {
+            throw new Error("Manual receipt reversal history is incomplete");
+          }
+          return {
+            manualReceiptId: row.id,
+            fundReceiptId: row.fund_receipt_id,
+            reference: row.reference,
+            receivedAt: row.received_at.toISOString(),
+            grossAmountMinor: row.gross_amount_minor,
+            feeMinor: row.fee_minor,
+            netAmountMinor: (
+              BigInt(row.gross_amount_minor) - BigInt(row.fee_minor)
+            ).toString(),
+            allocatedMinor: row.allocated_minor,
+            availableMinor: row.available_minor,
+            capacityFrozen: row.capacity_frozen,
+            currency: row.currency,
+            disposition: row.disposition,
+            reversal: row.reversal_id
+              ? {
+                  reversalId: row.reversal_id,
+                  actorId: row.reversal_actor_id!,
+                  reason: row.reversal_reason!,
+                  createdAt: row.reversed_at!.toISOString(),
+                }
+              : null,
+            actorId: row.actor_id,
+            reason: row.reason,
+            createdAt: row.created_at.toISOString(),
+          };
+        }),
       };
     },
   );
@@ -509,6 +541,259 @@ export async function registerAdminRoutes(
     },
   );
 
+  app.post(
+    "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts/:manualReceiptId/reversal",
+    async (request, reply) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
+      await requireStaffPermission(pool, user, "billing.unclaimed_manage");
+      await requireRecentReauth(pool, user);
+      const params = z
+        .object({ clientAccountId: canonicalUuid, manualReceiptId: canonicalUuid })
+        .parse(request.params);
+      const body = manualReceiptReversalSchema.parse(request.body);
+      const fingerprint = requestFingerprint("admin.manual-receipt-reversal:v1", {
+        clientAccountId: params.clientAccountId,
+        manualReceiptId: params.manualReceiptId,
+        expectedFundReceiptId: body.expectedFundReceiptId,
+        expectedGrossAmountMinor: body.expectedGrossAmountMinor,
+        reason: body.reason,
+      });
+
+      const outcome = await transaction(pool, async (client) => {
+        const locks = [
+          `manual-receipt-reversal:idempotency:${body.idempotencyKey}`,
+          `manual-receipt-reversal:semantic:${params.manualReceiptId}`,
+        ].sort();
+        for (const lock of locks) {
+          await client.query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))",
+            [lock],
+          );
+        }
+
+        const replayResult = await client.query<{
+          manual_receipt_id: string;
+          client_account_id: string;
+          request_fingerprint: string;
+          result: Record<string, unknown>;
+        }>(
+          `SELECT reversal.manual_receipt_id,
+                  fact.client_account_id,
+                  reversal.request_fingerprint,
+                  reversal.result
+           FROM manual_receipt_reversals reversal
+           JOIN manual_receipt_facts fact ON fact.id = reversal.manual_receipt_id
+           WHERE reversal.idempotency_key = $1
+           FOR UPDATE OF reversal, fact`,
+          [body.idempotencyKey],
+        );
+        const replay = replayResult.rows[0];
+        if (replay) {
+          if (
+            replay.manual_receipt_id !== params.manualReceiptId ||
+            replay.client_account_id !== params.clientAccountId ||
+            replay.request_fingerprint !== fingerprint
+          ) {
+            throw Object.assign(
+              new Error("The idempotency key was used for a different manual receipt reversal"),
+              { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
+            );
+          }
+          await requireStaffActionLocked(client, user, "billing.manual_receipt_manage");
+          await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+          return { ...replay.result, replayed: true };
+        }
+
+        await requireStaffActionLocked(client, user, "billing.manual_receipt_manage");
+        await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+        const receiptResult = await client.query<{
+          manual_receipt_id: string;
+          fund_receipt_id: string;
+          client_account_id: string;
+          gross_amount_minor: string;
+          fee_minor: string;
+          currency: string;
+          receipt_amount_minor: string;
+          allocated_minor: string;
+          disposition: string;
+        }>(
+          `SELECT fact.id AS manual_receipt_id,
+                  receipt.id AS fund_receipt_id,
+                  fact.client_account_id,
+                  fact.gross_amount_minor::text,
+                  fact.fee_minor::text,
+                  fact.currency,
+                  receipt.amount_minor::text AS receipt_amount_minor,
+                  receipt.allocated_minor::text,
+                  receipt.disposition
+           FROM manual_receipt_facts fact
+           JOIN fund_receipts receipt ON receipt.reported_manual_receipt_id = fact.id
+           WHERE fact.id = $1 AND fact.client_account_id = $2
+           FOR UPDATE OF fact, receipt`,
+          [params.manualReceiptId, params.clientAccountId],
+        );
+        const receipt = receiptResult.rows[0];
+        if (!receipt) {
+          throw Object.assign(new Error("Manual receipt not found"), { statusCode: 404 });
+        }
+        if (
+          receipt.fund_receipt_id !== body.expectedFundReceiptId ||
+          receipt.gross_amount_minor !== body.expectedGrossAmountMinor
+        ) {
+          throw Object.assign(
+            new Error("The manual receipt changed since it was reviewed; refresh and confirm again"),
+            { statusCode: 409, code: "MANUAL_RECEIPT_STALE" },
+          );
+        }
+        if (receipt.receipt_amount_minor !== receipt.gross_amount_minor) {
+          throw new Error("Manual receipt and fund receipt amounts do not match");
+        }
+
+        const existingReversal = await client.query(
+          "SELECT id FROM manual_receipt_reversals WHERE manual_receipt_id = $1",
+          [params.manualReceiptId],
+        );
+        if (existingReversal.rowCount !== 0) {
+          throw Object.assign(new Error("This manual receipt was already reversed"), {
+            statusCode: 409,
+            code: "MANUAL_RECEIPT_ALREADY_REVERSED",
+          });
+        }
+        const capacityResult = await client.query<{
+          reserved_refund_minor: string;
+          confirmed_outflow_minor: string;
+          available_minor: string;
+          capacity_frozen: boolean;
+        }>(
+          `SELECT reserved_refund_minor::text,
+                  confirmed_outflow_minor::text,
+                  available_minor::text,
+                  capacity_frozen
+           FROM unclaimed_fund_refund_capacity
+           WHERE fund_receipt_id = $1`,
+          [receipt.fund_receipt_id],
+        );
+        const capacity = capacityResult.rows[0];
+        if (!capacity) {
+          throw new Error("Manual receipt refund capacity is unavailable");
+        }
+        const untouched =
+          receipt.disposition === "unclaimed" &&
+          receipt.allocated_minor === "0" &&
+          capacity.reserved_refund_minor === "0" &&
+          capacity.confirmed_outflow_minor === "0" &&
+          capacity.available_minor === receipt.gross_amount_minor &&
+          !capacity.capacity_frozen;
+        if (!untouched) {
+          throw Object.assign(
+            new Error(
+              "Only a fully untouched manual receipt can be reversed; resolve allocations or outflow evidence first",
+            ),
+            { statusCode: 409, code: "MANUAL_RECEIPT_REVERSAL_NOT_ALLOWED" },
+          );
+        }
+
+        const reversalId = randomUUID();
+        const netAmount =
+          BigInt(receipt.gross_amount_minor) - BigInt(receipt.fee_minor);
+        const result = {
+          reversalId,
+          manualReceiptId: receipt.manual_receipt_id,
+          fundReceiptId: receipt.fund_receipt_id,
+          clientAccountId: receipt.client_account_id,
+          grossAmountMinor: receipt.gross_amount_minor,
+          feeMinor: receipt.fee_minor,
+          netAmountMinor: netAmount.toString(),
+          currency: receipt.currency,
+          disposition: "reversed",
+          providerUsed: false,
+          cashOutflow: false,
+        };
+        await client.query(
+          `INSERT INTO manual_receipt_reversals(
+             id, manual_receipt_id, fund_receipt_id, actor_id, reason,
+             idempotency_key, request_fingerprint, result
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            reversalId,
+            receipt.manual_receipt_id,
+            receipt.fund_receipt_id,
+            user.userId,
+            body.reason,
+            body.idempotencyKey,
+            fingerprint,
+            result,
+          ],
+        );
+        await client.query(
+          `UPDATE fund_receipts
+           SET disposition = 'reversed', updated_at = now()
+           WHERE id = $1`,
+          [receipt.fund_receipt_id],
+        );
+        const journal = await client.query<{ id: string }>(
+          `INSERT INTO ledger_journals(source_type, source_id, currency, description)
+           VALUES (
+             'manual_receipt_reversal', $1, $2,
+             'Audited reversal of an untouched mistaken manual receipt'
+           ) RETURNING id`,
+          [reversalId, receipt.currency],
+        );
+        const journalId = journal.rows[0]?.id;
+        if (!journalId) throw new Error("Unable to create manual receipt reversal journal");
+        await client.query(
+          `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+           VALUES ($1, 'unclaimed_funds_liability', $2, 0)`,
+          [journalId, receipt.gross_amount_minor],
+        );
+        if (netAmount > 0n) {
+          await client.query(
+            `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+             VALUES ($1, 'cash_clearing', 0, $2)`,
+            [journalId, netAmount.toString()],
+          );
+        }
+        if (BigInt(receipt.fee_minor) > 0n) {
+          await client.query(
+            `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+             VALUES ($1, 'payment_processing_expense', 0, $2)`,
+            [journalId, receipt.fee_minor],
+          );
+        }
+        await client.query("UPDATE ledger_journals SET sealed_at = now() WHERE id = $1", [
+          journalId,
+        ]);
+        await client.query(
+          `INSERT INTO audit_events(
+             actor_type, actor_id, action, target_type, target_id, reason, metadata
+           ) VALUES (
+             'staff', $1, 'billing.manual_receipt_reversed',
+             'manual_receipt', $2, $3, $4
+           )`,
+          [
+            user.userId,
+            receipt.manual_receipt_id,
+            body.reason,
+            {
+              reversalId,
+              fundReceiptId: receipt.fund_receipt_id,
+              clientAccountId: receipt.client_account_id,
+              grossAmountMinor: receipt.gross_amount_minor,
+              feeMinor: receipt.fee_minor,
+              netAmountMinor: netAmount.toString(),
+              currency: receipt.currency,
+              providerUsed: false,
+              cashOutflow: false,
+            },
+          ],
+        );
+        return { ...result, replayed: false };
+      });
+      return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+    },
+  );
+
   app.get("/api/v1/admin/funds/unclaimed", async (request) => {
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "billing.unclaimed_manage");
@@ -568,9 +853,10 @@ export async function registerAdminRoutes(
          ON payment.id = receipt.reported_payment_attempt_id
        LEFT JOIN manual_receipt_facts manual
          ON manual.id = receipt.reported_manual_receipt_id
-       WHERE capacity.available_minor > 0
+       WHERE receipt.disposition <> 'reversed'
+         AND (capacity.available_minor > 0
           OR capacity.reserved_refund_minor > 0
-          OR capacity.capacity_frozen
+          OR capacity.capacity_frozen)
        ORDER BY receipt.created_at DESC, receipt.id`,
     );
     return {
