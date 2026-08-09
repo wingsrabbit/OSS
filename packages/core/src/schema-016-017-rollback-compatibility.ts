@@ -40,6 +40,10 @@ const EXPECTED_MIGRATION_HISTORY = [
   SCHEMA_017,
 ] as const;
 
+export type Schema017CatalogShapeInput = Readonly<{
+  expectedMigrationHistory?: readonly string[];
+}>;
+
 export type Schema017NativePreflightReport = Readonly<{
   installedSchemaVersion: typeof SCHEMA_017;
   applicationSchemaVersion: typeof SCHEMA_017;
@@ -93,6 +97,7 @@ async function installedSchemaVersion(
 
 export async function schema017CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
+  input: Schema017CatalogShapeInput = {},
 ): Promise<Readonly<{ historyExact: boolean; fingerprintInput: string | null }>> {
   const result = await database.query(
     `WITH catalog_items(item) AS (
@@ -341,7 +346,7 @@ export async function schema017CatalogFingerprintInput(
        (SELECT pg_catalog.array_agg(version ORDER BY version COLLATE "C")
         FROM public.schema_migrations) = $1::text[] AS history_exact,
        (SELECT value FROM fingerprint) AS fingerprint_input`,
-    [[...EXPECTED_MIGRATION_HISTORY]],
+    [[...(input.expectedMigrationHistory ?? EXPECTED_MIGRATION_HISTORY)]],
   );
   const row = rowRecord(result.rows[0]);
   return {
@@ -353,8 +358,9 @@ export async function schema017CatalogFingerprintInput(
 
 export async function assertSchema017CatalogShape(
   database: RollbackPreflightQueryable,
+  input: Schema017CatalogShapeInput = {},
 ): Promise<void> {
-  const shape = await schema017CatalogFingerprintInput(database);
+  const shape = await schema017CatalogFingerprintInput(database, input);
   const digest = shape.fingerprintInput
     ? createHash("sha256").update(shape.fingerprintInput, "utf8").digest("hex")
     : null;

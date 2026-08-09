@@ -3,6 +3,12 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { SCHEMA_017 } from "@opensales/core/schema-016-017-rollback-compatibility";
+import {
+  assertSchema018NativeSafe,
+  schema018CatalogDigest,
+  schema018CatalogFingerprintInput,
+  SCHEMA_018_CATALOG_DIGEST,
+} from "@opensales/core/schema-017-018-native-compatibility";
 import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
@@ -54,6 +60,26 @@ type Fixture = {
 
 function responseJson<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
+}
+
+async function assertNative018RejectsCatalogDrift(
+  statement: string,
+  expected: RegExp,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(statement);
+    await assert.rejects(
+      assertSchema018NativeSafe({
+        query: async (text: string, values?: unknown[]) => client.query(text, values),
+      }),
+      expected,
+    );
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
 }
 
 async function createFixture(label: string): Promise<Fixture> {
@@ -181,9 +207,31 @@ try {
     ),
     "migration 018 must forward-repair every reviewed Schema 017 PG18 writer",
   );
+  const catalogFingerprintInput = await schema018CatalogFingerprintInput({
+    query: async (text: string, values?: unknown[]) => pool.query(text, values),
+  });
+  const catalogDigest = schema018CatalogDigest(catalogFingerprintInput);
+  process.stdout.write(`schema018CatalogDigest=${String(catalogDigest)}\n`);
+  assert.equal(
+    catalogDigest,
+    SCHEMA_018_CATALOG_DIGEST,
+    "commit the digest emitted by the actual PostgreSQL 18 ticket catalog",
+  );
   const preflight = await assertSchemaCompatible(pool);
   assert.equal(preflight.installedSchemaVersion, "018_stage_c_support_tickets");
   assert.equal(preflight.mode, "native");
+  await assertNative018RejectsCatalogDrift(
+    "DROP TRIGGER z_schema_017_manual_outflow_provider_rejection ON public.provider_operations",
+    /Schema 017 is incomplete or counterfeit/,
+  );
+  await assertNative018RejectsCatalogDrift(
+    "DROP INDEX public.support_tickets_staff_updated_idx",
+    /Schema 018 is incomplete or counterfeit/,
+  );
+  await assertNative018RejectsCatalogDrift(
+    "ALTER TABLE public.support_tickets DROP CONSTRAINT support_tickets_status_check",
+    /Schema 018 is incomplete or counterfeit/,
+  );
 
   const customerA = await createFixture("customer-a");
   const customerB = await createFixture("customer-b");
@@ -352,7 +400,7 @@ try {
   );
   assert.deepEqual(counts.rows[0], { public_count: "3", internal_count: "1" });
   process.stdout.write(
-    "ticketIntegration=passed native018=passed schema017ForwardRepair=passed accountIsolation=passed internalVisibility=passed\n",
+    "ticketIntegration=passed native018=passed schema017ForwardRepair=passed inherited017Catalog=passed ticketCatalogDrift=passed ticketConstraintDrift=passed accountIsolation=passed internalVisibility=passed\n",
   );
 } finally {
   if (app) await app.close().catch(() => undefined);
