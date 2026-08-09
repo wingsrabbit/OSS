@@ -75,9 +75,9 @@ try {
       unknownStaleKey,
       knownStaleKey,
       JSON.stringify({ marker: "future-017", nested: { amountMinor: "1250" } }),
-      `{"notificationId":"${randomUUID()}","large":900719925474099312345}`,
-      JSON.stringify({ marker: "future-017-running", externalFactId: randomUUID() }),
       JSON.stringify({ notificationId: randomUUID() }),
+      JSON.stringify({ marker: "future-017-running", externalFactId: randomUUID() }),
+      `{"notificationId":"${randomUUID()}","large":900719925474099312345}`,
     ],
   );
   const unknownId = inserted.rows.find(
