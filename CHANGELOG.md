@@ -8,6 +8,16 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Billing staff can record an independently confirmed USD manual or offline
+  receipt for a Client Account after fixed-window password confirmation. Core
+  preserves gross, fee, net, reference, received time, operator, and reason as
+  append-only facts, exposes the receipt in the unclaimed-funds queue, and does
+  not involve a Provider or automatically pay an invoice, create Credit, or
+  activate a service.
+- Manual receipts post one balanced journal from net cash and actual processing
+  expense to the gross unclaimed-funds liability. Idempotency replay returns the
+  original result, while reused keys and concurrent duplicate references fail
+  with an explicit conflict.
 - Eligible recurring-service customers can schedule cancellation for the exact
   end of their current paid term. The service remains available until that
   instant, future renewal generation stops, and a still-pristine issued renewal

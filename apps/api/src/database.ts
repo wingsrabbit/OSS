@@ -15,7 +15,9 @@ import {
 } from "@opensales/core/schema-rollback-compatibility";
 import {
   assert015RollbackBridgeSafe,
+  assertSchema016NativeSafe,
   SCHEMA_015_016_GUARD,
+  SCHEMA_016,
   type Schema015RollbackPreflightReport,
 } from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
@@ -24,9 +26,11 @@ import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = "015_stage_b_saved_payment_auto_renew";
+export const REQUIRED_SCHEMA_VERSION = SCHEMA_016;
 const TOKEN_REGISTRY_EXTENSION_GUARD =
   "opensales:payment-method-token-registry-extension";
+export const SCHEMA_016_APPLICATION_GUARD =
+  "opensales:schema-016-application";
 
 export function createPool(
   config: Config,
@@ -137,6 +141,30 @@ export async function holdSchema015RollbackBridgeGuard(
   };
 }
 
+export async function holdSchema016ApplicationGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SET lock_timeout = '15s'");
+    await client.query(
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_016_APPLICATION_GUARD],
+    );
+    await client.query("RESET lock_timeout");
+    held = true;
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    await releaseGuardClient(client, SCHEMA_016_APPLICATION_GUARD);
+  };
+}
+
 export async function tryLockPaymentMethodTokenRegistryExtension(
   client: DatabaseClient,
 ): Promise<boolean> {
@@ -151,6 +179,7 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   const client = await pool.connect();
   let migrationLockHeld = false;
   let compatibilityLockHeld = false;
+  let schema016ApplicationLockHeld = false;
   let failed = false;
   let failure: unknown;
   try {
@@ -169,6 +198,16 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       );
     }
     compatibilityLockHeld = true;
+    const schema016ApplicationGuard = await client.query<{ locked: boolean }>(
+      "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
+      [SCHEMA_016_APPLICATION_GUARD],
+    );
+    if (schema016ApplicationGuard.rows[0]?.locked !== true) {
+      throw new Error(
+        "Schema migration is blocked by a running schema-016 API or Worker; stop every application process before migrating",
+      );
+    }
+    schema016ApplicationLockHeld = true;
     await client.query(
       "CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
@@ -221,6 +260,12 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       discardClient = true;
     }
   };
+  if (schema016ApplicationLockHeld) {
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [SCHEMA_016_APPLICATION_GUARD],
+    );
+  }
   if (compatibilityLockHeld) {
     await unlock(
       "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
@@ -247,6 +292,34 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
 }
 
 export async function assertSchemaCompatible(
+  pool: DatabasePool,
+): Promise<Readonly<{
+  installedSchemaVersion: typeof SCHEMA_016;
+  applicationSchemaVersion: typeof SCHEMA_016;
+  mode: "native";
+  safe: true;
+  blockers: readonly [];
+}>> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await client.query("SET LOCAL search_path TO pg_catalog, public");
+    const report = await assertSchema016NativeSafe(
+      {
+        query: async (text, values) => client.query(text, values),
+      },
+    );
+    await client.query("COMMIT");
+    return report;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function assertSchema015ApplicationCompatible(
   pool: DatabasePool,
   input: Readonly<{ enable016RollbackBridge?: boolean }> = {},
 ): Promise<Schema015RollbackPreflightReport> {

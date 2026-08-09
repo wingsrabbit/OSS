@@ -30,7 +30,7 @@ try {
   assert.equal(original.rows[0]?.version, "014_stage_b_cycle_end_cancellation");
   await assert.rejects(
     assertSchemaCompatible(pool),
-    /older than the 015 bridge supports.*dedicated forward migration/i,
+    /incompatible.*016_stage_b_manual_receipts/i,
   );
 
   const native = await assert014RollbackBridgeSafe(database, {

@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import {
   assert015RollbackBridgeSafe,
+  assertSchema016NativeSafe,
   SCHEMA_015_016_GUARD,
   SCHEMA_016,
   SCHEMA_016_CATALOG_DIGEST,
@@ -13,7 +14,7 @@ import {
 } from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
 import {
-  assertSchemaCompatible,
+  assertSchema015ApplicationCompatible,
   holdSchema015RollbackBridgeGuard,
   runMigrations,
 } from "./database.js";
@@ -38,7 +39,7 @@ try {
     "SELECT max(version) AS version FROM schema_migrations",
   );
   assert.equal(installed.rows[0]?.version, SCHEMA_015);
-  const native = await assertSchemaCompatible(pool);
+  const native = await assertSchema015ApplicationCompatible(pool);
   assert.equal(native.mode, "native");
 
   await client.query(`
@@ -701,6 +702,8 @@ try {
     enable016RollbackBridge: true,
   });
   assert.equal(empty016.mode, "rollback_bridge");
+  const emptyNative016 = await assertSchema016NativeSafe(database);
+  assert.equal(emptyNative016.mode, "native");
 
   await client.query("ALTER TABLE manual_receipt_facts DISABLE TRIGGER manual_receipt_facts_append_only");
   await assert.rejects(
@@ -870,6 +873,8 @@ try {
   );
 
   let blocked: unknown;
+  const populatedNative016 = await assertSchema016NativeSafe(database);
+  assert.equal(populatedNative016.mode, "native");
   try {
     await assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true });
   } catch (error) {
@@ -897,6 +902,7 @@ try {
       publicFunctionShadowRejected: true,
       incompleteSchema016Rejected: true,
       emptySchema016Accepted: true,
+      populatedSchema016AcceptedNatively: true,
       disabledTriggerRejected: true,
       replicaTriggerRejected: true,
       counterfeitConstraintRejected: true,

@@ -22,6 +22,14 @@ export type Schema015RollbackPreflightReport = Readonly<{
   blockers: readonly SchemaRollbackBlocker[];
 }>;
 
+export type Schema016NativePreflightReport = Readonly<{
+  installedSchemaVersion: typeof SCHEMA_016;
+  applicationSchemaVersion: typeof SCHEMA_016;
+  mode: "native";
+  safe: true;
+  blockers: readonly [];
+}>;
+
 function rowRecord(row: unknown): Record<string, unknown> {
   if (!row || typeof row !== "object" || Array.isArray(row)) {
     throw new Error("Schema 015 rollback preflight returned an invalid database row");
@@ -440,7 +448,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
       : null;
   if (catalogDigest !== SCHEMA_016_CATALOG_DIGEST) {
     throw new SchemaRollbackPreflightError(
-      `Schema 016 is incomplete or counterfeit: catalog digest ${String(catalogDigest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start the 015 rollback bridge.`,
+      `Schema 016 is incomplete or counterfeit: catalog digest ${String(catalogDigest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start a schema-016 application or the 015 rollback bridge.`,
       SCHEMA_016,
     );
   }
@@ -453,10 +461,32 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
     shape.has_capacity_view !== true
   ) {
     throw new SchemaRollbackPreflightError(
-      "Schema 016 is incomplete or counterfeit; do not start the 015 rollback bridge. Deploy a compatible application and repair forward without a down migration.",
+      "Schema 016 is incomplete or counterfeit; do not start a schema-016 application or the 015 rollback bridge. Deploy a compatible application and repair forward without a down migration.",
       SCHEMA_016,
     );
   }
+}
+
+export async function assertSchema016NativeSafe(
+  database: RollbackPreflightQueryable,
+): Promise<Schema016NativePreflightReport> {
+  const installed = await installedSchemaVersion(database);
+  if (installed !== SCHEMA_016) {
+    throw new SchemaRollbackPreflightError(
+      installed === null
+        ? `Database schema is missing; application schema ${SCHEMA_016} requires a forward migration.`
+        : `Database schema ${installed} is incompatible with application schema ${SCHEMA_016}; run the dedicated forward migration or the matching application version.`,
+      installed,
+    );
+  }
+  await assertSchema016Shape(database);
+  return {
+    installedSchemaVersion: SCHEMA_016,
+    applicationSchemaVersion: SCHEMA_016,
+    mode: "native",
+    safe: true,
+    blockers: [],
+  };
 }
 
 async function schema016Blockers(
