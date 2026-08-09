@@ -18,7 +18,7 @@ export const SCHEMA_017_APPLICATION_GUARD =
   "opensales:schema-017-application" as const;
 
 export const SCHEMA_017_CATALOG_DIGEST =
-  "c47371a58ef68daa553745e2bb5e9e2828310f2b97100fdb2e4620ab1866c760" as const;
+  "c4915cd11b51e18283d2e54f75a2bb0b78f9ee7ed04ea82ca269e5c3ee60be93" as const;
 
 const EXPECTED_MIGRATION_HISTORY = [
   "001_stage_a",

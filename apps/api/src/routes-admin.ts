@@ -270,6 +270,80 @@ export async function registerAdminRoutes(
          ORDER BY fact.received_at DESC, fact.id DESC`,
         [params.clientAccountId],
       );
+      const outflowSources = await pool.query<{
+        manual_receipt_id: string;
+        source_amount_minor: string;
+        confirmed_outflow_minor: string;
+        available_minor: string;
+        capacity_frozen: boolean;
+      }>(
+        `SELECT capacity.manual_receipt_id,
+                capacity.source_amount_minor::text,
+                capacity.confirmed_outflow_minor::text,
+                capacity.available_minor::text,
+                capacity.capacity_frozen
+         FROM manual_receipt_outflow_capacity capacity
+         WHERE capacity.client_account_id = $1
+           AND capacity.source_context = 'unclaimed_funds'
+           AND capacity.fund_receipt_resolution_id IS NULL`,
+        [params.clientAccountId],
+      );
+      const outflowReports = await pool.query<{
+        id: string;
+        manual_receipt_id: string;
+        amount_minor: string;
+        currency: string;
+        destination_reference: string;
+        observed_outcome: "confirmed" | "unknown";
+        occurred_at: Date | null;
+        actor_id: string;
+        reason: string;
+        created_at: Date;
+        outflow_id: string | null;
+        reconciliation_id: string | null;
+        reconciliation_outcome: "confirm_outflow" | "confirm_no_outflow" | null;
+        reconciliation_occurred_at: Date | null;
+        reconciliation_actor_id: string | null;
+        reconciliation_reason: string | null;
+        reconciled_at: Date | null;
+      }>(
+        `SELECT report.id,
+                report.manual_receipt_id,
+                report.amount_minor::text,
+                report.currency,
+                report.destination_reference,
+                report.observed_outcome,
+                report.occurred_at,
+                report.actor_id,
+                report.reason,
+                report.created_at,
+                outflow.id AS outflow_id,
+                reconciliation.id AS reconciliation_id,
+                reconciliation.outcome AS reconciliation_outcome,
+                reconciliation.occurred_at AS reconciliation_occurred_at,
+                reconciliation.actor_id AS reconciliation_actor_id,
+                reconciliation.reason AS reconciliation_reason,
+                reconciliation.created_at AS reconciled_at
+         FROM manual_receipt_outflow_reports report
+         LEFT JOIN manual_receipt_outflows outflow ON outflow.report_id = report.id
+         LEFT JOIN manual_receipt_outflow_reconciliations reconciliation
+           ON reconciliation.report_id = report.id
+         WHERE report.client_account_id = $1
+           AND report.source_context = 'unclaimed_funds'
+           AND report.fund_receipt_resolution_id IS NULL
+           AND report.destination = 'original_source'
+         ORDER BY report.created_at DESC, report.id DESC`,
+        [params.clientAccountId],
+      );
+      const sourceByReceipt = new Map(
+        outflowSources.rows.map((source) => [source.manual_receipt_id, source]),
+      );
+      const reportsByReceipt = new Map<string, typeof outflowReports.rows>();
+      for (const report of outflowReports.rows) {
+        const reports = reportsByReceipt.get(report.manual_receipt_id) ?? [];
+        reports.push(report);
+        reportsByReceipt.set(report.manual_receipt_id, reports);
+      }
       return {
         warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
         clientAccount: target,
@@ -279,6 +353,10 @@ export async function registerAdminRoutes(
             (!row.reversal_actor_id || !row.reversal_reason || !row.reversed_at)
           ) {
             throw new Error("Manual receipt reversal history is incomplete");
+          }
+          const outflowSource = sourceByReceipt.get(row.id);
+          if (!outflowSource) {
+            throw new Error("Manual receipt original-source capacity is unavailable");
           }
           return {
             manualReceiptId: row.id,
@@ -295,6 +373,45 @@ export async function registerAdminRoutes(
             capacityFrozen: row.capacity_frozen,
             currency: row.currency,
             disposition: row.disposition,
+            originalSourceOutflow: {
+              sourceContext: "unclaimed_funds",
+              sourceAmountMinor: outflowSource.source_amount_minor,
+              confirmedOutflowMinor: outflowSource.confirmed_outflow_minor,
+              availableMinor: outflowSource.available_minor,
+              capacityFrozen: outflowSource.capacity_frozen,
+              reports: (reportsByReceipt.get(row.id) ?? []).map((report) => ({
+                outflowReportId: report.id,
+                outflowId: report.outflow_id,
+                amountMinor: report.amount_minor,
+                currency: report.currency,
+                destination: "original_source",
+                destinationReference: report.destination_reference,
+                observedOutcome: report.observed_outcome,
+                status:
+                  report.observed_outcome === "confirmed"
+                    ? "confirmed"
+                    : report.reconciliation_outcome === "confirm_outflow"
+                      ? "confirmed_outflow"
+                      : report.reconciliation_outcome === "confirm_no_outflow"
+                        ? "no_outflow"
+                        : "unknown",
+                occurredAt: report.occurred_at?.toISOString() ?? null,
+                actorId: report.actor_id,
+                reason: report.reason,
+                createdAt: report.created_at.toISOString(),
+                reconciliation: report.reconciliation_id
+                  ? {
+                      reconciliationId: report.reconciliation_id,
+                      outcome: report.reconciliation_outcome!,
+                      occurredAt:
+                        report.reconciliation_occurred_at?.toISOString() ?? null,
+                      actorId: report.reconciliation_actor_id!,
+                      reason: report.reconciliation_reason!,
+                      createdAt: report.reconciled_at!.toISOString(),
+                    }
+                  : null,
+              })),
+            },
             reversal: row.reversal_id
               ? {
                   reversalId: row.reversal_id,

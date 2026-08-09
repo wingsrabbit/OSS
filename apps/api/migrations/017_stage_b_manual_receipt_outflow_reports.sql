@@ -619,6 +619,12 @@ DECLARE
 DECLARE
   resolution_created_at timestamptz;
 BEGIN
+  -- Give the optional record a stable tuple descriptor even when this report
+  -- is not backed by converted Credit. PostgreSQL cannot dereference an
+  -- entirely unassigned RECORD inside the guarded boolean expression below.
+  SELECT NULL::uuid AS id, NULL::uuid AS client_account_id, NULL::text AS currency
+  INTO credit_row;
+
   SELECT
     fact.client_account_id AS fact_client_account_id,
     fact.received_at,
@@ -855,6 +861,11 @@ DECLARE
 DECLARE
   credit_row record;
 BEGIN
+  -- See the report guard above: unclaimed/allocated paths still evaluate a
+  -- boolean expression containing this optional record on PostgreSQL 18.
+  SELECT NULL::uuid AS id, NULL::uuid AS client_account_id, NULL::text AS currency
+  INTO credit_row;
+
   SELECT report.*, receipt.id AS locked_receipt_id
   INTO report_row
   FROM public.manual_receipt_outflow_reports report
@@ -1210,6 +1221,15 @@ DECLARE
 DECLARE
   effect_row record;
 BEGIN
+  -- The aggregate below contains CASE branches for converted Credit. Give the
+  -- optional record a tuple descriptor so ordinary unclaimed/allocated facts
+  -- do not fail before PostgreSQL selects the non-Credit branch.
+  SELECT NULL::uuid AS id,
+         NULL::uuid AS credit_account_id,
+         NULL::bigint AS credit_recovered_minor,
+         NULL::bigint AS debt_minor
+  INTO effect_row;
+
   IF NEW.source_context = 'converted_credit' THEN
     SELECT effect.id, effect.credit_account_id,
            effect.credit_recovered_minor, effect.debt_minor

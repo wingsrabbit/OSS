@@ -2,6 +2,10 @@
 
 import { LAB_BANNER } from "@opensales/core";
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ManualReceiptOutflowPanel,
+  type ManualReceiptOriginalSourceOutflow,
+} from "./ManualReceiptOutflows.js";
 
 type Locale = "en" | "zh-CN";
 
@@ -184,6 +188,7 @@ type ManualReceiptItem = {
   capacityFrozen: boolean;
   currency: "USD";
   disposition: string;
+  originalSourceOutflow: ManualReceiptOriginalSourceOutflow;
   reversal: {
     reversalId: string;
     actorId: string;
@@ -4120,6 +4125,27 @@ export function App() {
                             {receipt.disposition}
                           </span>
                           <span>{receipt.reason}</span>
+                          {manualReceiptTarget && (
+                            <ManualReceiptOutflowPanel
+                              clientAccountId={manualReceiptTarget.id}
+                              receipt={receipt}
+                              password={adminPassword}
+                              disabled={
+                                manualReceiptPending ||
+                                manualReceiptReversalPendingId !== null
+                              }
+                              onPasswordConsumed={() => setAdminPassword("")}
+                              onRefresh={async () => {
+                                const refreshed = await fetchManualReceiptHistory(
+                                  manualReceiptTarget.id,
+                                );
+                                setManualReceiptTarget(refreshed.clientAccount);
+                                setManualReceiptHistory(refreshed.items);
+                              }}
+                              onNotice={setNotice}
+                              onError={setError}
+                            />
+                          )}
                           {receipt.reversal && (
                             <span data-testid="manual-receipt-reversal">
                               Reversed {new Date(receipt.reversal.createdAt).toLocaleString()} · {" "}
