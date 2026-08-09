@@ -113,6 +113,14 @@ function commandResult(binary, args, options = {}) {
   return (result.stdout ?? "").trim();
 }
 
+function repositoryRevision() {
+  const revision = commandResult("git", ["rev-parse", "--verify", "HEAD"]);
+  if (!/^[0-9a-f]{40}$/.test(revision)) {
+    throw new Error(`Unable to identify the local Demo source revision: ${revision}`);
+  }
+  return revision;
+}
+
 function executableVersion(binary, args = ["--version"]) {
   try {
     return commandResult(binary, args);
@@ -416,7 +424,7 @@ function prepareDatabases(config, pgBin, node) {
     DATABASE_API_ROLE_PASSWORD: config.secrets.apiDatabasePassword,
     DATABASE_WORKER_ROLE_PASSWORD: config.secrets.workerDatabasePassword,
   };
-  console.log("Applying schema 017 and synthetic catalog seed...");
+  console.log("Applying the latest native schema (018) and synthetic catalog seed...");
   commandResult(node, ["apps/api/dist/migrate.js"], { env: migrationEnvironment });
   commandResult(node, ["apps/api/dist/seed-termrat.js"], { env: apiEnvironment(config) });
 }
@@ -539,9 +547,11 @@ function printResult(config, currentState, stackRunning = true) {
   );
   console.log(LAB_WARNING);
   console.log(`URL: http://127.0.0.1:${config.ports.web}/`);
+  console.log(`Code revision: ${currentState.runtimeRevision ?? "unknown"}`);
   if (result?.syntheticAccount) {
     console.log(`Latest synthetic customer login: ${result.syntheticAccount.email}`);
     console.log(`Latest synthetic customer password: ${result.syntheticAccount.password}`);
+    console.log(`Latest synthetic customer Client Account ID: ${result.syntheticAccount.clientAccountId}`);
     console.log(
       `Smoke: order ${result.journey.orderStatus}, invoice ${result.journey.invoiceStatus}, payment ${result.journey.paymentStatus}, service ${result.journey.serviceStatus}`,
     );
@@ -552,8 +562,21 @@ function printResult(config, currentState, stackRunning = true) {
   if (administrator) {
     console.log(`Synthetic administrator login: ${administrator.email}`);
     console.log(`Synthetic administrator password: ${administrator.password}`);
+    console.log(`Synthetic administrator Client Account ID: ${administrator.clientAccountId}`);
   } else {
     console.log("Synthetic administrator: unavailable (an administrator may already exist in this Demo database)");
+  }
+  if (result?.manualReceiptOutflow) {
+    console.log(`Manual receipt target Client Account ID: ${result.manualReceiptOutflow.clientAccountId}`);
+    console.log(`Synthetic manual receipt ID: ${result.manualReceiptOutflow.manualReceiptId}`);
+    console.log(`Synthetic fund receipt ID: ${result.manualReceiptOutflow.fundReceiptId}`);
+    console.log(`Synthetic outflow report ID: ${result.manualReceiptOutflow.outflowReportId}`);
+    console.log(`Synthetic confirmed outflow ID: ${result.manualReceiptOutflow.outflowId}`);
+    console.log(
+      `Manual receipt smoke: status ${result.manualReceiptOutflow.status}, Provider used ${result.manualReceiptOutflow.providerUsed}`,
+    );
+  } else {
+    console.log("Manual receipt smoke: skipped because no synthetic administrator credential was available");
   }
   console.log(`Credentials/state: ${stateFile}`);
   console.log(`Logs: ${logsDir}`);
@@ -568,14 +591,29 @@ async function up() {
   const config = createConfig();
   const node = resolveExactNode();
   const pgBin = resolvePostgresBin();
+  const sourceRevision = repositoryRevision();
   let currentState = state();
   currentState.processes ??= {};
-  const runningProcesses = processNames.filter((name) =>
+  let runningProcesses = processNames.filter((name) =>
     processIsAlive(currentState.processes[name]),
   );
-  const postgresRunning = postgresIsRunning(pgBin);
-  const stackAlreadyRunning =
+  let postgresRunning = postgresIsRunning(pgBin);
+  let stackAlreadyRunning =
     postgresRunning && runningProcesses.length === processNames.length;
+  if (
+    (postgresRunning || runningProcesses.length > 0) &&
+    currentState.runtimeRevision !== sourceRevision
+  ) {
+    console.log(
+      `The running Demo revision ${currentState.runtimeRevision ?? "unknown"} differs from source ${sourceRevision}; preserving data while restarting and migrating forward.`,
+    );
+    await down();
+    currentState = state();
+    currentState.processes ??= {};
+    runningProcesses = [];
+    postgresRunning = false;
+    stackAlreadyRunning = false;
+  }
   if (runningProcesses.length > 0 && !stackAlreadyRunning) {
     throw new Error(
       `The local Demo is only partially running (${runningProcesses.join(", ")}). Run node tools/demo-local.mjs down, then run up again.`,
@@ -584,20 +622,26 @@ async function up() {
 
   let bootstrapToken;
   if (stackAlreadyRunning) {
-    console.log("The complete loopback Demo stack is already running; reusing it for a fresh smoke journey.");
+    console.log(
+      `The complete loopback Demo stack is already running at ${sourceRevision}; reusing it for a fresh smoke journey.`,
+    );
   } else {
     buildWorkspace(node);
     startPostgres(config, pgBin);
     prepareDatabases(config, pgBin, node);
     bootstrapToken = createBootstrapToken(config, node, currentState);
+    currentState.runtimeRevision = sourceRevision;
+    saveState(currentState);
     await startProcesses(config, node, currentState);
   }
-  console.log("Running the synthetic register → verify → order → Mock pay → Active smoke journey...");
+  console.log("Running the synthetic customer plus manual receipt → confirmed original-source outflow smoke journeys...");
   const result = await runDemoSmoke({
     baseUrl: `http://127.0.0.1:${config.ports.web}`,
     bootstrapToken,
+    administratorAccount: currentState.administratorAccount,
   });
   currentState = state();
+  currentState.runtimeRevision = sourceRevision;
   currentState.latestSmoke = result;
   if (result.syntheticAccount.administrator) {
     currentState.administratorAccount = result.syntheticAccount;
@@ -611,10 +655,17 @@ async function smoke() {
   const config = createConfig();
   const node = resolveExactNode();
   const currentState = state();
+  const sourceRevision = repositoryRevision();
+  if (currentState.runtimeRevision !== sourceRevision) {
+    throw new Error(
+      `The Demo runtime revision ${currentState.runtimeRevision ?? "unknown"} differs from source ${sourceRevision}; run node tools/demo-local.mjs up to rebuild and migrate it first.`,
+    );
+  }
   const bootstrapToken = createBootstrapToken(config, node, currentState);
   const result = await runDemoSmoke({
     baseUrl: `http://127.0.0.1:${config.ports.web}`,
     bootstrapToken,
+    administratorAccount: currentState.administratorAccount,
   });
   const refreshed = state();
   refreshed.latestSmoke = result;
@@ -676,9 +727,12 @@ async function status() {
   const stackRunning =
     postgresIsRunning(pgBin) &&
     processNames.every((name) => processIsAlive(currentState.processes?.[name]));
+  const sourceRevision = repositoryRevision();
   console.log(LAB_WARNING);
   console.log(`URL: http://127.0.0.1:${config.ports.web}/`);
   console.log(`Stack: ${stackRunning ? "running" : "stopped"}`);
+  console.log(`Source revision: ${sourceRevision}`);
+  console.log(`Runtime revision: ${currentState.runtimeRevision ?? "unknown"}`);
   for (const name of processNames) {
     const pid = currentState.processes?.[name];
     console.log(

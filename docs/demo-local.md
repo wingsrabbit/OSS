@@ -31,12 +31,16 @@ The command:
 
 1. builds Core, API, Worker, Web, and Mock Provider Lab;
 2. initializes a repository-local PostgreSQL 18 cluster at `.demo/local`;
-3. migrates through schema 017 and runs `seed-termrat.ts`;
+3. migrates through the latest native schema (currently 018) and runs
+   `seed-termrat.ts`;
 4. starts the API, Worker, Vite Web app, and separate Mock payment,
    provisioning, mail, and mailbox processes on loopback;
 5. runs `register -> Mock Mail verification -> order -> Mock payment -> Mock
-   provisioning -> Ready for Service -> Active`;
-6. writes the generated synthetic credentials and journey IDs to
+   provisioning -> Ready for Service -> Active`, then uses the synthetic
+   administrator to record one manual receipt and one confirmed
+   `original_source` outflow without calling a Provider;
+6. writes the source revision, generated synthetic credentials, Client Account
+   IDs, and both journey IDs to
    `.demo/local/state.json` with mode `0600` and prints them in the terminal.
 
 Open [http://127.0.0.1:5173/](http://127.0.0.1:5173/) and sign in with the
@@ -52,9 +56,24 @@ node tools/demo-local.mjs smoke
 node tools/demo-local.mjs down
 ```
 
-`smoke` creates another fully synthetic paid/Active customer journey. `down`
-stops only the recorded Demo processes and its isolated PostgreSQL cluster; it
-preserves `.demo/local`, including the synthetic login and database.
+`smoke` creates another fully synthetic paid/Active customer journey plus a
+manual receipt/original-source outflow journey. `down` stops only the recorded
+Demo processes and its isolated PostgreSQL cluster; it preserves `.demo/local`,
+including the synthetic logins and database.
+
+### Revision-aware upgrades
+
+The state file records the exact Git revision used by the running processes.
+When `up` sees a complete or partial stack from another revision, it performs a
+controlled `down`, rebuilds, applies forward migrations through the latest
+native schema, and starts the stack again. Synthetic data is preserved. A stack
+already running at the current revision is reused for another smoke journey.
+
+The launcher never resets the database automatically. Applied migrations are
+immutable: a schema correction must use a new numbered forward migration. If a
+revision cannot migrate the preserved Demo database safely, startup fails
+closed so the migration can be fixed. `reset --yes` remains a separate,
+explicit option only for a deliberately disposable synthetic Demo runtime.
 
 To explicitly delete only that generated Demo runtime:
 
@@ -87,8 +106,9 @@ and database files are ignored by Git.
   separate loopback instances with separate payment/provisioning databases and
   a deliberately shared Mock mail database.
 - `conformance/e2e/tests/stage-a.spec.ts` remains the broad browser acceptance
-  suite. `tools/demo-smoke.mjs` is intentionally shorter: it proves one
-  user-visible happy path and leaves the stack running for a human Demo.
+  suite. `tools/demo-smoke.mjs` is intentionally shorter: it proves the main
+  customer journey plus one Provider-free manual-receipt outflow and leaves the
+  stack running for a human Demo.
 
 ## Limits
 

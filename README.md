@@ -80,17 +80,17 @@ Use only synthetic identities and data.
 With PostgreSQL 18, the frozen workspace dependencies, and Node 24.18.0
 available locally, one command builds the applications, initializes an isolated
 PostgreSQL cluster under `.demo/local`, starts API/Worker/Web plus all four Mock
-Provider processes on loopback, creates a synthetic account, and proves the
-Stage A happy path through an Active service:
+Provider processes on loopback, creates synthetic accounts, and proves the
+Stage A happy path through an Active service plus one Provider-free manual
+receipt/original-source outflow:
 
 ```bash
 node tools/demo-local.mjs up
 ```
 
 The command prints `http://127.0.0.1:5173/`, a generated `.example.invalid`
-login, a generated password, the administrator login when this is a fresh Demo
-database, and the exact smoke result. Stop it without deleting the synthetic
-data:
+login, generated password, Client Account IDs, administrator login, repository
+revision, and exact smoke IDs. Stop it without deleting the synthetic data:
 
 ```bash
 node tools/demo-local.mjs down

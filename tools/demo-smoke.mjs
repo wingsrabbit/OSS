@@ -81,9 +81,131 @@ function syntheticIdentity() {
   };
 }
 
+async function administratorSession({
+  baseUrl,
+  customerSession,
+  customerIdentity,
+  customerIsAdministrator,
+  administratorAccount,
+}) {
+  if (customerIsAdministrator) {
+    return { session: customerSession, password: customerIdentity.password };
+  }
+  if (!administratorAccount?.email || !administratorAccount?.password) return null;
+
+  const session = new DemoSession(baseUrl);
+  await session.request("/api/v1/auth/login", {
+    method: "POST",
+    body: JSON.stringify({
+      email: administratorAccount.email,
+      password: administratorAccount.password,
+    }),
+  });
+  const principal = await session.request("/api/v1/auth/me");
+  assert.ok(principal.staff, "Stored synthetic administrator is no longer a staff principal");
+  return { session, password: administratorAccount.password };
+}
+
+async function runManualReceiptOutflowSmoke({
+  baseUrl,
+  customerSession,
+  customerIdentity,
+  customerIsAdministrator,
+  administratorAccount,
+  clientAccountId,
+}) {
+  const administrator = await administratorSession({
+    baseUrl,
+    customerSession,
+    customerIdentity,
+    customerIsAdministrator,
+    administratorAccount,
+  });
+  if (!administrator) return null;
+
+  await administrator.session.request("/api/v1/auth/reauth", {
+    method: "POST",
+    body: JSON.stringify({ password: administrator.password }),
+  });
+
+  const marker = randomUUID();
+  const grossAmountMinor = "10000";
+  const outflowAmountMinor = "1200";
+  const receipt = await administrator.session.request(
+    `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        reference: `SYNTHETIC-RECEIPT-${marker}`,
+        receivedAt: new Date(Date.now() - 60_000).toISOString(),
+        grossAmountMinor,
+        feeMinor: "0",
+        currency: "USD",
+        reason: "Synthetic Demo evidence confirms isolated manual funds arrived",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    201,
+  );
+  assert.equal(receipt.providerUsed, false, "Manual receipt unexpectedly used a Provider");
+
+  const outflow = await administrator.session.request(
+    `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/outflow-reports`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        expectedAvailableMinor: grossAmountMinor,
+        amountMinor: outflowAmountMinor,
+        currency: "USD",
+        destination: "original_source",
+        destinationReference: `SYNTHETIC-RETURN-${marker}`,
+        observedOutcome: "confirmed",
+        occurredAt: new Date().toISOString(),
+        reason: "Synthetic Demo evidence confirms the original-source outflow completed",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    201,
+  );
+  assert.equal(outflow.status, "confirmed");
+  assert.equal(outflow.destination, "original_source");
+  assert.ok(outflow.outflowId, "Confirmed original-source report has no outflow fact ID");
+  assert.equal(outflow.providerUsed, false, "Manual receipt outflow unexpectedly used a Provider");
+
+  const history = await administrator.session.request(
+    `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
+  );
+  const listed = history.items.find((item) => item.manualReceiptId === receipt.manualReceiptId);
+  assert.ok(listed, "Synthetic manual receipt is missing from administrator history");
+  assert.equal(listed.originalSourceOutflow.confirmedOutflowMinor, outflowAmountMinor);
+  assert.equal(listed.originalSourceOutflow.availableMinor, "8800");
+  assert.equal(
+    listed.originalSourceOutflow.reports.some(
+      (report) => report.outflowReportId === outflow.outflowReportId && report.status === "confirmed",
+    ),
+    true,
+    "Confirmed original-source outflow is missing from administrator history",
+  );
+
+  return {
+    clientAccountId,
+    manualReceiptId: receipt.manualReceiptId,
+    fundReceiptId: receipt.fundReceiptId,
+    outflowReportId: outflow.outflowReportId,
+    outflowId: outflow.outflowId,
+    grossAmountMinor,
+    confirmedOutflowMinor: outflowAmountMinor,
+    availableMinor: listed.originalSourceOutflow.availableMinor,
+    destination: outflow.destination,
+    status: outflow.status,
+    providerUsed: outflow.providerUsed,
+  };
+}
+
 export async function runDemoSmoke({
   baseUrl = "http://127.0.0.1:5173",
   bootstrapToken,
+  administratorAccount,
   timeoutMs = 90_000,
 } = {}) {
   const parsedBaseUrl = assertLoopbackBaseUrl(baseUrl);
@@ -223,13 +345,24 @@ export async function runDemoSmoke({
   );
   assert.ok(activeOrder.service.activatedAt, "Active service has no Ready-for-Service time");
 
+  const manualReceiptOutflow = await runManualReceiptOutflowSmoke({
+    baseUrl: parsedBaseUrl,
+    customerSession: session,
+    customerIdentity: identity,
+    customerIsAdministrator: administrator,
+    administratorAccount,
+    clientAccountId: registration.clientAccountId,
+  });
+
   return {
     warning: LAB_WARNING,
     startedAt,
     completedAt: new Date().toISOString(),
     baseUrl: parsedBaseUrl.toString().replace(/\/$/, ""),
     loginPath: "/",
-    administratorPanelPath: administrator ? "/ (sign in; administrator panel appears below)" : null,
+    administratorPanelPath: manualReceiptOutflow
+      ? "/ (sign in with the printed administrator; panels appear below)"
+      : null,
     syntheticAccount: {
       ...identity,
       userId: registration.userId,
@@ -247,6 +380,7 @@ export async function runDemoSmoke({
       serviceStatus: activeOrder.service.status,
       readyForServiceAt: activeOrder.service.activatedAt,
     },
+    manualReceiptOutflow,
   };
 }
 
