@@ -137,6 +137,11 @@ type Job = {
   attempts: number;
 };
 
+type StaleJob = Job & {
+  locked_at: Date;
+  locked_by: string | null;
+};
+
 type DatabaseClient = pg.PoolClient;
 
 class LostJobLeaseError extends Error {
@@ -258,9 +263,9 @@ async function enqueueReconcileWithClient(
 
 async function lockStaleJobWithClient(
   client: DatabaseClient,
-  candidate: Job,
-): Promise<Job | null> {
-  return lockSchema016StaleJob<Job>(
+  candidate: StaleJob,
+): Promise<StaleJob | null> {
+  return lockSchema016StaleJob<StaleJob>(
     client,
     candidate,
     config.JOB_LOCK_TIMEOUT_SECONDS,
@@ -291,14 +296,14 @@ async function manualRecoveredJobWithClient(
   );
 }
 
-async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleJob(candidate: StaleJob): Promise<boolean> {
   if (!isSchema016GenericRecoveryJobType(candidate.job_type)) return false;
   const sideEffecting = ["payment.start", "add_funds.start", "provision.start"].includes(
     candidate.job_type,
   );
   if (!sideEffecting) {
     return transaction(async (client) => {
-      const job = await lockSchema016StaleJob<Job>(
+      const job = await lockSchema016StaleJob<StaleJob>(
         client,
         candidate,
         config.JOB_LOCK_TIMEOUT_SECONDS,
@@ -336,7 +341,7 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
   const operationId = candidate.payload.providerOperationId;
   if (!subjectId || !operationId) {
     return transaction(async (client) => {
-      const job = await lockSchema016StaleJob<Job>(
+      const job = await lockSchema016StaleJob<StaleJob>(
         client,
         candidate,
         config.JOB_LOCK_TIMEOUT_SECONDS,
@@ -360,7 +365,7 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
        FOR UPDATE`,
       [operationId],
     );
-    const job = await lockSchema016StaleJob<Job>(
+    const job = await lockSchema016StaleJob<StaleJob>(
       client,
       candidate,
       config.JOB_LOCK_TIMEOUT_SECONDS,
@@ -466,7 +471,7 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
 }
 
 async function recoverStaleJobs(): Promise<number> {
-  const candidates = await findSchema016GenericRecoveryCandidates<Job>(
+  const candidates = await findSchema016GenericRecoveryCandidates<StaleJob>(
     pool,
     config.JOB_LOCK_TIMEOUT_SECONDS,
   );
@@ -477,7 +482,7 @@ async function recoverStaleJobs(): Promise<number> {
   return recovered;
 }
 
-async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleRefundJob(candidate: StaleJob): Promise<boolean> {
   const refundId = candidate.payload.refundId;
   const operationId = candidate.payload.operationId ?? candidate.payload.providerOperationId;
   if (!refundId || !operationId) {
@@ -524,17 +529,11 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
        FOR UPDATE OF refund, operation`,
       [refundId, operationId],
     );
-    const currentJob = await client.query<Job>(
-      `SELECT id, job_type, unique_key, payload, attempts
-       FROM durable_jobs
-       WHERE id = $1
-         AND status = 'running'
-         AND attempts = $2
-         AND locked_at < now() - make_interval(secs => $3)
-       FOR UPDATE`,
-      [candidate.id, candidate.attempts, config.JOB_LOCK_TIMEOUT_SECONDS],
+    const job = await lockSchema016StaleJob<StaleJob>(
+      client,
+      candidate,
+      config.JOB_LOCK_TIMEOUT_SECONDS,
     );
-    const job = currentJob.rows[0];
     if (!job) return false;
     const record = state.rows[0];
     if (!receiptId || !record) {
@@ -678,8 +677,8 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
 }
 
 async function recoverStaleRefundJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
+  const candidates = await pool.query<StaleJob>(
+    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN ('refund.start', 'refund.reconcile')
@@ -5579,7 +5578,7 @@ async function reconcileCancellation(job: Job): Promise<void> {
   await completeJob(job);
 }
 
-async function recoverOneStaleServiceActionJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleServiceActionJob(candidate: StaleJob): Promise<boolean> {
   const action: ServiceAction | null = candidate.job_type.startsWith("service.suspend.")
     ? "suspend"
     : candidate.job_type.startsWith("service.resume.")
@@ -5829,8 +5828,8 @@ async function recoverOneStaleServiceActionJob(candidate: Job): Promise<boolean>
 }
 
 async function recoverStaleServiceActionJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
+  const candidates = await pool.query<StaleJob>(
+    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN (
@@ -5849,7 +5848,7 @@ async function recoverStaleServiceActionJobs(): Promise<number> {
   return recovered;
 }
 
-async function recoverOneStaleCancellationJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleCancellationJob(candidate: StaleJob): Promise<boolean> {
   const requestId = candidate.payload.cancellationRequestId ?? candidate.payload.requestId;
   const executionId = candidate.payload.executionId;
   const serviceId = candidate.payload.serviceId;
@@ -6098,8 +6097,8 @@ async function recoverOneStaleCancellationJob(candidate: Job): Promise<boolean> 
 }
 
 async function recoverStaleCancellationJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
+  const candidates = await pool.query<StaleJob>(
+    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN ('service.cancellation.due', 'service.cancellation.reconcile')

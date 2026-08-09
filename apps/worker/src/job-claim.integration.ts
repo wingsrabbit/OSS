@@ -17,6 +17,11 @@ type ClaimedJob = pg.QueryResultRow & {
   attempts: number;
 };
 
+type StaleJob = ClaimedJob & {
+  locked_at: Date;
+  locked_by: string | null;
+};
+
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
@@ -40,7 +45,10 @@ try {
     id: string;
     job_type: string;
     unique_key: string;
+    payload: Record<string, unknown>;
     attempts: number;
+    locked_at: Date | null;
+    locked_by: string | null;
   }>(
     `INSERT INTO public.durable_jobs(
        job_type, unique_key, payload, status, available_at, attempts,
@@ -54,7 +62,7 @@ try {
         now() - interval '2 minutes', 7, now() - interval '2 minutes', 'future-worker'),
        ('notification.send', $4, $8::jsonb, 'running',
         now() - interval '1 minute', 3, now() - interval '1 minute', 'stale-schema016-worker')
-     RETURNING id, job_type, unique_key, attempts`,
+     RETURNING id, job_type, unique_key, payload, attempts, locked_at, locked_by`,
     [
       unknownKey,
       knownKey,
@@ -69,13 +77,21 @@ try {
   const unknownId = inserted.rows.find(
     (row) => row.unique_key === unknownKey,
   )?.id;
-  const unknownStale = inserted.rows.find(
+  const unknownStaleRow = inserted.rows.find(
     (row) => row.unique_key === unknownStaleKey,
   );
-  const knownStale = inserted.rows.find((row) => row.unique_key === knownStaleKey);
+  const knownStaleRow = inserted.rows.find((row) => row.unique_key === knownStaleKey);
   assert.ok(unknownId);
-  assert.ok(unknownStale);
-  assert.ok(knownStale);
+  assert.ok(unknownStaleRow?.locked_at);
+  assert.ok(knownStaleRow?.locked_at);
+  const unknownStale: StaleJob = {
+    ...unknownStaleRow,
+    locked_at: unknownStaleRow.locked_at,
+  };
+  const knownStale: StaleJob = {
+    ...knownStaleRow,
+    locked_at: knownStaleRow.locked_at,
+  };
 
   const before = await pool.query(
     `SELECT status, attempts, payload, available_at, locked_at, locked_by,
@@ -101,7 +117,7 @@ try {
   );
   assert.equal(next, null);
 
-  const recoveryCandidates = await findSchema016GenericRecoveryCandidates<ClaimedJob>(
+  const recoveryCandidates = await findSchema016GenericRecoveryCandidates<StaleJob>(
     pool,
     1,
   );
@@ -114,6 +130,25 @@ try {
     true,
   );
 
+  await pool.query(
+    `UPDATE public.durable_jobs
+     SET job_type = 'schema017.reconciliation',
+         payload = $2::jsonb
+     WHERE id = $1`,
+    [
+      knownStale.id,
+      JSON.stringify({ marker: "future-017-type-swap", externalFactId: randomUUID() }),
+    ],
+  );
+  const swappedBefore = await pool.query(
+    `SELECT status, job_type, unique_key, attempts, payload, available_at,
+            locked_at, locked_by, last_error, created_at, updated_at
+     FROM public.durable_jobs
+     WHERE id = $1`,
+    [knownStale.id],
+  );
+  assert.equal(swappedBefore.rowCount, 1);
+
   const guardClient = await pool.connect();
   try {
     await guardClient.query("BEGIN");
@@ -123,6 +158,12 @@ try {
       1,
     );
     assert.equal(guardedUnknown, null);
+    const guardedTypeSwap = await lockSchema016StaleJob<ClaimedJob>(
+      guardClient,
+      knownStale,
+      1,
+    );
+    assert.equal(guardedTypeSwap, null);
     await guardClient.query("ROLLBACK");
   } catch (error) {
     await guardClient.query("ROLLBACK");
@@ -141,6 +182,14 @@ try {
   );
   assert.equal(after.rowCount, 2);
   assert.deepEqual(after.rows, before.rows);
+  const swappedAfter = await pool.query(
+    `SELECT status, job_type, unique_key, attempts, payload, available_at,
+            locked_at, locked_by, last_error, created_at, updated_at
+     FROM public.durable_jobs
+     WHERE id = $1`,
+    [knownStale.id],
+  );
+  assert.deepEqual(swappedAfter.rows, swappedBefore.rows);
 
   console.log(
     JSON.stringify({
@@ -149,6 +198,8 @@ try {
       unknownPendingJobUntouched: true,
       unknownStaleRunningJobUntouched: true,
       staleRowLockRechecksKnownType: true,
+      candidateTypeSwapRejected: true,
+      candidateSnapshotRechecked: true,
     }),
   );
 } finally {

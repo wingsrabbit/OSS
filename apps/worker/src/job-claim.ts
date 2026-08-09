@@ -82,7 +82,11 @@ export async function claimSchema016Job<T extends pg.QueryResultRow>(
 export type StaleJobIdentity = {
   readonly id: string;
   readonly job_type: string;
+  readonly unique_key: string;
+  readonly payload: Readonly<Record<string, unknown>>;
   readonly attempts: number;
+  readonly locked_at: Date;
+  readonly locked_by: string | null;
 };
 
 export async function findSchema016GenericRecoveryCandidates<
@@ -93,7 +97,7 @@ export async function findSchema016GenericRecoveryCandidates<
   limit = 50,
 ): Promise<T[]> {
   const result = await pool.query<T>(
-    `SELECT id, job_type, unique_key, payload, attempts
+    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
      FROM public.durable_jobs
      WHERE status = 'running'
        AND locked_at < now() - make_interval(secs => $1)
@@ -111,20 +115,28 @@ export async function lockSchema016StaleJob<T extends pg.QueryResultRow>(
   lockTimeoutSeconds: number,
 ): Promise<T | null> {
   const result = await client.query<T>(
-    `SELECT id, job_type, unique_key, payload, attempts
+    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
      FROM public.durable_jobs
      WHERE id = $1
        AND status = 'running'
        AND attempts = $2
        AND locked_at < now() - make_interval(secs => $3)
        AND job_type = $4
-       AND job_type = ANY($5::text[])
+       AND unique_key = $5
+       AND payload = $6::jsonb
+       AND locked_at = $7
+       AND locked_by IS NOT DISTINCT FROM $8
+       AND job_type = ANY($9::text[])
      FOR UPDATE`,
     [
       candidate.id,
       candidate.attempts,
       lockTimeoutSeconds,
       candidate.job_type,
+      candidate.unique_key,
+      JSON.stringify(candidate.payload),
+      candidate.locked_at,
+      candidate.locked_by,
       [...SCHEMA_016_SUPPORTED_JOB_TYPES],
     ],
   );
