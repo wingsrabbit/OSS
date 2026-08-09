@@ -230,6 +230,7 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
   const fundReceiptId = randomUUID();
   const resolutionId = randomUUID();
   const creditAccountId = randomUUID();
+  const receiptAmountMinor = 700;
   const amountMinor = 600;
   const baseOccurredAt = new Date(Date.now() - 60_000).toISOString();
   try {
@@ -285,7 +286,7 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
         clientAccountId,
         `SCHEMA-017-${manualReceiptId}`,
         baseOccurredAt,
-        amountMinor,
+        receiptAmountMinor,
         userId,
         `schema-017-receipt-${manualReceiptId}`,
         `schema-017-receipt-fingerprint-${manualReceiptId}`,
@@ -301,7 +302,7 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
          $1, NULL, NULL, NULL, NULL, $2, $3, $4, 0, 'USD', $5,
          'unclaimed', 'Synthetic schema 017 manual receipt source'
        )`,
-      [fundReceiptId, manualReceiptId, clientAccountId, amountMinor, baseOccurredAt],
+      [fundReceiptId, manualReceiptId, clientAccountId, receiptAmountMinor, baseOccurredAt],
     );
     const receiptJournal = await client.query<{ id: string }>(
       `INSERT INTO public.ledger_journals(source_type, source_id, currency, description)
@@ -314,7 +315,7 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
        VALUES
          ($1, 'cash_clearing', $2, 0),
          ($1, 'unclaimed_funds_liability', 0, $2)`,
-      [receiptJournal.rows[0]?.id, amountMinor],
+      [receiptJournal.rows[0]?.id, receiptAmountMinor],
     );
     await client.query(
       "UPDATE public.ledger_journals SET sealed_at = pg_catalog.now() WHERE id = $1",
@@ -377,7 +378,8 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
     );
     await client.query(
       `UPDATE public.fund_receipts
-       SET allocated_minor = $2, disposition = 'allocated', updated_at = pg_catalog.now()
+       SET allocated_minor = $2, disposition = 'partially_allocated',
+           updated_at = pg_catalog.now()
        WHERE id = $1`,
       [fundReceiptId, amountMinor],
     );
@@ -419,7 +421,87 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
        ) VALUES ($1, $2, $3, 'USD')`,
       [unknownReportId, creditAccountId, amountMinor],
     );
+    const competingCreditWriter = await pool.connect();
+    try {
+      await competingCreditWriter.query("BEGIN");
+      await competingCreditWriter.query("SET LOCAL lock_timeout = '250ms'");
+      await assert.rejects(
+        competingCreditWriter.query(
+          `INSERT INTO public.fund_receipt_resolutions(
+             fund_receipt_id, client_account_id, action, amount_minor,
+             currency, invoice_id, actor_id, reason, idempotency_key,
+             request_fingerprint, result
+           ) VALUES (
+             $1, $2, 'convert_to_credit', 100, 'USD', NULL, $3,
+             'Concurrent resolution races unresolved manual receipt outflow',
+             $4, $5, '{}'::jsonb
+           )`,
+          [
+            fundReceiptId,
+            clientAccountId,
+            userId,
+            `schema-017-concurrent-resolution-${unknownReportId}`,
+            `schema-017-concurrent-resolution-fingerprint-${unknownReportId}`,
+          ],
+        ),
+        (error: unknown) =>
+          typeof error === "object" && error !== null && "code" in error
+            && error.code === "55P03",
+      );
+      await competingCreditWriter.query("ROLLBACK");
+      await competingCreditWriter.query("BEGIN");
+      await competingCreditWriter.query("SET LOCAL lock_timeout = '250ms'");
+      await assert.rejects(
+        competingCreditWriter.query(
+          `INSERT INTO public.credit_transactions(
+             credit_account_id, kind, credit_minor, debit_minor,
+             source_type, source_id, actor_type, actor_id, reason,
+             idempotency_key, request_fingerprint, result
+           ) VALUES (
+             $1, 'manual_adjustment', 0, 1,
+             'schema_017_concurrent_spend', $2, 'staff', $3,
+             'Concurrent Credit spend races unresolved manual outflow report',
+             $4, $5, '{}'::jsonb
+           )`,
+          [
+            creditAccountId,
+            randomUUID(),
+            userId,
+            `schema-017-concurrent-spend-${unknownReportId}`,
+            `schema-017-concurrent-spend-fingerprint-${unknownReportId}`,
+          ],
+        ),
+        (error: unknown) =>
+          typeof error === "object" && error !== null && "code" in error
+            && error.code === "55P03",
+      );
+    } finally {
+      await competingCreditWriter.query("ROLLBACK").catch(() => undefined);
+      competingCreditWriter.release();
+    }
     await client.query("COMMIT");
+
+    await assert.rejects(
+      client.query(
+        `INSERT INTO public.fund_receipt_resolutions(
+           fund_receipt_id, client_account_id, action, amount_minor,
+           currency, invoice_id, actor_id, reason, idempotency_key,
+           request_fingerprint, result
+         ) VALUES (
+           $1, $2, 'convert_to_credit', 100, 'USD', NULL, $3,
+           'Resolution after unresolved manual receipt outflow must fail',
+           $4, $5, '{}'::jsonb
+         )`,
+        [
+          fundReceiptId,
+          clientAccountId,
+          userId,
+          `schema-017-frozen-resolution-${unknownReportId}`,
+          `schema-017-frozen-resolution-fingerprint-${unknownReportId}`,
+        ],
+      ),
+      /available funds|frozen|outflow-adjusted capacity/,
+    );
 
     await assert.rejects(
       client.query(
@@ -465,6 +547,151 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
       ],
     );
 
+    const remainingResolutionId = randomUUID();
+    const remainingResolutionResult = {
+      resolutionId: remainingResolutionId,
+      amountMinor: "100",
+      currency: "USD",
+    };
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.fund_receipt_resolutions(
+         id, fund_receipt_id, client_account_id, action, amount_minor,
+         currency, invoice_id, actor_id, reason, idempotency_key,
+         request_fingerprint, result
+       ) VALUES (
+         $1, $2, $3, 'convert_to_credit', 100, 'USD', NULL, $4,
+         'Synthetic resolution wins the reverse outflow concurrency ordering',
+         $5, $6, $7::jsonb
+       )`,
+      [
+        remainingResolutionId,
+        fundReceiptId,
+        clientAccountId,
+        userId,
+        `schema-017-resolution-first-${remainingResolutionId}`,
+        `schema-017-resolution-first-fingerprint-${remainingResolutionId}`,
+        JSON.stringify(remainingResolutionResult),
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.credit_transactions(
+         credit_account_id, kind, credit_minor, debit_minor,
+         source_type, source_id, actor_type, actor_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, 'unclaimed_funds', 100, 0,
+         'fund_receipt_resolution', $2, 'staff', $3,
+         'Synthetic resolution wins the reverse outflow concurrency ordering',
+         $4, $5, $6::jsonb
+       )`,
+      [
+        creditAccountId,
+        remainingResolutionId,
+        userId,
+        `schema-017-resolution-first-credit-${remainingResolutionId}`,
+        `schema-017-resolution-first-fingerprint-${remainingResolutionId}`,
+        JSON.stringify(remainingResolutionResult),
+      ],
+    );
+    const remainingJournal = await client.query<{ id: string }>(
+      `INSERT INTO public.ledger_journals(source_type, source_id, currency, description)
+       VALUES (
+         'fund_receipt_resolution', $1, 'USD',
+         'Synthetic remaining funds converted to Credit'
+       ) RETURNING id`,
+      [remainingResolutionId],
+    );
+    await client.query(
+      `INSERT INTO public.ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+       VALUES
+         ($1, 'unclaimed_funds_liability', 100, 0),
+         ($1, 'client_credit_liability', 0, 100)`,
+      [remainingJournal.rows[0]?.id],
+    );
+    await client.query(
+      "UPDATE public.ledger_journals SET sealed_at = pg_catalog.now() WHERE id = $1",
+      [remainingJournal.rows[0]?.id],
+    );
+    await client.query(
+      `UPDATE public.fund_receipts
+       SET allocated_minor = $2, disposition = 'allocated', updated_at = pg_catalog.now()
+       WHERE id = $1`,
+      [fundReceiptId, receiptAmountMinor],
+    );
+
+    const resolutionFirstReportId = randomUUID();
+    const competingOutflowWriter = await pool.connect();
+    try {
+      await competingOutflowWriter.query("BEGIN");
+      await competingOutflowWriter.query("SET LOCAL lock_timeout = '250ms'");
+      await assert.rejects(
+        competingOutflowWriter.query(
+          `INSERT INTO public.manual_receipt_outflow_reports(
+             id, manual_receipt_id, fund_receipt_id, client_account_id,
+             source_context, fund_receipt_resolution_id, amount_minor, currency,
+             destination, destination_reference, observed_outcome, occurred_at,
+             actor_id, actor_session_id, reauth_grant_id, reason,
+             idempotency_key, request_fingerprint, result
+           ) VALUES (
+             $1, $2, $3, $4, 'unclaimed_funds', NULL, 100, 'USD',
+             'original_source', $5, 'unknown', NULL, $6, $7, $8,
+             'Concurrent unclaimed outflow loses to the committed resolution',
+             $9, $10, '{}'::jsonb
+           )`,
+          [
+            resolutionFirstReportId,
+            manualReceiptId,
+            fundReceiptId,
+            clientAccountId,
+            `RESOLUTION-FIRST-${resolutionFirstReportId}`,
+            userId,
+            sessionId,
+            reauthId,
+            `schema-017-resolution-first-report-${resolutionFirstReportId}`,
+            `schema-017-resolution-first-report-fingerprint-${resolutionFirstReportId}`,
+          ],
+        ),
+        (error: unknown) =>
+          typeof error === "object" && error !== null && "code" in error
+            && error.code === "55P03",
+      );
+    } finally {
+      await competingOutflowWriter.query("ROLLBACK").catch(() => undefined);
+      competingOutflowWriter.release();
+    }
+    await client.query("COMMIT");
+
+    await assert.rejects(
+      client.query(
+        `INSERT INTO public.manual_receipt_outflow_reports(
+           id, manual_receipt_id, fund_receipt_id, client_account_id,
+           source_context, fund_receipt_resolution_id, amount_minor, currency,
+           destination, destination_reference, observed_outcome, occurred_at,
+           actor_id, actor_session_id, reauth_grant_id, reason,
+           idempotency_key, request_fingerprint, result
+         ) VALUES (
+           $1, $2, $3, $4, 'unclaimed_funds', NULL, 100, 'USD',
+           'original_source', $5, 'unknown', NULL, $6, $7, $8,
+           'Unclaimed outflow cannot consume capacity won by resolution',
+           $9, $10, '{}'::jsonb
+         )`,
+        [
+          resolutionFirstReportId,
+          manualReceiptId,
+          fundReceiptId,
+          clientAccountId,
+          `RESOLUTION-FIRST-${resolutionFirstReportId}`,
+          userId,
+          sessionId,
+          reauthId,
+          `schema-017-resolution-first-report-${resolutionFirstReportId}`,
+          `schema-017-resolution-first-report-fingerprint-${resolutionFirstReportId}`,
+        ],
+      ),
+      /exceeds or mismatches/,
+    );
+
     await client.query(
       `INSERT INTO public.credit_transactions(
          credit_account_id, kind, credit_minor, debit_minor,
@@ -478,7 +705,7 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
        )`,
       [
         creditAccountId,
-        amountMinor,
+        receiptAmountMinor,
         randomUUID(),
         userId,
         `schema-017-consumed-credit-${resolutionId}`,
