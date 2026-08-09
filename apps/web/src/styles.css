@@ -199,6 +199,34 @@ main {
   border-top: 1px solid var(--line);
 }
 
+.manual-receipt-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.manual-receipt-form label {
+  display: grid;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.manual-receipt-form input,
+.manual-receipt-form textarea {
+  width: 100%;
+}
+
+.manual-receipt-reason {
+  grid-column: 1 / -1;
+}
+
+.manual-receipt-reason textarea {
+  min-height: 7rem;
+  resize: vertical;
+}
+
 .fund-actions {
   display: flex !important;
   flex-wrap: wrap;
@@ -537,6 +565,14 @@ select:focus {
   .manual-item {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .manual-receipt-form {
+    grid-template-columns: 1fr;
+  }
+
+  .manual-receipt-reason {
+    grid-column: auto;
   }
 
   .header-actions .pill {

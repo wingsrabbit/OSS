@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Route } from "@playwright/test";
 
 test("unverified customer verifies, pays, reaches Ready for Service, and sees Add Funds Chargeback debt", async ({
   page,
@@ -192,6 +192,159 @@ test("staff sees the affected Client Account Chargeback and its exact recovery s
     "Credit recovered $45.00 · debt $5.00 · fee reversal $1.75",
   );
   await expect(chargeback).toContainText("Client Account restriction: active");
+});
+
+test("staff records received funds manually and sees the immutable unclaimed result", async ({
+  page,
+  request,
+}) => {
+  const staffEmail = "stage-a-browser-admin@example.invalid";
+  const staffPassword = "Synthetic-Stage-A-Browser-Admin-Only!";
+  const reference = `BROWSER-MANUAL-${crypto.randomUUID()}`;
+  const targetIdentity = crypto.randomUUID();
+  const targetName = `Synthetic Manual Receipt Target ${targetIdentity}`;
+  const targetRegistration = await request.post("/api/v1/auth/register", {
+    data: {
+      email: `manual-receipt-target-${targetIdentity}@example.invalid`,
+      password: `Synthetic-${targetIdentity}-Target!`,
+      clientName: targetName,
+      locale: "en",
+    },
+  });
+  const targetRegistrationBody = (await targetRegistration.json()) as {
+    clientAccountId?: string;
+  };
+  expect(targetRegistration.status(), JSON.stringify(targetRegistrationBody)).toBe(201);
+  expect(targetRegistrationBody.clientAccountId).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  const targetClientAccountId = targetRegistrationBody.clientAccountId!;
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Singapore" });
+
+  await page.goto("/");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
+  await page.getByPlaceholder("Password", { exact: true }).fill(staffPassword);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  const admin = page.locator("section.admin-panel");
+  const manualReceipt = admin.locator('div[aria-label="Record manual receipt"]');
+  await expect(
+    manualReceipt.getByRole("heading", { name: "Record received funds manually" }),
+  ).toBeVisible();
+  const clientAccountInput = manualReceipt.getByLabel("Manual receipt Client Account ID");
+  await expect(clientAccountInput).toHaveValue("");
+  await clientAccountInput.fill(targetClientAccountId);
+  await manualReceipt.getByRole("button", { name: "Verify account & load history" }).click();
+  await expect(manualReceipt.getByTestId("manual-receipt-target")).toContainText(
+    `${targetName} · ${targetClientAccountId}`,
+  );
+  await expect(manualReceipt.getByText("Received at (Asia/Singapore)")).toBeVisible();
+  const receivedAtInput = manualReceipt.getByLabel("Manual receipt received at");
+  const intendedReceivedAt = await receivedAtInput.evaluate((element) =>
+    new Date((element as HTMLInputElement).value).getTime(),
+  );
+  expect(Date.now() - intendedReceivedAt).toBeGreaterThanOrEqual(0);
+  expect(Date.now() - intendedReceivedAt).toBeLessThan(180_000);
+
+  await manualReceipt.getByLabel("Manual receipt reference").fill(reference);
+  await manualReceipt
+    .getByLabel("Manual receipt gross amount in cents")
+    .fill("9007199254740993");
+  await manualReceipt.getByLabel("Manual receipt fee in cents").fill("0");
+  await expect(manualReceipt.getByTestId("manual-receipt-impact")).toContainText(
+    "gross $90,071,992,547,409.93",
+  );
+  await manualReceipt.getByLabel("Manual receipt gross amount in cents").fill("10000");
+  await manualReceipt.getByLabel("Manual receipt fee in cents").fill("350");
+  await manualReceipt
+    .getByLabel("Manual receipt reason")
+    .fill("Synthetic browser billing staff independently confirmed the offline receipt");
+  await expect(manualReceipt.getByTestId("manual-receipt-impact")).toContainText(
+    "gross $100.00 · fee $3.50 · net cash $96.50 · unclaimed liability $100.00",
+  );
+
+  const recordButton = manualReceipt.getByRole("button", { name: "Record manual receipt" });
+  await expect(recordButton).toBeDisabled();
+  const passwordInput = admin.getByPlaceholder("Re-enter password (15-minute fixed window)");
+  await passwordInput.fill(staffPassword);
+  await expect(recordButton).toBeEnabled();
+
+  const manualReceiptPattern = "**/api/v1/admin/client-accounts/*/manual-receipts";
+  let committedReceivedAt = "";
+  const loseFirstResponse = async (route: Route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    const responseBody = (await response.json()) as { receivedAt: string };
+    expect(response.status(), JSON.stringify(responseBody)).toBe(201);
+    committedReceivedAt = responseBody.receivedAt;
+    await route.abort("connectionfailed");
+  };
+  await page.route(manualReceiptPattern, loseFirstResponse);
+  await recordButton.click();
+  await expect(passwordInput).toHaveValue("");
+  await expect(manualReceipt.getByLabel("Manual receipt reference")).toHaveValue(reference);
+  await expect(recordButton).toBeDisabled();
+  expect(Date.parse(committedReceivedAt)).toBe(intendedReceivedAt);
+  await page.unroute(manualReceiptPattern, loseFirstResponse);
+
+  await passwordInput.fill(staffPassword);
+  const replayResponsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      response.url().includes(`/client-accounts/${targetClientAccountId}/manual-receipts`),
+  );
+  await expect(recordButton).toBeEnabled();
+  await recordButton.click();
+  const replayResponse = await replayResponsePromise;
+  const replayBody = (await replayResponse.json()) as {
+    replayed: boolean;
+    receivedAt: string;
+  };
+  expect(replayResponse.status(), JSON.stringify(replayBody)).toBe(200);
+  expect(replayBody.replayed).toBe(true);
+  expect(replayBody.receivedAt).toBe(committedReceivedAt);
+  await expect(
+    page.getByText(
+      "This exact manual receipt was already recorded; no second cash or liability entry was created.",
+    ),
+  ).toBeVisible();
+  await expect(passwordInput).toHaveValue("");
+
+  const outcome = manualReceipt.getByTestId("manual-receipt-outcome");
+  await expect(outcome).toContainText(`${reference} · $100.00 · replayed safely`);
+  await expect(outcome).toContainText("Fee $3.50 · net cash $96.50 · disposition unclaimed");
+  await expect(outcome).toContainText(`${targetName} · ${targetClientAccountId}`);
+  await expect(outcome).toContainText(
+    "No Provider or automatic customer balance/service action was used.",
+  );
+  const history = manualReceipt
+    .getByTestId("manual-receipt-history-item")
+    .filter({ hasText: reference });
+  await expect(history).toHaveCount(1);
+  await expect(history).toContainText("available $100.00");
+  await expect(history).toHaveAttribute("data-received-at", committedReceivedAt);
+
+  const unclaimed = admin.getByTestId("unclaimed-fund-item").filter({ hasText: reference });
+  await expect(unclaimed).toHaveCount(1);
+  await expect(unclaimed).toHaveAttribute("data-source", "manual");
+  await expect(unclaimed).toContainText("Received $100.00 via manual receipt");
+  await expect(unclaimed.getByTestId("manual-receipt-no-provider-return")).toContainText(
+    "No Provider refund target",
+  );
+  await expect(unclaimed.getByTestId("return-unclaimed-funds")).toHaveCount(0);
+
+  await page.reload();
+  const persisted = page
+    .locator("section.admin-panel")
+    .getByTestId("unclaimed-fund-item")
+    .filter({ hasText: reference });
+  await expect(persisted).toHaveCount(1);
+  await expect(persisted).toHaveAttribute("data-source", "manual");
 });
 
 test("staff records a manual refund decision and reloads its history", async ({ page }) => {
