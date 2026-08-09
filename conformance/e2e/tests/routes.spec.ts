@@ -348,6 +348,75 @@ test("public Home stays session-neutral for a signed-in wildcard Staff account",
   );
 });
 
+test("reopening the current customer route keeps the resolved session", async ({ page }) => {
+  const email = "same-route-customer@example.invalid";
+  await installMockApi(page, mockViewer({ email }));
+
+  await page.goto("/customer");
+  await expect(page.getByRole("heading", { name: email, exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  await expect(page.getByRole("heading", { name: email, exact: true })).toBeVisible();
+  await expect(page.getByText("Checking session", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Checking the current session…", { exact: true })).toHaveCount(0);
+});
+
+test("reopening the current Admin route keeps the resolved Staff session", async ({ page }) => {
+  const email = "same-route-staff@example.invalid";
+  await installMockApi(
+    page,
+    mockViewer({ email, permissions: ["support.tickets.manage"] }),
+  );
+
+  await page.goto("/admin");
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toBeVisible();
+  await page.getByRole("link", { name: "Admin", exact: true }).click();
+  await expect(page.getByText(email, { exact: true })).toBeVisible();
+  await expect(page.getByText("Checking session", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Checking Staff access…" })).toHaveCount(0);
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toBeVisible();
+});
+
+test("same-route query popstate keeps the resolved workspace session", async ({ page }) => {
+  const email = "query-history-customer@example.invalid";
+  await installMockApi(page, mockViewer({ email }));
+
+  await page.goto("/customer");
+  await expect(page.getByRole("heading", { name: email, exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    window.history.pushState({}, "", "/customer?view=first");
+    window.history.pushState({}, "", "/customer?view=second");
+  });
+  await page.goBack();
+  await expect(page).toHaveURL(/\/customer\?view=first$/);
+  await expect(page.getByRole("heading", { name: email, exact: true })).toBeVisible();
+  await expect(page.getByText("Checking session", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Checking the current session…", { exact: true })).toHaveCount(0);
+});
+
+test("catalog query 401 stays on public Home without a hard-reload loop", async ({ page }) => {
+  await installMockApi(page, null, {
+    unauthorizedPath: "/api/v1/catalog",
+    unauthorizedError: "Synthetic catalog unavailable",
+  });
+  const documents: string[] = [];
+  const catalogRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.resourceType() === "document") documents.push(url.pathname);
+    if (url.pathname === "/api/v1/catalog") catalogRequests.push(url.toString());
+  });
+
+  await page.goto("/");
+  await expect(page.locator(".notice.error")).toContainText("Synthetic catalog unavailable");
+  await page.waitForTimeout(250);
+  expect(documents).toEqual(["/"]);
+  expect(catalogRequests.length).toBeGreaterThan(0);
+  expect(
+    catalogRequests.every((url) => new URL(url).searchParams.get("locale") === "en"),
+  ).toBe(true);
+  await expect(page).toHaveURL(/\/$/);
+});
+
 test("restricted wildcard Staff mounts no Admin capability or Admin fetch", async ({ page }) => {
   const requests = await installMockApi(
     page,
@@ -659,6 +728,98 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
   expect(requests.filter((path) => path === "/api/v1/admin/tickets").length).toBe(
     staffListFetchesBeforeRelease,
   );
+});
+
+test("delayed manual outflow completion does not refresh Admin history after leaving Admin", async ({
+  page,
+}) => {
+  let releaseResponse!: () => void;
+  let markRequestStarted!: () => void;
+  let markResponseFulfilled!: () => void;
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  const requestStarted = new Promise<void>((resolve) => { markRequestStarted = resolve; });
+  const responseFulfilled = new Promise<void>((resolve) => { markResponseFulfilled = resolve; });
+  const clientAccountId = "00000000-0000-4000-8000-0000000000aa";
+  const manualReceiptId = "00000000-0000-4000-8000-0000000000bb";
+  const historyPath = `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`;
+  const outflowPath = `${historyPath}/${manualReceiptId}/outflow-reports`;
+  let historyReads = 0;
+  const receipt = {
+    manualReceiptId,
+    fundReceiptId: "00000000-0000-4000-8000-0000000000cc",
+    reference: "SYNTHETIC-MANUAL-RECEIPT",
+    receivedAt: "2026-01-01T00:00:00.000Z",
+    grossAmountMinor: "10000",
+    feeMinor: "0",
+    netAmountMinor: "10000",
+    allocatedMinor: "0",
+    availableMinor: "10000",
+    capacityFrozen: false,
+    currency: "USD",
+    disposition: "unclaimed",
+    originalSourceOutflow: {
+      sourceContext: "unclaimed_funds",
+      sourceAmountMinor: "10000",
+      confirmedOutflowMinor: "0",
+      availableMinor: "10000",
+      capacityFrozen: false,
+      reports: [],
+    },
+    reversal: null,
+    actorId: "00000000-0000-4000-8000-0000000000dd",
+    reason: "Synthetic receipt fixture",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  await installMockApi(
+    page,
+    mockViewer({ email: "delayed-outflow-staff@example.invalid", permissions: ["*"] }),
+    {
+      intercept: async (path, route) => {
+        if (path === historyPath && route.request().method() === "GET") {
+          historyReads += 1;
+          await route.fulfill({
+            json: {
+              clientAccount: { id: clientAccountId, name: "Synthetic outflow target" },
+              items: [receipt],
+            },
+          });
+          return true;
+        }
+        if (path === outflowPath && route.request().method() === "POST") {
+          markRequestStarted();
+          await responseGate;
+          await route.fulfill({ json: { status: "confirmed", replayed: false } });
+          markResponseFulfilled();
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  await page.getByLabel("Manual receipt Client Account ID").fill(clientAccountId);
+  await page.getByRole("button", { name: "Verify account & load history" }).click();
+  await expect(page.getByTestId("manual-receipt-history-item")).toBeVisible();
+  await page.getByPlaceholder("Re-enter password (15-minute fixed window)").fill(
+    "Synthetic-Admin-Password!",
+  );
+  await page.getByRole("button", { name: "Report original-source outflow" }).click();
+  await page.getByLabel("Original-source destination reference").fill("SYNTHETIC-RETURN");
+  await page.getByLabel("Original-source outflow reason").fill(
+    "Synthetic evidence confirms this exact return",
+  );
+  await page.getByRole("button", { name: "Record outflow report" }).click();
+  await requestStarted;
+  const historyReadsBeforeLeaving = historyReads;
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseResponse();
+  await responseFulfilled;
+  await page.waitForTimeout(100);
+  expect(historyReads).toBe(historyReadsBeforeLeaving);
+  await expect(page.getByTestId("manual-receipt-history")).toHaveCount(0);
+  await expect(page.locator(".notice")).toHaveCount(0);
 });
 
 test("History navigation clears selected checkout, reauth grant, passwords and Admin drafts", async ({

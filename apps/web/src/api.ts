@@ -20,17 +20,19 @@ export function hardResetSession(): void {
 }
 
 function isProtectedApiPath(path: string): boolean {
+  const pathname = new URL(path, window.location.origin).pathname;
   return (
-    path.startsWith("/api/v1/") &&
-    !path.startsWith("/api/v1/auth/") &&
-    path !== "/api/v1/catalog" &&
-    !path.startsWith("/api/v1/legal/")
+    pathname.startsWith("/api/v1/") &&
+    !pathname.startsWith("/api/v1/auth/") &&
+    pathname !== "/api/v1/catalog" &&
+    !pathname.startsWith("/api/v1/legal/")
   );
 }
 
 function reauthenticationMeansSessionExpired(path: string, status: number, message?: string): boolean {
+  const pathname = new URL(path, window.location.origin).pathname;
   return (
-    path === "/api/v1/auth/reauth" &&
+    pathname === "/api/v1/auth/reauth" &&
     status === 401 &&
     (message === "Session is invalid or expired" || message === "Authentication required")
   );

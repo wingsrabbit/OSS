@@ -1015,10 +1015,11 @@ export function App() {
   }, []);
 
   const openRoute = useCallback((target: AppRoute, replace = false) => {
+    const routeChanged = activeRouteRef.current !== target;
     routeGenerationRef.current += 1;
     activeRouteRef.current = target;
     clearWorkspaceTransientState();
-    if (target !== "/") setSessionResolved(false);
+    if (target !== "/" && routeChanged) setSessionResolved(false);
     if (replace) {
       window.history.replaceState({}, "", target);
     } else if (window.location.pathname !== target || window.location.search.length > 0) {
@@ -1078,10 +1079,11 @@ export function App() {
   useEffect(() => {
     const onPopState = () => {
       const target = routeFromPath(window.location.pathname);
+      const routeChanged = activeRouteRef.current !== target;
       routeGenerationRef.current += 1;
       activeRouteRef.current = target;
       clearWorkspaceTransientState();
-      if (target !== "/") setSessionResolved(false);
+      if (target !== "/" && routeChanged) setSessionResolved(false);
       setRoute(target);
       window.scrollTo({ top: 0, behavior: "auto" });
     };
@@ -2231,7 +2233,11 @@ export function App() {
     clientAccount: { id: string; name: string };
     items: ManualReceiptItem[];
   }> {
-    if (!canUseFullAdminRoute) {
+    if (
+      !canUseFullAdminRoute ||
+      activeRouteRef.current !== "/admin" ||
+      routeGenerationRef.current !== renderRouteGeneration
+    ) {
       throw new Error("Full administrator permission is required");
     }
     return api<{
