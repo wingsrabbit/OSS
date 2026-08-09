@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 export const LAB_WARNING = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+const SPA_PATHS = Object.freeze(["/", "/customer", "/admin"]);
 
 export function assertLoopbackBaseUrl(value) {
   const url = new URL(value);
@@ -106,23 +107,73 @@ async function administratorSession({
   return { session, password: administratorAccount.password };
 }
 
-async function runManualReceiptOutflowSmoke({
-  baseUrl,
+async function runSupportTicketSmoke({
   customerSession,
-  customerIdentity,
-  customerIsAdministrator,
-  administratorAccount,
+  administrator,
+  clientAccountId,
+  serviceId,
+}) {
+  const marker = randomUUID();
+  const subject = `Synthetic active-service ticket ${marker}`;
+  const openingMessage =
+    "Synthetic Demo customer asks Staff to confirm the linked active service.";
+  const internalNoteBody =
+    "Synthetic Demo internal note: active service linkage reviewed; customer must not see this note.";
+
+  const created = await customerSession.request(
+    "/api/v1/tickets",
+    {
+      method: "POST",
+      body: JSON.stringify({ subject, message: openingMessage, serviceId }),
+    },
+    201,
+  );
+  assert.equal(created.ticket.subject, subject);
+  assert.equal(created.ticket.service?.id, serviceId, "Synthetic ticket is not linked to the Active service");
+
+  const staffView = await administrator.session.request(
+    `/api/v1/admin/tickets/${created.ticket.id}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify({ kind: "internal_note", message: internalNoteBody }),
+    },
+    201,
+  );
+  assert.equal(staffView.ticket.clientAccount.id, clientAccountId);
+  assert.equal(staffView.ticket.service?.id, serviceId);
+  const internalNote = staffView.messages.find(
+    (message) => message.visibility === "internal" && message.body === internalNoteBody,
+  );
+  assert.ok(internalNote, "Synthetic Staff internal note is missing from the Staff ticket view");
+
+  const customerView = await customerSession.request(`/api/v1/tickets/${created.ticket.id}`);
+  assert.equal(customerView.ticket.service?.id, serviceId);
+  assert.equal(
+    customerView.messages.some((message) => message.id === internalNote.id),
+    false,
+    "Staff internal note leaked into the customer ticket view",
+  );
+  assert.equal(
+    customerView.messages.some((message) => message.body === internalNoteBody),
+    false,
+    "Staff internal note body leaked into the customer ticket view",
+  );
+
+  return {
+    ticketId: created.ticket.id,
+    internalNoteId: internalNote.id,
+    clientAccountId,
+    serviceId,
+    subject,
+    status: customerView.ticket.status,
+    internalNoteCustomerVisible: false,
+  };
+}
+
+async function runManualReceiptOutflowSmoke({
+  administrator,
   clientAccountId,
 }) {
-  const administrator = await administratorSession({
-    baseUrl,
-    customerSession,
-    customerIdentity,
-    customerIsAdministrator,
-    administratorAccount,
-  });
-  if (!administrator) return null;
-
   await administrator.session.request("/api/v1/auth/reauth", {
     method: "POST",
     body: JSON.stringify({ password: administrator.password }),
@@ -215,19 +266,34 @@ export async function runDemoSmoke({
   await waitFor(
     "Web and API readiness",
     async () => {
-      const [page, readiness] = await Promise.all([
-        fetch(new URL("/", parsedBaseUrl), { signal: AbortSignal.timeout(5_000) }),
+      const [pages, readiness] = await Promise.all([
+        Promise.all(
+          SPA_PATHS.map(async (path) => {
+            const response = await fetch(new URL(path, parsedBaseUrl), {
+              headers: { Accept: "text/html" },
+              signal: AbortSignal.timeout(5_000),
+            });
+            const pageText = await response.text();
+            return {
+              path,
+              status: response.status,
+              contentType: response.headers.get("content-type") ?? "",
+              spaHtml: pageText.includes("OpenSales System Laboratory"),
+            };
+          }),
+        ),
         fetch(new URL("/health/ready", parsedBaseUrl), { signal: AbortSignal.timeout(5_000) }),
       ]);
       return {
-        page: page.status,
-        pageText: await page.text(),
+        pages,
         readiness: readiness.status,
       };
     },
     (value) =>
-      value.page === 200 &&
-      value.pageText.includes("OpenSales System Laboratory") &&
+      value.pages.every(
+        (page) =>
+          page.status === 200 && page.contentType.includes("text/html") && page.spaHtml,
+      ) &&
       value.readiness === 200,
     timeoutMs,
   );
@@ -345,24 +411,42 @@ export async function runDemoSmoke({
   );
   assert.ok(activeOrder.service.activatedAt, "Active service has no Ready-for-Service time");
 
-  const manualReceiptOutflow = await runManualReceiptOutflowSmoke({
+  const administratorAccess = await administratorSession({
     baseUrl: parsedBaseUrl,
     customerSession: session,
     customerIdentity: identity,
     customerIsAdministrator: administrator,
     administratorAccount,
+  });
+  assert.ok(
+    administratorAccess,
+    "A stored synthetic administrator credential is required for the Demo Staff journeys",
+  );
+
+  const supportTicket = await runSupportTicketSmoke({
+    customerSession: session,
+    administrator: administratorAccess,
+    clientAccountId: registration.clientAccountId,
+    serviceId: activeOrder.service.id,
+  });
+
+  const manualReceiptOutflow = await runManualReceiptOutflowSmoke({
+    administrator: administratorAccess,
     clientAccountId: registration.clientAccountId,
   });
+
+  const publicUrl = new URL("/", parsedBaseUrl).toString();
+  const customerUrl = new URL("/customer", parsedBaseUrl).toString();
+  const adminUrl = new URL("/admin", parsedBaseUrl).toString();
 
   return {
     warning: LAB_WARNING,
     startedAt,
     completedAt: new Date().toISOString(),
     baseUrl: parsedBaseUrl.toString().replace(/\/$/, ""),
-    loginPath: "/",
-    administratorPanelPath: manualReceiptOutflow
-      ? "/ (sign in with the printed administrator; panels appear below)"
-      : null,
+    urls: { public: publicUrl, customer: customerUrl, admin: adminUrl },
+    loginPath: "/customer",
+    administratorPanelPath: "/admin",
     syntheticAccount: {
       ...identity,
       userId: registration.userId,
@@ -380,6 +464,7 @@ export async function runDemoSmoke({
       serviceStatus: activeOrder.service.status,
       readyForServiceAt: activeOrder.service.activatedAt,
     },
+    supportTicket,
     manualReceiptOutflow,
   };
 }

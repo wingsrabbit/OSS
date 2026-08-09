@@ -81,16 +81,21 @@ With PostgreSQL 18, the frozen workspace dependencies, and Node 24.18.0
 available locally, one command builds the applications, initializes an isolated
 PostgreSQL cluster under `.demo/local`, starts API/Worker/Web plus all four Mock
 Provider processes on loopback, creates synthetic accounts, and proves the
-Stage A happy path through an Active service plus one Provider-free manual
+Stage A happy path through an Active service, a service-linked support ticket
+whose Staff internal note stays customer-hidden, plus one Provider-free manual
 receipt/original-source outflow:
 
 ```bash
 node tools/demo-local.mjs up
 ```
 
-The command prints `http://127.0.0.1:5173/`, a generated `.example.invalid`
-login, generated password, Client Account IDs, administrator login, repository
-revision, and exact smoke IDs. Stop it without deleting the synthetic data:
+The command prints the public `http://127.0.0.1:5173/`, customer
+`http://127.0.0.1:5173/customer`, and Staff
+`http://127.0.0.1:5173/admin` URLs, generated `.example.invalid` customer and
+administrator logins, Client Account IDs, repository revision, and exact
+order, service, ticket, internal-note, receipt, and outflow IDs. Use those
+printed `127.0.0.1` URLs consistently rather than substituting `localhost`.
+Stop the stack without deleting the synthetic data:
 
 ```bash
 node tools/demo-local.mjs down

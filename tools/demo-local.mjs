@@ -54,6 +54,22 @@ const defaultPorts = Object.freeze({
   mailbox: 4_104,
 });
 
+function demoUrls(config) {
+  const baseUrl = `http://127.0.0.1:${config.ports.web}`;
+  return {
+    public: `${baseUrl}/`,
+    customer: `${baseUrl}/customer`,
+    admin: `${baseUrl}/admin`,
+  };
+}
+
+function printDemoUrls(config) {
+  const urls = demoUrls(config);
+  console.log(`Public URL: ${urls.public}`);
+  console.log(`Customer URL: ${urls.customer}`);
+  console.log(`Admin URL: ${urls.admin}`);
+}
+
 function secureToken(bytes = 32) {
   return randomBytes(bytes).toString("base64url");
 }
@@ -367,7 +383,169 @@ function postgresIsRunning(pgBin) {
   return result.status === 0;
 }
 
-function startPostgres(config, pgBin) {
+function postmasterPid() {
+  const pidFile = join(postgresData, "postmaster.pid");
+  if (!existsSync(pidFile)) return null;
+  const value = Number.parseInt(readFileSync(pidFile, "utf8").split("\n", 1)[0] ?? "", 10);
+  return Number.isInteger(value) && value > 1 ? value : null;
+}
+
+function processCommand(pid) {
+  const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  const command = (result.stdout ?? "").trim();
+  if (result.status === 1 && command.length === 0) return null;
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `Unable to inspect tracked Demo PostgreSQL PID ${pid}${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return command || null;
+}
+
+function commandHasArgument(command, flag, value) {
+  const fragment = `${flag} ${value}`;
+  return command.includes(` ${fragment} `) || command.endsWith(` ${fragment}`);
+}
+
+function commandTargetsDemoPostgres(command, config) {
+  const executable = command.split(" ", 1)[0] ?? "";
+  return (
+    executable.endsWith("/postgres") &&
+    commandHasArgument(command, "-D", postgresData) &&
+    commandHasArgument(command, "-h", "127.0.0.1") &&
+    commandHasArgument(command, "-p", String(config.ports.postgres)) &&
+    commandHasArgument(command, "-k", postgresSocket)
+  );
+}
+
+function processListensOnDemoPostgresPort(pid, config) {
+  const endpoint = `127.0.0.1:${config.ports.postgres}`;
+  const result = spawnSync(
+    "lsof",
+    [
+      "-nP",
+      "-a",
+      "-p",
+      String(pid),
+      `-iTCP@${endpoint}`,
+      "-sTCP:LISTEN",
+      "-F",
+      "pcn",
+    ],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (result.status === 1 && !(result.stdout ?? "").trim()) return false;
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `Unable to inspect tracked Demo PostgreSQL listener${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  const fields = (result.stdout ?? "").trim().split("\n");
+  return (
+    fields.includes(`p${pid}`) &&
+    fields.includes("cpostgres") &&
+    fields.includes(`n${endpoint}`)
+  );
+}
+
+function recordPostgresProcess(config, currentState) {
+  const pid = postmasterPid();
+  if (!pid) throw new Error("Demo PostgreSQL started without a valid postmaster PID");
+  const argv = processCommand(pid);
+  if (!argv || !commandTargetsDemoPostgres(argv, config)) {
+    throw new Error("Demo PostgreSQL process arguments do not match the configured data directory");
+  }
+  if (!processListensOnDemoPostgresPort(pid, config)) {
+    throw new Error("Demo PostgreSQL process is not listening on its configured loopback port");
+  }
+  currentState.postgresProcess = {
+    pid,
+    argv,
+    dataDir: postgresData,
+    host: "127.0.0.1",
+    port: config.ports.postgres,
+    socketDir: postgresSocket,
+  };
+  saveState(currentState);
+}
+
+function inspectTrackedPostgres(config, currentState) {
+  const tracked = currentState.postgresProcess;
+  if (!tracked) return { tracked: null, running: false };
+  if (
+    !Number.isInteger(tracked.pid) ||
+    tracked.pid <= 1 ||
+    tracked.dataDir !== postgresData ||
+    tracked.host !== "127.0.0.1" ||
+    tracked.port !== config.ports.postgres ||
+    tracked.socketDir !== postgresSocket ||
+    typeof tracked.argv !== "string"
+  ) {
+    throw new Error(
+      "Refusing to stop an unverified PostgreSQL process: stored Demo process identity does not match this runtime",
+    );
+  }
+  const pidFromFile = postmasterPid();
+  if (pidFromFile !== null && pidFromFile !== tracked.pid) {
+    throw new Error(
+      "Refusing to stop an unverified PostgreSQL process: postmaster PID differs from the stored Demo PID",
+    );
+  }
+  const argv = processCommand(tracked.pid);
+  if (argv === null) return { tracked, running: false };
+  if (argv !== tracked.argv || !commandTargetsDemoPostgres(argv, config)) {
+    throw new Error(
+      "Refusing to stop an unverified PostgreSQL process: current argv does not exactly match the stored Demo process",
+    );
+  }
+  if (!processListensOnDemoPostgresPort(tracked.pid, config)) {
+    throw new Error(
+      "Refusing to stop an unverified PostgreSQL process: the stored PID is not listening on the Demo PostgreSQL port",
+    );
+  }
+  return { tracked, running: true };
+}
+
+async function stopTrackedPostgresOrphan(config, currentState) {
+  const inspected = inspectTrackedPostgres(config, currentState);
+  if (!inspected.tracked) return false;
+  if (!inspected.running) {
+    delete currentState.postgresProcess;
+    saveState(currentState);
+    return false;
+  }
+  console.log(
+    `Stopping verified orphaned Demo PostgreSQL process (pid ${inspected.tracked.pid})...`,
+  );
+  process.kill(inspected.tracked.pid, "SIGINT");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const argv = processCommand(inspected.tracked.pid);
+    if (argv === null) break;
+    if (argv !== inspected.tracked.argv) {
+      throw new Error(
+        "Tracked Demo PostgreSQL PID changed identity while waiting for shutdown; refusing further action",
+      );
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  if (processCommand(inspected.tracked.pid) !== null) {
+    throw new Error("Verified orphaned Demo PostgreSQL did not stop within 10 seconds");
+  }
+  if (processListensOnDemoPostgresPort(inspected.tracked.pid, config)) {
+    throw new Error("Verified orphaned Demo PostgreSQL stopped but its loopback listener remains");
+  }
+  delete currentState.postgresProcess;
+  saveState(currentState);
+  return true;
+}
+
+function startPostgres(config, pgBin, currentState) {
   ensureRuntimeDirectories();
   if (!existsSync(join(postgresData, "PG_VERSION"))) {
     console.log("Initializing an isolated synthetic PostgreSQL 18 cluster...");
@@ -383,7 +561,10 @@ function startPostgres(config, pgBin) {
       "--no-locale",
     ]);
   }
-  if (postgresIsRunning(pgBin)) return;
+  if (postgresIsRunning(pgBin)) {
+    recordPostgresProcess(config, currentState);
+    return;
+  }
   commandResult(join(pgBin, "pg_ctl"), [
     "-D",
     postgresData,
@@ -394,6 +575,7 @@ function startPostgres(config, pgBin) {
     "-w",
     "start",
   ]);
+  recordPostgresProcess(config, currentState);
 }
 
 function createDatabase(config, pgBin, database) {
@@ -553,7 +735,7 @@ function printResult(config, currentState, stackRunning = true) {
       : "\nOpenSales System local demo is stopped; latest verified synthetic result:",
   );
   console.log(LAB_WARNING);
-  console.log(`URL: http://127.0.0.1:${config.ports.web}/`);
+  printDemoUrls(config);
   console.log(`Code revision: ${currentState.runtimeRevision ?? "unknown"}`);
   if (result?.syntheticAccount) {
     console.log(`Latest synthetic customer login: ${result.syntheticAccount.email}`);
@@ -562,6 +744,15 @@ function printResult(config, currentState, stackRunning = true) {
     console.log(
       `Smoke: order ${result.journey.orderStatus}, invoice ${result.journey.invoiceStatus}, payment ${result.journey.paymentStatus}, service ${result.journey.serviceStatus}`,
     );
+  }
+  if (result?.supportTicket) {
+    console.log(`Synthetic support ticket ID: ${result.supportTicket.ticketId}`);
+    console.log(`Synthetic Staff internal note ID: ${result.supportTicket.internalNoteId}`);
+    console.log(
+      `Support smoke: service linked ${result.supportTicket.serviceId}, internal note customer visible ${result.supportTicket.internalNoteCustomerVisible}`,
+    );
+  } else {
+    console.log("Support smoke: unavailable in the latest stored result");
   }
   const administrator =
     currentState.administratorAccount ??
@@ -605,6 +796,15 @@ async function up() {
     processIsAlive(currentState.processes[name]),
   );
   let postgresRunning = postgresIsRunning(pgBin);
+  if (!postgresRunning && currentState.postgresProcess) {
+    await down();
+    currentState = state();
+    currentState.processes ??= {};
+    runningProcesses = processNames.filter((name) =>
+      processIsAlive(currentState.processes[name]),
+    );
+    postgresRunning = false;
+  }
   let stackAlreadyRunning =
     postgresRunning && runningProcesses.length === processNames.length;
   if (
@@ -634,14 +834,16 @@ async function up() {
     );
   } else {
     buildWorkspace(node);
-    startPostgres(config, pgBin);
+    startPostgres(config, pgBin, currentState);
     prepareDatabases(config, pgBin, node);
     bootstrapToken = createBootstrapToken(config, node, currentState);
     currentState.runtimeRevision = sourceRevision;
     saveState(currentState);
     await startProcesses(config, node, currentState);
   }
-  console.log("Running the synthetic customer plus manual receipt → confirmed original-source outflow smoke journeys...");
+  console.log(
+    "Running the synthetic customer, service-linked support ticket, and manual receipt → confirmed original-source outflow smoke journeys...",
+  );
   const result = await runDemoSmoke({
     baseUrl: `http://127.0.0.1:${config.ports.web}`,
     bootstrapToken,
@@ -714,13 +916,16 @@ async function down() {
   const pgBin = resolvePostgresBin();
   if (postgresIsRunning(pgBin)) {
     commandResult(join(pgBin, "pg_ctl"), ["-D", postgresData, "-m", "fast", "-w", "stop"]);
+    delete currentState.postgresProcess;
+  } else {
+    await stopTrackedPostgresOrphan(config, currentState);
   }
   currentState.processes = {};
   currentState.lastStoppedAt = new Date().toISOString();
   saveState(currentState);
   console.log(`Stopped the loopback Demo stack. Synthetic data remains in ${runtimeDir}.`);
   console.log(`Restart: node tools/demo-local.mjs up`);
-  console.log(`URL was http://127.0.0.1:${config.ports.web}/`);
+  printDemoUrls(config);
 }
 
 async function status() {
@@ -736,7 +941,6 @@ async function status() {
     processNames.every((name) => processIsAlive(currentState.processes?.[name]));
   const sourceRevision = repositoryRevision();
   console.log(LAB_WARNING);
-  console.log(`URL: http://127.0.0.1:${config.ports.web}/`);
   console.log(`Stack: ${stackRunning ? "running" : "stopped"}`);
   console.log(`Source revision: ${sourceRevision}`);
   console.log(`Runtime revision: ${currentState.runtimeRevision ?? "unknown"}`);
@@ -763,7 +967,7 @@ async function reset() {
 }
 
 function help() {
-  console.log(`${LAB_WARNING}\n\nUsage:\n  node tools/demo-local.mjs up       Build, start, seed, and smoke-test the local Demo\n  node tools/demo-local.mjs smoke    Create another synthetic paid/Active customer journey\n  node tools/demo-local.mjs status   Show loopback services and the latest synthetic login\n  node tools/demo-local.mjs down     Stop services and preserve synthetic Demo data\n  node tools/demo-local.mjs reset --yes\n                                     Stop and delete only .demo/local\n\nNo Docker, VPS, GitHub, real Provider, real credential, or real customer data is used.`);
+  console.log(`${LAB_WARNING}\n\nUsage:\n  node tools/demo-local.mjs up       Build, start, seed, and smoke-test the three-page local Demo\n  node tools/demo-local.mjs smoke    Create another synthetic paid/Active, ticket, and outflow journey\n  node tools/demo-local.mjs status   Show loopback services and the latest synthetic logins and IDs\n  node tools/demo-local.mjs down     Stop services and preserve synthetic Demo data\n  node tools/demo-local.mjs reset --yes\n                                     Stop and delete only .demo/local\n\nSurfaces:\n  http://127.0.0.1:5173/\n  http://127.0.0.1:5173/customer\n  http://127.0.0.1:5173/admin\n\nNo Docker, VPS, GitHub, real Provider, real credential, or real customer data is used.`);
 }
 
 const command = process.argv[2] ?? "up";

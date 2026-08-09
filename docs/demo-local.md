@@ -36,17 +36,32 @@ The command:
 4. starts the API, Worker, Vite Web app, and separate Mock payment,
    provisioning, mail, and mailbox processes on loopback;
 5. runs `register -> Mock Mail verification -> order -> Mock payment -> Mock
-   provisioning -> Ready for Service -> Active`, then uses the synthetic
-   administrator to record one manual receipt and one confirmed
-   `original_source` outflow without calling a Provider;
-6. writes the source revision, generated synthetic credentials, Client Account
-   IDs, and both journey IDs to
+   provisioning -> Ready for Service -> Active -> service-linked customer
+   ticket`; the synthetic administrator adds one internal note, and the
+   customer API view proves that note is not visible; the same administrator
+   then records one manual receipt and one confirmed `original_source` outflow
+   without calling a Provider;
+6. proves that `/`, `/customer`, and `/admin` each return the Vite SPA HTML,
+   then writes the source revision, generated synthetic credentials, Client
+   Account IDs, and exact order, service, ticket, internal-note, receipt, and
+   outflow IDs to
    `.demo/local/state.json` with mode `0600` and prints them in the terminal.
 
-Open [http://127.0.0.1:5173/](http://127.0.0.1:5173/) and sign in with the
-printed synthetic account. Customer and administrator views share `/`; when
-the printed account is the first administrator, the administrator panels
-appear below the customer view after sign-in.
+The launcher prints three product surfaces:
+
+| Surface | URL | Demo check |
+| --- | --- | --- |
+| Public | [http://127.0.0.1:5173/](http://127.0.0.1:5173/) | Public laboratory homepage and synthetic catalog |
+| Customer | [http://127.0.0.1:5173/customer](http://127.0.0.1:5173/customer) | Sign in with the latest synthetic customer; inspect the Active service and linked ticket |
+| Staff | [http://127.0.0.1:5173/admin](http://127.0.0.1:5173/admin) | Sign in with the synthetic administrator; inspect the internal note and confirmed manual outflow |
+
+Use the exact printed `127.0.0.1` host for every surface. Do not switch to
+`localhost`: browser cookies are host-scoped, and the Mock Mail verification
+link also uses the canonical `127.0.0.1` Demo URL. Use **Sign out** before
+switching between the printed customer and Staff identities. On the Staff
+page, paste the printed `Manual receipt target Client Account ID` into the
+manual-receipt form and choose **Verify account & load history** to display the
+stored confirmed `original_source` report.
 
 ## Repeat, inspect, and stop
 
@@ -56,9 +71,10 @@ node tools/demo-local.mjs smoke
 node tools/demo-local.mjs down
 ```
 
-`smoke` creates another fully synthetic paid/Active customer journey plus a
-manual receipt/original-source outflow journey. `down` stops only the recorded
-Demo processes and its isolated PostgreSQL cluster; it preserves `.demo/local`,
+`smoke` creates another fully synthetic paid/Active customer journey, linked
+ticket with a customer-hidden Staff internal note, and manual
+receipt/original-source outflow journey. `down` stops only the recorded Demo
+processes and its isolated PostgreSQL cluster; it preserves `.demo/local`,
 including the synthetic logins and database.
 
 ### Revision-aware upgrades
@@ -75,6 +91,13 @@ revision cannot migrate the preserved Demo database safely, startup fails
 closed so the migration can be fixed. `reset --yes` remains a separate,
 explicit option only for a deliberately disposable synthetic Demo runtime.
 
+The private state file also records the Demo PostgreSQL PID, exact process
+arguments, data directory, loopback host/port, and socket directory. If a stale
+process survives after its PostgreSQL PID file disappears, `up` or `down` stops
+it only when every stored field, the current full process arguments, and the
+actual listening endpoint still match. A missing or different identity fails
+closed instead of signaling an unrelated process.
+
 To explicitly delete only that generated Demo runtime:
 
 ```bash
@@ -85,7 +108,9 @@ node tools/demo-local.mjs reset --yes
 
 | Component | Local endpoint |
 | --- | --- |
-| Web | `http://127.0.0.1:5173/` |
+| Public Web | `http://127.0.0.1:5173/` |
+| Customer Web | `http://127.0.0.1:5173/customer` |
+| Staff Web | `http://127.0.0.1:5173/admin` |
 | API | `http://127.0.0.1:3000/` |
 | Mock Payment Provider | `http://127.0.0.1:4101/` |
 | Mock Provisioning Provider | `http://127.0.0.1:4102/` |
@@ -106,9 +131,10 @@ and database files are ignored by Git.
   separate loopback instances with separate payment/provisioning databases and
   a deliberately shared Mock mail database.
 - `conformance/e2e/tests/stage-a.spec.ts` remains the broad browser acceptance
-  suite. `tools/demo-smoke.mjs` is intentionally shorter: it proves the main
-  customer journey plus one Provider-free manual-receipt outflow and leaves the
-  stack running for a human Demo.
+  suite. `tools/demo-smoke.mjs` is intentionally shorter: it proves all three
+  SPA entry paths, the main customer journey, Staff-only ticket-note visibility,
+  and one Provider-free manual-receipt outflow, then leaves the stack running
+  for a human Demo.
 
 ## Limits
 
