@@ -1221,7 +1221,7 @@ try {
 
   process.stdout.write(
     `${JSON.stringify({
-      schema017Native: true,
+      schema018Native: true,
       manualReceiptRecorded: true,
       mistakenManualReceiptReversed: true,
       reversalRequiresBothPermissions: true,

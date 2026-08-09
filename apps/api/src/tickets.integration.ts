@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
+import { SCHEMA_017 } from "@opensales/core/schema-016-017-rollback-compatibility";
 import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
@@ -136,7 +137,50 @@ let app: Awaited<ReturnType<typeof buildApp>>["app"] | null = null;
 const ticketIds: string[] = [];
 const fixtures: Fixture[] = [];
 try {
+  await runMigrations(pool, { throughVersion: SCHEMA_017 });
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public.opensales_validate_manual_receipt_outflow_report()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'legacy schema 017 outflow report writer';
+    END
+    $$;
+    CREATE OR REPLACE FUNCTION public.opensales_validate_manual_receipt_outflow_reconciliation()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'legacy schema 017 outflow reconciliation writer';
+    END
+    $$;
+    CREATE OR REPLACE FUNCTION public.opensales_assert_manual_receipt_outflow_complete()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'legacy schema 017 outflow completeness writer';
+    END
+    $$;
+  `);
   await runMigrations(pool);
+  const repairedFunctions = await pool.query<{ definition: string }>(
+    `SELECT pg_catalog.pg_get_functiondef(procedure.oid) AS definition
+     FROM pg_catalog.pg_proc procedure
+     JOIN pg_catalog.pg_namespace namespace ON namespace.oid = procedure.pronamespace
+     WHERE namespace.nspname = 'public'
+       AND procedure.proname IN (
+         'opensales_validate_manual_receipt_outflow_report',
+         'opensales_validate_manual_receipt_outflow_reconciliation',
+         'opensales_assert_manual_receipt_outflow_complete'
+       )
+     ORDER BY procedure.proname COLLATE "C"`,
+  );
+  assert.equal(repairedFunctions.rowCount, 3);
+  assert.ok(
+    repairedFunctions.rows.every(
+      (row) =>
+        !row.definition.includes("legacy schema 017") &&
+        (row.definition.includes("INTO credit_row") ||
+          row.definition.includes("INTO effect_row")),
+    ),
+    "migration 018 must forward-repair every reviewed Schema 017 PG18 writer",
+  );
   const preflight = await assertSchemaCompatible(pool);
   assert.equal(preflight.installedSchemaVersion, "018_stage_c_support_tickets");
   assert.equal(preflight.mode, "native");
@@ -308,7 +352,7 @@ try {
   );
   assert.deepEqual(counts.rows[0], { public_count: "3", internal_count: "1" });
   process.stdout.write(
-    "ticketIntegration=passed native018=passed accountIsolation=passed internalVisibility=passed\n",
+    "ticketIntegration=passed native018=passed schema017ForwardRepair=passed accountIsolation=passed internalVisibility=passed\n",
   );
 } finally {
   if (app) await app.close().catch(() => undefined);

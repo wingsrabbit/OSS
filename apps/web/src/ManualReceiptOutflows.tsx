@@ -109,7 +109,7 @@ function localNow(): string {
   const instant = new Date();
   return new Date(instant.getTime() - instant.getTimezoneOffset() * 60_000)
     .toISOString()
-    .slice(0, 16);
+    .slice(0, 23);
 }
 
 function usd(minor: string): string {
@@ -341,6 +341,7 @@ export function ManualReceiptOutflowPanel({
               <input
                 aria-label="Original-source outflow occurred at"
                 type="datetime-local"
+                step="0.001"
                 disabled={disabled || pending}
                 value={reportDraft.occurredAt}
                 onChange={(event) =>
@@ -436,6 +437,7 @@ export function ManualReceiptOutflowPanel({
                     <input
                       aria-label="Reconciled outflow occurred at"
                       type="datetime-local"
+                      step="0.001"
                       disabled={disabled || pending}
                       value={reconciliationDraft.occurredAt}
                       onChange={(event) =>
