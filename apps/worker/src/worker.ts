@@ -20,7 +20,13 @@ import {
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
-import { attemptJobClaim, claimSchema016Job } from "./job-claim.js";
+import {
+  attemptJobClaim,
+  claimSchema016Job,
+  findSchema016GenericRecoveryCandidates,
+  isSchema016GenericRecoveryJobType,
+  lockSchema016StaleJob,
+} from "./job-claim.js";
 
 const config = z
   .object({
@@ -254,17 +260,11 @@ async function lockStaleJobWithClient(
   client: DatabaseClient,
   candidate: Job,
 ): Promise<Job | null> {
-  const result = await client.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
-     FROM durable_jobs
-     WHERE id = $1
-       AND status = 'running'
-       AND attempts = $2
-       AND locked_at < now() - make_interval(secs => $3)
-     FOR UPDATE`,
-    [candidate.id, candidate.attempts, config.JOB_LOCK_TIMEOUT_SECONDS],
+  return lockSchema016StaleJob<Job>(
+    client,
+    candidate,
+    config.JOB_LOCK_TIMEOUT_SECONDS,
   );
-  return result.rows[0] ?? null;
 }
 
 async function completeRecoveredJobWithClient(client: DatabaseClient, job: Job): Promise<void> {
@@ -292,12 +292,17 @@ async function manualRecoveredJobWithClient(
 }
 
 async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
+  if (!isSchema016GenericRecoveryJobType(candidate.job_type)) return false;
   const sideEffecting = ["payment.start", "add_funds.start", "provision.start"].includes(
     candidate.job_type,
   );
   if (!sideEffecting) {
     return transaction(async (client) => {
-      const job = await lockStaleJobWithClient(client, candidate);
+      const job = await lockSchema016StaleJob<Job>(
+        client,
+        candidate,
+        config.JOB_LOCK_TIMEOUT_SECONDS,
+      );
       if (!job) return false;
       const maxAttempts = job.job_type.endsWith(".reconcile")
         ? config.RECONCILE_MAX_ATTEMPTS
@@ -331,7 +336,11 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
   const operationId = candidate.payload.providerOperationId;
   if (!subjectId || !operationId) {
     return transaction(async (client) => {
-      const job = await lockStaleJobWithClient(client, candidate);
+      const job = await lockSchema016StaleJob<Job>(
+        client,
+        candidate,
+        config.JOB_LOCK_TIMEOUT_SECONDS,
+      );
       if (!job) return false;
       await manualRecoveredJobWithClient(
         client,
@@ -351,7 +360,11 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
        FOR UPDATE`,
       [operationId],
     );
-    const job = await lockStaleJobWithClient(client, candidate);
+    const job = await lockSchema016StaleJob<Job>(
+      client,
+      candidate,
+      config.JOB_LOCK_TIMEOUT_SECONDS,
+    );
     if (!job) return false;
     const operationRecord = operation.rows[0];
     if (!operationRecord) {
@@ -453,23 +466,12 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
 }
 
 async function recoverStaleJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
-     FROM durable_jobs
-     WHERE status = 'running'
-       AND locked_at < now() - make_interval(secs => $1)
-       AND job_type NOT IN (
-         'refund.start', 'refund.reconcile',
-         'service.suspend.start', 'service.suspend.reconcile',
-         'service.resume.start', 'service.resume.reconcile',
-         'service.cancellation.due', 'service.cancellation.reconcile'
-       )
-     ORDER BY locked_at, created_at
-     LIMIT 50`,
-    [config.JOB_LOCK_TIMEOUT_SECONDS],
+  const candidates = await findSchema016GenericRecoveryCandidates<Job>(
+    pool,
+    config.JOB_LOCK_TIMEOUT_SECONDS,
   );
   let recovered = 0;
-  for (const candidate of candidates.rows) {
+  for (const candidate of candidates) {
     if (await recoverOneStaleJob(candidate)) recovered += 1;
   }
   return recovered;
