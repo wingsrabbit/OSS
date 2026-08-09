@@ -144,6 +144,7 @@ jobs:
           const client = new pg.Client({ connectionString: process.env.ADMIN_DATABASE_URL });
           await client.connect();
           await client.query('CREATE DATABASE payment_token_rotation');
+          await client.query('CREATE DATABASE manual_receipts');
           await client.query('CREATE DATABASE schema_rollback');
           await client.query('CREATE DATABASE schema_015_016_rollback');
           await client.end();"
@@ -157,6 +158,11 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/payment_token_rotation
         run: pnpm --filter @opensales/api test:integration:payment-method-token-rotation
+
+      - name: Run manual receipt PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/manual_receipts
+        run: pnpm --filter @opensales/api test:integration:manual-receipts
 
       - name: Prepare schema 014 rollback database
         shell: bash
