@@ -134,7 +134,27 @@ test("role-schema and public built-in shadows cannot spoof schema 017", async ()
 test("known pending job claims have the pinned selective index path", async () => {
   const client = await pool.connect();
   try {
-    await client.query("BEGIN READ ONLY");
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.durable_jobs(
+         id, job_type, unique_key, payload, status, available_at, created_at
+       )
+       SELECT pg_catalog.gen_random_uuid(), 'future.unknown',
+              'schema-017-index-unknown-' || series::text,
+              '{}'::jsonb, 'pending',
+              pg_catalog.now() - interval '1 minute',
+              pg_catalog.now() - interval '1 minute'
+       FROM pg_catalog.generate_series(1, 4000) series`,
+    );
+    await client.query(
+      `INSERT INTO public.durable_jobs(
+         job_type, unique_key, payload, status, available_at, created_at
+       ) VALUES (
+         'notification.send', 'schema-017-index-known', '{}', 'pending',
+         pg_catalog.now(), pg_catalog.now()
+       )`,
+    );
+    await client.query("ANALYZE public.durable_jobs");
     await client.query("SET LOCAL enable_seqscan = off");
     const explained = await client.query<{ "QUERY PLAN": unknown }>(
       `EXPLAIN (FORMAT JSON)
