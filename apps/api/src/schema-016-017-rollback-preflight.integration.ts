@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   assertSchema016RollbackBridgeSafe,
@@ -58,24 +59,37 @@ test("explicit schema-016 bridge accepts exact native 016 before migration", asy
 });
 
 test("migration 017 rejects a pre-existing orphan outflow marker before DDL", async () => {
+  const client = await pool.connect();
   const markerId = randomUUID();
-  await pool.query(
-    `INSERT INTO public.ledger_journals(
-       id, source_type, source_id, currency, description
-     ) VALUES ($1, 'manual_receipt_outflow', $2, 'USD', 'synthetic pre-017 orphan')`,
-    [markerId, randomUUID()],
-  );
   try {
-    await assert.rejects(runMigrations(pool), /unsupported manual receipt outflow markers/);
+    const migration = await readFile(
+      new URL("../migrations/017_stage_b_manual_receipt_outflow_reports.sql", import.meta.url),
+      "utf8",
+    );
+    const preDdlGuard = migration.match(/DO \$\$[\s\S]*?\$\$;/)?.[0];
+    assert.ok(preDdlGuard, "migration 017 must start with its reviewed pre-DDL guard");
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.ledger_journals(
+         id, source_type, source_id, currency, description
+       ) VALUES ($1, 'manual_receipt_outflow', $2, 'USD', 'synthetic pre-017 orphan')`,
+      [markerId, randomUUID()],
+    );
+    await assert.rejects(client.query(preDdlGuard), /unsupported manual receipt outflow markers/);
+    await client.query("ROLLBACK");
     assert.equal(await currentVersion(), "016_stage_b_manual_receipts");
     assert.equal(
       (await pool.query("SELECT pg_catalog.to_regclass('public.manual_receipt_outflow_reports') AS relation")).rows[0]?.relation,
       null,
     );
+    const cleaned = await pool.query<{ count: string }>(
+      "SELECT pg_catalog.count(*)::text AS count FROM public.ledger_journals WHERE id = $1",
+      [markerId],
+    );
+    assert.equal(cleaned.rows[0]?.count, "0");
   } finally {
-    await pool.query("ALTER TABLE public.ledger_journals DISABLE TRIGGER ledger_journals_append_only");
-    await pool.query("DELETE FROM public.ledger_journals WHERE id = $1", [markerId]);
-    await pool.query("ALTER TABLE public.ledger_journals ENABLE TRIGGER ledger_journals_append_only");
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
   }
 });
 
