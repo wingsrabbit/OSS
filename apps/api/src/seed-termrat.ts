@@ -2,9 +2,7 @@
 
 import { loadConfig } from "./config.js";
 import {
-  bootstrapPaymentMethodTokenKeyrings,
   createPool,
-  runMigrations,
   transaction,
 } from "./database.js";
 
@@ -189,8 +187,6 @@ function cyclePrice(monthlyMinor: number, months: number): number {
 
 const config = loadConfig();
 const pool = createPool(config);
-await runMigrations(pool);
-await bootstrapPaymentMethodTokenKeyrings(pool, config);
 
 await transaction(pool, async (client) => {
   for (const [id, sortOrder, names] of groups) {
