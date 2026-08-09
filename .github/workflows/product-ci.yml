@@ -147,6 +147,7 @@ jobs:
           await client.query('CREATE DATABASE manual_receipts');
           await client.query('CREATE DATABASE schema_rollback');
           await client.query('CREATE DATABASE schema_015_016_rollback');
+          await client.query('CREATE DATABASE schema_016_017_rollback');
           await client.end();"
 
       - name: Run renewal lifecycle PostgreSQL journey
@@ -232,6 +233,40 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
         run: pnpm --filter @opensales/api test:integration:schema-015-016-rollback-preflight
+
+      - name: Prepare schema 016 rollback bridge database
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-6])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
+      - name: Run schema 016 to 017 rollback bridge PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+        run: pnpm --filter @opensales/api test:integration:schema-016-017-rollback-preflight
 
       - name: Apply forward migrations and synthetic configuration
         shell: bash

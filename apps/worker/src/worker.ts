@@ -14,9 +14,11 @@ import {
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
 import {
-  assertSchema016NativeSafe,
-  SCHEMA_016_APPLICATION_GUARD,
-} from "@opensales/core/schema-015-016-rollback-compatibility";
+  assertSchema016RollbackBridgeSafe,
+  assertSchema017NativeSafe,
+  SCHEMA_016_017_GUARD,
+  SCHEMA_017_APPLICATION_GUARD,
+} from "@opensales/core/schema-016-017-rollback-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -32,7 +34,9 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
-    OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "015-to-016"]).optional(),
+    OSS_SCHEMA_ROLLBACK_BRIDGE: z
+      .enum(["disabled", "016-to-017"])
+      .optional(),
     PAYMENT_METHOD_TOKEN_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     PAYMENT_METHOD_TOKEN_KEY_VERSION: z.coerce.number().int().positive().optional(),
     PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: z.string().optional(),
@@ -70,6 +74,10 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
+const schemaCompatibilityGuardName =
+  config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017"
+    ? SCHEMA_016_017_GUARD
+    : SCHEMA_017_APPLICATION_GUARD;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 
 async function releaseWorkerGuard(
@@ -105,7 +113,7 @@ async function cleanupWorkerResources(): Promise<void> {
   }
   if (schemaCompatibilityGuard) {
     releases.push(
-      releaseWorkerGuard(schemaCompatibilityGuard, SCHEMA_016_APPLICATION_GUARD),
+      releaseWorkerGuard(schemaCompatibilityGuard, schemaCompatibilityGuardName),
     );
     schemaCompatibilityGuard = null;
   }
@@ -7379,7 +7387,7 @@ try {
   await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
   await schemaCompatibilityGuard.query(
     "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
-    [SCHEMA_016_APPLICATION_GUARD],
+    [schemaCompatibilityGuardName],
   );
   await schemaCompatibilityGuard.query("RESET lock_timeout");
   try {
@@ -7387,11 +7395,17 @@ try {
       "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
     );
     await schemaCompatibilityGuard.query("SET LOCAL search_path TO pg_catalog, public");
-    await assertSchema016NativeSafe(
-      {
-        query: async (text, values) => schemaCompatibilityGuard!.query(text, values),
-      },
-    );
+    const queryable = {
+      query: async (text: string, values?: unknown[]) =>
+        schemaCompatibilityGuard!.query(text, values),
+    };
+    if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
+      await assertSchema016RollbackBridgeSafe(queryable, {
+        enable017RollbackBridge: true,
+      });
+    } else {
+      await assertSchema017NativeSafe(queryable);
+    }
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {
     await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);

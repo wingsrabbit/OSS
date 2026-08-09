@@ -1,0 +1,950 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+
+-- Schema 016 reserved manual_receipt_outflows but exposed no supported writer.
+-- Refuse to invent report, authorization, source, or reconciliation evidence for
+-- an unsupported row. An operator must inspect and repair forward explicitly.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM public.manual_receipt_outflows) THEN
+    RAISE EXCEPTION
+      'schema 017 cannot attest pre-existing unsupported manual receipt outflows; keep financial mutation stopped and repair forward';
+  END IF;
+END
+$$;
+
+-- Bridge Workers claim only job types they understand. Give that allowlist a
+-- selective pending queue path so older unrelated rows cannot force a scan.
+CREATE INDEX durable_jobs_pending_type_available_created_idx
+  ON public.durable_jobs(job_type, available_at, created_at)
+  WHERE status = 'pending';
+
+CREATE TABLE public.manual_receipt_outflow_reports(
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  manual_receipt_id uuid NOT NULL REFERENCES public.manual_receipt_facts(id),
+  fund_receipt_id uuid NOT NULL REFERENCES public.fund_receipts(id),
+  client_account_id uuid NOT NULL REFERENCES public.client_accounts(id),
+  source_context text NOT NULL CHECK (
+    source_context IN ('unclaimed_funds', 'allocated_invoice', 'converted_credit')
+  ),
+  fund_receipt_resolution_id uuid REFERENCES public.fund_receipt_resolutions(id),
+  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
+  currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  destination text NOT NULL CHECK (destination = 'original_source'),
+  destination_reference text NOT NULL CHECK (
+    pg_catalog.length(destination_reference) BETWEEN 1 AND 200
+  ),
+  observed_outcome text NOT NULL CHECK (observed_outcome IN ('confirmed', 'unknown')),
+  occurred_at timestamptz,
+  actor_id uuid NOT NULL REFERENCES public.users(id),
+  actor_session_id uuid NOT NULL REFERENCES public.sessions(id),
+  reauth_grant_id uuid NOT NULL REFERENCES public.reauth_grants(id),
+  reason text NOT NULL CHECK (pg_catalog.length(reason) BETWEEN 10 AND 1000),
+  idempotency_key text NOT NULL UNIQUE CHECK (
+    pg_catalog.length(idempotency_key) BETWEEN 8 AND 128
+  ),
+  request_fingerprint text NOT NULL,
+  result jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+  UNIQUE (manual_receipt_id, request_fingerprint),
+  UNIQUE (manual_receipt_id, destination_reference),
+  CHECK (
+    (source_context = 'unclaimed_funds' AND fund_receipt_resolution_id IS NULL)
+    OR
+    (source_context IN ('allocated_invoice', 'converted_credit')
+      AND fund_receipt_resolution_id IS NOT NULL)
+  ),
+  CHECK (
+    (observed_outcome = 'confirmed' AND occurred_at IS NOT NULL)
+    OR (observed_outcome = 'unknown' AND occurred_at IS NULL)
+  )
+);
+
+CREATE TABLE public.manual_receipt_outflow_reconciliations(
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  report_id uuid NOT NULL UNIQUE REFERENCES public.manual_receipt_outflow_reports(id),
+  outcome text NOT NULL CHECK (outcome IN ('confirm_outflow', 'confirm_no_outflow')),
+  occurred_at timestamptz,
+  actor_id uuid NOT NULL REFERENCES public.users(id),
+  actor_session_id uuid NOT NULL REFERENCES public.sessions(id),
+  reauth_grant_id uuid NOT NULL REFERENCES public.reauth_grants(id),
+  reason text NOT NULL CHECK (pg_catalog.length(reason) BETWEEN 10 AND 1000),
+  idempotency_key text NOT NULL UNIQUE CHECK (
+    pg_catalog.length(idempotency_key) BETWEEN 8 AND 128
+  ),
+  request_fingerprint text NOT NULL,
+  result jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+  CHECK (
+    (outcome = 'confirm_outflow' AND occurred_at IS NOT NULL)
+    OR (outcome = 'confirm_no_outflow' AND occurred_at IS NULL)
+  )
+);
+
+CREATE TABLE public.manual_receipt_invoice_allocation_reversals(
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  outflow_id uuid NOT NULL UNIQUE REFERENCES public.manual_receipt_outflows(id)
+    DEFERRABLE INITIALLY DEFERRED,
+  fund_receipt_resolution_id uuid NOT NULL
+    REFERENCES public.fund_receipt_resolutions(id),
+  fund_receipt_allocation_id uuid NOT NULL
+    REFERENCES public.fund_receipt_allocations(id),
+  invoice_id uuid NOT NULL REFERENCES public.invoices(id),
+  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
+  currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
+);
+
+ALTER TABLE public.manual_receipt_outflows
+  ADD COLUMN report_id uuid NOT NULL UNIQUE
+    REFERENCES public.manual_receipt_outflow_reports(id),
+  ADD COLUMN client_account_id uuid NOT NULL REFERENCES public.client_accounts(id),
+  ADD COLUMN source_context text NOT NULL CHECK (
+    source_context IN ('unclaimed_funds', 'allocated_invoice', 'converted_credit')
+  ),
+  ADD COLUMN fund_receipt_resolution_id uuid
+    REFERENCES public.fund_receipt_resolutions(id),
+  ADD COLUMN occurred_at timestamptz NOT NULL,
+  ADD COLUMN actor_session_id uuid NOT NULL REFERENCES public.sessions(id),
+  ADD COLUMN reauth_grant_id uuid NOT NULL REFERENCES public.reauth_grants(id),
+  ADD CONSTRAINT manual_receipt_outflows_source_context_check CHECK (
+    (source_context = 'unclaimed_funds' AND fund_receipt_resolution_id IS NULL)
+    OR
+    (source_context IN ('allocated_invoice', 'converted_credit')
+      AND fund_receipt_resolution_id IS NOT NULL)
+  ),
+  ADD CONSTRAINT manual_receipt_outflows_manual_fingerprint_key
+    UNIQUE (manual_receipt_id, request_fingerprint),
+  ADD CONSTRAINT manual_receipt_outflows_manual_destination_key
+    UNIQUE (manual_receipt_id, destination_reference);
+
+ALTER TABLE public.credit_transactions
+  DROP CONSTRAINT credit_transactions_kind_check;
+ALTER TABLE public.credit_transactions
+  ADD CONSTRAINT credit_transactions_kind_check CHECK (
+    kind IN (
+      'manual_adjustment',
+      'invoice_application',
+      'invoice_application_reversal',
+      'add_funds',
+      'unclaimed_funds',
+      'refund',
+      'chargeback',
+      'manual_receipt_outflow'
+    )
+  );
+
+CREATE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'manual receipt outflow reports and reconciliations are append-only';
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_reports_append_only
+  BEFORE UPDATE OR DELETE ON public.manual_receipt_outflow_reports
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
+CREATE TRIGGER manual_receipt_outflow_reconciliations_append_only
+  BEFORE UPDATE OR DELETE ON public.manual_receipt_outflow_reconciliations
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
+CREATE TRIGGER manual_receipt_invoice_allocation_reversals_append_only
+  BEFORE UPDATE OR DELETE ON public.manual_receipt_invoice_allocation_reversals
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
+
+CREATE FUNCTION public.opensales_schema_017_marker_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  row_data jsonb := pg_catalog.to_jsonb(NEW);
+DECLARE
+  old_row_data jsonb := CASE WHEN TG_OP = 'UPDATE'
+    THEN pg_catalog.to_jsonb(OLD) ELSE '{}'::jsonb END;
+DECLARE
+  is_schema_017_marker boolean := false;
+BEGIN
+  is_schema_017_marker :=
+    TG_TABLE_SCHEMA = 'public'
+    AND (
+      TG_TABLE_NAME IN (
+        'manual_receipt_outflow_reports',
+        'manual_receipt_outflow_reconciliations',
+        'manual_receipt_invoice_allocation_reversals',
+        'manual_receipt_outflows'
+      )
+      OR (TG_TABLE_NAME = 'ledger_journals'
+        AND (row_data->>'source_type' = 'manual_receipt_outflow'
+          OR old_row_data->>'source_type' = 'manual_receipt_outflow'))
+      OR (TG_TABLE_NAME = 'credit_transactions'
+        AND (row_data->>'kind' = 'manual_receipt_outflow'
+          OR row_data->>'source_type' = 'manual_receipt_outflow'
+          OR old_row_data->>'kind' = 'manual_receipt_outflow'
+          OR old_row_data->>'source_type' = 'manual_receipt_outflow'))
+      OR (TG_TABLE_NAME = 'provider_operations'
+        AND (row_data->>'subject_type' IN (
+            'manual_receipt_outflow_report', 'manual_receipt_outflow'
+          ) OR old_row_data->>'subject_type' IN (
+            'manual_receipt_outflow_report', 'manual_receipt_outflow'
+          )))
+      OR (TG_TABLE_NAME = 'durable_jobs'
+        AND ((row_data->>'job_type') LIKE 'manual_receipt_outflow.%'
+          OR row_data->'payload' ? 'manualReceiptOutflowReportId'
+          OR row_data->'payload' ? 'manualReceiptOutflowId'
+          OR (old_row_data->>'job_type') LIKE 'manual_receipt_outflow.%'
+          OR old_row_data->'payload' ? 'manualReceiptOutflowReportId'
+          OR old_row_data->'payload' ? 'manualReceiptOutflowId'))
+      OR (TG_TABLE_NAME = 'provider_inbox'
+        AND (row_data->'payload' ? 'manualReceiptOutflowReportId'
+          OR row_data->'payload' ? 'manualReceiptOutflowId'
+          OR old_row_data->'payload' ? 'manualReceiptOutflowReportId'
+          OR old_row_data->'payload' ? 'manualReceiptOutflowId'))
+      OR (TG_TABLE_NAME = 'outbox'
+        AND ((row_data->>'event_type') LIKE 'manual_receipt_outflow.%'
+          OR row_data->'payload' ? 'manualReceiptOutflowReportId'
+          OR row_data->'payload' ? 'manualReceiptOutflowId'
+          OR (old_row_data->>'event_type') LIKE 'manual_receipt_outflow.%'
+          OR old_row_data->'payload' ? 'manualReceiptOutflowReportId'
+          OR old_row_data->'payload' ? 'manualReceiptOutflowId'))
+    );
+  IF is_schema_017_marker THEN
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('opensales:schema-016-017-rollback-bridge', 0)
+    );
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER a_schema_017_outflow_report_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_outflow_reports
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_outflow_reconciliation_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_outflow_reconciliations
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_outflow_fact_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_outflows
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_ledger_marker_guard
+  BEFORE INSERT OR UPDATE ON public.ledger_journals
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_credit_marker_guard
+  BEFORE INSERT OR UPDATE ON public.credit_transactions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_provider_operation_marker_guard
+  BEFORE INSERT OR UPDATE ON public.provider_operations
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_job_marker_guard
+  BEFORE INSERT OR UPDATE ON public.durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_inbox_marker_guard
+  BEFORE INSERT OR UPDATE ON public.provider_inbox
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_outbox_marker_guard
+  BEFORE INSERT OR UPDATE ON public.outbox
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_invoice_allocation_reversal_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_invoice_allocation_reversals
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_authorization(
+  staff_user_id uuid,
+  staff_session_id uuid,
+  staff_reauth_grant_id uuid
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.users user_record
+    JOIN public.sessions session_record
+      ON session_record.id = staff_session_id
+     AND session_record.user_id = user_record.id
+     AND session_record.revoked_at IS NULL
+     AND session_record.expires_at > pg_catalog.now()
+    JOIN public.reauth_grants reauth
+      ON reauth.id = staff_reauth_grant_id
+     AND reauth.user_id = user_record.id
+     AND reauth.session_id = session_record.id
+     AND reauth.invalidated_at IS NULL
+     AND reauth.expires_at > pg_catalog.now()
+    JOIN public.staff_members staff
+      ON staff.user_id = user_record.id
+     AND staff.active
+    WHERE user_record.id = staff_user_id
+      AND user_record.email_verified_at IS NOT NULL
+      AND user_record.restricted_at IS NULL
+      AND (staff.permissions ? '*' OR staff.permissions ? 'billing.manual_receipt_manage')
+  )
+$$;
+
+CREATE VIEW public.manual_receipt_outflow_capacity AS
+WITH source_buckets AS (
+  SELECT
+    fact.id AS manual_receipt_id,
+    receipt.id AS fund_receipt_id,
+    fact.client_account_id,
+    'unclaimed_funds'::text AS source_context,
+    NULL::uuid AS fund_receipt_resolution_id,
+    receipt.currency,
+    pg_catalog.greatest(0, receipt.amount_minor - receipt.allocated_minor)::bigint
+      AS source_amount_minor
+  FROM public.manual_receipt_facts fact
+  JOIN public.fund_receipts receipt ON receipt.reported_manual_receipt_id = fact.id
+  UNION ALL
+  SELECT
+    fact.id,
+    receipt.id,
+    fact.client_account_id,
+    CASE resolution.action
+      WHEN 'allocate_invoice' THEN 'allocated_invoice'::text
+      ELSE 'converted_credit'::text
+    END,
+    resolution.id,
+    receipt.currency,
+    resolution.amount_minor
+  FROM public.manual_receipt_facts fact
+  JOIN public.fund_receipts receipt ON receipt.reported_manual_receipt_id = fact.id
+  JOIN public.fund_receipt_resolutions resolution ON resolution.fund_receipt_id = receipt.id
+), confirmed AS (
+  SELECT
+    outflow.manual_receipt_id,
+    outflow.fund_receipt_id,
+    outflow.source_context,
+    outflow.fund_receipt_resolution_id,
+    pg_catalog.sum(outflow.amount_minor)::bigint AS amount_minor
+  FROM public.manual_receipt_outflows outflow
+  GROUP BY
+    outflow.manual_receipt_id,
+    outflow.fund_receipt_id,
+    outflow.source_context,
+    outflow.fund_receipt_resolution_id
+), blocked AS (
+  SELECT
+    report.manual_receipt_id,
+    report.fund_receipt_id,
+    true AS present
+  FROM public.manual_receipt_outflow_reports report
+  WHERE report.observed_outcome = 'unknown'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.manual_receipt_outflow_reconciliations reconciliation
+      WHERE reconciliation.report_id = report.id
+    )
+  GROUP BY report.manual_receipt_id, report.fund_receipt_id
+)
+SELECT
+  source.manual_receipt_id,
+  source.fund_receipt_id,
+  source.client_account_id,
+  source.source_context,
+  source.fund_receipt_resolution_id,
+  source.currency,
+  source.source_amount_minor,
+  pg_catalog.coalesce(confirmed.amount_minor, 0)::bigint AS confirmed_outflow_minor,
+  (
+    pg_catalog.coalesce(blocked.present, false)
+    OR EXISTS (
+      SELECT 1
+      FROM public.manual_receipt_reversals reversal
+      WHERE reversal.manual_receipt_id = source.manual_receipt_id
+        AND reversal.fund_receipt_id = source.fund_receipt_id
+    )
+  ) AS capacity_frozen,
+  CASE
+    WHEN pg_catalog.coalesce(blocked.present, false)
+      OR EXISTS (
+        SELECT 1
+        FROM public.manual_receipt_reversals reversal
+        WHERE reversal.manual_receipt_id = source.manual_receipt_id
+          AND reversal.fund_receipt_id = source.fund_receipt_id
+      )
+      THEN 0
+    ELSE pg_catalog.greatest(
+      0,
+      source.source_amount_minor - pg_catalog.coalesce(confirmed.amount_minor, 0)
+    )
+  END::bigint AS available_minor
+FROM source_buckets source
+LEFT JOIN confirmed
+  ON confirmed.manual_receipt_id = source.manual_receipt_id
+ AND confirmed.fund_receipt_id = source.fund_receipt_id
+ AND confirmed.source_context = source.source_context
+ AND confirmed.fund_receipt_resolution_id IS NOT DISTINCT FROM
+     source.fund_receipt_resolution_id
+LEFT JOIN blocked
+  ON blocked.manual_receipt_id = source.manual_receipt_id
+ AND blocked.fund_receipt_id = source.fund_receipt_id;
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_report()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  receipt_row record;
+DECLARE
+  source_row record;
+BEGIN
+  SELECT
+    fact.client_account_id AS fact_client_account_id,
+    fact.received_at,
+    fact.currency AS fact_currency,
+    receipt.client_account_id AS receipt_client_account_id,
+    receipt.amount_minor,
+    receipt.currency AS receipt_currency,
+    receipt.disposition
+  INTO receipt_row
+  FROM public.manual_receipt_facts fact
+  JOIN public.fund_receipts receipt
+    ON receipt.id = NEW.fund_receipt_id
+   AND receipt.reported_manual_receipt_id = fact.id
+  WHERE fact.id = NEW.manual_receipt_id
+  FOR UPDATE OF receipt;
+
+  SELECT source_context, client_account_id, currency, source_amount_minor,
+         confirmed_outflow_minor, capacity_frozen, available_minor
+  INTO source_row
+  FROM public.manual_receipt_outflow_capacity
+  WHERE manual_receipt_id = NEW.manual_receipt_id
+    AND fund_receipt_id = NEW.fund_receipt_id
+    AND source_context = NEW.source_context
+    AND fund_receipt_resolution_id IS NOT DISTINCT FROM NEW.fund_receipt_resolution_id;
+
+  IF receipt_row IS NULL
+     OR source_row IS NULL
+     OR receipt_row.fact_client_account_id <> NEW.client_account_id
+     OR receipt_row.receipt_client_account_id <> NEW.client_account_id
+     OR receipt_row.fact_currency <> NEW.currency
+     OR receipt_row.receipt_currency <> NEW.currency
+     OR source_row.client_account_id <> NEW.client_account_id
+     OR source_row.currency <> NEW.currency
+     OR receipt_row.disposition = 'reversed'
+     OR source_row.capacity_frozen
+     OR NEW.amount_minor > source_row.available_minor
+     OR (NEW.occurred_at IS NOT NULL AND NEW.occurred_at < receipt_row.received_at)
+     OR (NEW.occurred_at IS NOT NULL
+       AND NEW.occurred_at > pg_catalog.now() + interval '5 minutes')
+     OR NOT public.opensales_validate_manual_receipt_outflow_authorization(
+       NEW.actor_id, NEW.actor_session_id, NEW.reauth_grant_id
+     ) THEN
+    RAISE EXCEPTION 'manual receipt outflow report exceeds or mismatches its immutable authorized source';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_report_guard
+  BEFORE INSERT ON public.manual_receipt_outflow_reports
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_report();
+
+CREATE FUNCTION public.opensales_assert_manual_receipt_outflow_report_complete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.observed_outcome = 'confirmed' AND NOT EXISTS (
+    SELECT 1
+    FROM public.manual_receipt_outflows outflow
+    WHERE outflow.report_id = NEW.id
+      AND outflow.manual_receipt_id = NEW.manual_receipt_id
+      AND outflow.fund_receipt_id = NEW.fund_receipt_id
+      AND outflow.client_account_id = NEW.client_account_id
+      AND outflow.source_context = NEW.source_context
+      AND outflow.fund_receipt_resolution_id IS NOT DISTINCT FROM
+          NEW.fund_receipt_resolution_id
+      AND outflow.amount_minor = NEW.amount_minor
+      AND outflow.currency = NEW.currency
+      AND outflow.destination_reference = NEW.destination_reference
+      AND outflow.occurred_at = NEW.occurred_at
+  ) THEN
+    RAISE EXCEPTION 'confirmed manual receipt outflow report is missing its immutable fact';
+  END IF;
+  IF NEW.observed_outcome = 'unknown' AND EXISTS (
+    SELECT 1 FROM public.manual_receipt_outflows outflow WHERE outflow.report_id = NEW.id
+  ) THEN
+    RAISE EXCEPTION 'unknown manual receipt outflow report cannot be an actual outflow fact';
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER manual_receipt_outflow_report_completeness_guard
+  AFTER INSERT ON public.manual_receipt_outflow_reports
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_assert_manual_receipt_outflow_report_complete();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_reconciliation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  report_row record;
+BEGIN
+  SELECT report.*, receipt.id AS locked_receipt_id
+  INTO report_row
+  FROM public.manual_receipt_outflow_reports report
+  JOIN public.fund_receipts receipt ON receipt.id = report.fund_receipt_id
+  WHERE report.id = NEW.report_id
+  FOR UPDATE OF report, receipt;
+
+  IF report_row IS NULL
+     OR report_row.observed_outcome <> 'unknown'
+     OR NOT public.opensales_validate_manual_receipt_outflow_authorization(
+       NEW.actor_id, NEW.actor_session_id, NEW.reauth_grant_id
+     )
+     OR (NEW.occurred_at IS NOT NULL AND NEW.occurred_at < report_row.created_at)
+     OR (NEW.occurred_at IS NOT NULL
+       AND NEW.occurred_at > pg_catalog.now() + interval '5 minutes')
+  THEN
+    RAISE EXCEPTION 'manual receipt outflow reconciliation mismatches its unknown authorized report';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_reconciliation_guard
+  BEFORE INSERT ON public.manual_receipt_outflow_reconciliations
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_reconciliation();
+
+CREATE FUNCTION public.opensales_assert_manual_receipt_outflow_reconciliation_complete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.outcome = 'confirm_outflow' AND NOT EXISTS (
+    SELECT 1
+    FROM public.manual_receipt_outflows outflow
+    WHERE outflow.report_id = NEW.report_id
+      AND outflow.occurred_at = NEW.occurred_at
+  ) THEN
+    RAISE EXCEPTION 'confirmed manual receipt outflow reconciliation is missing its fact';
+  END IF;
+  IF NEW.outcome = 'confirm_no_outflow' AND EXISTS (
+    SELECT 1 FROM public.manual_receipt_outflows outflow WHERE outflow.report_id = NEW.report_id
+  ) THEN
+    RAISE EXCEPTION 'no-outflow reconciliation cannot have an actual outflow fact';
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER manual_receipt_outflow_reconciliation_completeness_guard
+  AFTER INSERT ON public.manual_receipt_outflow_reconciliations
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_assert_manual_receipt_outflow_reconciliation_complete();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_fact()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  report_row record;
+DECLARE
+  reconciliation_row record;
+DECLARE
+  source_row record;
+BEGIN
+  SELECT report.*, receipt.id AS locked_receipt_id
+  INTO report_row
+  FROM public.manual_receipt_outflow_reports report
+  JOIN public.fund_receipts receipt
+    ON receipt.id = report.fund_receipt_id
+   AND receipt.reported_manual_receipt_id = report.manual_receipt_id
+  WHERE report.id = NEW.report_id
+  FOR UPDATE OF report, receipt;
+
+  SELECT reconciliation.*
+  INTO reconciliation_row
+  FROM public.manual_receipt_outflow_reconciliations reconciliation
+  WHERE reconciliation.report_id = NEW.report_id;
+
+  SELECT source_amount_minor, confirmed_outflow_minor, capacity_frozen
+  INTO source_row
+  FROM public.manual_receipt_outflow_capacity
+  WHERE manual_receipt_id = NEW.manual_receipt_id
+    AND fund_receipt_id = NEW.fund_receipt_id
+    AND source_context = NEW.source_context
+    AND fund_receipt_resolution_id IS NOT DISTINCT FROM NEW.fund_receipt_resolution_id;
+
+  IF report_row IS NULL
+     OR source_row IS NULL
+     OR NEW.manual_receipt_id <> report_row.manual_receipt_id
+     OR NEW.fund_receipt_id <> report_row.fund_receipt_id
+     OR NEW.client_account_id <> report_row.client_account_id
+     OR NEW.source_context <> report_row.source_context
+     OR NEW.fund_receipt_resolution_id IS DISTINCT FROM
+        report_row.fund_receipt_resolution_id
+     OR NEW.amount_minor <> report_row.amount_minor
+     OR NEW.currency <> report_row.currency
+     OR NEW.destination_reference <> report_row.destination_reference
+     OR (
+       report_row.observed_outcome = 'confirmed'
+       AND (
+         reconciliation_row IS NOT NULL
+         OR NEW.occurred_at <> report_row.occurred_at
+         OR NEW.actor_id <> report_row.actor_id
+         OR NEW.actor_session_id <> report_row.actor_session_id
+         OR NEW.reauth_grant_id <> report_row.reauth_grant_id
+         OR NEW.reason <> report_row.reason
+       )
+     )
+     OR (
+       report_row.observed_outcome = 'unknown'
+       AND (
+         reconciliation_row IS NULL
+         OR reconciliation_row.outcome <> 'confirm_outflow'
+         OR NEW.occurred_at <> reconciliation_row.occurred_at
+         OR NEW.actor_id <> reconciliation_row.actor_id
+         OR NEW.actor_session_id <> reconciliation_row.actor_session_id
+         OR NEW.reauth_grant_id <> reconciliation_row.reauth_grant_id
+         OR NEW.reason <> reconciliation_row.reason
+       )
+     )
+     OR source_row.confirmed_outflow_minor + NEW.amount_minor > source_row.source_amount_minor
+     OR EXISTS (
+       SELECT 1 FROM public.manual_receipt_reversals reversal
+       WHERE reversal.manual_receipt_id = NEW.manual_receipt_id
+         AND reversal.fund_receipt_id = NEW.fund_receipt_id
+     ) THEN
+    RAISE EXCEPTION 'manual receipt outflow fact exceeds or mismatches its confirmed report and immutable source';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_fact_guard
+  BEFORE INSERT ON public.manual_receipt_outflows
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_fact();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_invoice_allocation_reversal()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_row record;
+DECLARE
+  already_reversed_minor bigint;
+BEGIN
+  SELECT
+    outflow.id AS outflow_id,
+    outflow.source_context,
+    outflow.fund_receipt_resolution_id,
+    outflow.amount_minor,
+    outflow.currency,
+    report.client_account_id,
+    resolution.action,
+    resolution.invoice_id AS resolution_invoice_id,
+    resolution.currency AS resolution_currency,
+    allocation.id AS allocation_id,
+    allocation.invoice_id AS allocation_invoice_id,
+    allocation.amount_minor AS allocation_amount_minor,
+    invoice.client_account_id AS invoice_client_account_id,
+    invoice.currency AS invoice_currency
+  INTO source_row
+  FROM public.manual_receipt_outflows outflow
+  JOIN public.manual_receipt_outflow_reports report ON report.id = outflow.report_id
+  JOIN public.fund_receipt_resolutions resolution
+    ON resolution.id = outflow.fund_receipt_resolution_id
+  JOIN public.fund_receipt_allocations allocation
+    ON allocation.resolution_id = resolution.id
+  JOIN public.invoices invoice ON invoice.id = allocation.invoice_id
+  WHERE outflow.id = NEW.outflow_id
+  FOR UPDATE OF outflow, resolution, allocation, invoice;
+
+  SELECT pg_catalog.coalesce(pg_catalog.sum(reversal.amount_minor), 0)::bigint
+  INTO already_reversed_minor
+  FROM public.manual_receipt_invoice_allocation_reversals reversal
+  WHERE reversal.fund_receipt_allocation_id = NEW.fund_receipt_allocation_id;
+
+  IF source_row IS NULL
+     OR source_row.source_context <> 'allocated_invoice'
+     OR source_row.action <> 'allocate_invoice'
+     OR NEW.fund_receipt_resolution_id <> source_row.fund_receipt_resolution_id
+     OR NEW.fund_receipt_allocation_id <> source_row.allocation_id
+     OR NEW.invoice_id <> source_row.resolution_invoice_id
+     OR NEW.invoice_id <> source_row.allocation_invoice_id
+     OR NEW.amount_minor <> source_row.amount_minor
+     OR NEW.currency <> source_row.currency
+     OR NEW.currency <> source_row.resolution_currency
+     OR NEW.currency <> source_row.invoice_currency
+     OR source_row.client_account_id <> source_row.invoice_client_account_id
+     OR already_reversed_minor + NEW.amount_minor > source_row.allocation_amount_minor THEN
+    RAISE EXCEPTION 'manual receipt invoice allocation reversal mismatches its confirmed outflow source';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_invoice_allocation_reversal_guard
+  BEFORE INSERT ON public.manual_receipt_invoice_allocation_reversals
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_invoice_allocation_reversal();
+
+CREATE OR REPLACE FUNCTION public.opensales_assert_manual_receipt_outflow_complete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  expected_debit_account text;
+DECLARE
+  valid boolean;
+BEGIN
+  expected_debit_account := CASE NEW.source_context
+    WHEN 'unclaimed_funds' THEN 'unclaimed_funds_liability'
+    WHEN 'allocated_invoice' THEN 'sales_refunds_and_allowances'
+    ELSE 'client_credit_liability'
+  END;
+
+  SELECT
+    journal.sealed_at IS NOT NULL
+    AND pg_catalog.count(*) = 2
+    AND pg_catalog.coalesce(pg_catalog.sum(line.debit_minor), 0) = NEW.amount_minor
+    AND pg_catalog.coalesce(pg_catalog.sum(line.credit_minor), 0) = NEW.amount_minor
+    AND pg_catalog.coalesce(pg_catalog.sum(line.debit_minor) FILTER (
+      WHERE line.account_code = expected_debit_account
+        AND line.credit_minor = 0), 0) = NEW.amount_minor
+    AND pg_catalog.coalesce(pg_catalog.sum(line.credit_minor) FILTER (
+      WHERE line.account_code = 'cash_clearing'
+        AND line.debit_minor = 0), 0) = NEW.amount_minor
+  INTO valid
+  FROM public.ledger_journals journal
+  JOIN public.ledger_lines line ON line.journal_id = journal.id
+  WHERE journal.source_type = 'manual_receipt_outflow'
+    AND journal.source_id = NEW.id
+    AND journal.currency = NEW.currency
+  GROUP BY journal.id, journal.sealed_at;
+
+  IF NOT pg_catalog.coalesce(valid, false) THEN
+    RAISE EXCEPTION 'manual receipt outflow fact ledger is incomplete';
+  END IF;
+
+  IF NEW.source_context = 'converted_credit' AND NOT EXISTS (
+    SELECT 1
+    FROM public.credit_transactions transaction_record
+    JOIN public.credit_accounts credit_account
+      ON credit_account.id = transaction_record.credit_account_id
+    WHERE transaction_record.kind = 'manual_receipt_outflow'
+      AND transaction_record.source_type = 'manual_receipt_outflow'
+      AND transaction_record.source_id = NEW.id
+      AND transaction_record.credit_minor = 0
+      AND transaction_record.debit_minor = NEW.amount_minor
+      AND credit_account.client_account_id = NEW.client_account_id
+      AND credit_account.currency = NEW.currency
+  ) THEN
+    RAISE EXCEPTION 'converted Credit manual receipt outflow is missing its compensating Credit debit';
+  END IF;
+  IF NEW.source_context = 'allocated_invoice' AND NOT EXISTS (
+    SELECT 1
+    FROM public.manual_receipt_invoice_allocation_reversals reversal
+    WHERE reversal.outflow_id = NEW.id
+      AND reversal.fund_receipt_resolution_id = NEW.fund_receipt_resolution_id
+      AND reversal.amount_minor = NEW.amount_minor
+      AND reversal.currency = NEW.currency
+  ) THEN
+    RAISE EXCEPTION 'allocated invoice manual receipt outflow is missing its immutable allocation reversal';
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE FUNCTION public.opensales_reject_manual_receipt_provider_artifact()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.subject_type IN ('manual_receipt_outflow_report', 'manual_receipt_outflow')
+     OR (TG_OP = 'UPDATE' AND OLD.subject_type IN (
+       'manual_receipt_outflow_report', 'manual_receipt_outflow'
+     )) THEN
+    RAISE EXCEPTION 'manual receipt outflows cannot use a Payment Provider operation';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER z_schema_017_manual_outflow_provider_rejection
+  BEFORE INSERT OR UPDATE ON public.provider_operations
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_provider_artifact();
+
+DROP VIEW public.unclaimed_fund_refund_capacity;
+CREATE VIEW public.unclaimed_fund_refund_capacity AS
+SELECT
+  receipt.id AS fund_receipt_id,
+  receipt.amount_minor,
+  receipt.allocated_minor,
+  pg_catalog.coalesce(reserved.amount_minor, 0)::bigint AS reserved_refund_minor,
+  pg_catalog.coalesce(confirmed.amount_minor, 0)::bigint AS confirmed_outflow_minor,
+  blocked.present AS capacity_frozen,
+  CASE WHEN blocked.present THEN 0
+       ELSE pg_catalog.greatest(
+         0,
+         receipt.amount_minor - receipt.allocated_minor
+           - pg_catalog.coalesce(reserved.amount_minor, 0)
+           - pg_catalog.coalesce(confirmed.amount_minor, 0)
+       )
+  END::bigint AS available_minor
+FROM public.fund_receipts receipt
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.coalesce(pg_catalog.sum(refund.amount_minor), 0)::bigint AS amount_minor
+  FROM public.refunds refund
+  WHERE refund.source_fund_receipt_id = receipt.id
+    AND refund.source_context = 'unclaimed_funds'
+    AND refund.status IN ('queued', 'processing')
+) reserved ON true
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.coalesce(pg_catalog.sum(outflow.amount_minor), 0)::bigint AS amount_minor
+  FROM (
+    SELECT settlement.amount_minor
+    FROM public.refunds refund
+    JOIN public.refund_settlements settlement ON settlement.refund_id = refund.id
+    WHERE refund.source_fund_receipt_id = receipt.id
+      AND refund.source_context = 'unclaimed_funds'
+    UNION ALL
+    SELECT discrepancy.amount_minor
+    FROM public.refunds refund
+    JOIN public.refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+    JOIN public.refund_security_hold_adjudications adjudication
+      ON adjudication.discrepancy_settlement_id = discrepancy.id
+     AND adjudication.decision = 'record_unexpected_outflow'
+    WHERE refund.source_fund_receipt_id = receipt.id
+      AND refund.source_context = 'unclaimed_funds'
+      AND discrepancy.currency = receipt.currency
+    UNION ALL
+    SELECT discrepancy.amount_minor
+    FROM public.refunds refund
+    JOIN public.refund_discrepancy_settlements discrepancy ON discrepancy.refund_id = refund.id
+    JOIN public.refund_adjudication_corrections correction
+      ON correction.discrepancy_settlement_id = discrepancy.id
+    WHERE refund.source_fund_receipt_id = receipt.id
+      AND refund.source_context = 'unclaimed_funds'
+      AND discrepancy.currency = receipt.currency
+    UNION ALL
+    SELECT manual.amount_minor
+    FROM public.manual_receipt_outflows manual
+    WHERE manual.fund_receipt_id = receipt.id
+      AND manual.source_context = 'unclaimed_funds'
+  ) outflow
+) confirmed ON true
+LEFT JOIN LATERAL (
+  SELECT
+    receipt.disposition = 'charged_back'
+    OR EXISTS (
+      SELECT 1 FROM public.manual_receipt_reversals reversal
+      WHERE reversal.fund_receipt_id = receipt.id
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.manual_receipt_outflow_reports report
+      WHERE report.fund_receipt_id = receipt.id
+        AND report.observed_outcome = 'unknown'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.manual_receipt_outflow_reconciliations reconciliation
+          WHERE reconciliation.report_id = report.id
+        )
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.refunds refund
+      WHERE refund.source_fund_receipt_id = receipt.id
+        AND refund.source_context = 'unclaimed_funds'
+        AND refund.status IN ('unknown', 'manual')
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.refund_receipt_security_holds security_hold
+      WHERE security_hold.source_fund_receipt_id = receipt.id
+        AND NOT EXISTS (
+          SELECT 1 FROM public.refund_security_hold_adjudications adjudication
+          WHERE adjudication.receipt_security_hold_id = security_hold.id
+        )
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.add_funds_chargeback_holds chargeback_hold
+      JOIN public.add_funds_chargeback_facts chargeback_fact
+        ON chargeback_fact.id = chargeback_hold.fact_id
+      WHERE chargeback_fact.add_funds_attempt_id = receipt.reported_add_funds_attempt_id
+        AND chargeback_fact.original_external_payment_id = receipt.external_payment_id
+    ) AS present
+) blocked ON true;
+
+CREATE OR REPLACE VIEW public.invoice_allocation_totals AS
+SELECT
+  invoice.id AS invoice_id,
+  (
+    pg_catalog.coalesce(payment.amount_minor, 0)
+    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
+  )::bigint AS payment_minor,
+  pg_catalog.coalesce(credit.amount_minor, 0)::bigint AS credit_minor,
+  (
+    pg_catalog.coalesce(payment.amount_minor, 0)
+    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
+    + pg_catalog.coalesce(credit.amount_minor, 0)
+  )::bigint AS allocated_minor,
+  pg_catalog.coalesce(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
+FROM public.invoices invoice
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
+  FROM public.payment_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) payment ON true
+LEFT JOIN LATERAL (
+  SELECT
+    pg_catalog.sum(allocation.amount_minor)
+      - pg_catalog.coalesce((
+          SELECT pg_catalog.sum(reversal.amount_minor)
+          FROM public.manual_receipt_invoice_allocation_reversals reversal
+          WHERE reversal.invoice_id = invoice.id
+        ), 0) AS amount_minor
+  FROM public.fund_receipt_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) unclaimed ON true
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
+  FROM public.credit_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) credit ON true;
+
+CREATE OR REPLACE VIEW public.invoice_delinquency_allocation_totals AS
+SELECT
+  invoice.id AS invoice_id,
+  (
+    pg_catalog.coalesce(payment.principal_minor, 0)
+    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
+  )::bigint AS payment_minor,
+  pg_catalog.coalesce(credit.amount_minor, 0)::bigint AS credit_minor,
+  (
+    pg_catalog.coalesce(payment.principal_minor, 0)
+    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
+    + pg_catalog.coalesce(credit.amount_minor, 0)
+  )::bigint AS allocated_minor,
+  pg_catalog.coalesce(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
+FROM public.invoices invoice
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.sum(
+    pg_catalog.greatest(
+      allocation.amount_minor - pg_catalog.coalesce(fee.amount_minor, 0), 0
+    )
+  ) AS principal_minor
+  FROM public.payment_allocations allocation
+  LEFT JOIN public.invoice_fee_charges fee
+    ON fee.payment_attempt_id = allocation.payment_attempt_id
+   AND fee.invoice_id = allocation.invoice_id
+  WHERE allocation.invoice_id = invoice.id
+) payment ON true
+LEFT JOIN LATERAL (
+  SELECT
+    pg_catalog.sum(allocation.amount_minor)
+      - pg_catalog.coalesce((
+          SELECT pg_catalog.sum(reversal.amount_minor)
+          FROM public.manual_receipt_invoice_allocation_reversals reversal
+          WHERE reversal.invoice_id = invoice.id
+        ), 0) AS amount_minor
+  FROM public.fund_receipt_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) unclaimed ON true
+LEFT JOIN LATERAL (
+  SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
+  FROM public.credit_allocations allocation
+  WHERE allocation.invoice_id = invoice.id
+) credit ON true;

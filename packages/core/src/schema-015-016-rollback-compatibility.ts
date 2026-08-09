@@ -67,7 +67,9 @@ async function installedSchemaVersion(
   return typeof value === "string" ? value : null;
 }
 
-async function assertSchema016Shape(database: RollbackPreflightQueryable): Promise<void> {
+export async function assertSchema016CatalogShape(
+  database: RollbackPreflightQueryable,
+): Promise<void> {
   const result = await database.query(
     `WITH required_columns(table_name, column_name, data_type, nullable) AS (
        VALUES
@@ -445,7 +447,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                           '\\s+', ' ', 'g'
                         ))
      ), catalog_fingerprint(value) AS (
-       SELECT string_agg(item, E'\n' ORDER BY item)
+       SELECT string_agg(item, E'\n' ORDER BY item COLLATE "C")
        FROM catalog_items
      )
      SELECT
@@ -509,7 +511,7 @@ export async function assertSchema016NativeSafe(
       installed,
     );
   }
-  await assertSchema016Shape(database);
+  await assertSchema016CatalogShape(database);
   return {
     installedSchemaVersion: SCHEMA_016,
     applicationSchemaVersion: SCHEMA_016,
@@ -579,7 +581,7 @@ async function schema016Blockers(
      SELECT code, count::text AS count
      FROM blocker_counts
      WHERE count > 0
-     ORDER BY code`,
+     ORDER BY code COLLATE "C"`,
   );
   return result.rows.map((row) => {
     const record = rowRecord(row);
@@ -631,7 +633,7 @@ export async function assert015RollbackBridgeSafe(
     );
   }
 
-  await assertSchema016Shape(database);
+  await assertSchema016CatalogShape(database);
   const blockers = await schema016Blockers(database);
   if (blockers.length > 0) {
     throw new SchemaRollbackPreflightError(

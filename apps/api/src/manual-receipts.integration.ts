@@ -56,7 +56,10 @@ let app: Awaited<ReturnType<typeof buildApp>>["app"] | null = null;
 try {
   await runMigrations(pool);
   const schema = await assertSchemaCompatible(pool);
-  assert.equal(schema.installedSchemaVersion, "016_stage_b_manual_receipts");
+  assert.equal(
+    schema.installedSchemaVersion,
+    "017_stage_b_manual_receipt_outflow_reports",
+  );
   assert.equal(schema.mode, "native");
 
   await pool.query(
@@ -928,7 +931,7 @@ try {
 
   process.stdout.write(
     `${JSON.stringify({
-      schema016Native: true,
+      schema017Native: true,
       manualReceiptRecorded: true,
       mistakenManualReceiptReversed: true,
       reversalRequiresBothPermissions: true,

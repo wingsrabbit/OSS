@@ -19,6 +19,7 @@
     "test:integration:manual-receipts": "node dist/manual-receipts.integration.js",
     "test:integration:schema-rollback-preflight": "node dist/schema-rollback-preflight.integration.js",
     "test:integration:schema-015-016-rollback-preflight": "node dist/schema-015-016-rollback-preflight.integration.js",
+    "test:integration:schema-016-017-rollback-preflight": "node dist/schema-016-017-rollback-preflight.integration.js",
     "test:integration:stage-a": "node dist/stage-a-integration.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

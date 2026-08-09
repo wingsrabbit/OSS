@@ -10,7 +10,8 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema016ApplicationGuard,
+  holdSchema016RollbackBridgeGuard,
+  holdSchema017ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -79,7 +80,9 @@ export async function buildApp(
   };
 
   try {
-    releaseSchemaRollbackGuard = await holdSchema016ApplicationGuard(pool);
+    releaseSchemaRollbackGuard = config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017"
+      ? await holdSchema016RollbackBridgeGuard(pool)
+      : await holdSchema017ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
