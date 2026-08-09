@@ -779,6 +779,17 @@ try {
   );
 
   await client.query(
+    "ALTER TABLE ledger_journals DISABLE TRIGGER ledger_journals_append_only",
+  );
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query(
+    "ALTER TABLE ledger_journals ENABLE TRIGGER ledger_journals_append_only",
+  );
+
+  await client.query(
     "ALTER TABLE fund_receipts DISABLE TRIGGER fund_receipts_external_facts_append_only",
   );
   await assert.rejects(

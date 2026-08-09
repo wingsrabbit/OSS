@@ -238,6 +238,13 @@ try {
   assert.ok(sealedJournal.rows[0]?.id);
   await assert.rejects(
     pool.query(
+      "UPDATE ledger_journals SET sealed_at = NULL WHERE id = $1",
+      [sealedJournal.rows[0].id],
+    ),
+    /ledger records are append-only/,
+  );
+  await assert.rejects(
+    pool.query(
       `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
        VALUES
          ($1, 'cash_clearing', 1, 0),
