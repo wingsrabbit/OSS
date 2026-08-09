@@ -12,6 +12,10 @@ test("customer and staff complete a public ticket conversation while internal no
   const internalNote = `Internal synthetic handoff ${unique}`;
   const publicReply = `Public synthetic reply ${unique}`;
   const customerReply = `Customer synthetic follow-up ${unique}`;
+  const staffEmail =
+    process.env.OSS_E2E_STAFF_EMAIL ?? "stage-a-browser-admin@example.invalid";
+  const staffPassword =
+    process.env.OSS_E2E_STAFF_PASSWORD ?? "Synthetic-Stage-A-Browser-Admin-Only!";
 
   await page.goto("/");
   await page.getByPlaceholder("Client account name").fill(`Ticket Browser ${unique.slice(0, 8)}`);
@@ -22,6 +26,7 @@ test("customer and staff complete a public ticket conversation while internal no
   await page.getByPlaceholder("Email").last().fill(email);
   await page.getByPlaceholder("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page).toHaveURL(/\/customer$/);
 
   const mailboxButton = page.getByRole("button", { name: "Open my Mock Provider mailbox" });
   const verificationLink = page.getByRole("link", { name: "Use one-time verification link" });
@@ -31,6 +36,7 @@ test("customer and staff complete a public ticket conversation while internal no
   }
   await expect(verificationLink).toBeVisible();
   await verificationLink.click();
+  await expect(page).toHaveURL(/\/customer$/);
   await expect(page.getByText(/Email verified — account is eligible/)).toBeVisible();
 
   const customerPanel = page.locator('section[aria-label="Customer support tickets"]');
@@ -44,11 +50,12 @@ test("customer and staff complete a public ticket conversation while internal no
 
   await page.context().clearCookies();
   await page.goto("/");
-  await page.getByPlaceholder("Email").last().fill("stage-a-browser-admin@example.invalid");
+  await page.getByPlaceholder("Email").last().fill(staffEmail);
   await page
     .getByPlaceholder("Password", { exact: true })
-    .fill("Synthetic-Stage-A-Browser-Admin-Only!");
+    .fill(staffPassword);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page).toHaveURL(/\/admin$/);
 
   const staffPanel = page.locator('section[aria-label="Staff support tickets"]');
   await expect(staffPanel.getByRole("heading", { name: "Ticket queue" })).toBeVisible();
@@ -72,6 +79,7 @@ test("customer and staff complete a public ticket conversation while internal no
   await page.getByPlaceholder("Email").last().fill(email);
   await page.getByPlaceholder("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page).toHaveURL(/\/customer$/);
   const returningCustomerPanel = page.locator('section[aria-label="Customer support tickets"]');
   await returningCustomerPanel
     .getByTestId("customer-ticket-list")

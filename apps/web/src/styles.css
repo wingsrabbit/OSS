@@ -82,6 +82,31 @@ header {
   font-size: 0.82rem;
 }
 
+.app-nav {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  padding: 0.3rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(7, 17, 31, 0.72);
+}
+
+.app-nav a {
+  padding: 0.55rem 0.85rem;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 760;
+  text-decoration: none;
+}
+
+.app-nav a:hover,
+.app-nav a[aria-current="page"] {
+  color: #07111f;
+  background: var(--cyan);
+}
+
 .header-actions {
   display: flex;
   gap: 0.75rem;
@@ -152,6 +177,71 @@ main {
 
 .panel {
   padding: 2rem;
+}
+
+.route-access {
+  display: grid;
+  gap: 0.75rem;
+  margin: 1.5rem 0;
+  padding: 2rem;
+  border: 1px solid var(--line);
+  border-radius: 1.3rem;
+  background: var(--panel);
+}
+
+.route-access h2,
+.route-access p {
+  margin: 0;
+}
+
+.restricted-access {
+  border-color: rgba(255, 191, 105, 0.4);
+}
+
+.route-action {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  padding: 0.7rem 1rem;
+  border: 1px solid rgba(97, 217, 207, 0.4);
+  border-radius: 0.75rem;
+  color: var(--cyan);
+  background: rgba(97, 217, 207, 0.08);
+  font-weight: 780;
+  text-decoration: none;
+}
+
+.workspace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.home-session-entry {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.home-session-entry h2,
+.home-session-entry p {
+  margin: 0;
+}
+
+.admin-login-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  align-items: end;
+  margin-top: 0.5rem;
+}
+
+.admin-login-form label {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
 }
 
 .bootstrap-panel,
@@ -663,6 +753,17 @@ select:focus {
     padding: 4rem 0 3rem;
   }
 
+  header {
+    flex-wrap: wrap;
+    gap: 0.85rem;
+  }
+
+  .app-nav {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+  }
+
   .form-columns,
   .product-grid,
   .journey,
@@ -688,6 +789,10 @@ select:focus {
   }
 
   .manual-receipt-form {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-login-form {
     grid-template-columns: 1fr;
   }
 

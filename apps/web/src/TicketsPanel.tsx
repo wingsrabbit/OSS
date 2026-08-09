@@ -63,11 +63,13 @@ async function ticketApi<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function TicketsPanel({
+  mode,
   me,
   locale,
   onNotice,
   onError,
 }: {
+  mode: "customer" | "staff";
   me: Viewer | null;
   locale: Locale;
   onNotice: (message: string) => void;
@@ -113,12 +115,13 @@ export function TicketsPanel({
   }, [me?.id, me?.staff]);
 
   useEffect(() => {
-    void Promise.all([refreshCustomer(), refreshStaff()]).catch((caught: unknown) =>
+    void (mode === "customer" ? refreshCustomer() : refreshStaff()).catch((caught: unknown) =>
       onError(caught instanceof Error ? caught.message : "Tickets could not be loaded"),
     );
-  }, [onError, refreshCustomer, refreshStaff]);
+  }, [mode, onError, refreshCustomer, refreshStaff]);
 
-  if (!me?.eligible) return null;
+  if (mode === "customer" && !me?.eligible) return null;
+  if (mode === "staff" && !me?.staff) return null;
 
   async function openCustomerTicket(ticketId: string) {
     try {
@@ -145,7 +148,7 @@ export function TicketsPanel({
       setOpeningMessage("");
       setServiceId("");
       setSelected(created);
-      await Promise.all([refreshCustomer(), refreshStaff()]);
+      await refreshCustomer();
       onNotice(locale === "zh-CN" ? "工单已创建。" : "Support ticket created.");
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Ticket could not be created");
@@ -164,7 +167,7 @@ export function TicketsPanel({
       );
       setCustomerReply("");
       setSelected(updated);
-      await Promise.all([refreshCustomer(), refreshStaff()]);
+      await refreshCustomer();
       onNotice(locale === "zh-CN" ? "回复已发送给客服。" : "Reply sent to staff.");
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Reply could not be sent");
@@ -196,7 +199,7 @@ export function TicketsPanel({
       );
       setStaffReply("");
       setStaffSelected(updated);
-      await Promise.all([refreshStaff(), refreshCustomer()]);
+      await refreshStaff();
       onNotice(
         kind === "internal_note"
           ? locale === "zh-CN"
@@ -215,6 +218,7 @@ export function TicketsPanel({
 
   return (
     <>
+      {mode === "customer" && (
       <section className="order-panel ticket-center" aria-label="Customer support tickets">
         <div>
           <p className="eyebrow">Customer support · Mock-only</p>
@@ -311,8 +315,9 @@ export function TicketsPanel({
           )}
         </div>
       </section>
+      )}
 
-      {me.staff && (
+      {mode === "staff" && me?.staff && (
         <section className="admin-panel ticket-center" aria-label="Staff support tickets">
           <div>
             <p className="eyebrow">Staff support workspace</p>

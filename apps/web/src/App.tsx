@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LAB_BANNER } from "@opensales/core";
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ManualReceiptOutflowPanel,
   type ManualReceiptOriginalSourceOutflow,
@@ -9,6 +17,13 @@ import {
 import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
+type AppRoute = "/" | "/customer" | "/admin";
+
+function routeFromPath(pathname: string): AppRoute {
+  const normalized = pathname.replace(/\/+$/, "") || "/";
+  if (normalized === "/customer" || normalized === "/admin") return normalized;
+  return "/";
+}
 
 function newIdempotencyKey(): string {
   const cryptoApi = globalThis.crypto;
@@ -758,10 +773,12 @@ function manualReceiptIsUntouched(receipt: ManualReceiptItem): boolean {
 }
 
 export function App() {
+  const [route, setRoute] = useState<AppRoute>(() => routeFromPath(window.location.pathname));
   const [locale, setLocale] = useState<Locale>("en");
   const [products, setProducts] = useState<Product[]>([]);
   const [legal, setLegal] = useState<Legal | null>(null);
   const [me, setMe] = useState<Me | null>(null);
+  const [sessionResolved, setSessionResolved] = useState(false);
   const [selected, setSelected] = useState<{ product: Product; price: Price } | null>(null);
   const [order, setOrder] = useState<OrderDetail | null>(null);
   const [notice, setNotice] = useState<string>("");
@@ -896,7 +913,34 @@ export function App() {
   const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
     ReadonlySet<string>
   >(new Set());
-  const [bootstrapToken, setBootstrapToken] = useState("");
+  const openRoute = useCallback((target: AppRoute, replace = false) => {
+    if (replace) {
+      window.history.replaceState({}, "", target);
+    } else if (window.location.pathname !== target || window.location.search.length > 0) {
+      window.history.pushState({}, "", target);
+    }
+    setRoute(target);
+    setNotice("");
+    setError("");
+    setSelected(null);
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, []);
+  const followRouteLink = useCallback(
+    (event: ReactMouseEvent<HTMLAnchorElement>, target: AppRoute) => {
+      if (
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return;
+      }
+      event.preventDefault();
+      openRoute(target);
+    },
+    [openRoute],
+  );
   const showTicketNotice = useCallback((message: string) => {
     setError("");
     setNotice(message);
@@ -929,18 +973,29 @@ export function App() {
   const paymentSettingsReauthReady =
     paymentSettingsReauthActive || paymentSettingsPassword.length > 0;
 
-  const refreshMe = useCallback(async () => {
+  useEffect(() => {
+    const onPopState = () => setRoute(routeFromPath(window.location.pathname));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const refreshMe = useCallback(async (): Promise<Me | null> => {
     try {
-      setMe(await api<Me>("/api/v1/auth/me"));
+      const viewer = await api<Me>("/api/v1/auth/me");
+      setMe(viewer);
+      setSessionResolved(true);
+      return viewer;
     } catch {
       setMe(null);
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
+      setSessionResolved(true);
+      return null;
     }
   }, []);
 
   const refreshLatestOrder = useCallback(async () => {
-    if (!me?.eligible) {
+    if (route !== "/customer" || !me?.eligible) {
       setOrder(null);
       return;
     }
@@ -951,38 +1006,38 @@ export function App() {
       return;
     }
     setOrder(await api<OrderDetail>(`/api/v1/orders/${latest.orderId}`));
-  }, [me?.clientAccountId, me?.eligible]);
+  }, [me?.clientAccountId, me?.eligible, route]);
 
   const refreshBilling = useCallback(async () => {
-    if (!me) {
+    if (route !== "/customer" || !me) {
       setBilling(null);
       return;
     }
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
-  }, [me]);
+  }, [me, route]);
 
   const refreshPaymentSettings = useCallback(async () => {
-    if (me?.verification.email !== "passed") {
+    if (route !== "/customer" || me?.verification.email !== "passed") {
       setPaymentSettings(null);
       return;
     }
     setPaymentSettings(
       await api<PaymentSettings>("/api/v1/billing/payment-settings"),
     );
-  }, [me?.clientAccountId, me?.verification.email]);
+  }, [me?.clientAccountId, me?.verification.email, route]);
 
   const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
-    if (!me?.eligible) {
+    if (route !== "/customer" || !me?.eligible) {
       setRenewals([]);
       return [];
     }
     const result = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
     setRenewals(result.items);
     return result.items;
-  }, [me?.eligible]);
+  }, [me?.eligible, route]);
 
   const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setAdminRenewals([]);
       return [];
     }
@@ -991,17 +1046,17 @@ export function App() {
     );
     setAdminRenewals(result.items);
     return result.items;
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshChargebackStatus = useCallback(async () => {
-    if (!me) {
+    if (route !== "/customer" || !me) {
       setChargebackStatus(null);
       return;
     }
     setChargebackStatus(
       await api<ChargebackStatus>("/api/v1/billing/chargeback-status"),
     );
-  }, [me]);
+  }, [me, route]);
 
   useEffect(() => {
     void Promise.all([
@@ -1016,7 +1071,7 @@ export function App() {
   }, [locale, refreshMe]);
 
   useEffect(() => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       manualReceiptDefaultedForUser.current = null;
       setManualReceiptClientAccountId("");
       setManualReceiptHistory([]);
@@ -1037,7 +1092,7 @@ export function App() {
     setManualReceiptReversalTargetId(null);
     setManualReceiptReversalReason("");
     setManualReceiptReversalOutcome(null);
-  }, [me]);
+  }, [me, route]);
 
   useEffect(() => {
     void refreshLatestOrder().catch(() => undefined);
@@ -1088,6 +1143,7 @@ export function App() {
 
   useEffect(() => {
     if (
+      route !== "/customer" ||
       !me?.eligible ||
       !billing?.addFunds.enabled ||
       !billing.addFunds.allowed ||
@@ -1128,10 +1184,12 @@ export function App() {
     billing?.addFunds.minimumMinor,
     billing?.creditBalanceMinor,
     me?.eligible,
+    route,
   ]);
 
   useEffect(() => {
     if (
+      route !== "/customer" ||
       !addFundsCommand ||
       ["succeeded", "failed", "cancelled", "expired", "manual"].includes(
         addFundsCommand.status,
@@ -1156,10 +1214,10 @@ export function App() {
         .catch(() => undefined);
     }, 750);
     return () => window.clearInterval(timer);
-  }, [addFundsCommand, refreshBilling]);
+  }, [addFundsCommand, refreshBilling, route]);
 
   useEffect(() => {
-    if (!order || order.invoice.status === "paid" || !me?.eligible) {
+    if (route !== "/customer" || !order || order.invoice.status === "paid" || !me?.eligible) {
       setPaymentQuote(null);
       return;
     }
@@ -1172,7 +1230,7 @@ export function App() {
         setPaymentQuote(null);
         setError(caught instanceof Error ? caught.message : "Payment quote is unavailable");
       });
-  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod]);
+  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod, route]);
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("token");
@@ -1183,17 +1241,18 @@ export function App() {
     })
       .then(async (result) => {
         const visibleStatus = result.status === "already_verified" ? "verified" : result.status;
-        setNotice(`Email verification: ${visibleStatus}`);
-        window.history.replaceState({}, "", window.location.pathname);
         await refreshMe();
+        openRoute("/customer", true);
+        setNotice(`Email verification: ${visibleStatus}`);
       })
       .catch((caught: unknown) =>
         setError(caught instanceof Error ? caught.message : "Verification failed"),
       );
-  }, [refreshMe]);
+  }, [openRoute, refreshMe]);
 
   useEffect(() => {
     if (
+      route !== "/customer" ||
       !order ||
       (order.service.cancellation
         ? ["manual", "terminated"].includes(order.service.cancellation.status)
@@ -1214,19 +1273,19 @@ export function App() {
         .catch(() => undefined);
     }, 1_000);
     return () => window.clearInterval(timer);
-  }, [order, refreshBilling, refreshPaymentSettings]);
+  }, [order, refreshBilling, refreshPaymentSettings, route]);
 
   const refreshManualItems = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setManualItems([]);
       return;
     }
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
     setManualItems(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshAdminCancellations = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setAdminCancellations([]);
       return;
     }
@@ -1234,28 +1293,28 @@ export function App() {
       "/api/v1/admin/services/cancellations",
     );
     setAdminCancellations(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshUnclaimedFunds = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setUnclaimedFunds([]);
       return;
     }
     const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
     setUnclaimedFunds(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshRefundCandidates = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setRefundCandidates([]);
       return;
     }
     const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
     setRefundCandidates(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshRefundRecords = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setRefundRecords({});
       return;
     }
@@ -1263,10 +1322,10 @@ export function App() {
     setRefundRecords(
       Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
     );
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshRefundSecurityHolds = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setRefundSecurityHolds([]);
       return;
     }
@@ -1274,10 +1333,10 @@ export function App() {
       "/api/v1/admin/refund-security-holds",
     );
     setRefundSecurityHolds(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshRefundDismissalCorrections = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setRefundDismissalCorrections([]);
       return;
     }
@@ -1285,10 +1344,10 @@ export function App() {
       "/api/v1/admin/refund-dismissal-corrections",
     );
     setRefundDismissalCorrections(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setRefundReceiptCapacityIncidents([]);
       return;
     }
@@ -1296,10 +1355,10 @@ export function App() {
       "/api/v1/admin/refund-receipt-capacity-incidents",
     );
     setRefundReceiptCapacityIncidents(result.items);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   const refreshAdminChargebacks = useCallback(async () => {
-    if (!me?.staff) {
+    if (route !== "/admin" || !me?.staff) {
       setAdminChargebacks([]);
       setAdminUnclaimedChargebacks([]);
       setAdminChargebackHolds([]);
@@ -1313,7 +1372,7 @@ export function App() {
     setAdminChargebacks(result.items);
     setAdminUnclaimedChargebacks(result.unclaimedChargebacks);
     setAdminChargebackHolds(result.manualHolds);
-  }, [me?.staff]);
+  }, [me?.staff, route]);
 
   useEffect(() => {
     void Promise.all([
@@ -1340,6 +1399,7 @@ export function App() {
   ]);
 
   useEffect(() => {
+    if (route !== "/admin") return;
     const active = Object.values(refundRecords).filter((refund) =>
       ["queued", "processing", "unknown"].includes(refund.status),
     );
@@ -1367,6 +1427,7 @@ export function App() {
     refreshRefundCandidates,
     refreshRefundSecurityHolds,
     refreshUnclaimedFunds,
+    route,
   ]);
 
   const groups = useMemo(() => {
@@ -1410,10 +1471,69 @@ export function App() {
       });
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
-      await refreshMe();
+      const viewer = await refreshMe();
+      openRoute(route === "/admin" ? "/admin" : viewer?.staff ? "/admin" : "/customer");
       setNotice("Signed in.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
+    }
+  }
+
+  async function logout() {
+    setError("");
+    try {
+      await api("/api/v1/auth/logout", { method: "POST", body: "{}" });
+      setMe(null);
+      setSessionResolved(true);
+      setSelected(null);
+      setOrder(null);
+      setBilling(null);
+      setPaymentSettings(null);
+      setPaymentSettingsPassword("");
+      setPaymentSettingsReauthExpiresAt(null);
+      setRenewals([]);
+      setChargebackStatus(null);
+      setAddFundsQuote(null);
+      setAddFundsCommand(null);
+      setMail([]);
+      setAdminRenewals([]);
+      setManualItems([]);
+      setAdminCancellations([]);
+      setUnclaimedFunds([]);
+      setAdminChargebacks([]);
+      setAdminUnclaimedChargebacks([]);
+      setAdminChargebackHolds([]);
+      setRefundCandidates([]);
+      setRefundRecords({});
+      setRefundSecurityHolds([]);
+      setRefundDismissalCorrections([]);
+      setRefundReceiptCapacityIncidents([]);
+      setAdminPassword("");
+      setManualReason("");
+      setCreditAdjustmentReason("");
+      setAutomationReason("");
+      setRenewalHoldReason("");
+      setManualSuspensionReason("");
+      setCancellationCompletionReason("");
+      setManualReceiptClientAccountId("");
+      setManualReceiptReference("");
+      setManualReceiptReceivedAt(defaultManualReceiptTime());
+      setManualReceiptGrossMinor("10000");
+      setManualReceiptFeeMinor("0");
+      setManualReceiptReason("");
+      setManualReceiptHistory([]);
+      setManualReceiptTarget(null);
+      setManualReceiptOutcome(null);
+      setManualReceiptReversalTargetId(null);
+      setManualReceiptReversalReason("");
+      setManualReceiptReversalOutcome(null);
+      setFundResolutionReason("");
+      setFundReturnReason("");
+      setRefundReason("");
+      openRoute("/", true);
+      setNotice("Signed out.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Sign out failed");
     }
   }
 
@@ -1976,21 +2096,6 @@ export function App() {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Mock mailbox is unavailable");
-    }
-  }
-
-  async function bootstrapAdministrator() {
-    setError("");
-    try {
-      await api("/api/v1/admin/bootstrap", {
-        method: "POST",
-        body: JSON.stringify({ bootstrapToken }),
-      });
-      setBootstrapToken("");
-      await refreshMe();
-      setNotice("Administrator role created. The bootstrap token is now unusable.");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Administrator bootstrap failed");
     }
   }
 
@@ -2814,26 +2919,65 @@ export function App() {
     <>
       <div className="lab-banner">{LAB_BANNER}</div>
       <header>
-        <a className="brand" href="/">
+        <a className="brand" href="/" onClick={(event) => followRouteLink(event, "/")}>
           <span>OSS</span>
           OpenSales System
         </a>
+        <nav className="app-nav" aria-label="Primary navigation">
+          <a
+            aria-current={route === "/" ? "page" : undefined}
+            href="/"
+            onClick={(event) => followRouteLink(event, "/")}
+          >
+            Home
+          </a>
+          <a
+            aria-current={route === "/customer" ? "page" : undefined}
+            href="/customer"
+            onClick={(event) => followRouteLink(event, "/customer")}
+          >
+            Customer
+          </a>
+          <a
+            aria-current={route === "/admin" ? "page" : undefined}
+            href="/admin"
+            onClick={(event) => followRouteLink(event, "/admin")}
+          >
+            Admin
+          </a>
+        </nav>
         <div className="header-actions">
           <button onClick={() => setLocale(locale === "en" ? "zh-CN" : "en")}>
             {locale === "en" ? "简体中文" : "English"}
           </button>
           <span className={me?.eligible ? "pill good" : "pill"}>
-            {me ? me.email : "Guest"}
+            {!sessionResolved ? "Checking session" : me ? (route === "/" ? "Signed in" : me.email) : "Guest"}
           </span>
+          {me && <button onClick={() => void logout()}>Sign out</button>}
         </div>
       </header>
       <main>
-        <section className="hero">
-          <p className="eyebrow">Mock-only laboratory release</p>
-          <h1>Customer, billing and service operations — without vendor lock-in.</h1>
+        <section className="hero" aria-label="Current workspace">
+          <p className="eyebrow">
+            {route === "/"
+              ? "Public · Mock-only laboratory"
+              : route === "/customer"
+                ? "Customer workspace · Mock-only"
+                : "Staff workspace · Mock-only"}
+          </p>
+          <h1>
+            {route === "/"
+              ? "Customer, billing and service operations — without vendor lock-in."
+              : route === "/customer"
+                ? "Orders, billing, services and support in one customer workspace."
+                : "Audited support, money and service operations for Staff."}
+          </h1>
           <p>
-            This synthetic environment separates orders, money, provider operations and services so
-            that failures remain visible and recoverable.
+            {route === "/"
+              ? "Explore the synthetic catalog, create an account or sign in. Customer and Staff data stay inside their dedicated workspaces."
+              : route === "/customer"
+                ? "Continue the real Mock Provider journey: open tickets, manage billing and follow each order through service delivery."
+                : "Public replies, internal notes, manual receipts, refunds and operational decisions remain explicit and reviewable."}
           </p>
         </section>
 
@@ -2844,10 +2988,36 @@ export function App() {
           </div>
         )}
 
+        {(route === "/" || route === "/customer") && (
         <section className="account-grid">
           <div className="panel">
-            <p className="eyebrow">{text.account}</p>
-            {me ? (
+            <p className="eyebrow">{route === "/" ? "Access" : text.account}</p>
+            {!sessionResolved ? (
+              <p className="muted">Checking the current session…</p>
+            ) : route === "/" && me ? (
+              <div className="home-session-entry">
+                <h2>Choose a workspace</h2>
+                <p>Your signed-in identity and account data are shown only inside the dedicated workspace.</p>
+                <div className="workspace-actions">
+                  <a
+                    className="route-action"
+                    href="/customer"
+                    onClick={(event) => followRouteLink(event, "/customer")}
+                  >
+                    Open customer workspace
+                  </a>
+                  {me.staff && (
+                    <a
+                      className="route-action"
+                      href="/admin"
+                      onClick={(event) => followRouteLink(event, "/admin")}
+                    >
+                      Open Staff workspace
+                    </a>
+                  )}
+                </div>
+              </div>
+            ) : me ? (
               <>
                 <h2>{me.email}</h2>
                 <p>{me.eligible ? text.ready : text.pending}</p>
@@ -2904,15 +3074,82 @@ export function App() {
             )}
           </div>
         </section>
+        )}
 
-        <TicketsPanel
-          me={me}
-          locale={locale}
-          onNotice={showTicketNotice}
-          onError={showTicketError}
-        />
+        {route === "/customer" && !me?.eligible && (
+          <section className="route-access" aria-label="Customer access status">
+            <p className="eyebrow">Customer access</p>
+            <h2>{me ? "Verify your email to continue" : "Sign in to open the customer workspace"}</h2>
+            <p>
+              {me
+                ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
+                : "Use the account forms above. Successful sign-in returns directly to this customer page."}
+            </p>
+          </section>
+        )}
 
-        {me &&
+        {route === "/admin" && !sessionResolved && (
+          <section className="route-access" aria-label="Administrator session status">
+            <p className="eyebrow">Restricted Staff workspace</p>
+            <h2>Checking Staff access…</h2>
+            <p>The administrative workspace remains unmounted until the current session is resolved.</p>
+          </section>
+        )}
+
+        {route === "/admin" && sessionResolved && !me?.staff && (
+          <section
+            className="route-access restricted-access"
+            aria-label="Administrator access status"
+            data-testid="admin-access-restricted"
+          >
+            <p className="eyebrow">Restricted Staff workspace</p>
+            <h2>{me ? "Access denied — Staff permission required" : "Sign in required"}</h2>
+            <p>
+              {me
+                ? `${me.email} is signed in without Staff access. No administrative capability has been loaded on this page.`
+                : "Sign in from the public homepage with an authorized Staff account. No administrative capability is shown to guests."}
+            </p>
+            {!me && (
+              <form className="admin-login-form" onSubmit={login}>
+                <label>
+                  Staff email
+                  <input name="email" type="email" placeholder="Staff email" required />
+                </label>
+                <label>
+                  Password
+                  <input name="password" type="password" placeholder="Staff password" required />
+                </label>
+                <button className="primary" type="submit">Sign in to Staff workspace</button>
+              </form>
+            )}
+            <a className="route-action" href="/" onClick={(event) => followRouteLink(event, "/")}>
+              Go to public sign in
+            </a>
+          </section>
+        )}
+
+        {route === "/customer" && (
+          <TicketsPanel
+            mode="customer"
+            me={me}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && me?.staff && (
+          <TicketsPanel
+            mode="staff"
+            me={me}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" &&
+          me &&
           chargebackStatus &&
           (chargebackStatus.chargebacks.length > 0 ||
             chargebackStatus.unclaimedChargebacks.length > 0 ||
@@ -2990,7 +3227,7 @@ export function App() {
             </section>
           )}
 
-        {me?.eligible && paymentSettings && (
+        {route === "/customer" && me?.eligible && paymentSettings && (
           <section className="order-panel" aria-label="Payment methods and automatic renewal">
             <div>
               <p className="eyebrow">Customer billing · payment permissions</p>
@@ -3148,7 +3385,7 @@ export function App() {
           </section>
         )}
 
-        {me?.eligible && renewals.length > 0 && (
+        {route === "/customer" && me?.eligible && renewals.length > 0 && (
           <section className="order-panel" aria-label="Service renewals">
             <div>
               <p className="eyebrow">Customer billing · renewals</p>
@@ -3300,7 +3537,7 @@ export function App() {
           </section>
         )}
 
-        {me?.eligible && billing?.addFunds.enabled && (
+        {route === "/customer" && me?.eligible && billing?.addFunds.enabled && (
           <section className="order-panel" aria-label="Add Funds">
             <div>
               <p className="eyebrow">Customer billing · Mock Add Funds</p>
@@ -3416,35 +3653,7 @@ export function App() {
           </section>
         )}
 
-        {me?.eligible && !me.staff && (
-          <section className="bootstrap-panel">
-            <div>
-              <p className="eyebrow">One-time laboratory setup</p>
-              <h2>Establish the first administrator</h2>
-              <p>
-                Generate a 15-minute, single-use token with the server-side CLI. There is no fixed
-                default administrator password.
-              </p>
-            </div>
-            <div className="inline-form">
-              <input
-                type="password"
-                value={bootstrapToken}
-                onChange={(event) => setBootstrapToken(event.target.value)}
-                placeholder="Single-use bootstrap token"
-              />
-              <button
-                className="primary"
-                disabled={bootstrapToken.length < 32}
-                onClick={bootstrapAdministrator}
-              >
-                Create administrator
-              </button>
-            </div>
-          </section>
-        )}
-
-        {me?.staff && (
+        {route === "/admin" && sessionResolved && me?.staff && (
           <section className="admin-panel">
             <div>
               <p className="eyebrow">Administrator · audited billing and fulfillment</p>
@@ -4857,7 +5066,7 @@ export function App() {
           </section>
         )}
 
-        {order && (
+        {route === "/customer" && order && (
           <section className="order-panel">
             <div>
               <p className="eyebrow">Live customer journey</p>
@@ -5088,6 +5297,7 @@ export function App() {
           </section>
         )}
 
+        {(route === "/" || route === "/customer") && (
         <section className="catalog">
           <p className="eyebrow">{text.catalog}</p>
           <h2>TermRat synthetic acceptance configuration</h2>
@@ -5131,9 +5341,10 @@ export function App() {
             </div>
           ))}
         </section>
+        )}
       </main>
 
-      {selected && (
+      {(route === "/" || route === "/customer") && selected && (
         <div className="modal-backdrop" role="presentation" onClick={() => setSelected(null)}>
           <section className="modal" role="dialog" onClick={(event) => event.stopPropagation()}>
             <button className="close" onClick={() => setSelected(null)}>
@@ -5169,9 +5380,21 @@ export function App() {
               <strong>{legal?.documents.aup.title}</strong>
               <p>{legal?.documents.aup.body}</p>
             </div>
-            <button className="primary wide" disabled={!me?.eligible} onClick={createOrder}>
-              {me?.eligible ? text.buy : text.pending}
-            </button>
+            {route === "/" ? (
+              <button
+                className="primary wide"
+                onClick={() => {
+                  setSelected(null);
+                  openRoute("/customer");
+                }}
+              >
+                Continue in customer workspace
+              </button>
+            ) : (
+              <button className="primary wide" disabled={!me?.eligible} onClick={createOrder}>
+                {me?.eligible ? text.buy : text.pending}
+              </button>
+            )}
           </section>
         </div>
       )}
