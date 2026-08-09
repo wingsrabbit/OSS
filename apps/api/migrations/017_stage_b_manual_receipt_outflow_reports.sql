@@ -18,6 +18,26 @@ CREATE INDEX durable_jobs_pending_type_available_created_idx
   ON public.durable_jobs(job_type, available_at, created_at)
   WHERE status = 'pending';
 
+CREATE FUNCTION public.opensales_guard_running_durable_job_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF OLD.status = 'running' AND (
+    NEW.job_type IS DISTINCT FROM OLD.job_type
+    OR NEW.unique_key IS DISTINCT FROM OLD.unique_key
+    OR NEW.payload IS DISTINCT FROM OLD.payload
+  ) THEN
+    RAISE EXCEPTION 'a running durable job cannot change type, identity, or payload';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER b_schema_017_running_job_identity_guard
+  BEFORE UPDATE ON public.durable_jobs
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_guard_running_durable_job_identity();
+
 CREATE TABLE public.manual_receipt_outflow_reports(
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   manual_receipt_id uuid NOT NULL REFERENCES public.manual_receipt_facts(id),
@@ -270,6 +290,8 @@ AS $$
      AND reauth.session_id = session_record.id
      AND reauth.invalidated_at IS NULL
      AND reauth.expires_at > pg_catalog.now()
+     AND reauth.created_at > pg_catalog.now() - interval '15 minutes'
+     AND reauth.expires_at <= reauth.created_at + interval '15 minutes'
     JOIN public.staff_members staff
       ON staff.user_id = user_record.id
      AND staff.active

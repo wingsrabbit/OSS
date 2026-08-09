@@ -451,12 +451,25 @@ export async function assertSchema016CatalogShape(
        FROM catalog_items
      )
      SELECT
-       (SELECT count(*) = 2
-        FROM public.schema_migrations
-        WHERE version IN (
+       (SELECT array_agg(version ORDER BY version COLLATE "C")
+        FROM public.schema_migrations) = ARRAY[
+          '001_stage_a',
+          '002_staff_stage_a',
+          '003_stage_a_financial_hardening',
+          '004_stage_b_credit_and_fees',
+          '005_stage_b_add_funds',
+          '006_stage_b_unclaimed_funds',
+          '007_stage_b_manual_refunds',
+          '008_stage_b_refund_reconciliation',
+          '009_stage_b_refund_capacity_incidents',
+          '010_stage_b_unclaimed_refunds',
+          '011_stage_b_add_funds_chargebacks',
+          '012_stage_b_renewal_lifecycle',
+          '013_stage_b_late_fee_suspension',
+          '014_stage_b_cycle_end_cancellation',
           '015_stage_b_saved_payment_auto_renew',
           '016_stage_b_manual_receipts'
-        )) AS has_contiguous_history,
+        ]::text[] AS has_contiguous_history,
        to_regclass('public.manual_receipt_facts') IS NOT NULL
          AND to_regclass('public.manual_receipt_reversals') IS NOT NULL
          AND to_regclass('public.manual_receipt_outflows') IS NOT NULL

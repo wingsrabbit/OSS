@@ -146,7 +146,7 @@ test("schema-017 marker INSERT and UPDATE conflict with a live rollback bridge",
   }
 });
 
-test("017-only facts block the 016 bridge and Provider artifacts are impossible", async () => {
+test("017-only facts block the 016 bridge", async () => {
   const client = await pool.connect();
   const sourceId = randomUUID();
   try {
@@ -167,6 +167,60 @@ test("017-only facts block the 016 bridge and Provider artifacts are impossible"
         return true;
       },
     );
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+});
+
+test("a claimed running job cannot be changed into a schema-017 job", async () => {
+  const client = await pool.connect();
+  const jobId = randomUUID();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.durable_jobs(
+         id, job_type, unique_key, payload, status
+       ) VALUES ($1, 'notification.send', $2, $3::jsonb, 'pending')`,
+      [jobId, `schema-017-running-job-${jobId}`, JSON.stringify({ messageId: jobId })],
+    );
+    await client.query(
+      "UPDATE public.durable_jobs SET payload = $2::jsonb WHERE id = $1",
+      [jobId, JSON.stringify({ messageId: jobId, retry: "allowed-while-pending" })],
+    );
+    await client.query(
+      `UPDATE public.durable_jobs
+       SET status = 'running', locked_at = pg_catalog.now(), locked_by = 'schema-017-test'
+       WHERE id = $1`,
+      [jobId],
+    );
+    await client.query("SAVEPOINT before_identity_attack");
+    await assert.rejects(
+      client.query(
+        `UPDATE public.durable_jobs
+         SET status = 'completed',
+             job_type = 'manual_receipt_outflow.reconcile',
+             payload = $2::jsonb
+         WHERE id = $1`,
+        [jobId, JSON.stringify({ manualReceiptOutflowReportId: randomUUID() })],
+      ),
+      /running durable job cannot change type, identity, or payload/,
+    );
+    await client.query("ROLLBACK TO SAVEPOINT before_identity_attack");
+    const unchanged = await client.query<{
+      status: string;
+      job_type: string;
+      payload: Record<string, unknown>;
+    }>(
+      "SELECT status, job_type, payload FROM public.durable_jobs WHERE id = $1",
+      [jobId],
+    );
+    assert.equal(unchanged.rows[0]?.status, "running");
+    assert.equal(unchanged.rows[0]?.job_type, "notification.send");
+    assert.deepEqual(unchanged.rows[0]?.payload, {
+      messageId: jobId,
+      retry: "allowed-while-pending",
+    });
   } finally {
     await client.query("ROLLBACK").catch(() => undefined);
     client.release();
