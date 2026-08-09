@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHmac, randomUUID } from "node:crypto";
-import { isPaymentBusinessStatePayable } from "@opensales/core";
+import {
+  assertRuntimeDatabaseRoleSafe,
+  isPaymentBusinessStatePayable,
+} from "@opensales/core";
 import {
   providerOperationCapability,
   providerOperationCapabilityMatches,
@@ -34,6 +37,7 @@ import {
 const config = z
   .object({
     DATABASE_URL: z.string().min(1),
+    DATABASE_RUNTIME_ROLE: z.string().regex(/^[a-z][a-z0-9_]{0,62}$/),
     MOCK_PAYMENT_PROVIDER_URL: z.url(),
     MOCK_PROVISIONING_PROVIDER_URL: z.url(),
     MOCK_MAIL_PROVIDER_URL: z.url(),
@@ -7427,6 +7431,10 @@ process.on("SIGINT", () => {
 let workerFailure: unknown;
 let cleanupFailure: unknown;
 try {
+  await assertRuntimeDatabaseRoleSafe(
+    { query: async (text, values) => pool.query(text, values) },
+    config.DATABASE_RUNTIME_ROLE,
+  );
   schemaCompatibilityGuard = await pool.connect();
   await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
   await schemaCompatibilityGuard.query(

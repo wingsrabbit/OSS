@@ -69,6 +69,9 @@ jobs:
     env:
       ADMIN_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/oss
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/oss
+      DATABASE_API_ROLE_PASSWORD: ci-only-api-database-password-000000000000
+      DATABASE_WORKER_ROLE_PASSWORD: ci-only-worker-database-password-000000000
       PROVIDER_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/provider
       OSS_ENV: test
       OSS_PUBLIC_URL: http://127.0.0.1:5173
@@ -169,6 +172,7 @@ jobs:
       - name: Run schema 016 Worker job boundary PostgreSQL journey
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
+          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
         run: |
           pnpm --filter @opensales/api migrate
           pnpm --filter @opensales/worker test:integration:job-claim
@@ -281,16 +285,23 @@ jobs:
         run: |
           set -euo pipefail
           pnpm --filter @opensales/api migrate
-          pnpm --filter @opensales/api seed:termrat
+          DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            pnpm --filter @opensales/api seed:termrat
+
+      - name: Prove migration and runtime database role separation
+        run: pnpm --filter @opensales/api test:integration:database-role-boundary
 
       - name: Start API, Worker, and Mock Provider
         shell: bash
         run: |
           set -euo pipefail
           node providers/mock-lab/dist/server.js > provider.log 2>&1 &
-          node apps/api/dist/server.js > api.log 2>&1 &
+          DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_api node apps/api/dist/server.js > api.log 2>&1 &
           echo "$!" > api.pid
-          MOCK_RESOURCE_ACTION_SCENARIO=timeout_success node apps/worker/dist/worker.js > worker.log 2>&1 &
+          DATABASE_URL=postgresql://oss_worker:${DATABASE_WORKER_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_worker MOCK_RESOURCE_ACTION_SCENARIO=timeout_success \
+            node apps/worker/dist/worker.js > worker.log 2>&1 &
           echo "$!" > worker.pid
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
@@ -323,7 +334,9 @@ jobs:
             echo "Worker process did not stop cleanly"
             exit 1
           fi
-          node apps/worker/dist/worker.js > worker-browser.log 2>&1 &
+          DATABASE_URL=postgresql://oss_worker:${DATABASE_WORKER_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_worker node apps/worker/dist/worker.js \
+            > worker-browser.log 2>&1 &
           echo "$!" > worker.pid
 
       - name: Install pinned Chromium runtime
@@ -347,7 +360,9 @@ jobs:
             echo "API process did not stop cleanly"
             exit 1
           fi
-          node apps/api/dist/server.js > api-browser.log 2>&1 &
+          DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_api node apps/api/dist/server.js \
+            > api-browser.log 2>&1 &
           echo "$!" > api.pid
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null; then

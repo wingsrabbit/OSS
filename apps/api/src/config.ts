@@ -9,6 +9,10 @@ import {
 
 const schema = z.object({
   DATABASE_URL: z.string().min(1),
+  DATABASE_RUNTIME_ROLE: z.string().regex(/^[a-z][a-z0-9_]{0,62}$/).optional(),
+  MIGRATION_DATABASE_URL: z.string().min(1).optional(),
+  DATABASE_API_ROLE_PASSWORD: z.string().min(32).optional(),
+  DATABASE_WORKER_ROLE_PASSWORD: z.string().min(32).optional(),
   OSS_ENV: z.enum(["development", "test", "laboratory"]).default("development"),
   OSS_LOG_LEVEL: z
     .enum(["silent", "fatal", "error", "warn", "info", "debug", "trace"])

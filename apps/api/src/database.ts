@@ -3,6 +3,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertMigrationDatabaseRoleSafe } from "@opensales/core";
 import {
   assertProviderTokenKeyringCoversVersions,
   fingerprintProviderTokenKey,
@@ -44,8 +45,15 @@ export function createPool(
   config: Config,
   applicationName = "opensales-api",
 ): DatabasePool {
+  return createPoolForConnection(config.DATABASE_URL, applicationName);
+}
+
+export function createPoolForConnection(
+  connectionString: string,
+  applicationName: string,
+): DatabasePool {
   return new Pool({
-    connectionString: config.DATABASE_URL,
+    connectionString,
     max: 20,
     connectionTimeoutMillis: 5_000,
     options: "-c search_path=pg_catalog,public",
@@ -243,6 +251,9 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   let failure: unknown;
   try {
     await client.query("SET search_path TO public");
+    await assertMigrationDatabaseRoleSafe({
+      query: async (text, values) => client.query(text, values),
+    });
     await client.query(
       "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('opensales:schema-migrations', 0))",
     );
@@ -380,6 +391,123 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   if (cleanupErrors.length > 0) {
     throw new AggregateError(cleanupErrors, "Schema migration advisory-lock cleanup failed");
   }
+}
+
+export type RuntimeDatabaseRole = Readonly<{
+  name: string;
+  password: string;
+}>;
+
+function assertRuntimeRoleInput(role: RuntimeDatabaseRole): void {
+  if (!/^[a-z][a-z0-9_]{0,62}$/.test(role.name)) {
+    throw new Error(`Invalid runtime database role identifier ${role.name}`);
+  }
+  if (role.password.length < 32) {
+    throw new Error(`Runtime database role ${role.name} requires a 32-character password`);
+  }
+}
+
+async function formattedRoleSql(
+  client: DatabaseClient,
+  template: string,
+  values: readonly unknown[],
+): Promise<string> {
+  const result = await client.query<{ statement: string }>(
+    "SELECT pg_catalog.format($1, VARIADIC $2::text[]) AS statement",
+    [template, values.map(String)],
+  );
+  const statement = result.rows[0]?.statement;
+  if (!statement) throw new Error("Unable to format database role boundary statement");
+  return statement;
+}
+
+export async function configureRuntimeDatabaseRoles(
+  pool: DatabasePool,
+  roles: readonly RuntimeDatabaseRole[],
+): Promise<void> {
+  if (roles.length === 0) throw new Error("At least one runtime database role is required");
+  const names = new Set<string>();
+  for (const role of roles) {
+    assertRuntimeRoleInput(role);
+    if (names.has(role.name)) throw new Error(`Duplicate runtime database role ${role.name}`);
+    names.add(role.name);
+  }
+  await transaction(pool, async (client) => {
+    await assertMigrationDatabaseRoleSafe({
+      query: async (text, values) => client.query(text, values),
+    });
+    await client.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await client.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC");
+    await client.query(
+      "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+    );
+    const databaseName = (await client.query<{ database_name: string }>(
+      "SELECT pg_catalog.current_database() AS database_name",
+    )).rows[0]?.database_name;
+    const migrationRole = (await client.query<{ role_name: string }>(
+      "SELECT current_user AS role_name",
+    )).rows[0]?.role_name;
+    if (!databaseName || !migrationRole) {
+      throw new Error("Unable to resolve migration database identity");
+    }
+    for (const role of roles) {
+      const existing = await client.query(
+        "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1",
+        [role.name],
+      );
+      if (existing.rowCount === 0) {
+        await client.query(
+          await formattedRoleSql(
+            client,
+            "CREATE ROLE %I LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L",
+            [role.name, role.password],
+          ),
+        );
+      } else {
+        await client.query(
+          await formattedRoleSql(
+            client,
+            "ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L",
+            [role.name, role.password],
+          ),
+        );
+      }
+      await client.query(
+        await formattedRoleSql(
+          client,
+          "REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I",
+          [databaseName, role.name],
+        ),
+      );
+      await client.query(
+        await formattedRoleSql(client, "GRANT CONNECT ON DATABASE %I TO %I", [
+          databaseName,
+          role.name,
+        ]),
+      );
+      await client.query(
+        await formattedRoleSql(client, "REVOKE %I FROM %I", [migrationRole, role.name]),
+      );
+      const statements = [
+        "REVOKE ALL PRIVILEGES ON SCHEMA public FROM %I",
+        "GRANT USAGE ON SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %I",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %I",
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM %I",
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON TABLE public.schema_migrations FROM %I",
+        "GRANT SELECT ON TABLE public.schema_migrations TO %I",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO %I",
+      ] as const;
+      for (const template of statements) {
+        await client.query(await formattedRoleSql(client, template, [role.name]));
+      }
+    }
+  });
 }
 
 export async function assertSchemaCompatible(
