@@ -15,7 +15,7 @@ import {
 } from "@opensales/core/provider-token-vault";
 import {
   assertSchema016NativeSafe,
-  SCHEMA_016,
+  SCHEMA_016_APPLICATION_GUARD,
 } from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
 import { z } from "zod";
@@ -69,7 +69,6 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const SCHEMA_016_APPLICATION_GUARD = "opensales:schema-016-application";
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 

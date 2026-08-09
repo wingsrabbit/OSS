@@ -40,8 +40,8 @@ const config: Config = {
   LAB_MAILBOX_TOKEN: "synthetic-manual-receipt-mail-token",
   PROVIDER_OPERATION_CAPABILITY_SECRET:
     "synthetic-manual-receipt-capability-secret",
-  PAYMENT_METHOD_TOKEN_KEY: "A".repeat(43),
-  PAYMENT_METHOD_TOKEN_LOOKUP_KEY: "B".repeat(43),
+  PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 41).toString("base64url"),
+  PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 42).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-manual-receipt-payment-hook",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-manual-receipt-provision-hook",
@@ -333,6 +333,23 @@ try {
     "MANUAL_RECEIPT_FEE_EXCEEDS_GROSS",
   );
 
+  const outOfRange = await app.inject({
+    method: "POST",
+    url,
+    headers: { cookie },
+    payload: {
+      ...firstBody,
+      reference: `OUT-OF-RANGE-${namespace}`,
+      grossAmountMinor: "9223372036854775808",
+      idempotencyKey: `out-of-range-${namespace}`,
+    },
+  });
+  assert.equal(outOfRange.statusCode, 400);
+  assert.equal(
+    responseJson<{ code: string }>(outOfRange).code,
+    "MANUAL_RECEIPT_AMOUNT_OUT_OF_RANGE",
+  );
+
   const listed = await app.inject({ method: "GET", url, headers: { cookie } });
   assert.equal(listed.statusCode, 200, listed.body);
   assert.equal(
@@ -427,6 +444,15 @@ try {
   assert.equal(effects.rows[0]?.manual_provider_operations, "0");
   assert.equal(effects.rows[0]?.manual_jobs, "0");
 
+  await assert.rejects(
+    runMigrations(pool),
+    /running schema-016 API or Worker/,
+  );
+  await app.close();
+  app = null;
+  await runMigrations(pool);
+  assert.equal((await assertSchemaCompatible(pool)).mode, "native");
+
   process.stdout.write(
     `${JSON.stringify({
       schema016Native: true,
@@ -444,6 +470,8 @@ try {
       automaticInvoicePayment: false,
       automaticCredit: false,
       automaticServiceActivation: false,
+      liveApplicationBlocksMigration: true,
+      migrationAllowedAfterShutdown: true,
     })}\n`,
   );
 } finally {

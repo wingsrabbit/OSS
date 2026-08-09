@@ -11,8 +11,10 @@ import {
 export const SCHEMA_016 = "016_stage_b_manual_receipts" as const;
 export const SCHEMA_015_016_GUARD =
   "opensales:schema-015-016-rollback-bridge" as const;
+export const SCHEMA_016_APPLICATION_GUARD =
+  "opensales:schema-016-application" as const;
 export const SCHEMA_016_CATALOG_DIGEST =
-  "1d2d65ad265a749cb2ff7ce5074a820130d2ef5675b53c5c37dd85e1dfd54ce6" as const;
+  "5727bf224ccf1e137440f30c34f4e1b685ab0b4eb07d261451eb27d89b10697a" as const;
 
 export type Schema015RollbackPreflightReport = Readonly<{
   installedSchemaVersion: string;
@@ -337,7 +339,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                         actual.contype::text, actual.convalidated::text,
                         actual.condeferrable::text, actual.condeferred::text,
                         actual.connoinherit::text,
-                        regexp_replace(pg_get_constraintdef(actual.oid), '\s+', ' ', 'g'))
+                        regexp_replace(pg_get_constraintdef(actual.oid), '\\s+', ' ', 'g'))
        FROM pg_namespace namespace
        JOIN pg_class relation ON relation.relnamespace = namespace.oid
        JOIN pg_constraint actual ON actual.conrelid = relation.oid
@@ -361,7 +363,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                         actual.tgenabled::text, actual.tgtype::text,
                         actual.tgdeferrable::text, actual.tginitdeferred::text,
                         procedure_namespace.nspname, procedure.proname,
-                        regexp_replace(pg_get_triggerdef(actual.oid, true), '\s+', ' ', 'g'))
+                        regexp_replace(pg_get_triggerdef(actual.oid, true), '\\s+', ' ', 'g'))
        FROM pg_namespace namespace
        JOIN pg_class relation ON relation.relnamespace = namespace.oid
        JOIN pg_trigger actual ON actual.tgrelid = relation.oid
@@ -393,7 +395,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                         COALESCE(array_to_string(actual.proconfig, ','), ''),
                         pg_get_function_identity_arguments(actual.oid),
                         pg_get_function_result(actual.oid),
-                        regexp_replace(btrim(actual.prosrc), '\s+', ' ', 'g'))
+                        regexp_replace(btrim(actual.prosrc), '\\s+', ' ', 'g'))
        FROM pg_namespace namespace
        JOIN pg_proc actual ON actual.pronamespace = namespace.oid
        JOIN pg_language language ON language.oid = actual.prolang
@@ -412,7 +414,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
        SELECT concat_ws('|', 'view', 'unclaimed_fund_refund_capacity',
                         regexp_replace(
                           pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true),
-                          '\s+', ' ', 'g'
+                          '\\s+', ' ', 'g'
                         ))
      ), catalog_fingerprint(value) AS (
        SELECT string_agg(item, E'\n' ORDER BY item)

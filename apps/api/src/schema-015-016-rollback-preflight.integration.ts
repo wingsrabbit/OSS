@@ -128,7 +128,7 @@ try {
       DROP CONSTRAINT fund_receipts_disposition_check;
 
     CREATE TABLE manual_receipt_facts(
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
       client_account_id uuid NOT NULL REFERENCES client_accounts(id),
       reference text NOT NULL,
       received_at timestamptz NOT NULL,
@@ -170,7 +170,7 @@ try {
       );
 
     CREATE TABLE manual_receipt_reversals(
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
       manual_receipt_id uuid NOT NULL UNIQUE REFERENCES manual_receipt_facts(id),
       fund_receipt_id uuid NOT NULL UNIQUE REFERENCES fund_receipts(id),
       actor_id uuid NOT NULL REFERENCES users(id),
@@ -181,7 +181,7 @@ try {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE TABLE manual_receipt_outflows(
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
       manual_receipt_id uuid NOT NULL REFERENCES manual_receipt_facts(id),
       fund_receipt_id uuid NOT NULL REFERENCES fund_receipts(id),
       amount_minor bigint NOT NULL CHECK (amount_minor > 0),

@@ -60,6 +60,7 @@ const manualReceiptSchema = z.object({
   reason: z.string().trim().min(10).max(1_000),
   idempotencyKey: z.string().min(8).max(128),
 });
+const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 
 export async function requireStaffPermission(
   pool: DatabasePool,
@@ -289,6 +290,12 @@ export async function registerAdminRoutes(
       const body = manualReceiptSchema.parse(request.body);
       const grossAmount = BigInt(body.grossAmountMinor);
       const fee = BigInt(body.feeMinor);
+      if (grossAmount > POSTGRES_BIGINT_MAX || fee > POSTGRES_BIGINT_MAX) {
+        throw Object.assign(new Error("Manual receipt amount is outside the supported range"), {
+          statusCode: 400,
+          code: "MANUAL_RECEIPT_AMOUNT_OUT_OF_RANGE",
+        });
+      }
       if (fee > grossAmount) {
         throw Object.assign(new Error("Fee cannot exceed the received gross amount"), {
           statusCode: 400,

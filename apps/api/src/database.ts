@@ -18,6 +18,7 @@ import {
   assertSchema016NativeSafe,
   SCHEMA_015_016_GUARD,
   SCHEMA_016,
+  SCHEMA_016_APPLICATION_GUARD,
   type Schema015RollbackPreflightReport,
 } from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
@@ -29,8 +30,6 @@ export type DatabaseClient = pg.PoolClient;
 export const REQUIRED_SCHEMA_VERSION = SCHEMA_016;
 const TOKEN_REGISTRY_EXTENSION_GUARD =
   "opensales:payment-method-token-registry-extension";
-export const SCHEMA_016_APPLICATION_GUARD =
-  "opensales:schema-016-application";
 
 export function createPool(
   config: Config,

@@ -160,7 +160,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
          ) AS payment_attempt_decision_generation
        FROM schema_migrations`,
     );
-    assert.equal(upgraded.rows[0]?.version, "015_stage_b_saved_payment_auto_renew");
+    assert.equal(upgraded.rows[0]?.version, "016_stage_b_manual_receipts");
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
