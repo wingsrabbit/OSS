@@ -75,6 +75,32 @@ Candidate.
 
 Use only synthetic identities and data.
 
+### Fast local Demo on macOS (no Docker)
+
+With PostgreSQL 18, the frozen workspace dependencies, and Node 24.18.0
+available locally, one command builds the applications, initializes an isolated
+PostgreSQL cluster under `.demo/local`, starts API/Worker/Web plus all four Mock
+Provider processes on loopback, creates a synthetic account, and proves the
+Stage A happy path through an Active service:
+
+```bash
+node tools/demo-local.mjs up
+```
+
+The command prints `http://127.0.0.1:5173/`, a generated `.example.invalid`
+login, a generated password, the administrator login when this is a fresh Demo
+database, and the exact smoke result. Stop it without deleting the synthetic
+data:
+
+```bash
+node tools/demo-local.mjs down
+```
+
+See [docs/demo-local.md](docs/demo-local.md) for status, repeat-smoke, reset,
+ports, reused product components, and limitations.
+
+### Docker Compose alternative
+
 ```bash
 cp .env.example .env
 # Replace every __GENERATE_* placeholder with an independent random value.
