@@ -3439,12 +3439,17 @@ async function proveScheduledBillingDay(pool: pg.Pool): Promise<{ runId: string 
   }
 }
 
-const pool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
+const pool = new pg.Pool({
+  connectionString: databaseUrl,
+  max: 4,
+  connectionTimeoutMillis: 5_000,
+});
 await runMigrations(pool);
 await assertSchemaCompatible(pool);
 await bootstrapPaymentMethodTokenKeyrings(pool, integrationConfig);
 await assertPaymentMethodTokenKeyringsCompatible(pool, integrationConfig);
 const client = await pool.connect();
+let clientReleased = false;
 
 try {
   await client.query("BEGIN");
@@ -4171,6 +4176,8 @@ try {
     ),
   );
   await client.query("ROLLBACK");
+  client.release();
+  clientReleased = true;
   await proveManualSuspensionApi(pool);
   console.log(
     JSON.stringify(
@@ -4233,9 +4240,11 @@ try {
     ),
   );
 } catch (error) {
-  await client.query("ROLLBACK").catch(() => undefined);
+  if (!clientReleased) {
+    await client.query("ROLLBACK").catch(() => undefined);
+  }
   throw error;
 } finally {
-  client.release();
+  if (!clientReleased) client.release();
   await pool.end();
 }

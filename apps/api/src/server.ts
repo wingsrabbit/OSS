@@ -8,12 +8,24 @@ import {
 } from "./database.js";
 
 const config = loadConfig();
-const { app, pool } = await buildApp(config);
+let app: Awaited<ReturnType<typeof buildApp>>["app"] | null = null;
 try {
-  await assertSchemaCompatible(pool);
+  const built = await buildApp(config);
+  app = built.app;
+  const { pool } = built;
+  const schemaPreflight = await assertSchemaCompatible(pool, {
+    enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
+  });
+  app.log.info(
+    {
+      installedSchemaVersion: schemaPreflight.installedSchemaVersion,
+      schemaMode: schemaPreflight.mode,
+    },
+    "schema startup preflight passed",
+  );
   await assertPaymentMethodTokenKeyringsCompatible(pool, config);
   await app.listen({ host: config.API_HOST, port: config.API_PORT });
 } catch (error) {
-  await app.close().catch(() => undefined);
+  if (app) await app.close().catch(() => undefined);
   throw error;
 }

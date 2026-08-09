@@ -13,6 +13,10 @@ import {
   fingerprintProviderTokenKey,
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
+import {
+  assert015RollbackBridgeSafe,
+  SCHEMA_015_016_GUARD,
+} from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -28,6 +32,7 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
+    OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "015-to-016"]).optional(),
     PAYMENT_METHOD_TOKEN_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     PAYMENT_METHOD_TOKEN_KEY_VERSION: z.coerce.number().int().positive().optional(),
     PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: z.string().optional(),
@@ -60,20 +65,60 @@ const paymentTokenEncryptionKeyring = createProviderTokenKeyring(
 const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
   max: 10,
+  options: "-c search_path=pg_catalog,public",
   statement_timeout: 15_000,
   application_name: "opensales-worker",
 });
-const tokenRegistryGuard = await pool.connect();
-try {
-  await tokenRegistryGuard.query(
-    "SELECT pg_advisory_lock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
-  );
-} catch (error) {
-  tokenRegistryGuard.release();
-  await pool.end();
-  throw error;
+let schemaCompatibilityGuard: pg.PoolClient | null = null;
+let tokenRegistryGuard: pg.PoolClient | null = null;
+
+async function releaseWorkerGuard(
+  client: pg.PoolClient,
+  guard: string,
+): Promise<void> {
+  try {
+    const result = await client.query<{ unlocked: boolean }>(
+      "SELECT pg_catalog.pg_advisory_unlock_shared(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [guard],
+    );
+    if (result.rows[0]?.unlocked !== true) {
+      throw new Error(`Worker guard ${guard} was not held by its session`);
+    }
+    client.release();
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
 }
-const REQUIRED_SCHEMA_VERSION = "015_stage_b_saved_payment_auto_renew";
+
+async function cleanupWorkerResources(): Promise<void> {
+  const errors: unknown[] = [];
+  const releases: Promise<void>[] = [];
+  if (tokenRegistryGuard) {
+    releases.push(
+      releaseWorkerGuard(
+        tokenRegistryGuard,
+        "opensales:payment-method-token-registry-extension",
+      ),
+    );
+    tokenRegistryGuard = null;
+  }
+  if (schemaCompatibilityGuard) {
+    releases.push(releaseWorkerGuard(schemaCompatibilityGuard, SCHEMA_015_016_GUARD));
+    schemaCompatibilityGuard = null;
+  }
+  for (const result of await Promise.allSettled(releases)) {
+    if (result.status === "rejected") errors.push(result.reason);
+  }
+  try {
+    await pool.end();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "OpenSales Worker resource cleanup failed");
+  }
+}
 
 type Job = {
   id: string;
@@ -7325,17 +7370,42 @@ process.on("SIGINT", () => {
   stopping = true;
 });
 
-const schema = await pool.query<{ version: string | null }>(
-  "SELECT max(version) AS version FROM schema_migrations",
-);
-if (schema.rows[0]?.version !== REQUIRED_SCHEMA_VERSION) {
-  throw new Error(
-    `OpenSales schema ${schema.rows[0]?.version ?? "missing"} is incompatible with worker requirement ${REQUIRED_SCHEMA_VERSION}`,
+let workerFailure: unknown;
+let cleanupFailure: unknown;
+try {
+  schemaCompatibilityGuard = await pool.connect();
+  await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
+  await schemaCompatibilityGuard.query(
+    "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+    [SCHEMA_015_016_GUARD],
   );
-}
-await transaction(async (client) => {
+  await schemaCompatibilityGuard.query("RESET lock_timeout");
+  try {
+    await schemaCompatibilityGuard.query(
+      "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
+    await schemaCompatibilityGuard.query("SET LOCAL search_path TO pg_catalog, public");
+    await assert015RollbackBridgeSafe(
+      {
+        query: async (text, values) => schemaCompatibilityGuard!.query(text, values),
+      },
+      {
+        enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
+      },
+    );
+    await schemaCompatibilityGuard.query("COMMIT");
+  } catch (error) {
+    await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
+
+  tokenRegistryGuard = await pool.connect();
+  await tokenRegistryGuard.query(
+    "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended('opensales:payment-method-token-registry-extension', 0))",
+  );
+  await transaction(async (client) => {
   await client.query(
-    "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+    "SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended('opensales:payment-method-token-rewrap', 0))",
   );
   const registered = await client.query<{ version: number; key_fingerprint: Buffer }>(
     `SELECT version, key_fingerprint
@@ -7397,12 +7467,12 @@ await transaction(async (client) => {
     storedTokenVersions.rows[0]?.encryption_versions ?? [],
     "encryption",
   );
-});
+  });
 
 console.log(`OpenSales worker ${config.WORKER_ID} started (${randomUUID()}).`);
 let nextRecoveryAt = 0;
 let nextBillingScheduleAt = 0;
-while (!stopping) {
+  while (!stopping) {
   if (Date.now() >= nextBillingScheduleAt) {
     try {
       const scheduled = await ensureScheduledBillingJob(pool);
@@ -7475,12 +7545,23 @@ while (!stopping) {
         },
       );
     }
+    }
+  }
+} catch (error) {
+  workerFailure = error;
+} finally {
+  try {
+    await cleanupWorkerResources();
+  } catch (error) {
+    cleanupFailure = error;
   }
 }
-await tokenRegistryGuard
-  .query(
-    "SELECT pg_advisory_unlock_shared(hashtextextended('opensales:payment-method-token-registry-extension', 0))",
-  )
-  .catch(() => undefined);
-tokenRegistryGuard.release();
-await pool.end();
+
+if (workerFailure !== undefined && cleanupFailure !== undefined) {
+  throw new AggregateError(
+    [workerFailure, cleanupFailure],
+    "OpenSales Worker failed and resource cleanup also failed",
+  );
+}
+if (workerFailure !== undefined) throw workerFailure;
+if (cleanupFailure !== undefined) throw cleanupFailure;

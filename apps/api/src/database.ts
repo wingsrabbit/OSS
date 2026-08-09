@@ -13,6 +13,11 @@ import {
   assert014RollbackBridgeSafe,
   type SchemaRollbackPreflightReport,
 } from "@opensales/core/schema-rollback-compatibility";
+import {
+  assert015RollbackBridgeSafe,
+  SCHEMA_015_016_GUARD,
+  type Schema015RollbackPreflightReport,
+} from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
 import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
@@ -30,6 +35,7 @@ export function createPool(
   return new Pool({
     connectionString: config.DATABASE_URL,
     max: 20,
+    options: "-c search_path=pg_catalog,public",
     statement_timeout: 15_000,
     query_timeout: 20_000,
     application_name: applicationName,
@@ -61,25 +67,73 @@ export async function holdPaymentMethodTokenRegistryExtensionGuard(
   let held = false;
   try {
     await client.query(
-      "SELECT pg_advisory_lock_shared(hashtextextended($1, 0))",
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
       [TOKEN_REGISTRY_EXTENSION_GUARD],
     );
     held = true;
   } catch (error) {
-    client.release();
+    client.release(error instanceof Error ? error : true);
     throw error;
   }
   return async () => {
     if (!held) return;
     held = false;
     try {
-      await client.query(
-        "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))",
+      const result = await client.query<{ unlocked: boolean }>(
+        "SELECT pg_catalog.pg_advisory_unlock_shared(pg_catalog.hashtextextended($1, 0)) AS unlocked",
         [TOKEN_REGISTRY_EXTENSION_GUARD],
       );
-    } finally {
+      if (result.rows[0]?.unlocked !== true) {
+        throw new Error("Payment token registry extension guard was not held by its session");
+      }
       client.release();
+    } catch (error) {
+      client.release(error instanceof Error ? error : true);
+      throw error;
     }
+  };
+}
+
+async function releaseGuardClient(
+  client: DatabaseClient,
+  guard: string,
+): Promise<void> {
+  try {
+    const result = await client.query<{ unlocked: boolean }>(
+      "SELECT pg_catalog.pg_advisory_unlock_shared(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [guard],
+    );
+    if (result.rows[0]?.unlocked !== true) {
+      throw new Error(`Schema compatibility guard ${guard} was not held by its session`);
+    }
+    client.release();
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+}
+
+export async function holdSchema015RollbackBridgeGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SET lock_timeout = '15s'");
+    await client.query(
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_015_016_GUARD],
+    );
+    await client.query("RESET lock_timeout");
+    held = true;
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    await releaseGuardClient(client, SCHEMA_015_016_GUARD);
   };
 }
 
@@ -87,7 +141,7 @@ export async function tryLockPaymentMethodTokenRegistryExtension(
   client: DatabaseClient,
 ): Promise<boolean> {
   const result = await client.query<{ locked: boolean }>(
-    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked",
+    "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
     [TOKEN_REGISTRY_EXTENSION_GUARD],
   );
   return result.rows[0]?.locked === true;
@@ -95,12 +149,28 @@ export async function tryLockPaymentMethodTokenRegistryExtension(
 
 export async function runMigrations(pool: DatabasePool): Promise<void> {
   const client = await pool.connect();
+  let migrationLockHeld = false;
+  let compatibilityLockHeld = false;
+  let failed = false;
+  let failure: unknown;
   try {
+    await client.query("SET search_path TO public");
     await client.query(
-      "SELECT pg_advisory_lock(hashtextextended('opensales:schema-migrations', 0))",
+      "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('opensales:schema-migrations', 0))",
     );
+    migrationLockHeld = true;
+    const compatibilityGuard = await client.query<{ locked: boolean }>(
+      "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
+      [SCHEMA_015_016_GUARD],
+    );
+    if (compatibilityGuard.rows[0]?.locked !== true) {
+      throw new Error(
+        "Schema migration is blocked by a running compatibility-bridge API or Worker; stop every application process before migrating",
+      );
+    }
+    compatibilityLockHeld = true;
     await client.query(
-      "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+      "CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
     const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
     const migrationFiles = (await readdir(migrationsDirectory))
@@ -112,12 +182,14 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       await client.query("BEGIN");
       try {
         const existing = await client.query<{ version: string }>(
-          "SELECT version FROM schema_migrations WHERE version = $1",
+          "SELECT version FROM public.schema_migrations WHERE version = $1",
           [version],
         );
         if (existing.rowCount === 0) {
           await client.query(migration);
-          await client.query("INSERT INTO schema_migrations(version) VALUES ($1)", [version]);
+          await client.query("INSERT INTO public.schema_migrations(version) VALUES ($1)", [
+            version,
+          ]);
         }
         await client.query("COMMIT");
       } catch (error) {
@@ -125,24 +197,76 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
         throw error;
       }
     }
-  } finally {
-    await client
-      .query("SELECT pg_advisory_unlock(hashtextextended('opensales:schema-migrations', 0))")
-      .catch(() => undefined);
-    client.release();
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+
+  const cleanupErrors: unknown[] = [];
+  let discardClient = false;
+  try {
+    await client.query("SET search_path TO pg_catalog, public");
+  } catch (error) {
+    cleanupErrors.push(error);
+    discardClient = true;
+  }
+  const unlock = async (query: string, values?: unknown[]): Promise<void> => {
+    try {
+      const result = await client.query<{ unlocked: boolean }>(query, values);
+      if (result.rows[0]?.unlocked !== true) {
+        throw new Error("Database migration advisory lock was not held by its session");
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+      discardClient = true;
+    }
+  };
+  if (compatibilityLockHeld) {
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [SCHEMA_015_016_GUARD],
+    );
+  }
+  if (migrationLockHeld) {
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended('opensales:schema-migrations', 0)) AS unlocked",
+    );
+  }
+  client.release(discardClient ? true : undefined);
+
+  if (failed && cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [failure, ...cleanupErrors],
+      "Schema migration failed and advisory-lock cleanup also failed",
+    );
+  }
+  if (failed) throw failure;
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Schema migration advisory-lock cleanup failed");
   }
 }
 
-export async function assertSchemaCompatible(pool: DatabasePool): Promise<void> {
-  const result = await pool.query<{ version: string | null }>(
-    `SELECT max(version) AS version
-     FROM schema_migrations`,
-  );
-  const installed = result.rows[0]?.version ?? null;
-  if (installed !== REQUIRED_SCHEMA_VERSION) {
-    throw new Error(
-      `OpenSales schema ${installed ?? "missing"} is incompatible; run the dedicated migrate command for ${REQUIRED_SCHEMA_VERSION}`,
+export async function assertSchemaCompatible(
+  pool: DatabasePool,
+  input: Readonly<{ enable016RollbackBridge?: boolean }> = {},
+): Promise<Schema015RollbackPreflightReport> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await client.query("SET LOCAL search_path TO pg_catalog, public");
+    const report = await assert015RollbackBridgeSafe(
+      {
+        query: async (text, values) => client.query(text, values),
+      },
+      { enable016RollbackBridge: input.enable016RollbackBridge === true },
     );
+    await client.query("COMMIT");
+    return report;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -153,6 +277,7 @@ export async function assert014RollbackSchemaCompatible(
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await client.query("SET LOCAL search_path TO pg_catalog, public");
     const report = await assert014RollbackBridgeSafe(
       {
         query: async (text, values) => client.query(text, values),
@@ -325,7 +450,7 @@ export async function bootstrapPaymentMethodTokenKeyrings(
   const keyrings = paymentMethodTokenKeyrings(config);
   await transaction(pool, async (client) => {
     await client.query(
-      "SELECT pg_advisory_xact_lock(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+      "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('opensales:payment-method-token-rewrap', 0))",
     );
     const counts = await client.query<{
       encryption_count: string;
@@ -391,7 +516,7 @@ export async function assertPaymentMethodTokenKeyringsCompatible(
 ): Promise<void> {
   await transaction(pool, async (client) => {
     await client.query(
-      "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
+      "SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended('opensales:payment-method-token-rewrap', 0))",
     );
     await assertPaymentMethodTokenKeyringsCompatibleWithClient(client, config);
   });
