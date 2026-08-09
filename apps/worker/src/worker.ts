@@ -20,7 +20,7 @@ import {
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
-import { attemptJobClaim } from "./job-claim.js";
+import { attemptJobClaim, claimSchema016Job } from "./job-claim.js";
 
 const config = z
   .object({
@@ -65,6 +65,7 @@ const paymentTokenEncryptionKeyring = createProviderTokenKeyring(
 const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
   max: 10,
+  connectionTimeoutMillis: 5_000,
   options: "-c search_path=pg_catalog,public",
   statement_timeout: 15_000,
   application_name: "opensales-worker",
@@ -693,27 +694,7 @@ async function recoverStaleRefundJobs(): Promise<number> {
 }
 
 async function claimJob(): Promise<Job | null> {
-  const result = await pool.query<Job>(
-    `WITH candidate AS (
-       SELECT id
-       FROM durable_jobs
-       WHERE status = 'pending' AND available_at <= now()
-       ORDER BY available_at, created_at
-       FOR UPDATE SKIP LOCKED
-       LIMIT 1
-     )
-     UPDATE durable_jobs job
-     SET status = 'running',
-         attempts = job.attempts + 1,
-         locked_at = now(),
-         locked_by = $1,
-         updated_at = now()
-     FROM candidate
-     WHERE job.id = candidate.id
-     RETURNING job.id, job.job_type, job.unique_key, job.payload, job.attempts`,
-    [config.WORKER_ID],
-  );
-  return result.rows[0] ?? null;
+  return claimSchema016Job<Job>(pool, config.WORKER_ID);
 }
 
 async function completeJob(job: Job): Promise<void> {
