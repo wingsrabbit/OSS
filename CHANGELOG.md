@@ -30,6 +30,43 @@ All notable project changes will be documented here. Project release numbering a
   appends one balanced compensating journal, removes the reversed item from the
   actionable unclaimed queue, safely replays a lost response, and sends no money
   or Provider request.
+- Forward migration `017_stage_b_manual_receipt_outflow_reports` lets authorized
+  billing staff report an independently observed manual-receipt outflow to the
+  fixed `original_source` destination as confirmed or unknown, then reconcile an
+  unknown report to confirmed outflow or no outflow. The flow requires current
+  source capacity, fixed-window password confirmation, a reason, occurrence
+  evidence where applicable, and an idempotent request identity; it never calls
+  a Provider.
+- An unknown manual-receipt outflow freezes only its exact source capacity until
+  reconciliation. A confirmed result appends one immutable outflow fact and one
+  sealed balanced journal, while no-outflow reconciliation releases capacity;
+  the original receipt, report, reconciliation, Credit/debt effects, and audit
+  history remain separate append-only facts and replay safely.
+- Forward migration `018_stage_c_support_tickets` adds Client Account-scoped,
+  optionally Service-linked support tickets. Eligible customers can create,
+  list, open, and reply to their own tickets; Staff with the ticket permission
+  can read the Staff queue, send a public reply, or add an internal note.
+- Ticket Service links are bound to the same Client Account by a database
+  foreign key, customer replies cannot create internal messages, and customer
+  detail responses select only public messages. Staff internal notes remain in
+  the Staff history and are absent from the customer response.
+- The React application now exposes direct-refreshable public (`/`), customer
+  (`/customer`), and Staff (`/admin`) surfaces. Public Home stays independent of
+  authenticated workspace state, customer and Staff controllers are mounted
+  only on their own routes, and the Staff page distinguishes ticket-only access
+  from the full administrator workspace using server-derived permissions.
+- The loopback Demo launcher builds, migrates, seeds, and starts the Web, API,
+  Worker, PostgreSQL 18, and four Mock Provider processes, then uses distinct
+  synthetic customer and Staff sessions to prove a paid-to-Active service, a
+  Service-linked ticket whose Staff internal note is customer-hidden, and a
+  confirmed Provider-free manual-receipt outflow. It verifies all three SPA
+  entry paths and leaves exact synthetic business IDs for operator inspection.
+- Demo reuse is bound to the Git commit plus tracked and unignored-untracked
+  source content. Lifecycle handling records and rechecks exact child and
+  PostgreSQL process identities, migrates legacy PID state only after a complete
+  match, fails closed on identity drift or PID reuse, preserves synthetic data
+  across controlled restart and forward migration, and keeps destructive reset
+  as an explicit `reset --yes` operation.
 - Eligible recurring-service customers can schedule cancellation for the exact
   end of their current paid term. The service remains available until that
   instant, future renewal generation stops, and a still-pristine issued renewal
@@ -239,9 +276,8 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Still planned
 
-- Audited restriction release after Chargeback debt recovery, saved payment
-  methods and automatic-renewal authorization, customer operations, plugin,
-  and two-VPS laboratory stages.
+- Audited restriction release after Chargeback debt recovery, broader customer
+  operations, the plugin-developer journey, and the two-VPS laboratory stages.
 
 ## [0.1.1] - 2026-07-29
 
