@@ -57,6 +57,28 @@ test("explicit schema-016 bridge accepts exact native 016 before migration", asy
   }
 });
 
+test("migration 017 rejects a pre-existing orphan outflow marker before DDL", async () => {
+  const markerId = randomUUID();
+  await pool.query(
+    `INSERT INTO public.ledger_journals(
+       id, source_type, source_id, currency, description
+     ) VALUES ($1, 'manual_receipt_outflow', $2, 'USD', 'synthetic pre-017 orphan')`,
+    [markerId, randomUUID()],
+  );
+  try {
+    await assert.rejects(runMigrations(pool), /unsupported manual receipt outflow markers/);
+    assert.equal(await currentVersion(), "016_stage_b_manual_receipts");
+    assert.equal(
+      (await pool.query("SELECT pg_catalog.to_regclass('public.manual_receipt_outflow_reports') AS relation")).rows[0]?.relation,
+      null,
+    );
+  } finally {
+    await pool.query("ALTER TABLE public.ledger_journals DISABLE TRIGGER ledger_journals_append_only");
+    await pool.query("DELETE FROM public.ledger_journals WHERE id = $1", [markerId]);
+    await pool.query("ALTER TABLE public.ledger_journals ENABLE TRIGGER ledger_journals_append_only");
+  }
+});
+
 test("actual migration 017 file applies and emits its PG18 catalog digest", async () => {
   await runMigrations(pool);
   assert.equal(await currentVersion(), SCHEMA_017);
@@ -91,6 +113,97 @@ test("native 017 and an empty explicit 016 bridge use the exact catalog", async 
     await releaseGuard();
   }
   await runMigrations(pool);
+});
+
+test("orphan outflow journals fail at commit even when balanced and sealed", async () => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const journal = await client.query<{ id: string }>(
+      `INSERT INTO public.ledger_journals(
+         source_type, source_id, currency, description
+       ) VALUES ('manual_receipt_outflow', $1, 'USD', 'synthetic orphan journal')
+       RETURNING id`,
+      [randomUUID()],
+    );
+    await client.query(
+      `INSERT INTO public.ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+       VALUES
+         ($1, 'sales_refunds_and_allowances', 125, 0),
+         ($1, 'cash_clearing', 0, 125)`,
+      [journal.rows[0]?.id],
+    );
+    await client.query(
+      "UPDATE public.ledger_journals SET sealed_at = pg_catalog.now() WHERE id = $1",
+      [journal.rows[0]?.id],
+    );
+    await assert.rejects(client.query("COMMIT"), /has no immutable outflow fact/);
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+});
+
+test("manual outflow authorization requires both manual-receipt and refund permissions", async () => {
+  const client = await pool.connect();
+  const staffUserId = randomUUID();
+  const sessionId = randomUUID();
+  const reauthId = randomUUID();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.users(id, email, password_hash, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', pg_catalog.now())`,
+      [staffUserId, `schema-017-auth-${staffUserId}@example.invalid`],
+    );
+    await client.query(
+      `INSERT INTO public.sessions(id, user_id, token_digest, expires_at)
+       VALUES ($1, $2, $3, pg_catalog.now() + interval '1 hour')`,
+      [sessionId, staffUserId, `schema-017-auth-${sessionId}`],
+    );
+    await client.query(
+      `INSERT INTO public.reauth_grants(
+         id, user_id, session_id, created_at, expires_at
+       ) VALUES ($1, $2, $3, pg_catalog.now(), pg_catalog.now() + interval '15 minutes')`,
+      [reauthId, staffUserId, sessionId],
+    );
+    await client.query(
+      `INSERT INTO public.staff_members(user_id, roles, permissions)
+       VALUES ($1, ARRAY['Billing'], $2::jsonb)`,
+      [staffUserId, JSON.stringify(["billing.manual_receipt_manage"])],
+    );
+    const authorized = async (): Promise<boolean> => {
+      const result = await client.query<{ authorized: boolean }>(
+        `SELECT public.opensales_validate_manual_receipt_outflow_authorization(
+           $1, $2, $3
+         ) AS authorized`,
+        [staffUserId, sessionId, reauthId],
+      );
+      return result.rows[0]?.authorized === true;
+    };
+    assert.equal(await authorized(), false);
+    await client.query(
+      "UPDATE public.staff_members SET permissions = $2::jsonb WHERE user_id = $1",
+      [staffUserId, JSON.stringify(["billing.refund_manage"])],
+    );
+    assert.equal(await authorized(), false);
+    await client.query(
+      "UPDATE public.staff_members SET permissions = $2::jsonb WHERE user_id = $1",
+      [
+        staffUserId,
+        JSON.stringify(["billing.manual_receipt_manage", "billing.refund_manage"]),
+      ],
+    );
+    assert.equal(await authorized(), true);
+    await client.query(
+      "UPDATE public.staff_members SET permissions = '[]'::jsonb WHERE user_id = $1",
+      [staffUserId],
+    );
+    assert.equal(await authorized(), false);
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
 });
 
 test("role-schema and public built-in shadows cannot spoof schema 017", async () => {
@@ -340,6 +453,16 @@ test("trigger, function, and view drift fail exact native attestation", async ()
   try {
     const mutations = [
       "ALTER TABLE public.manual_receipt_outflow_reports DISABLE TRIGGER a_schema_017_outflow_report_marker_guard",
+      "ALTER TABLE public.credit_transactions DISABLE TRIGGER credit_balance_guard",
+      "ALTER TABLE public.fund_receipt_resolutions DISABLE TRIGGER fund_receipt_resolution_guard",
+      "ALTER TABLE public.fund_receipt_resolutions DISABLE TRIGGER fund_receipt_resolutions_append_only",
+      "ALTER TABLE public.client_account_debt_transactions DISABLE TRIGGER manual_receipt_outflow_debt_source_guard",
+      "ALTER TABLE public.manual_receipt_credit_holds DISABLE TRIGGER manual_receipt_credit_hold_guard",
+      "ALTER TABLE public.manual_receipt_credit_outflow_restrictions DISABLE TRIGGER manual_receipt_outflow_restriction_source_guard",
+      `CREATE OR REPLACE FUNCTION public.opensales_guard_credit_balance()
+       RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+      `CREATE OR REPLACE FUNCTION public.opensales_validate_fund_receipt_resolution()
+       RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
       `CREATE OR REPLACE FUNCTION public.opensales_reject_manual_receipt_provider_artifact()
        RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
       `CREATE OR REPLACE VIEW public.manual_receipt_outflow_capacity AS

@@ -18,7 +18,7 @@ export const SCHEMA_017_APPLICATION_GUARD =
   "opensales:schema-017-application" as const;
 
 export const SCHEMA_017_CATALOG_DIGEST =
-  "1aaf2769814ec5e70ffdef7bc12709745076d3552853da6111d2c6cef93e391a" as const;
+  "PENDING_REAL_PG18_CATALOG_DIGEST" as const;
 
 const EXPECTED_MIGRATION_HISTORY = [
   "001_stage_a",
@@ -105,11 +105,25 @@ export async function schema017CatalogFingerprintInput(
        WHERE namespace.nspname = 'public'
          AND relation.relname IN (
            'durable_jobs_pending_type_available_created_idx',
+           'client_account_debt_accounts',
+           'client_account_debt_transactions',
+           'client_accounts',
+           'credit_accounts',
+           'credit_allocations',
+           'credit_transactions',
            'fund_receipts',
+           'fund_receipt_allocations',
+           'fund_receipt_resolution_requests',
+           'fund_receipt_resolutions',
+           'ledger_journals',
+           'ledger_lines',
            'manual_receipt_facts',
            'manual_receipt_reversals',
            'manual_receipt_outflow_reports',
            'manual_receipt_outflow_reconciliations',
+           'manual_receipt_credit_holds',
+           'manual_receipt_credit_outflow_effects',
+           'manual_receipt_credit_outflow_restrictions',
            'manual_receipt_invoice_allocation_reversals',
            'manual_receipt_outflows'
          )
@@ -124,11 +138,25 @@ export async function schema017CatalogFingerprintInput(
        FROM information_schema.columns actual
        WHERE actual.table_schema = 'public'
          AND actual.table_name IN (
+           'client_account_debt_accounts',
+           'client_account_debt_transactions',
+           'client_accounts',
+           'credit_accounts',
+           'credit_allocations',
+           'credit_transactions',
            'fund_receipts',
+           'fund_receipt_allocations',
+           'fund_receipt_resolution_requests',
+           'fund_receipt_resolutions',
+           'ledger_journals',
+           'ledger_lines',
            'manual_receipt_facts',
            'manual_receipt_reversals',
            'manual_receipt_outflow_reports',
            'manual_receipt_outflow_reconciliations',
+           'manual_receipt_credit_holds',
+           'manual_receipt_credit_outflow_effects',
+           'manual_receipt_credit_outflow_restrictions',
            'manual_receipt_invoice_allocation_reversals',
            'manual_receipt_outflows'
          )
@@ -153,16 +181,28 @@ export async function schema017CatalogFingerprintInput(
        WHERE namespace.nspname = 'public'
          AND (
            relation.relname IN (
+             'client_account_debt_accounts',
+             'client_account_debt_transactions',
+             'client_accounts',
+             'credit_accounts',
+             'credit_allocations',
+             'credit_transactions',
              'fund_receipts',
+             'fund_receipt_allocations',
+             'fund_receipt_resolution_requests',
+             'fund_receipt_resolutions',
+             'ledger_journals',
+             'ledger_lines',
              'manual_receipt_facts',
              'manual_receipt_reversals',
              'manual_receipt_outflow_reports',
              'manual_receipt_outflow_reconciliations',
+             'manual_receipt_credit_holds',
+             'manual_receipt_credit_outflow_effects',
+             'manual_receipt_credit_outflow_restrictions',
              'manual_receipt_invoice_allocation_reversals',
              'manual_receipt_outflows'
            )
-           OR (relation.relname = 'credit_transactions'
-             AND actual.conname = 'credit_transactions_kind_check')
          )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'trigger', relation.relname, actual.tgname,
@@ -182,21 +222,37 @@ export async function schema017CatalogFingerprintInput(
          AND NOT actual.tgisinternal
          AND (
            relation.relname IN (
+             'client_account_debt_accounts',
+             'client_account_debt_transactions',
+             'client_accounts',
+             'credit_accounts',
+             'credit_allocations',
+             'credit_transactions',
              'fund_receipts',
+             'fund_receipt_allocations',
+             'fund_receipt_resolution_requests',
+             'fund_receipt_resolutions',
+             'ledger_journals',
+             'ledger_lines',
              'manual_receipt_facts',
              'manual_receipt_reversals',
              'manual_receipt_outflow_reports',
              'manual_receipt_outflow_reconciliations',
+             'manual_receipt_credit_holds',
+             'manual_receipt_credit_outflow_effects',
+             'manual_receipt_credit_outflow_restrictions',
              'manual_receipt_invoice_allocation_reversals',
              'manual_receipt_outflows'
            )
            OR actual.tgname IN (
              'a_schema_017_ledger_marker_guard',
              'a_schema_017_credit_marker_guard',
+             'a_schema_017_existing_restriction_marker_guard',
              'a_schema_017_provider_operation_marker_guard',
              'a_schema_017_job_marker_guard',
              'a_schema_017_inbox_marker_guard',
              'a_schema_017_outbox_marker_guard',
+             'a_schema_017_audit_marker_guard',
              'b_schema_017_running_job_identity_guard',
              'manual_receipt_ledger_line_mutation_guard',
              'manual_receipt_provider_refund_guard',
@@ -235,6 +291,19 @@ export async function schema017CatalogFingerprintInput(
            'opensales_validate_manual_receipt_reversal_017',
            'opensales_guard_manual_provider_refund',
            'opensales_guard_manual_receipt_resolution',
+           'opensales_reject_credit_mutation',
+           'opensales_guard_credit_balance',
+           'opensales_validate_unclaimed_funds_credit',
+           'opensales_validate_fund_receipt_resolution',
+           'opensales_reject_fund_resolution_mutation',
+           'opensales_validate_fund_resolution_request',
+           'opensales_validate_fund_receipt_allocation',
+           'opensales_reject_chargeback_mutation',
+           'opensales_guard_debt_balance',
+           'opensales_validate_chargeback_debt',
+           'opensales_guard_active_account_restriction',
+           'opensales_invalidate_client_account_reauth',
+           'opensales_assert_journal_balanced',
            'opensales_schema_017_marker_guard',
            'opensales_guard_running_durable_job_identity',
            'opensales_reject_manual_receipt_outflow_mutation',
@@ -244,8 +313,15 @@ export async function schema017CatalogFingerprintInput(
            'opensales_validate_manual_receipt_outflow_reconciliation',
            'opensales_assert_manual_receipt_outflow_reconciliation_complete',
            'opensales_validate_manual_receipt_outflow_fact',
+           'opensales_validate_manual_receipt_credit_hold',
            'opensales_validate_manual_receipt_invoice_allocation_reversal',
+           'opensales_validate_manual_receipt_credit_outflow_effect',
+           'opensales_validate_manual_receipt_outflow_credit',
+           'opensales_validate_manual_receipt_outflow_debt',
+           'opensales_apply_manual_receipt_outflow_restriction',
            'opensales_assert_manual_receipt_outflow_complete',
+           'opensales_assert_manual_receipt_credit_outflow_complete',
+           'opensales_assert_manual_receipt_outflow_marker_bound',
            'opensales_reject_manual_receipt_provider_artifact'
          )
        UNION ALL
@@ -313,6 +389,15 @@ async function schema017Blockers(
        SELECT 'manual_receipt_outflow_reconciliations', pg_catalog.count(*)::bigint
        FROM public.manual_receipt_outflow_reconciliations
        UNION ALL
+       SELECT 'manual_receipt_credit_holds', pg_catalog.count(*)::bigint
+       FROM public.manual_receipt_credit_holds
+       UNION ALL
+       SELECT 'manual_receipt_credit_outflow_effects', pg_catalog.count(*)::bigint
+       FROM public.manual_receipt_credit_outflow_effects
+       UNION ALL
+       SELECT 'manual_receipt_credit_outflow_restrictions', pg_catalog.count(*)::bigint
+       FROM public.manual_receipt_credit_outflow_restrictions
+       UNION ALL
        SELECT 'manual_receipt_invoice_allocation_reversals', pg_catalog.count(*)::bigint
        FROM public.manual_receipt_invoice_allocation_reversals
        UNION ALL
@@ -324,7 +409,18 @@ async function schema017Blockers(
        UNION ALL
        SELECT 'manual_receipt_outflow_credit', pg_catalog.count(*)::bigint
        FROM public.credit_transactions
-       WHERE kind = 'manual_receipt_outflow' OR source_type = 'manual_receipt_outflow'
+       WHERE kind = 'manual_receipt_outflow'
+          OR source_type IN (
+            'manual_receipt_outflow', 'manual_receipt_credit_outflow_effect'
+          )
+       UNION ALL
+       SELECT 'manual_receipt_outflow_debt', pg_catalog.count(*)::bigint
+       FROM public.client_account_debt_transactions
+       WHERE source_type = 'manual_receipt_credit_outflow_effect'
+       UNION ALL
+       SELECT 'manual_receipt_outflow_account_restrictions', pg_catalog.count(*)::bigint
+       FROM public.client_account_restrictions
+       WHERE source_type = 'manual_receipt_credit_outflow_effect'
        UNION ALL
        SELECT 'manual_receipt_outflow_provider_operations', pg_catalog.count(*)::bigint
        FROM public.provider_operations
@@ -346,6 +442,12 @@ async function schema017Blockers(
        WHERE event_type LIKE 'manual_receipt_outflow.%'
           OR payload ? 'manualReceiptOutflowReportId'
           OR payload ? 'manualReceiptOutflowId'
+       UNION ALL
+       SELECT 'manual_receipt_outflow_audit', pg_catalog.count(*)::bigint
+       FROM public.audit_events
+       WHERE target_type IN (
+         'manual_receipt_outflow_report', 'manual_receipt_outflow'
+       )
      )
      SELECT code, count::text
      FROM blocker_counts

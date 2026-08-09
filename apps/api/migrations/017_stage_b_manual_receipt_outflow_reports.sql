@@ -5,9 +5,57 @@
 -- an unsupported row. An operator must inspect and repair forward explicitly.
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM public.manual_receipt_outflows) THEN
+  IF EXISTS (SELECT 1 FROM public.manual_receipt_outflows)
+     OR EXISTS (
+       SELECT 1 FROM public.ledger_journals
+       WHERE source_type = 'manual_receipt_outflow'
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.credit_transactions
+       WHERE kind = 'manual_receipt_outflow'
+          OR source_type IN (
+            'manual_receipt_outflow', 'manual_receipt_credit_outflow_effect'
+          )
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.client_account_debt_transactions
+       WHERE source_type = 'manual_receipt_credit_outflow_effect'
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.client_account_restrictions
+       WHERE source_type = 'manual_receipt_credit_outflow_effect'
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.provider_operations
+       WHERE subject_type IN (
+         'manual_receipt_outflow_report', 'manual_receipt_outflow'
+       )
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.durable_jobs
+       WHERE job_type LIKE 'manual_receipt_outflow.%'
+          OR payload ? 'manualReceiptOutflowReportId'
+          OR payload ? 'manualReceiptOutflowId'
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.provider_inbox
+       WHERE payload ? 'manualReceiptOutflowReportId'
+          OR payload ? 'manualReceiptOutflowId'
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.outbox
+       WHERE event_type LIKE 'manual_receipt_outflow.%'
+          OR payload ? 'manualReceiptOutflowReportId'
+          OR payload ? 'manualReceiptOutflowId'
+     )
+     OR EXISTS (
+       SELECT 1 FROM public.audit_events
+       WHERE target_type IN (
+         'manual_receipt_outflow_report', 'manual_receipt_outflow'
+       )
+     ) THEN
     RAISE EXCEPTION
-      'schema 017 cannot attest pre-existing unsupported manual receipt outflows; keep financial mutation stopped and repair forward';
+      'schema 017 cannot attest pre-existing unsupported manual receipt outflow markers; keep financial mutation stopped and repair forward';
   END IF;
 END
 $$;
@@ -103,6 +151,9 @@ CREATE TABLE public.manual_receipt_outflow_reconciliations(
   )
 );
 
+-- Retained as an immutable audit artifact for the currently reviewed 017
+-- contract; invoice balance semantics are finalized by the outflow
+-- completeness and allocation-total views below.
 CREATE TABLE public.manual_receipt_invoice_allocation_reversals(
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   outflow_id uuid NOT NULL UNIQUE REFERENCES public.manual_receipt_outflows(id)
@@ -114,6 +165,38 @@ CREATE TABLE public.manual_receipt_invoice_allocation_reversals(
   invoice_id uuid NOT NULL REFERENCES public.invoices(id),
   amount_minor bigint NOT NULL CHECK (amount_minor > 0),
   currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
+);
+
+CREATE TABLE public.manual_receipt_credit_holds(
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  report_id uuid NOT NULL UNIQUE
+    REFERENCES public.manual_receipt_outflow_reports(id),
+  credit_account_id uuid NOT NULL REFERENCES public.credit_accounts(id),
+  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
+  currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
+);
+
+CREATE TABLE public.manual_receipt_credit_outflow_effects(
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  outflow_id uuid NOT NULL UNIQUE REFERENCES public.manual_receipt_outflows(id)
+    DEFERRABLE INITIALLY DEFERRED,
+  credit_account_id uuid NOT NULL REFERENCES public.credit_accounts(id),
+  client_account_id uuid NOT NULL REFERENCES public.client_accounts(id),
+  credit_recovered_minor bigint NOT NULL CHECK (credit_recovered_minor >= 0),
+  debt_minor bigint NOT NULL CHECK (debt_minor >= 0),
+  currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+  CHECK (credit_recovered_minor + debt_minor > 0)
+);
+
+CREATE TABLE public.manual_receipt_credit_outflow_restrictions(
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  effect_id uuid NOT NULL UNIQUE
+    REFERENCES public.manual_receipt_credit_outflow_effects(id),
+  client_account_id uuid NOT NULL REFERENCES public.client_accounts(id),
+  reason text NOT NULL CHECK (pg_catalog.length(reason) BETWEEN 10 AND 1000),
   created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
 );
 
@@ -172,6 +255,13 @@ ALTER TABLE public.credit_transactions
     )
   );
 
+ALTER TABLE public.client_account_debt_transactions
+  DROP CONSTRAINT client_account_debt_transactions_kind_check;
+ALTER TABLE public.client_account_debt_transactions
+  ADD CONSTRAINT client_account_debt_transactions_kind_check CHECK (
+    kind IN ('chargeback', 'manual_receipt_outflow')
+  );
+
 CREATE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -189,6 +279,15 @@ CREATE TRIGGER manual_receipt_outflow_reconciliations_append_only
   FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
 CREATE TRIGGER manual_receipt_invoice_allocation_reversals_append_only
   BEFORE UPDATE OR DELETE ON public.manual_receipt_invoice_allocation_reversals
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
+CREATE TRIGGER manual_receipt_credit_holds_append_only
+  BEFORE UPDATE OR DELETE ON public.manual_receipt_credit_holds
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
+CREATE TRIGGER manual_receipt_credit_outflow_effects_append_only
+  BEFORE UPDATE OR DELETE ON public.manual_receipt_credit_outflow_effects
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
+CREATE TRIGGER manual_receipt_credit_outflow_restrictions_append_only
+  BEFORE UPDATE OR DELETE ON public.manual_receipt_credit_outflow_restrictions
   FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
 
 CREATE FUNCTION public.opensales_schema_017_marker_guard()
@@ -210,6 +309,9 @@ BEGIN
         'manual_receipt_outflow_reports',
         'manual_receipt_outflow_reconciliations',
         'manual_receipt_invoice_allocation_reversals',
+        'manual_receipt_credit_holds',
+        'manual_receipt_credit_outflow_effects',
+        'manual_receipt_credit_outflow_restrictions',
         'manual_receipt_outflows'
       )
       OR (TG_TABLE_NAME = 'ledger_journals'
@@ -217,9 +319,15 @@ BEGIN
           OR old_row_data->>'source_type' = 'manual_receipt_outflow'))
       OR (TG_TABLE_NAME = 'credit_transactions'
         AND (row_data->>'kind' = 'manual_receipt_outflow'
-          OR row_data->>'source_type' = 'manual_receipt_outflow'
+          OR row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
           OR old_row_data->>'kind' = 'manual_receipt_outflow'
-          OR old_row_data->>'source_type' = 'manual_receipt_outflow'))
+          OR old_row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'))
+      OR (TG_TABLE_NAME = 'client_account_debt_transactions'
+        AND (row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
+          OR old_row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'))
+      OR (TG_TABLE_NAME = 'client_account_restrictions'
+        AND (row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
+          OR old_row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'))
       OR (TG_TABLE_NAME = 'provider_operations'
         AND (row_data->>'subject_type' IN (
             'manual_receipt_outflow_report', 'manual_receipt_outflow'
@@ -245,6 +353,12 @@ BEGIN
           OR (old_row_data->>'event_type') LIKE 'manual_receipt_outflow.%'
           OR old_row_data->'payload' ? 'manualReceiptOutflowReportId'
           OR old_row_data->'payload' ? 'manualReceiptOutflowId'))
+      OR (TG_TABLE_NAME = 'audit_events'
+        AND (row_data->>'target_type' IN (
+            'manual_receipt_outflow_report', 'manual_receipt_outflow'
+          ) OR old_row_data->>'target_type' IN (
+            'manual_receipt_outflow_report', 'manual_receipt_outflow'
+          )))
     );
   IF is_schema_017_marker THEN
     PERFORM pg_catalog.pg_advisory_xact_lock(
@@ -270,6 +384,12 @@ CREATE TRIGGER a_schema_017_ledger_marker_guard
 CREATE TRIGGER a_schema_017_credit_marker_guard
   BEFORE INSERT OR UPDATE ON public.credit_transactions
   FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_debt_marker_guard
+  BEFORE INSERT OR UPDATE ON public.client_account_debt_transactions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_existing_restriction_marker_guard
+  BEFORE INSERT OR UPDATE ON public.client_account_restrictions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
 CREATE TRIGGER a_schema_017_provider_operation_marker_guard
   BEFORE INSERT OR UPDATE ON public.provider_operations
   FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
@@ -281,6 +401,18 @@ CREATE TRIGGER a_schema_017_inbox_marker_guard
   FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
 CREATE TRIGGER a_schema_017_outbox_marker_guard
   BEFORE INSERT OR UPDATE ON public.outbox
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_audit_marker_guard
+  BEFORE INSERT OR UPDATE ON public.audit_events
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_credit_hold_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_credit_holds
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_credit_outflow_effect_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_credit_outflow_effects
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+CREATE TRIGGER a_schema_017_credit_outflow_restriction_marker_guard
+  BEFORE INSERT OR UPDATE ON public.manual_receipt_credit_outflow_restrictions
   FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
 CREATE TRIGGER a_schema_017_invoice_allocation_reversal_marker_guard
   BEFORE INSERT OR UPDATE ON public.manual_receipt_invoice_allocation_reversals
@@ -317,7 +449,10 @@ AS $$
     WHERE user_record.id = staff_user_id
       AND user_record.email_verified_at IS NOT NULL
       AND user_record.restricted_at IS NULL
-      AND (staff.permissions ? '*' OR staff.permissions ? 'billing.manual_receipt_manage')
+      AND (staff.permissions ? '*' OR (
+        staff.permissions ? 'billing.manual_receipt_manage'
+        AND staff.permissions ? 'billing.refund_manage'
+      ))
   )
 $$;
 
@@ -427,6 +562,10 @@ DECLARE
   receipt_row record;
 DECLARE
   source_row record;
+DECLARE
+  credit_row record;
+DECLARE
+  resolution_created_at timestamptz;
 BEGIN
   SELECT
     fact.client_account_id AS fact_client_account_id,
@@ -453,6 +592,28 @@ BEGIN
     AND source_context = NEW.source_context
     AND fund_receipt_resolution_id IS NOT DISTINCT FROM NEW.fund_receipt_resolution_id;
 
+  IF NEW.source_context = 'converted_credit' THEN
+    SELECT account.id, account.client_account_id, account.currency
+    INTO credit_row
+    FROM public.fund_receipt_resolutions resolution
+    JOIN public.credit_transactions source_credit
+      ON source_credit.kind = 'unclaimed_funds'
+     AND source_credit.source_type = 'fund_receipt_resolution'
+     AND source_credit.source_id = resolution.id
+    JOIN public.credit_accounts account
+      ON account.id = source_credit.credit_account_id
+    WHERE resolution.id = NEW.fund_receipt_resolution_id
+      AND resolution.action = 'convert_to_credit'
+    FOR UPDATE OF account;
+  END IF;
+
+  IF NEW.fund_receipt_resolution_id IS NOT NULL THEN
+    SELECT created_at
+    INTO resolution_created_at
+    FROM public.fund_receipt_resolutions
+    WHERE id = NEW.fund_receipt_resolution_id;
+  END IF;
+
   IF receipt_row IS NULL
      OR source_row IS NULL
      OR receipt_row.fact_client_account_id <> NEW.client_account_id
@@ -461,7 +622,15 @@ BEGIN
      OR receipt_row.receipt_currency <> NEW.currency
      OR source_row.client_account_id <> NEW.client_account_id
      OR source_row.currency <> NEW.currency
+     OR (NEW.source_context = 'converted_credit' AND (
+       credit_row.id IS NULL
+       OR credit_row.client_account_id <> NEW.client_account_id
+       OR credit_row.currency <> NEW.currency
+     ))
      OR receipt_row.disposition = 'reversed'
+     OR (NEW.occurred_at IS NOT NULL
+       AND resolution_created_at IS NOT NULL
+       AND NEW.occurred_at < resolution_created_at)
      OR source_row.capacity_frozen
      OR NEW.amount_minor > source_row.available_minor
      OR (NEW.occurred_at IS NOT NULL AND NEW.occurred_at < receipt_row.received_at)
@@ -479,6 +648,105 @@ $$;
 CREATE TRIGGER manual_receipt_outflow_report_guard
   BEFORE INSERT ON public.manual_receipt_outflow_reports
   FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_report();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_credit_hold()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_row record;
+BEGIN
+  SELECT
+    report.observed_outcome,
+    report.source_context,
+    report.amount_minor,
+    report.currency,
+    report.client_account_id,
+    account.id AS credit_account_id,
+    account.client_account_id AS credit_client_account_id,
+    account.currency AS credit_currency
+  INTO source_row
+  FROM public.manual_receipt_outflow_reports report
+  JOIN public.credit_transactions source_credit
+    ON source_credit.kind = 'unclaimed_funds'
+   AND source_credit.source_type = 'fund_receipt_resolution'
+   AND source_credit.source_id = report.fund_receipt_resolution_id
+  JOIN public.credit_accounts account
+    ON account.id = source_credit.credit_account_id
+  WHERE report.id = NEW.report_id
+  FOR UPDATE OF report, account;
+
+  IF source_row IS NULL
+     OR source_row.observed_outcome <> 'unknown'
+     OR source_row.source_context <> 'converted_credit'
+     OR NEW.credit_account_id <> source_row.credit_account_id
+     OR source_row.client_account_id <> source_row.credit_client_account_id
+     OR NEW.amount_minor <> source_row.amount_minor
+     OR NEW.currency <> source_row.currency
+     OR NEW.currency <> source_row.credit_currency THEN
+    RAISE EXCEPTION 'manual receipt Credit hold mismatches its unresolved converted Credit report';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_credit_hold_guard
+  BEFORE INSERT ON public.manual_receipt_credit_holds
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_credit_hold();
+
+CREATE OR REPLACE FUNCTION public.opensales_guard_credit_balance()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  available_minor bigint;
+DECLARE
+  reserved_minor bigint;
+DECLARE
+  account_currency text;
+DECLARE
+  cap_minor bigint;
+BEGIN
+  SELECT currency
+  INTO account_currency
+  FROM public.credit_accounts
+  WHERE id = NEW.credit_account_id
+  FOR UPDATE;
+
+  SELECT COALESCE(pg_catalog.sum(credit_minor - debit_minor), 0)
+  INTO available_minor
+  FROM public.credit_transactions
+  WHERE credit_account_id = NEW.credit_account_id;
+
+  SELECT COALESCE(pg_catalog.sum(hold.amount_minor), 0)
+  INTO reserved_minor
+  FROM public.manual_receipt_credit_holds hold
+  JOIN public.manual_receipt_outflow_reports report ON report.id = hold.report_id
+  WHERE hold.credit_account_id = NEW.credit_account_id
+    AND report.observed_outcome = 'unknown'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.manual_receipt_outflow_reconciliations reconciliation
+      WHERE reconciliation.report_id = report.id
+    );
+
+  IF available_minor + NEW.credit_minor - NEW.debit_minor - reserved_minor < 0 THEN
+    RAISE EXCEPTION 'credit balance net of unresolved manual outflow holds cannot become negative';
+  END IF;
+
+  IF NEW.kind IN ('add_funds', 'unclaimed_funds') THEN
+    SELECT balance_cap_minor
+    INTO cap_minor
+    FROM public.add_funds_policies
+    WHERE currency = account_currency;
+    IF cap_minor IS NULL
+       OR available_minor + NEW.credit_minor - NEW.debit_minor > cap_minor THEN
+      RAISE EXCEPTION 'Credit would exceed the configured balance cap';
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$$;
 
 CREATE FUNCTION public.opensales_assert_manual_receipt_outflow_report_complete()
 RETURNS trigger
@@ -507,6 +775,16 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'unknown manual receipt outflow report cannot be an actual outflow fact';
   END IF;
+  IF (NEW.observed_outcome = 'unknown' AND NEW.source_context = 'converted_credit')
+     <> EXISTS (
+       SELECT 1
+       FROM public.manual_receipt_credit_holds hold
+       WHERE hold.report_id = NEW.id
+         AND hold.amount_minor = NEW.amount_minor
+         AND hold.currency = NEW.currency
+     ) THEN
+    RAISE EXCEPTION 'unknown converted Credit report must have exactly one immutable Credit hold';
+  END IF;
   RETURN NULL;
 END
 $$;
@@ -522,6 +800,8 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   report_row record;
+DECLARE
+  credit_row record;
 BEGIN
   SELECT report.*, receipt.id AS locked_receipt_id
   INTO report_row
@@ -530,8 +810,25 @@ BEGIN
   WHERE report.id = NEW.report_id
   FOR UPDATE OF report, receipt;
 
+  IF report_row.source_context = 'converted_credit' THEN
+    SELECT account.id, account.client_account_id, account.currency
+    INTO credit_row
+    FROM public.credit_transactions source_credit
+    JOIN public.credit_accounts account
+      ON account.id = source_credit.credit_account_id
+    WHERE source_credit.kind = 'unclaimed_funds'
+      AND source_credit.source_type = 'fund_receipt_resolution'
+      AND source_credit.source_id = report_row.fund_receipt_resolution_id
+    FOR UPDATE OF account;
+  END IF;
+
   IF report_row IS NULL
      OR report_row.observed_outcome <> 'unknown'
+     OR (report_row.source_context = 'converted_credit' AND (
+       credit_row.id IS NULL
+       OR credit_row.client_account_id <> report_row.client_account_id
+       OR credit_row.currency <> report_row.currency
+     ))
      OR NOT public.opensales_validate_manual_receipt_outflow_authorization(
        NEW.actor_id, NEW.actor_session_id, NEW.reauth_grant_id
      )
@@ -629,6 +926,9 @@ BEGIN
          OR NEW.actor_session_id <> report_row.actor_session_id
          OR NEW.reauth_grant_id <> report_row.reauth_grant_id
          OR NEW.reason <> report_row.reason
+         OR NEW.idempotency_key <> report_row.idempotency_key
+         OR NEW.request_fingerprint <> report_row.request_fingerprint
+         OR NEW.result <> report_row.result
        )
      )
      OR (
@@ -641,6 +941,9 @@ BEGIN
          OR NEW.actor_session_id <> reconciliation_row.actor_session_id
          OR NEW.reauth_grant_id <> reconciliation_row.reauth_grant_id
          OR NEW.reason <> reconciliation_row.reason
+         OR NEW.idempotency_key <> reconciliation_row.idempotency_key
+         OR NEW.request_fingerprint <> reconciliation_row.request_fingerprint
+         OR NEW.result <> reconciliation_row.result
        )
      )
      OR source_row.confirmed_outflow_minor + NEW.amount_minor > source_row.source_amount_minor
@@ -722,6 +1025,166 @@ CREATE TRIGGER manual_receipt_invoice_allocation_reversal_guard
   BEFORE INSERT ON public.manual_receipt_invoice_allocation_reversals
   FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_invoice_allocation_reversal();
 
+CREATE FUNCTION public.opensales_validate_manual_receipt_credit_outflow_effect()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_row record;
+DECLARE
+  available_credit_minor bigint;
+BEGIN
+  SELECT
+    outflow.id AS outflow_id,
+    outflow.source_context,
+    outflow.amount_minor,
+    outflow.currency,
+    outflow.client_account_id,
+    resolution.action,
+    resolution.currency AS resolution_currency,
+    source_credit.credit_account_id,
+    account.client_account_id AS credit_client_account_id,
+    account.currency AS credit_currency
+  INTO source_row
+  FROM public.manual_receipt_outflows outflow
+  JOIN public.fund_receipt_resolutions resolution
+    ON resolution.id = outflow.fund_receipt_resolution_id
+  JOIN public.credit_transactions source_credit
+    ON source_credit.kind = 'unclaimed_funds'
+   AND source_credit.source_type = 'fund_receipt_resolution'
+   AND source_credit.source_id = resolution.id
+  JOIN public.credit_accounts account
+    ON account.id = source_credit.credit_account_id
+  WHERE outflow.id = NEW.outflow_id
+  FOR UPDATE OF outflow, account;
+
+  SELECT COALESCE(pg_catalog.sum(credit_minor - debit_minor), 0)::bigint
+  INTO available_credit_minor
+  FROM public.credit_transactions
+  WHERE credit_account_id = NEW.credit_account_id;
+
+  IF source_row IS NULL
+     OR source_row.source_context <> 'converted_credit'
+     OR source_row.action <> 'convert_to_credit'
+     OR NEW.credit_account_id <> source_row.credit_account_id
+     OR NEW.client_account_id <> source_row.client_account_id
+     OR NEW.client_account_id <> source_row.credit_client_account_id
+     OR NEW.currency <> source_row.currency
+     OR NEW.currency <> source_row.resolution_currency
+     OR NEW.currency <> source_row.credit_currency
+     OR NEW.credit_recovered_minor <>
+        LEAST(available_credit_minor, source_row.amount_minor)
+     OR NEW.debt_minor <>
+        source_row.amount_minor - LEAST(available_credit_minor, source_row.amount_minor)
+     OR NEW.credit_recovered_minor + NEW.debt_minor <> source_row.amount_minor THEN
+    RAISE EXCEPTION 'manual receipt converted Credit effect mismatches its immutable outflow and available Credit';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_credit_outflow_effect_guard
+  BEFORE INSERT ON public.manual_receipt_credit_outflow_effects
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_credit_outflow_effect();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_credit()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  effect_row record;
+BEGIN
+  IF NEW.kind <> 'manual_receipt_outflow' THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT effect.credit_account_id, effect.credit_recovered_minor
+  INTO effect_row
+  FROM public.manual_receipt_credit_outflow_effects effect
+  WHERE effect.id = NEW.source_id;
+
+  IF NEW.source_type <> 'manual_receipt_credit_outflow_effect'
+     OR effect_row.credit_account_id IS NULL
+     OR NEW.credit_account_id <> effect_row.credit_account_id
+     OR NEW.credit_minor <> 0
+     OR NEW.debit_minor <> effect_row.credit_recovered_minor
+     OR NEW.debit_minor <= 0 THEN
+    RAISE EXCEPTION 'manual receipt outflow Credit debit mismatches its immutable effect';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_credit_source_guard
+  BEFORE INSERT ON public.credit_transactions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_credit();
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_debt()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_row record;
+BEGIN
+  IF NEW.kind <> 'manual_receipt_outflow' THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT effect.client_account_id, effect.currency, effect.debt_minor,
+         account.client_account_id AS debt_client_account_id,
+         account.currency AS debt_currency
+  INTO source_row
+  FROM public.manual_receipt_credit_outflow_effects effect
+  JOIN public.client_account_debt_accounts account
+    ON account.id = NEW.debt_account_id
+  WHERE effect.id = NEW.source_id;
+
+  IF NEW.source_type <> 'manual_receipt_credit_outflow_effect'
+     OR source_row.client_account_id IS NULL
+     OR source_row.client_account_id <> source_row.debt_client_account_id
+     OR source_row.currency <> source_row.debt_currency
+     OR NEW.credit_minor <> 0
+     OR NEW.debit_minor <> source_row.debt_minor
+     OR NEW.debit_minor <= 0 THEN
+    RAISE EXCEPTION 'manual receipt outflow debt does not match its immutable effect';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_debt_source_guard
+  BEFORE INSERT ON public.client_account_debt_transactions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_debt();
+
+CREATE FUNCTION public.opensales_apply_manual_receipt_outflow_restriction()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  effect_row record;
+BEGIN
+  SELECT client_account_id, debt_minor
+  INTO effect_row
+  FROM public.manual_receipt_credit_outflow_effects
+  WHERE id = NEW.effect_id;
+
+  IF effect_row.client_account_id IS NULL
+     OR effect_row.debt_minor <= 0
+     OR NEW.client_account_id <> effect_row.client_account_id THEN
+    RAISE EXCEPTION 'Client Account restriction does not match manual receipt outflow debt';
+  END IF;
+
+  UPDATE public.client_accounts
+  SET restricted_at = COALESCE(restricted_at, NEW.created_at)
+  WHERE id = NEW.client_account_id;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_restriction_source_guard
+  BEFORE INSERT ON public.manual_receipt_credit_outflow_restrictions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_apply_manual_receipt_outflow_restriction();
+
 CREATE OR REPLACE FUNCTION public.opensales_assert_manual_receipt_outflow_complete()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -730,7 +1193,19 @@ DECLARE
   expected_debit_account text;
 DECLARE
   valid boolean;
+DECLARE
+  effect_row record;
 BEGIN
+  IF NEW.source_context = 'converted_credit' THEN
+    SELECT effect.id, effect.credit_account_id,
+           effect.credit_recovered_minor, effect.debt_minor
+    INTO effect_row
+    FROM public.manual_receipt_credit_outflow_effects effect
+    WHERE effect.outflow_id = NEW.id
+      AND effect.client_account_id = NEW.client_account_id
+      AND effect.currency = NEW.currency;
+  END IF;
+
   expected_debit_account := CASE NEW.source_context
     WHEN 'unclaimed_funds' THEN 'unclaimed_funds_liability'
     WHEN 'allocated_invoice' THEN 'sales_refunds_and_allowances'
@@ -739,12 +1214,27 @@ BEGIN
 
   SELECT
     journal.sealed_at IS NOT NULL
-    AND pg_catalog.count(*) = 2
+    AND pg_catalog.count(*) = CASE
+      WHEN NEW.source_context = 'converted_credit' THEN
+        1
+        + (CASE WHEN effect_row.credit_recovered_minor > 0 THEN 1 ELSE 0 END)
+        + (CASE WHEN effect_row.debt_minor > 0 THEN 1 ELSE 0 END)
+      ELSE 2
+    END
     AND COALESCE(pg_catalog.sum(line.debit_minor), 0) = NEW.amount_minor
     AND COALESCE(pg_catalog.sum(line.credit_minor), 0) = NEW.amount_minor
-    AND COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
-      WHERE line.account_code = expected_debit_account
-        AND line.credit_minor = 0), 0) = NEW.amount_minor
+    AND CASE WHEN NEW.source_context = 'converted_credit' THEN
+      COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
+        WHERE line.account_code = 'client_credit_liability'
+          AND line.credit_minor = 0), 0) = effect_row.credit_recovered_minor
+      AND COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
+        WHERE line.account_code = 'chargeback_receivable'
+          AND line.credit_minor = 0), 0) = effect_row.debt_minor
+    ELSE
+      COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
+        WHERE line.account_code = expected_debit_account
+          AND line.credit_minor = 0), 0) = NEW.amount_minor
+    END
     AND COALESCE(pg_catalog.sum(line.credit_minor) FILTER (
       WHERE line.account_code = 'cash_clearing'
         AND line.debit_minor = 0), 0) = NEW.amount_minor
@@ -760,20 +1250,21 @@ BEGIN
     RAISE EXCEPTION 'manual receipt outflow fact ledger is incomplete';
   END IF;
 
-  IF NEW.source_context = 'converted_credit' AND NOT EXISTS (
-    SELECT 1
-    FROM public.credit_transactions transaction_record
-    JOIN public.credit_accounts credit_account
-      ON credit_account.id = transaction_record.credit_account_id
-    WHERE transaction_record.kind = 'manual_receipt_outflow'
-      AND transaction_record.source_type = 'manual_receipt_outflow'
-      AND transaction_record.source_id = NEW.id
-      AND transaction_record.credit_minor = 0
-      AND transaction_record.debit_minor = NEW.amount_minor
-      AND credit_account.client_account_id = NEW.client_account_id
-      AND credit_account.currency = NEW.currency
+  IF NEW.source_context = 'converted_credit' AND (
+    effect_row.id IS NULL
+    OR effect_row.credit_recovered_minor + effect_row.debt_minor <> NEW.amount_minor
+    OR ((effect_row.credit_recovered_minor > 0) <> EXISTS (
+      SELECT 1
+      FROM public.credit_transactions transaction_record
+      WHERE transaction_record.kind = 'manual_receipt_outflow'
+        AND transaction_record.source_type = 'manual_receipt_credit_outflow_effect'
+        AND transaction_record.source_id = effect_row.id
+        AND transaction_record.credit_account_id = effect_row.credit_account_id
+        AND transaction_record.credit_minor = 0
+        AND transaction_record.debit_minor = effect_row.credit_recovered_minor
+    ))
   ) THEN
-    RAISE EXCEPTION 'converted Credit manual receipt outflow is missing its compensating Credit debit';
+    RAISE EXCEPTION 'converted Credit manual receipt outflow is missing its exact compensating Credit debit';
   END IF;
   IF NEW.source_context = 'allocated_invoice' AND NOT EXISTS (
     SELECT 1
@@ -788,6 +1279,152 @@ BEGIN
   RETURN NULL;
 END
 $$;
+
+CREATE FUNCTION public.opensales_assert_manual_receipt_credit_outflow_complete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  effect_row record;
+DECLARE
+  ledger_valid boolean;
+DECLARE
+  credit_count integer;
+DECLARE
+  debt_count integer;
+DECLARE
+  restriction_count integer;
+BEGIN
+  IF NEW.source_context <> 'converted_credit' THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT effect.id, effect.credit_account_id,
+         effect.credit_recovered_minor, effect.debt_minor
+  INTO effect_row
+  FROM public.manual_receipt_credit_outflow_effects effect
+  WHERE effect.outflow_id = NEW.id
+    AND effect.client_account_id = NEW.client_account_id
+    AND effect.currency = NEW.currency;
+
+  SELECT
+    journal.sealed_at IS NOT NULL
+    AND pg_catalog.count(*) = 1
+      + (CASE WHEN effect_row.credit_recovered_minor > 0 THEN 1 ELSE 0 END)
+      + (CASE WHEN effect_row.debt_minor > 0 THEN 1 ELSE 0 END)
+    AND COALESCE(pg_catalog.sum(line.debit_minor), 0) = NEW.amount_minor
+    AND COALESCE(pg_catalog.sum(line.credit_minor), 0) = NEW.amount_minor
+    AND COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
+      WHERE line.account_code = 'client_credit_liability'
+        AND line.credit_minor = 0), 0) = effect_row.credit_recovered_minor
+    AND COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
+      WHERE line.account_code = 'chargeback_receivable'
+        AND line.credit_minor = 0), 0) = effect_row.debt_minor
+    AND COALESCE(pg_catalog.sum(line.credit_minor) FILTER (
+      WHERE line.account_code = 'cash_clearing'
+        AND line.debit_minor = 0), 0) = NEW.amount_minor
+  INTO ledger_valid
+  FROM public.ledger_journals journal
+  JOIN public.ledger_lines line ON line.journal_id = journal.id
+  WHERE journal.source_type = 'manual_receipt_outflow'
+    AND journal.source_id = NEW.id
+    AND journal.currency = NEW.currency
+  GROUP BY journal.id, journal.sealed_at;
+
+  SELECT pg_catalog.count(*)
+  INTO credit_count
+  FROM public.credit_transactions transaction_record
+  WHERE transaction_record.kind = 'manual_receipt_outflow'
+    AND transaction_record.source_type = 'manual_receipt_credit_outflow_effect'
+    AND transaction_record.source_id = effect_row.id
+    AND transaction_record.credit_account_id = effect_row.credit_account_id
+    AND transaction_record.credit_minor = 0
+    AND transaction_record.debit_minor = effect_row.credit_recovered_minor;
+
+  SELECT pg_catalog.count(*)
+  INTO debt_count
+  FROM public.client_account_debt_transactions transaction_record
+  JOIN public.client_account_debt_accounts account
+    ON account.id = transaction_record.debt_account_id
+  WHERE transaction_record.kind = 'manual_receipt_outflow'
+    AND transaction_record.source_type = 'manual_receipt_credit_outflow_effect'
+    AND transaction_record.source_id = effect_row.id
+    AND transaction_record.credit_minor = 0
+    AND transaction_record.debit_minor = effect_row.debt_minor
+    AND account.client_account_id = NEW.client_account_id
+    AND account.currency = NEW.currency;
+
+  SELECT pg_catalog.count(*)
+  INTO restriction_count
+  FROM public.manual_receipt_credit_outflow_restrictions restriction
+  WHERE restriction.effect_id = effect_row.id
+    AND restriction.client_account_id = NEW.client_account_id;
+
+  IF effect_row.id IS NULL
+     OR effect_row.credit_recovered_minor + effect_row.debt_minor <> NEW.amount_minor
+     OR ledger_valid IS NOT TRUE
+     OR credit_count <> (CASE WHEN effect_row.credit_recovered_minor > 0 THEN 1 ELSE 0 END)
+     OR debt_count <> (CASE WHEN effect_row.debt_minor > 0 THEN 1 ELSE 0 END)
+     OR restriction_count <> (CASE WHEN effect_row.debt_minor > 0 THEN 1 ELSE 0 END) THEN
+    RAISE EXCEPTION 'converted Credit manual receipt outflow is missing its exact ledger, Credit recovery, debt, or restriction';
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER manual_receipt_credit_outflow_completeness_guard
+  AFTER INSERT ON public.manual_receipt_outflows
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_assert_manual_receipt_credit_outflow_complete();
+
+CREATE FUNCTION public.opensales_assert_manual_receipt_outflow_marker_bound()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'ledger_journals'
+     AND NEW.source_type = 'manual_receipt_outflow'
+     AND NOT EXISTS (
+       SELECT 1 FROM public.manual_receipt_outflows outflow
+       WHERE outflow.id = NEW.source_id
+     ) THEN
+    RAISE EXCEPTION 'manual receipt outflow journal has no immutable outflow fact';
+  END IF;
+
+  IF TG_TABLE_NAME = 'credit_transactions'
+     AND (NEW.kind = 'manual_receipt_outflow'
+       OR NEW.source_type = 'manual_receipt_credit_outflow_effect')
+     AND NOT EXISTS (
+       SELECT 1 FROM public.manual_receipt_credit_outflow_effects effect
+       WHERE effect.id = NEW.source_id
+     ) THEN
+    RAISE EXCEPTION 'manual receipt outflow Credit marker has no immutable effect';
+  END IF;
+
+  IF TG_TABLE_NAME = 'client_account_debt_transactions'
+     AND NEW.source_type = 'manual_receipt_credit_outflow_effect'
+     AND NOT EXISTS (
+       SELECT 1 FROM public.manual_receipt_credit_outflow_effects effect
+       WHERE effect.id = NEW.source_id
+     ) THEN
+    RAISE EXCEPTION 'manual receipt outflow debt marker has no immutable effect';
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER manual_receipt_outflow_journal_binding_guard
+  AFTER INSERT OR UPDATE ON public.ledger_journals
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_assert_manual_receipt_outflow_marker_bound();
+CREATE CONSTRAINT TRIGGER manual_receipt_outflow_credit_binding_guard
+  AFTER INSERT ON public.credit_transactions
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_assert_manual_receipt_outflow_marker_bound();
+CREATE CONSTRAINT TRIGGER manual_receipt_outflow_debt_binding_guard
+  AFTER INSERT ON public.client_account_debt_transactions
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_assert_manual_receipt_outflow_marker_bound();
 
 CREATE FUNCTION public.opensales_reject_manual_receipt_provider_artifact()
 RETURNS trigger
