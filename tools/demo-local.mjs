@@ -2,7 +2,7 @@
 // NOT FOR PRODUCTION — MOCK PROVIDERS ONLY
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LAB_WARNING, runDemoSmoke } from "./demo-smoke.mjs";
@@ -25,7 +26,12 @@ const runtimeDir = join(root, ".demo", "local");
 const configFile = join(runtimeDir, "config.json");
 const stateFile = join(runtimeDir, "state.json");
 const postgresData = join(runtimeDir, "postgres");
-const postgresSocket = join(runtimeDir, "postgres-socket");
+// PostgreSQL includes the directory in its Unix-socket pathname. Keeping this
+// outside a potentially long repository path avoids macOS's 103-byte limit.
+const postgresSocket = join(
+  tmpdir(),
+  `oss-demo-pg-${createHash("sha256").update(root).digest("hex").slice(0, 12)}`,
+);
 const logsDir = join(runtimeDir, "logs");
 const ownerRole = "oss_demo_owner";
 const processNames = Object.freeze([
@@ -57,6 +63,7 @@ function ensureRuntimeDirectories() {
   mkdirSync(logsDir, { recursive: true, mode: 0o700 });
   mkdirSync(postgresSocket, { recursive: true, mode: 0o700 });
   chmodSync(runtimeDir, 0o700);
+  chmodSync(postgresSocket, 0o700);
 }
 
 function writePrivateJson(path, value) {
@@ -751,6 +758,7 @@ async function reset() {
   }
   await down();
   if (existsSync(runtimeDir)) rmSync(runtimeDir, { recursive: true });
+  if (existsSync(postgresSocket)) rmSync(postgresSocket, { recursive: true });
   console.log("Deleted the generated local Demo runtime. Repository files were not removed.");
 }
 
