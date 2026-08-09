@@ -60,6 +60,21 @@ BEGIN
 END
 $$;
 
+-- A future-dated grant could otherwise become valid later for longer than the
+-- fixed 15-minute window intended when the operator reauthenticated.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.reauth_grants
+    WHERE created_at > pg_catalog.clock_timestamp()
+  ) THEN
+    RAISE EXCEPTION
+      'schema 017 rejects future-dated reauthentication grants; invalidate or repair them before retrying the forward migration';
+  END IF;
+END
+$$;
+
 -- Bridge Workers claim only job types they understand. Give that allowlist a
 -- selective pending queue path so older unrelated rows cannot force a scan.
 CREATE INDEX durable_jobs_pending_type_available_created_idx
@@ -424,18 +439,46 @@ CREATE TRIGGER a_schema_017_credit_outflow_effect_marker_guard
 CREATE TRIGGER a_schema_017_credit_outflow_restriction_marker_guard
   BEFORE INSERT OR UPDATE ON public.manual_receipt_credit_outflow_restrictions
   FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
+
+CREATE FUNCTION public.opensales_guard_reauth_grant_time()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.created_at > pg_catalog.clock_timestamp()
+     OR NEW.expires_at <= NEW.created_at
+     OR NEW.expires_at > NEW.created_at + interval '15 minutes'
+     OR (TG_OP = 'UPDATE' AND (
+       NEW.user_id IS DISTINCT FROM OLD.user_id
+       OR NEW.session_id IS DISTINCT FROM OLD.session_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+     )) THEN
+    RAISE EXCEPTION 'reauthentication grants must be immutable, current, and valid for at most 15 minutes';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER schema_017_reauth_grant_time_guard
+  BEFORE INSERT OR UPDATE ON public.reauth_grants
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_guard_reauth_grant_time();
+
 CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_authorization(
   staff_user_id uuid,
   staff_session_id uuid,
   staff_reauth_grant_id uuid
 )
 RETURNS boolean
-LANGUAGE sql
-STABLE
+LANGUAGE plpgsql
+VOLATILE
 AS $$
-  SELECT EXISTS (
-    SELECT 1
-    FROM public.users user_record
+DECLARE
+  authorized boolean;
+BEGIN
+  SELECT true
+  INTO authorized
+  FROM public.users user_record
     JOIN public.sessions session_record
       ON session_record.id = staff_session_id
      AND session_record.user_id = user_record.id
@@ -447,6 +490,7 @@ AS $$
      AND reauth.session_id = session_record.id
      AND reauth.invalidated_at IS NULL
      AND reauth.expires_at > pg_catalog.now()
+     AND reauth.created_at <= pg_catalog.now()
      AND reauth.created_at > pg_catalog.now() - interval '15 minutes'
      AND reauth.expires_at <= reauth.created_at + interval '15 minutes'
     JOIN public.staff_members staff
@@ -459,7 +503,9 @@ AS $$
         staff.permissions ? 'billing.manual_receipt_manage'
         AND staff.permissions ? 'billing.refund_manage'
       ))
-  )
+  FOR UPDATE OF user_record, session_record, reauth, staff;
+  RETURN COALESCE(authorized, false);
+END
 $$;
 
 CREATE VIEW public.manual_receipt_outflow_capacity AS
@@ -976,6 +1022,10 @@ DECLARE
   source_row record;
 DECLARE
   available_credit_minor bigint;
+DECLARE
+  reserved_credit_minor bigint;
+DECLARE
+  recoverable_credit_minor bigint;
 BEGIN
   SELECT
     outflow.id AS outflow_id,
@@ -1006,6 +1056,18 @@ BEGIN
   FROM public.credit_transactions
   WHERE credit_account_id = NEW.credit_account_id;
 
+  SELECT COALESCE(pg_catalog.sum(hold.amount_minor), 0)::bigint
+  INTO reserved_credit_minor
+  FROM public.manual_receipt_credit_holds hold
+  JOIN public.manual_receipt_outflow_reports report ON report.id = hold.report_id
+  WHERE hold.credit_account_id = NEW.credit_account_id
+    AND report.observed_outcome = 'unknown'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.manual_receipt_outflow_reconciliations reconciliation
+      WHERE reconciliation.report_id = report.id
+    );
+
   IF source_row IS NULL
      OR source_row.source_context <> 'converted_credit'
      OR source_row.action <> 'convert_to_credit'
@@ -1014,11 +1076,16 @@ BEGIN
      OR NEW.client_account_id <> source_row.credit_client_account_id
      OR NEW.currency <> source_row.currency
      OR NEW.currency <> source_row.resolution_currency
-     OR NEW.currency <> source_row.credit_currency
-     OR NEW.credit_recovered_minor <>
-        LEAST(available_credit_minor, source_row.amount_minor)
-     OR NEW.debt_minor <>
-        source_row.amount_minor - LEAST(available_credit_minor, source_row.amount_minor)
+     OR NEW.currency <> source_row.credit_currency THEN
+    RAISE EXCEPTION 'manual receipt converted Credit effect mismatches its immutable outflow and available Credit';
+  END IF;
+
+  recoverable_credit_minor := LEAST(
+    GREATEST(available_credit_minor - reserved_credit_minor, 0),
+    source_row.amount_minor
+  );
+  IF NEW.credit_recovered_minor <> recoverable_credit_minor
+     OR NEW.debt_minor <> source_row.amount_minor - recoverable_credit_minor
      OR NEW.credit_recovered_minor + NEW.debt_minor <> source_row.amount_minor THEN
     RAISE EXCEPTION 'manual receipt converted Credit effect mismatches its immutable outflow and available Credit';
   END IF;
@@ -1037,7 +1104,8 @@ AS $$
 DECLARE
   effect_row record;
 BEGIN
-  IF NEW.kind <> 'manual_receipt_outflow' THEN
+  IF NEW.kind <> 'manual_receipt_outflow'
+     AND NEW.source_type <> 'manual_receipt_credit_outflow_effect' THEN
     RETURN NEW;
   END IF;
 
@@ -1046,7 +1114,8 @@ BEGIN
   FROM public.manual_receipt_credit_outflow_effects effect
   WHERE effect.id = NEW.source_id;
 
-  IF NEW.source_type <> 'manual_receipt_credit_outflow_effect'
+  IF NEW.kind <> 'manual_receipt_outflow'
+     OR NEW.source_type <> 'manual_receipt_credit_outflow_effect'
      OR effect_row.credit_account_id IS NULL
      OR NEW.credit_account_id <> effect_row.credit_account_id
      OR NEW.credit_minor <> 0
@@ -1069,7 +1138,8 @@ AS $$
 DECLARE
   source_row record;
 BEGIN
-  IF NEW.kind <> 'manual_receipt_outflow' THEN
+  IF NEW.kind <> 'manual_receipt_outflow'
+     AND NEW.source_type <> 'manual_receipt_credit_outflow_effect' THEN
     RETURN NEW;
   END IF;
 
@@ -1082,7 +1152,8 @@ BEGIN
     ON account.id = NEW.debt_account_id
   WHERE effect.id = NEW.source_id;
 
-  IF NEW.source_type <> 'manual_receipt_credit_outflow_effect'
+  IF NEW.kind <> 'manual_receipt_outflow'
+     OR NEW.source_type <> 'manual_receipt_credit_outflow_effect'
      OR source_row.client_account_id IS NULL
      OR source_row.client_account_id <> source_row.debt_client_account_id
      OR source_row.currency <> source_row.debt_currency
@@ -1332,15 +1403,30 @@ BEGIN
      AND NOT EXISTS (
        SELECT 1 FROM public.manual_receipt_credit_outflow_effects effect
        WHERE effect.id::text = row_data->>'source_id'
+         AND row_data->>'kind' = 'manual_receipt_outflow'
+         AND row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
+         AND effect.credit_account_id::text = row_data->>'credit_account_id'
+         AND (row_data->>'credit_minor')::bigint = 0
+         AND (row_data->>'debit_minor')::bigint = effect.credit_recovered_minor
      ) THEN
     RAISE EXCEPTION 'manual receipt outflow Credit marker has no immutable effect';
   END IF;
 
   IF TG_TABLE_NAME = 'client_account_debt_transactions'
-     AND row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
+     AND (row_data->>'kind' = 'manual_receipt_outflow'
+       OR row_data->>'source_type' = 'manual_receipt_credit_outflow_effect')
      AND NOT EXISTS (
-       SELECT 1 FROM public.manual_receipt_credit_outflow_effects effect
+       SELECT 1
+       FROM public.manual_receipt_credit_outflow_effects effect
+       JOIN public.client_account_debt_accounts account
+         ON account.id::text = row_data->>'debt_account_id'
        WHERE effect.id::text = row_data->>'source_id'
+         AND row_data->>'kind' = 'manual_receipt_outflow'
+         AND row_data->>'source_type' = 'manual_receipt_credit_outflow_effect'
+         AND account.client_account_id = effect.client_account_id
+         AND account.currency = effect.currency
+         AND (row_data->>'credit_minor')::bigint = 0
+         AND (row_data->>'debit_minor')::bigint = effect.debt_minor
      ) THEN
     RAISE EXCEPTION 'manual receipt outflow debt marker has no immutable effect';
   END IF;

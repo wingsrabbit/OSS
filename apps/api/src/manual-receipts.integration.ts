@@ -922,7 +922,7 @@ try {
 
   await assert.rejects(
     runMigrations(pool),
-    /running schema-016 API or Worker/,
+    /running schema-017 API or Worker/,
   );
   await app.close();
   app = null;

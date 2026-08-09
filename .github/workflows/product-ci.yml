@@ -169,12 +169,39 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/manual_receipts
         run: pnpm --filter @opensales/api test:integration:manual-receipts
 
+      - name: Prepare and run schema 016 Worker job boundary PostgreSQL journey
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-6])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
       - name: Run schema 016 Worker job boundary PostgreSQL journey
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
-          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
         run: |
-          pnpm --filter @opensales/api migrate
           pnpm --filter @opensales/worker test:integration:job-claim
 
       - name: Prepare schema 014 rollback database
