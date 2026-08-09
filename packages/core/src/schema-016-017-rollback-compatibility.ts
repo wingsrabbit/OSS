@@ -232,6 +232,7 @@ export async function schema017CatalogFingerprintInput(
            'opensales_reject_ledger_mutation',
            'opensales_assert_manual_receipt_complete',
            'opensales_assert_manual_receipt_reversal_complete',
+           'opensales_validate_manual_receipt_reversal_017',
            'opensales_guard_manual_provider_refund',
            'opensales_guard_manual_receipt_resolution',
            'opensales_schema_017_marker_guard',

@@ -65,8 +65,8 @@ CREATE TABLE public.manual_receipt_outflow_reports(
   idempotency_key text NOT NULL UNIQUE CHECK (
     pg_catalog.length(idempotency_key) BETWEEN 8 AND 128
   ),
-  request_fingerprint text NOT NULL,
-  result jsonb NOT NULL,
+  request_fingerprint text NOT NULL CHECK (pg_catalog.length(request_fingerprint) > 0),
+  result jsonb NOT NULL CHECK (pg_catalog.jsonb_typeof(result) = 'object'),
   created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
   UNIQUE (manual_receipt_id, request_fingerprint),
   UNIQUE (manual_receipt_id, destination_reference),
@@ -94,8 +94,8 @@ CREATE TABLE public.manual_receipt_outflow_reconciliations(
   idempotency_key text NOT NULL UNIQUE CHECK (
     pg_catalog.length(idempotency_key) BETWEEN 8 AND 128
   ),
-  request_fingerprint text NOT NULL,
-  result jsonb NOT NULL,
+  request_fingerprint text NOT NULL CHECK (pg_catalog.length(request_fingerprint) > 0),
+  result jsonb NOT NULL CHECK (pg_catalog.jsonb_typeof(result) = 'object'),
   created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
   CHECK (
     (outcome = 'confirm_outflow' AND occurred_at IS NOT NULL)
@@ -139,7 +139,22 @@ ALTER TABLE public.manual_receipt_outflows
   ADD CONSTRAINT manual_receipt_outflows_manual_fingerprint_key
     UNIQUE (manual_receipt_id, request_fingerprint),
   ADD CONSTRAINT manual_receipt_outflows_manual_destination_key
-    UNIQUE (manual_receipt_id, destination_reference);
+    UNIQUE (manual_receipt_id, destination_reference),
+  ADD CONSTRAINT manual_receipt_outflows_destination_reference_check CHECK (
+    pg_catalog.length(destination_reference) BETWEEN 1 AND 200
+  ),
+  ADD CONSTRAINT manual_receipt_outflows_reason_check CHECK (
+    pg_catalog.length(reason) BETWEEN 10 AND 1000
+  ),
+  ADD CONSTRAINT manual_receipt_outflows_idempotency_key_length_check CHECK (
+    pg_catalog.length(idempotency_key) BETWEEN 8 AND 128
+  ),
+  ADD CONSTRAINT manual_receipt_outflows_request_fingerprint_check CHECK (
+    pg_catalog.length(request_fingerprint) > 0
+  ),
+  ADD CONSTRAINT manual_receipt_outflows_result_check CHECK (
+    pg_catalog.jsonb_typeof(result) = 'object'
+  );
 
 ALTER TABLE public.credit_transactions
   DROP CONSTRAINT credit_transactions_kind_check;
@@ -930,6 +945,57 @@ LEFT JOIN LATERAL (
   FROM public.credit_allocations allocation
   WHERE allocation.invoice_id = invoice.id
 ) credit ON true;
+
+CREATE FUNCTION public.opensales_validate_manual_receipt_reversal_017()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_row record;
+DECLARE
+  capacity_row record;
+BEGIN
+  SELECT
+    fact.client_account_id,
+    fact.gross_amount_minor,
+    fact.currency AS fact_currency,
+    receipt.amount_minor AS receipt_amount_minor,
+    receipt.currency AS receipt_currency,
+    receipt.allocated_minor,
+    receipt.disposition
+  INTO source_row
+  FROM public.manual_receipt_facts fact
+  JOIN public.fund_receipts receipt
+    ON receipt.id = NEW.fund_receipt_id
+   AND receipt.reported_manual_receipt_id = fact.id
+  WHERE fact.id = NEW.manual_receipt_id
+  FOR UPDATE OF fact, receipt;
+
+  SELECT reserved_refund_minor, confirmed_outflow_minor,
+         capacity_frozen, available_minor
+  INTO capacity_row
+  FROM public.unclaimed_fund_refund_capacity
+  WHERE fund_receipt_id = NEW.fund_receipt_id;
+
+  IF source_row IS NULL
+     OR capacity_row IS NULL
+     OR source_row.receipt_amount_minor <> source_row.gross_amount_minor
+     OR source_row.receipt_currency <> source_row.fact_currency
+     OR source_row.disposition <> 'unclaimed'
+     OR source_row.allocated_minor <> 0
+     OR capacity_row.reserved_refund_minor <> 0
+     OR capacity_row.confirmed_outflow_minor <> 0
+     OR capacity_row.capacity_frozen
+     OR capacity_row.available_minor <> source_row.gross_amount_minor THEN
+    RAISE EXCEPTION 'only a fully untouched manual receipt can be reversed';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER z_schema_017_manual_receipt_reversal_eligibility_guard
+  BEFORE INSERT ON public.manual_receipt_reversals
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_reversal_017();
 
 CREATE OR REPLACE VIEW public.invoice_delinquency_allocation_totals AS
 SELECT
