@@ -58,7 +58,7 @@ try {
   const schema = await assertSchemaCompatible(pool);
   assert.equal(
     schema.installedSchemaVersion,
-    "017_stage_b_manual_receipt_outflow_reports",
+    "018_stage_c_support_tickets",
   );
   assert.equal(schema.mode, "native");
 

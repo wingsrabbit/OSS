@@ -28,6 +28,7 @@ import { registerProviderEventRoutes } from "./routes-provider-events.js";
 import { registerRefundRoutes } from "./routes-refunds.js";
 import { registerRenewalRoutes } from "./routes-renewals.js";
 import { registerServiceRoutes } from "./routes-services.js";
+import { registerTicketRoutes } from "./routes-tickets.js";
 
 export async function buildApp(
   config: Config,
@@ -179,6 +180,7 @@ export async function buildApp(
   await registerRefundRoutes(app, pool, config);
   await registerRenewalRoutes(app, pool, config);
   await registerServiceRoutes(app, pool, config);
+  await registerTicketRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
     return { app, pool };

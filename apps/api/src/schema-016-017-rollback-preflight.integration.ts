@@ -50,7 +50,7 @@ test("explicit schema-016 bridge accepts exact native 016 before migration", asy
   const releaseGuard = await holdSchema016RollbackBridgeGuard(pool);
   try {
     await assert.rejects(
-      runMigrations(pool),
+      runMigrations(pool, { throughVersion: SCHEMA_017 }),
       /running schema-016\/017 bridge API or Worker/,
     );
   } finally {
@@ -94,7 +94,7 @@ test("migration 017 rejects a pre-existing orphan outflow marker before DDL", as
 });
 
 test("actual migration 017 file applies and emits its PG18 catalog digest", async () => {
-  await runMigrations(pool);
+  await runMigrations(pool, { throughVersion: SCHEMA_017 });
   assert.equal(await currentVersion(), SCHEMA_017);
   const catalog = await schema017CatalogFingerprintInput(queryable);
   assert.equal(catalog.historyExact, true);
@@ -120,13 +120,13 @@ test("native 017 and an empty explicit 016 bridge use the exact catalog", async 
   const releaseGuard = await holdSchema017ApplicationGuard(pool);
   try {
     await assert.rejects(
-      runMigrations(pool),
+      runMigrations(pool, { throughVersion: SCHEMA_017 }),
       /running schema-017 API or Worker/,
     );
   } finally {
     await releaseGuard();
   }
-  await runMigrations(pool);
+  await runMigrations(pool, { throughVersion: SCHEMA_017 });
 });
 
 test("orphan outflow journals fail at commit even when balanced and sealed", async () => {

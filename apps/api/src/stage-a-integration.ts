@@ -162,7 +162,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
     );
     assert.equal(
       upgraded.rows[0]?.version,
-      "017_stage_b_manual_receipt_outflow_reports",
+      "018_stage_c_support_tickets",
     );
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");

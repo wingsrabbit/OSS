@@ -6,6 +6,7 @@ import {
   ManualReceiptOutflowPanel,
   type ManualReceiptOriginalSourceOutflow,
 } from "./ManualReceiptOutflows.js";
+import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
 
@@ -896,6 +897,14 @@ export function App() {
     ReadonlySet<string>
   >(new Set());
   const [bootstrapToken, setBootstrapToken] = useState("");
+  const showTicketNotice = useCallback((message: string) => {
+    setError("");
+    setNotice(message);
+  }, []);
+  const showTicketError = useCallback((message: string) => {
+    setNotice("");
+    setError(message);
+  }, []);
   const text = words[locale];
   const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const manualReceiptAmountsValid =
@@ -2895,6 +2904,13 @@ export function App() {
             )}
           </div>
         </section>
+
+        <TicketsPanel
+          me={me}
+          locale={locale}
+          onNotice={showTicketNotice}
+          onError={showTicketError}
+        />
 
         {me &&
           chargebackStatus &&

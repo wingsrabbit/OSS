@@ -18,10 +18,10 @@ import {
 } from "@opensales/core/provider-token-vault";
 import {
   assertSchema016RollbackBridgeSafe,
-  assertSchema017NativeSafe,
   SCHEMA_016_017_GUARD,
   SCHEMA_017_APPLICATION_GUARD,
 } from "@opensales/core/schema-016-017-rollback-compatibility";
+import { assertSchema018NativeSafe } from "@opensales/core/schema-017-018-native-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -7456,7 +7456,7 @@ try {
         enable017RollbackBridge: true,
       });
     } else {
-      await assertSchema017NativeSafe(queryable);
+      await assertSchema018NativeSafe(queryable);
     }
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {

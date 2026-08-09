@@ -24,20 +24,22 @@ import {
 } from "@opensales/core/schema-015-016-rollback-compatibility";
 import {
   assertSchema016RollbackBridgeSafe,
-  assertSchema017NativeSafe,
   SCHEMA_016_017_GUARD,
-  SCHEMA_017,
   SCHEMA_017_APPLICATION_GUARD,
   type Schema016BridgePreflightReport,
-  type Schema017NativePreflightReport,
 } from "@opensales/core/schema-016-017-rollback-compatibility";
+import {
+  assertSchema018NativeSafe,
+  SCHEMA_018,
+  type Schema018NativePreflightReport,
+} from "@opensales/core/schema-017-018-native-compatibility";
 import pg from "pg";
 import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = SCHEMA_017;
+export const REQUIRED_SCHEMA_VERSION = SCHEMA_018;
 const TOKEN_REGISTRY_EXTENSION_GUARD =
   "opensales:payment-method-token-registry-extension";
 
@@ -240,7 +242,10 @@ export async function tryLockPaymentMethodTokenRegistryExtension(
   return result.rows[0]?.locked === true;
 }
 
-export async function runMigrations(pool: DatabasePool): Promise<void> {
+export async function runMigrations(
+  pool: DatabasePool,
+  input: Readonly<{ throughVersion?: string }> = {},
+): Promise<void> {
   const client = await pool.connect();
   let migrationLockHeld = false;
   let compatibilityLockHeld = false;
@@ -302,9 +307,17 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       "CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
     const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
-    const migrationFiles = (await readdir(migrationsDirectory))
+    let migrationFiles = (await readdir(migrationsDirectory))
       .filter((file) => /^\d{3}_[a-z0-9_]+\.sql$/.test(file))
       .sort();
+    if (input.throughVersion) {
+      const targetFile = `${input.throughVersion}.sql`;
+      const targetIndex = migrationFiles.indexOf(targetFile);
+      if (targetIndex === -1) {
+        throw new Error(`Migration target ${input.throughVersion} does not exist`);
+      }
+      migrationFiles = migrationFiles.slice(0, targetIndex + 1);
+    }
     for (const migrationFile of migrationFiles) {
       const version = migrationFile.replace(/\.sql$/, "");
       const migration = await readFile(resolve(migrationsDirectory, migrationFile), "utf8");
@@ -513,19 +526,22 @@ export async function configureRuntimeDatabaseRoles(
 export async function assertSchemaCompatible(
   pool: DatabasePool,
   input: Readonly<{ enable017RollbackBridge?: boolean }> = {},
-): Promise<Schema017NativePreflightReport | Schema016BridgePreflightReport> {
+): Promise<Schema018NativePreflightReport | Schema016BridgePreflightReport> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await client.query("SET LOCAL search_path TO pg_catalog, public");
-    const queryable = {
-      query: async (text: string, values?: unknown[]) => client.query(text, values),
-    };
-    const report = input.enable017RollbackBridge === true
-      ? await assertSchema016RollbackBridgeSafe(queryable, {
-          enable017RollbackBridge: true,
-        })
-      : await assertSchema017NativeSafe(queryable);
+    let report: Schema018NativePreflightReport | Schema016BridgePreflightReport;
+    if (input.enable017RollbackBridge === true) {
+      report = await assertSchema016RollbackBridgeSafe(
+        { query: async (text: string, values?: unknown[]) => client.query(text, values) },
+        { enable017RollbackBridge: true },
+      );
+    } else {
+      report = await assertSchema018NativeSafe(
+        { query: async (text: string, values?: unknown[]) => client.query(text, values) },
+      );
+    }
     await client.query("COMMIT");
     return report;
   } catch (error) {
