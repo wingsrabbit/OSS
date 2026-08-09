@@ -124,6 +124,7 @@ services:
     environment:
       <<: *core-env
       DATABASE_URL: postgresql://oss_api:${CORE_DATABASE_API_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_api
       MIGRATION_DATABASE_URL: postgresql://oss_migrator:${CORE_DATABASE_MIGRATOR_PASSWORD:?required}@core-db:5432/oss
       DATABASE_API_ROLE_PASSWORD: ${CORE_DATABASE_API_PASSWORD:?required}
       DATABASE_WORKER_ROLE_PASSWORD: ${CORE_DATABASE_WORKER_PASSWORD:?required}

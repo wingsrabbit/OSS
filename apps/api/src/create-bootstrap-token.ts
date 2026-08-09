@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { open } from "node:fs/promises";
+import { assertRuntimeDatabaseRoleSafe } from "@opensales/core";
 import { createOpaqueToken, digestToken } from "./auth.js";
 import { loadConfig } from "./config.js";
 import {
@@ -9,7 +10,14 @@ import {
 } from "./database.js";
 
 const config = loadConfig();
+if (!config.DATABASE_RUNTIME_ROLE) {
+  throw new Error("Staff bootstrap requires DATABASE_RUNTIME_ROLE");
+}
 const pool = createPool(config);
+await assertRuntimeDatabaseRoleSafe(
+  { query: async (text, values) => pool.query(text, values) },
+  config.DATABASE_RUNTIME_ROLE,
+);
 const outputFile = process.env.BOOTSTRAP_TOKEN_OUTPUT_FILE;
 if (!outputFile) {
   await pool.end();

@@ -286,7 +286,7 @@ jobs:
           set -euo pipefail
           pnpm --filter @opensales/api migrate
           DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
-            pnpm --filter @opensales/api seed:termrat
+            DATABASE_RUNTIME_ROLE=oss_api pnpm --filter @opensales/api seed:termrat
 
       - name: Prove migration and runtime database role separation
         run: pnpm --filter @opensales/api test:integration:database-role-boundary
