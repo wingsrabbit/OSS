@@ -98,16 +98,42 @@ revision cannot migrate the preserved Demo database safely, startup fails
 closed so the migration can be fixed. `reset --yes` remains a separate,
 explicit option only for a deliberately disposable synthetic Demo runtime.
 
+Every `up`, `smoke`, `status`, `down`, and `reset` command acquires one
+repository-scoped OS advisory lock before it reads or writes config, state, or
+source identity. The lock lives in a hashed directory under the operating
+system temporary directory, outside both `.demo/local` and the source
+fingerprint. The launcher opens the stable semaphore inode itself and retains
+the locked file description until command completion or process exit; the
+`lockf`/`flock` helper only applies the descriptor lock. A diagnostic owner
+record contains the command, PID, process start identity, exact argv, and a
+random token. Concurrent commands fail closed without reading Demo state, and
+kernel process teardown releases a crashed holder without unlinking the
+semaphore inode.
+
 The private state file records a verifiable identity for every process. Each
 Node child has its logical name, PID, process start identity, exact argv,
 working directory, and (where applicable) exact loopback listener. Newly
-started children also receive a random per-process argv token. Legacy numeric
-PIDs are migrated only after their expected name/argv/cwd and listener all
-match. PostgreSQL records its PID, start identity, exact process arguments,
-data directory, loopback host/port, and socket directory. Normal `pg_ctl stop`
-and orphan recovery both preflight this identity; TERM/KILL escalation rechecks
-the immutable identity before and after signaling. A missing, reused, or
-different identity fails closed instead of signaling an unrelated process.
+started children also receive a random per-process argv token. Before spawn,
+the launcher persists a `pendingProcesses` record containing that token and
+the exact specification; it saves the PID immediately after spawn and promotes
+the record only after exact observation. The next locked command scans for the
+unique token before normal inspection: no candidate safely clears the pending
+record, one exact argv/cwd/listener candidate is promoted, and multiple or
+mismatched candidates retain the evidence and fail closed. The Worker has no
+listener, so its independent contract is exact token/PID/start/argv/cwd.
+Legacy numeric PIDs are migrated only after their expected name/argv/cwd and
+listener all match.
+
+PostgreSQL records its PID, start identity, exact process arguments, data
+directory, loopback host/port, and socket directory. Normal `pg_ctl stop` and
+orphan recovery both preflight this identity. TERM/KILL escalation repeats the
+PID/start/argv/cwd checks immediately before signaling and again while waiting;
+the initial preflight also verifies the configured listener. macOS does not
+provide this JavaScript launcher an atomic
+compare-identity-and-signal primitive, so a very narrow exit/PID-reuse race can
+still exist between the final check and the signal syscall; random argv tokens
+and repeated fail-closed checks reduce that residual risk but do not claim an
+absolute atomic guarantee.
 
 An older preserved database may already contain Staff after the old launcher
 has overwritten its only synthetic administrator password. That credential
@@ -123,10 +149,14 @@ part of `product-static` CI:
 node --test tools/demo-local.test.mjs
 ```
 
-It covers dirty tracked/untracked source fingerprints, legacy PID migration,
-argv mismatch and PID-reuse refusal, separate Staff/customer identities, and a
-negative assertion that fails if a customer ticket response exposes the Staff
-internal note.
+It covers dirty tracked/untracked source fingerprints; real advisory-lock
+contention, stable-inode ownership, holder crash release, diagnostic-owner ABA,
+and non-inheritance by detached service-like children; pending-process
+0/1/multiple candidate and identity-mismatch decisions; a real token-bearing
+Node recovery from the pre-PID crash window; failed-spawn cleanup dispositions;
+legacy PID migration and PID-reuse refusal; separate Staff/customer identities;
+and a negative assertion that fails if a customer ticket response exposes the
+Staff internal note.
 
 To explicitly delete only that generated Demo runtime:
 

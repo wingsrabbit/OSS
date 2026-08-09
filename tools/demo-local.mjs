@@ -11,10 +11,12 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   readlinkSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +35,12 @@ const postgresSocket = join(
   tmpdir(),
   `oss-demo-pg-${createHash("sha256").update(root).digest("hex").slice(0, 12)}`,
 );
+const lifecycleLockDirectory = join(
+  tmpdir(),
+  `oss-demo-lifecycle-${createHash("sha256").update(root).digest("hex").slice(0, 12)}`,
+);
+const lifecycleSemaphoreFile = join(lifecycleLockDirectory, "lifecycle.lock");
+const lifecycleOwnerFile = join(lifecycleLockDirectory, "owner.json");
 const logsDir = join(runtimeDir, "logs");
 const ownerRole = "oss_demo_owner";
 const processNames = Object.freeze([
@@ -129,7 +137,9 @@ function commandResult(binary, args, options = {}) {
     stdio: options.inherit ? "inherit" : "pipe",
   });
   if (result.status !== 0) {
-    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    const detail = truncateDiagnostic(
+      [result.stdout, result.stderr].filter(Boolean).join("\n").trim(),
+    );
     throw new Error(
       `${binary} ${args.join(" ")} failed${detail ? `:\n${detail}` : ""}`,
     );
@@ -144,17 +154,47 @@ function commandBufferResult(binary, args, options = {}) {
     encoding: null,
     maxBuffer: 64 * 1024 * 1024,
   });
-  if (result.status !== 0) {
-    const detail = [result.stdout, result.stderr]
+  if (result.status !== 0 || result.error) {
+    const diagnosticBuffers = options.redactStdout
+      ? [result.stderr]
+      : [result.stdout, result.stderr];
+    const detail = truncateDiagnostic([
+      result.error?.message,
+      ...diagnosticBuffers
       .filter(Boolean)
-      .map((value) => value.toString("utf8"))
+      .map((value) => value.toString("utf8")),
+      result.signal ? `terminated by signal ${result.signal}` : null,
+      result.status === null ? null : `exit status ${result.status}`,
+    ]
+      .filter(Boolean)
       .join("\n")
-      .trim();
+      .trim());
     throw new Error(
-      `${binary} ${args.join(" ")} failed${detail ? `:\n${detail}` : ""}`,
+      `${options.failureLabel ?? `${binary} ${args.join(" ")} failed`}${detail ? `:\n${detail}` : ""}`,
     );
   }
   return result.stdout ?? Buffer.alloc(0);
+}
+
+function truncateDiagnostic(detail, limit = 4_096) {
+  if (detail.length <= limit) return detail;
+  const headLength = Math.floor(limit * 0.7);
+  const tailLength = limit - headLength;
+  return `${detail.slice(0, headLength)}\n...[truncated ${detail.length - limit} characters]...\n${detail.slice(-tailLength)}`;
+}
+
+function updateHashFromFile(hash, path) {
+  const descriptor = openSync(path, "r");
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const bytesRead = readSync(descriptor, chunk, 0, chunk.length, null);
+      if (bytesRead === 0) return;
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 export function repositoryRevision(repositoryRoot = root) {
@@ -168,7 +208,11 @@ export function repositoryRevision(repositoryRoot = root) {
   const trackedDiff = commandBufferResult(
     "git",
     ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
-    { cwd: repositoryRoot },
+    {
+      cwd: repositoryRoot,
+      redactStdout: true,
+      failureLabel: "Unable to fingerprint tracked Demo source changes",
+    },
   );
   const untrackedOutput = commandBufferResult(
     "git",
@@ -196,7 +240,7 @@ export function repositoryRevision(repositoryRoot = root) {
     fingerprint.update(String(metadata.mode));
     fingerprint.update("\0");
     if (metadata.isFile()) {
-      fingerprint.update(readFileSync(absolutePath));
+      updateHashFromFile(fingerprint, absolutePath);
     } else if (metadata.isSymbolicLink()) {
       fingerprint.update("symlink\0");
       fingerprint.update(readlinkSync(absolutePath));
@@ -218,11 +262,14 @@ function executableVersion(binary, args = ["--version"]) {
 }
 
 function resolveExactNode(currentState = null) {
-  const trackedExecutables = Object.values(currentState?.processes ?? {})
+  const trackedExecutables = [
+    ...Object.values(currentState?.processes ?? {}),
+    ...Object.values(currentState?.pendingProcesses ?? {}),
+  ]
     .map((identity) =>
       Number.isInteger(identity)
         ? processCommand(identity)?.split(" ", 1)[0]
-        : identity?.argv?.split(" ", 1)[0],
+        : identity?.executable ?? identity?.argv?.split(" ", 1)[0],
     )
     .filter((candidate) => candidate?.endsWith("/node"));
   const candidates = [
@@ -280,8 +327,11 @@ function state() {
   const current = readJson(stateFile, {
     warning: LAB_WARNING,
     processes: {},
+    pendingProcesses: {},
     latestSmoke: null,
   });
+  current.processes ??= {};
+  current.pendingProcesses ??= {};
   current.administratorAccount ??= recoverAdministratorAccount(current);
   return current;
 }
@@ -545,6 +595,254 @@ function processStartTime(pid) {
   return startedAt || null;
 }
 
+function observeLifecycleProcess(pid) {
+  const initialStartedAt = processStartTime(pid);
+  if (initialStartedAt === null) return null;
+  const initialArgv = processCommand(pid);
+  if (initialArgv === null) return null;
+  const finalStartedAt = processStartTime(pid);
+  const finalArgv = processCommand(pid);
+  if (finalStartedAt === null || finalArgv === null) return null;
+  if (initialStartedAt !== finalStartedAt || initialArgv !== finalArgv) {
+    return { startedAt: finalStartedAt, argv: finalArgv, unstable: true };
+  }
+  return { startedAt: initialStartedAt, argv: initialArgv, unstable: false };
+}
+
+export function lifecycleLockPaths(repositoryRoot = root) {
+  const directory = join(
+    tmpdir(),
+    `oss-demo-lifecycle-${createHash("sha256").update(resolve(repositoryRoot)).digest("hex").slice(0, 12)}`,
+  );
+  return {
+    directory,
+    semaphore: join(directory, "lifecycle.lock"),
+    owner: join(directory, "owner.json"),
+  };
+}
+
+function validateLifecycleLockOwner(owner) {
+  if (
+    owner?.version !== 1 ||
+    typeof owner.command !== "string" ||
+    !Number.isInteger(owner.pid) ||
+    owner.pid <= 1 ||
+    typeof owner.startedAt !== "string" ||
+    typeof owner.argv !== "string" ||
+    typeof owner.token !== "string" ||
+    owner.token.length < 16 ||
+    typeof owner.acquiredAt !== "string"
+  ) {
+    throw new Error(
+      "Refusing to recover a malformed local Demo lifecycle lock; inspect its owner record manually",
+    );
+  }
+  return owner;
+}
+
+export function classifyLifecycleLockOwner(owner, observation) {
+  validateLifecycleLockOwner(owner);
+  if (observation === null) return "stale";
+  if (
+    observation.unstable === true ||
+    observation.startedAt !== owner.startedAt ||
+    observation.argv !== owner.argv
+  ) {
+    return "stale";
+  }
+  return "active";
+}
+
+function readLifecycleLock(path) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  let owner;
+  try {
+    owner = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Refusing to recover malformed local Demo lifecycle lock JSON at ${path}`,
+    );
+  }
+  validateLifecycleLockOwner(owner);
+  return { owner, raw };
+}
+
+function lifecycleOwner(command, token = secureToken(24)) {
+  const observation = observeLifecycleProcess(process.pid);
+  if (!observation || observation.unstable) {
+    throw new Error("Unable to record a stable identity for this Demo lifecycle command");
+  }
+  return {
+    version: 1,
+    command,
+    pid: process.pid,
+    startedAt: observation.startedAt,
+    argv: observation.argv,
+    token,
+    acquiredAt: new Date().toISOString(),
+  };
+}
+
+function resolveAdvisoryLockHelper(descriptor = 3) {
+  if (existsSync("/usr/bin/lockf")) {
+    return {
+      binary: "/usr/bin/lockf",
+      args: ["-s", "-t", "0", String(descriptor)],
+      kind: "lockf-fd",
+    };
+  }
+  const flock = ["/usr/bin/flock", "/bin/flock"].find((candidate) =>
+    existsSync(candidate),
+  );
+  if (flock) {
+    return {
+      binary: flock,
+      args: ["--nonblock", String(descriptor)],
+      kind: "flock-fd",
+    };
+  }
+  throw new Error(
+    "Local Demo lifecycle commands require /usr/bin/lockf descriptor mode (macOS) or flock descriptor mode (Linux); neither advisory-lock helper is available",
+  );
+}
+
+export function advisoryLockInvocation(descriptor = 3) {
+  return resolveAdvisoryLockHelper(descriptor);
+}
+
+function ensureLifecycleLockFiles() {
+  mkdirSync(lifecycleLockDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(lifecycleLockDirectory, 0o700);
+  const descriptor = openSync(lifecycleSemaphoreFile, "a", 0o600);
+  closeSync(descriptor);
+  chmodSync(lifecycleSemaphoreFile, 0o600);
+}
+
+export function acquireAdvisoryFileLock(path) {
+  const descriptor = openSync(path, "a+", 0o600);
+  chmodSync(path, 0o600);
+  const invocation = resolveAdvisoryLockHelper(3);
+  const result = spawnSync(invocation.binary, invocation.args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "ignore", "pipe", descriptor],
+  });
+  if (result.status !== 0 || result.error) {
+    closeSync(descriptor);
+    const detail = truncateDiagnostic(
+      [result.error?.message, result.stderr]
+        .filter(Boolean)
+        .join("\n")
+        .trim(),
+    );
+    const error = new Error(
+      `Unable to acquire the local Demo advisory lock with ${invocation.kind}${detail ? `: ${detail}` : ""}`,
+    );
+    error.code = "OSS_DEMO_LOCK_UNAVAILABLE";
+    throw error;
+  }
+  return { descriptor, path, kind: invocation.kind };
+}
+
+export function releaseAdvisoryFileLock(lock) {
+  closeSync(lock.descriptor);
+}
+
+export function registerLifecycleLockOwner(
+  command,
+  token,
+  {
+    ownerPath = lifecycleOwnerFile,
+    inspectOwner = observeLifecycleProcess,
+    owner = lifecycleOwner(command, token),
+  } = {},
+) {
+  const previous = readLifecycleLock(ownerPath);
+  if (previous) {
+    const status = classifyLifecycleLockOwner(
+      previous.owner,
+      inspectOwner(previous.owner.pid),
+    );
+    if (status === "active") {
+      throw new Error(
+        `The advisory lifecycle lock was acquired but its diagnostic owner is still active: ${previous.owner.command} (pid ${previous.owner.pid}). Refusing to read Demo state.`,
+      );
+    }
+  }
+  writePrivateJson(ownerPath, owner);
+  return { path: ownerPath, owner };
+}
+
+export function releaseLifecycleLockOwner(lock) {
+  const recorded = readLifecycleLock(lock.path);
+  if (recorded === null) {
+    throw new Error(
+      `Local Demo lifecycle lock disappeared before ${lock.owner.command} could release it`,
+    );
+  }
+  if (
+    recorded.owner.token !== lock.owner.token ||
+    recorded.owner.pid !== lock.owner.pid ||
+    recorded.owner.startedAt !== lock.owner.startedAt ||
+    recorded.owner.argv !== lock.owner.argv
+  ) {
+    throw new Error(
+      "Refusing to release a local Demo lifecycle lock whose owner token or process identity changed",
+    );
+  }
+  // This is diagnostic metadata only. The advisory-lock inode is never
+  // removed, so even a diagnostic-file race cannot release the kernel lock.
+  unlinkSync(lock.path);
+}
+
+function acquireLifecycleLock(command) {
+  ensureLifecycleLockFiles();
+  let advisory;
+  try {
+    advisory = acquireAdvisoryFileLock(lifecycleSemaphoreFile);
+  } catch (error) {
+    const recorded = readLifecycleLock(lifecycleOwnerFile);
+    if (
+      error?.code === "OSS_DEMO_LOCK_UNAVAILABLE" &&
+      recorded &&
+      classifyLifecycleLockOwner(
+        recorded.owner,
+        observeLifecycleProcess(recorded.owner.pid),
+      ) === "active"
+    ) {
+      throw new Error(
+        `Another local Demo lifecycle command is active: ${recorded.owner.command} (pid ${recorded.owner.pid}, acquired ${recorded.owner.acquiredAt}). No Demo state was read or changed by ${command}.`,
+      );
+    }
+    throw error;
+  }
+  try {
+    const owner = registerLifecycleLockOwner(command, secureToken(24));
+    return { advisory, owner };
+  } catch (error) {
+    releaseAdvisoryFileLock(advisory);
+    throw error;
+  }
+}
+
+function releaseLifecycleLock(lock) {
+  let ownerError = null;
+  try {
+    releaseLifecycleLockOwner(lock.owner);
+  } catch (error) {
+    ownerError = error;
+  } finally {
+    releaseAdvisoryFileLock(lock.advisory);
+  }
+  if (ownerError) throw ownerError;
+}
+
 function processWorkingDirectory(pid) {
   const result = spawnSync(
     "lsof",
@@ -611,6 +909,191 @@ function observeProcess(pid, spec) {
     throw new Error(`Unable to verify working directory for tracked Demo PID ${pid}`);
   }
   return { pid, startedAt: initialStartedAt, argv, cwd, listener };
+}
+
+function listProcessCommands() {
+  const result = spawnSync("ps", ["-axww", "-o", "pid=,command="], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    const detail = truncateDiagnostic(
+      [result.stderr, result.error?.message].filter(Boolean).join("\n").trim(),
+    );
+    throw new Error(
+      `Unable to scan local process identities for pending Demo recovery${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return (result.stdout ?? "")
+    .split("\n")
+    .map((line) => line.match(/^\s*(\d+)\s+(.+)$/))
+    .filter(Boolean)
+    .map((match) => ({ pid: Number.parseInt(match[1], 10), argv: match[2] }));
+}
+
+function pendingConditionArgument(token) {
+  return `--conditions=oss-demo-process-${token}`;
+}
+
+function commandContainsExactArgument(command, argument) {
+  return command.split(/\s+/).includes(argument);
+}
+
+function validatePendingProcessRecord(pending) {
+  if (
+    pending?.version !== 1 ||
+    !processNames.includes(pending?.name) ||
+    typeof pending.token !== "string" ||
+    pending.token.length < 16 ||
+    typeof pending.executable !== "string" ||
+    !Array.isArray(pending.args) ||
+    !pending.args.every((argument) => typeof argument === "string") ||
+    pending.args[0] !== pendingConditionArgument(pending.token) ||
+    typeof pending.argv !== "string" ||
+    pending.argv !== [pending.executable, ...pending.args].join(" ") ||
+    typeof pending.cwd !== "string" ||
+    !((pending.host === "127.0.0.1" && Number.isInteger(pending.port)) ||
+      (pending.host === null && pending.port === null)) ||
+    ![null, undefined].includes(pending.pid) &&
+      (!Number.isInteger(pending.pid) || pending.pid <= 1)
+  ) {
+    throw new Error("Refusing to recover a malformed pending Demo process record");
+  }
+  return pending;
+}
+
+export function pendingProcessRecord(spec, pid = null) {
+  if (typeof spec.token !== "string" || spec.token.length < 16) {
+    throw new Error(`${spec.name} cannot enter pending state without a unique argv token`);
+  }
+  return validatePendingProcessRecord({
+    version: 1,
+    name: spec.name,
+    token: spec.token,
+    executable: spec.executable,
+    args: [...spec.args],
+    argv: spec.argv,
+    cwd: spec.cwd,
+    host: spec.host,
+    port: spec.port,
+    pid,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+export function evaluatePendingProcessRecovery(
+  pending,
+  candidates,
+  observeCandidate,
+) {
+  validatePendingProcessRecord(pending);
+  const condition = pendingConditionArgument(pending.token);
+  const matchingToken = candidates.filter(
+    (candidate) =>
+      Number.isInteger(candidate?.pid) &&
+      candidate.pid > 1 &&
+      typeof candidate.argv === "string" &&
+      commandContainsExactArgument(candidate.argv, condition),
+  );
+  if (matchingToken.length === 0) return { action: "clear" };
+  if (matchingToken.length > 1) {
+    throw new Error(
+      `Refusing to recover pending ${pending.name}: ${matchingToken.length} processes contain its unique argv token`,
+    );
+  }
+  const candidate = matchingToken[0];
+  if (pending.pid !== null && pending.pid !== undefined && candidate.pid !== pending.pid) {
+    throw new Error(
+      `Refusing to recover pending ${pending.name}: its recorded PID ${pending.pid} differs from token-bearing PID ${candidate.pid}`,
+    );
+  }
+  if (candidate.argv !== pending.argv) {
+    throw new Error(
+      `Refusing to recover pending ${pending.name}: token-bearing process argv does not exactly match`,
+    );
+  }
+  const observation = observeCandidate(candidate.pid, pending);
+  if (
+    !observation ||
+    observation.pid !== candidate.pid ||
+    observation.argv !== pending.argv ||
+    observation.cwd !== pending.cwd
+  ) {
+    throw new Error(
+      `Refusing to recover pending ${pending.name}: exact PID, argv, and cwd identity could not be verified`,
+    );
+  }
+  if (pending.port !== null && observation.listener !== true) {
+    throw new Error(
+      `Refusing to recover pending ${pending.name}: PID ${candidate.pid} is not listening on ${pending.host}:${pending.port}; pending evidence is retained`,
+    );
+  }
+  return {
+    action: "promote",
+    identity: storedProcessIdentity(
+      pending,
+      observation,
+      pending.port === null || observation.listener === true,
+    ),
+  };
+}
+
+export function inspectPendingProcess(pending) {
+  return evaluatePendingProcessRecovery(
+    pending,
+    listProcessCommands(),
+    observeProcess,
+  );
+}
+
+function recoverPendingProcesses(config, node, currentState) {
+  currentState.pendingProcesses ??= {};
+  currentState.processes ??= {};
+  const unexpected = Object.keys(currentState.pendingProcesses).filter(
+    (name) => !processNames.includes(name),
+  );
+  if (unexpected.length > 0) {
+    throw new Error(
+      `Refusing to recover unknown pending Demo processes: ${unexpected.join(", ")}`,
+    );
+  }
+  const candidates = listProcessCommands();
+  for (const name of processNames) {
+    const pending = currentState.pendingProcesses[name];
+    if (!pending) continue;
+    if (currentState.processes[name] !== undefined) {
+      throw new Error(
+        `Refusing to recover ${name}: both pending and formal process identities are recorded`,
+      );
+    }
+    const expected = processSpecifications(config, node, {
+      [name]: pending.token,
+    })[name];
+    if (
+      pending.executable !== expected.executable ||
+      pending.argv !== expected.argv ||
+      pending.cwd !== expected.cwd ||
+      pending.host !== expected.host ||
+      pending.port !== expected.port
+    ) {
+      throw new Error(
+        `Refusing to recover pending ${name}: its stored specification differs from this Demo source/runtime`,
+      );
+    }
+    const resolution = evaluatePendingProcessRecovery(
+      pending,
+      candidates,
+      observeProcess,
+    );
+    if (resolution.action === "clear") {
+      delete currentState.pendingProcesses[name];
+      saveState(currentState);
+      continue;
+    }
+    currentState.processes[name] = resolution.identity;
+    delete currentState.pendingProcesses[name];
+    saveState(currentState);
+  }
 }
 
 function storedProcessIdentity(spec, observation, listenerVerified) {
@@ -989,34 +1472,144 @@ async function waitForSpawnIdentity(spec, pid, timeoutMs = 5_000) {
   throw new Error(`${spec.name} exited before its exact process identity could be recorded`);
 }
 
+function savePendingTransition(currentState, pendingProcesses, processes = currentState.processes) {
+  const next = { ...currentState, pendingProcesses, processes };
+  saveState(next);
+  currentState.pendingProcesses = pendingProcesses;
+  currentState.processes = processes;
+}
+
+export async function cleanupExactPendingProcess(
+  pending,
+  currentState,
+  {
+    inspect = inspectPendingProcess,
+    identityStillMatches = trackedProcessIdentityStillMatches,
+    signal = (pid, signalName) => process.kill(pid, signalName),
+    persist = (pendingProcesses) =>
+      savePendingTransition(currentState, pendingProcesses),
+    now = Date.now,
+    wait = (milliseconds) =>
+      new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)),
+    termTimeoutMs = 2_000,
+    killTimeoutMs = 1_000,
+  } = {},
+) {
+  let resolution;
+  try {
+    resolution = inspect(pending);
+  } catch {
+    return "retained";
+  }
+  if (resolution.action === "clear") {
+    const pendingProcesses = { ...currentState.pendingProcesses };
+    delete pendingProcesses[pending.name];
+    persist(pendingProcesses);
+    return "cleared_no_child";
+  }
+  const identity = resolution.identity;
+  const spec = pending;
+  if (!identityStillMatches(identity, spec)) return "retained";
+  try {
+    signal(identity.pid, "SIGTERM");
+  } catch (error) {
+    if (error?.code !== "ESRCH") return "retained";
+  }
+  const deadline = now() + termTimeoutMs;
+  while (now() < deadline && identityStillMatches(identity, spec)) {
+    await wait(50);
+  }
+  if (identityStillMatches(identity, spec)) {
+    if (!identityStillMatches(identity, spec)) return "retained";
+    try {
+      signal(identity.pid, "SIGKILL");
+    } catch (error) {
+      if (error?.code !== "ESRCH") return "retained";
+    }
+    const killDeadline = now() + killTimeoutMs;
+    while (
+      now() < killDeadline &&
+      identityStillMatches(identity, spec)
+    ) {
+      await wait(25);
+    }
+    if (identityStillMatches(identity, spec)) return "retained";
+  }
+  const pendingProcesses = { ...currentState.pendingProcesses };
+  delete pendingProcesses[pending.name];
+  persist(pendingProcesses);
+  return "stopped_exact_child";
+}
+
 async function startDetached(spec, environment, currentState) {
   if (currentState.processes?.[spec.name] !== undefined) {
     throw new Error(`Refusing to overwrite an existing tracked ${spec.name} process identity`);
   }
-  const logPath = join(logsDir, `${spec.name}.log`);
-  const logFd = openSync(logPath, "a", 0o600);
-  const child = spawn(spec.executable, spec.args, {
-    cwd: spec.cwd,
-    env: { ...process.env, ...environment },
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-  });
-  closeSync(logFd);
-  child.unref();
-  if (!Number.isInteger(child.pid) || child.pid <= 1) {
-    throw new Error(`${spec.name} started without a valid PID`);
+  if (currentState.pendingProcesses?.[spec.name] !== undefined) {
+    throw new Error(`Refusing to overwrite an existing pending ${spec.name} process identity`);
   }
-  const observation = await waitForSpawnIdentity(spec, child.pid);
-  currentState.processes = {
-    ...currentState.processes,
-    [spec.name]: storedProcessIdentity(
+  const initialPending = pendingProcessRecord(spec);
+  savePendingTransition(currentState, {
+    ...currentState.pendingProcesses,
+    [spec.name]: initialPending,
+  });
+
+  let child;
+  try {
+    const logPath = join(logsDir, `${spec.name}.log`);
+    const logFd = openSync(logPath, "a", 0o600);
+    try {
+      child = spawn(spec.executable, spec.args, {
+        cwd: spec.cwd,
+        env: { ...process.env, ...environment },
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+      });
+    } finally {
+      closeSync(logFd);
+    }
+    await new Promise((resolvePromise, reject) => {
+      child.once("error", reject);
+      child.once("spawn", resolvePromise);
+    });
+    child.unref();
+    if (!Number.isInteger(child.pid) || child.pid <= 1) {
+      throw new Error(`${spec.name} started without a valid PID`);
+    }
+    const withPid = { ...initialPending, pid: child.pid };
+    savePendingTransition(currentState, {
+      ...currentState.pendingProcesses,
+      [spec.name]: withPid,
+    });
+
+    const observation = await waitForSpawnIdentity(spec, child.pid);
+    const identity = storedProcessIdentity(
       spec,
       observation,
       spec.port === null || observation.listener === true,
-    ),
-  };
-  saveState(currentState);
-  return currentState.processes[spec.name];
+    );
+    const pendingProcesses = { ...currentState.pendingProcesses };
+    delete pendingProcesses[spec.name];
+    savePendingTransition(
+      currentState,
+      pendingProcesses,
+      { ...currentState.processes, [spec.name]: identity },
+    );
+    return identity;
+  } catch (error) {
+    const recordedPending = currentState.pendingProcesses?.[spec.name] ?? initialPending;
+    const cleanup = await cleanupExactPendingProcess(recordedPending, currentState);
+    const detail = error instanceof Error ? error.message : String(error);
+    if (cleanup === "stopped_exact_child") {
+      throw new Error(`${detail}; the exact failed child was verified and stopped`);
+    }
+    if (cleanup === "cleared_no_child") {
+      throw new Error(`${detail}; no process carried the pending argv token, so the pending record was cleared without signaling`);
+    }
+    throw new Error(
+      `${detail}; pendingProcesses.${spec.name} is retained. The next locked Demo lifecycle command will recover it or fail closed with the exact mismatch.`,
+    );
+  }
 }
 
 function markProcessReady(spec, currentState) {
@@ -1196,6 +1789,7 @@ async function up() {
   const config = createConfig();
   let currentState = state();
   const node = resolveExactNode(currentState);
+  recoverPendingProcesses(config, node, currentState);
   const pgBin = resolvePostgresBin();
   const sourceRevision = repositoryRevision();
   currentState.processes ??= {};
@@ -1252,6 +1846,10 @@ async function up() {
     currentState.runtimeRevision = sourceRevision;
     saveState(currentState);
     await startProcesses(config, node, currentState);
+    assertSourceIdentityUnchanged(
+      sourceRevision,
+      "while the Demo processes were starting and passing health checks",
+    );
   }
   console.log(
     "Running the synthetic customer, service-linked support ticket, and manual receipt → confirmed original-source outflow smoke journeys...",
@@ -1266,6 +1864,7 @@ async function up() {
       saveState(refreshed);
     },
   });
+  assertSourceIdentityUnchanged(sourceRevision, "while the Demo smoke journey was running");
   currentState = state();
   currentState.runtimeRevision = sourceRevision;
   currentState.latestSmoke = result;
@@ -1279,6 +1878,7 @@ async function smoke() {
   const config = createConfig();
   const currentState = state();
   const node = resolveExactNode(currentState);
+  recoverPendingProcesses(config, node, currentState);
   const sourceRevision = repositoryRevision();
   if (currentState.runtimeRevision !== sourceRevision) {
     throw new Error(
@@ -1305,6 +1905,7 @@ async function smoke() {
       saveState(refreshed);
     },
   });
+  assertSourceIdentityUnchanged(sourceRevision, "while the Demo smoke journey was running");
   const refreshed = state();
   refreshed.latestSmoke = result;
   refreshed.administratorAccount = result.administratorAccount;
@@ -1360,6 +1961,7 @@ async function down() {
   const config = createConfig();
   const currentState = state();
   const node = resolveExactNode(currentState);
+  recoverPendingProcesses(config, node, currentState);
   const processRuntime = inspectTrackedProcesses(config, node, currentState);
   const pgBin = resolvePostgresBin();
   const postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
@@ -1410,6 +2012,7 @@ async function status() {
   const config = createConfig();
   const currentState = state();
   const node = resolveExactNode(currentState);
+  recoverPendingProcesses(config, node, currentState);
   const pgBin = resolvePostgresBin();
   const processRuntime = inspectTrackedProcesses(config, node, currentState);
   const postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
@@ -1452,17 +2055,36 @@ function help() {
 
 async function main() {
   const command = process.argv[2] ?? "up";
+  const lifecycleCommands = new Set(["up", "smoke", "status", "down", "reset"]);
+  let lock = null;
   try {
+    if (["help", "--help", "-h"].includes(command)) {
+      help();
+      return;
+    }
+    if (!lifecycleCommands.has(command)) {
+      throw new Error(`Unknown Demo command: ${command}`);
+    }
+    // This remains before config, state, source identity, migration, or child
+    // inspection. The current Node process keeps the locked descriptor open.
+    lock = acquireLifecycleLock(command);
     if (command === "up") await up();
     else if (command === "smoke") await smoke();
     else if (command === "status") await status();
     else if (command === "down") await down();
-    else if (command === "reset") await reset();
-    else if (["help", "--help", "-h"].includes(command)) help();
-    else throw new Error(`Unknown Demo command: ${command}`);
+    else await reset();
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     process.exitCode = 1;
+  } finally {
+    if (lock) {
+      try {
+        releaseLifecycleLock(lock);
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : error);
+        process.exitCode = 1;
+      }
+    }
   }
 }
 

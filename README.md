@@ -96,7 +96,10 @@ The command prints the public `http://127.0.0.1:5173/`, customer
 administrator logins, Client Account IDs, commit/worktree source fingerprint,
 and exact order, invoice, service, ticket, internal-note, receipt, and outflow
 IDs. Use those printed `127.0.0.1` URLs consistently rather than substituting
-`localhost`.
+`localhost`. Every lifecycle command is serialized by a repository-scoped OS
+advisory lock, and a pre-spawn pending record lets the next command safely
+recover or reject an interrupted synthetic child start before normal tracked-
+process inspection or any action.
 Stop the stack without deleting the synthetic data:
 
 ```bash

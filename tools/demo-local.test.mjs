@@ -1,13 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  acquireAdvisoryFileLock,
+  classifyLifecycleLockOwner,
+  cleanupExactPendingProcess,
+  evaluatePendingProcessRecovery,
+  inspectPendingProcess,
+  lifecycleLockPaths,
+  pendingProcessRecord,
   recoverAdministratorAccount,
+  registerLifecycleLockOwner,
+  releaseAdvisoryFileLock,
+  releaseLifecycleLockOwner,
   repositoryRevision,
   verifyStoredProcessIdentity,
 } from "./demo-local.mjs";
@@ -15,6 +35,545 @@ import {
   assertSeparatedDemoRoles,
   runSupportTicketSmoke,
 } from "./demo-smoke.mjs";
+
+const demoLocalModuleUrl = new URL("./demo-local.mjs", import.meta.url).href;
+
+function lockedNodeScript(lockFile, body) {
+  return `(async()=>{const lifecycle=await import(${JSON.stringify(demoLocalModuleUrl)});let lock=null;try{lock=lifecycle.acquireAdvisoryFileLock(${JSON.stringify(lockFile)});${body}}catch(error){process.stderr.write(String(error?.message??error)+"\\n");process.exitCode=75;}finally{if(lock)lifecycle.releaseAdvisoryFileLock(lock);}})();`;
+}
+
+function advisoryRun(lockFile, body) {
+  return spawnSync(process.execPath, ["-e", lockedNodeScript(lockFile, body)], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+}
+
+function spawnAdvisory(lockFile, body, options = {}) {
+  return spawn(process.execPath, ["-e", lockedNodeScript(lockFile, body)], {
+    stdio: options.stdio ?? "ignore",
+  });
+}
+
+async function childOutcome(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  const [code, signal] = await once(child, "exit");
+  return { code, signal };
+}
+
+async function waitForOutput(stream, expected, timeoutMs = 3_000) {
+  stream.setEncoding("utf8");
+  let output = "";
+  await new Promise((resolvePromise, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`Timed out waiting for child output: ${expected}`)),
+      timeoutMs,
+    );
+    const onData = (chunk) => {
+      output += chunk;
+      if (!output.includes(expected)) return;
+      clearTimeout(timeout);
+      stream.off("data", onData);
+      resolvePromise();
+    };
+    stream.on("data", onData);
+  });
+}
+
+function pidExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function stopTestPid(pid) {
+  if (!pidExists(pid)) return;
+  process.kill(pid, "SIGTERM");
+  let deadline = Date.now() + 1_000;
+  while (Date.now() < deadline && pidExists(pid)) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+  if (pidExists(pid)) process.kill(pid, "SIGKILL");
+  deadline = Date.now() + 1_000;
+  while (Date.now() < deadline && pidExists(pid)) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+  assert.equal(pidExists(pid), false, `test PID ${pid} did not stop`);
+}
+
+test("advisory lock keeps one stable semaphore inode across success and failure", () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-inode-"));
+  const semaphore = join(directory, "lifecycle.lock");
+  let held = null;
+  try {
+    writeFileSync(semaphore, "", { mode: 0o600 });
+    const before = statSync(semaphore);
+    held = acquireAdvisoryFileLock(semaphore);
+    const busyWhileParentFdIsHeld = advisoryRun(semaphore, "process.exit(0)");
+    assert.notEqual(busyWhileParentFdIsHeld.status, 0);
+    releaseAdvisoryFileLock(held);
+    held = null;
+
+    const success = advisoryRun(semaphore, "process.exit(0)");
+    assert.equal(success.status, 0, success.stderr);
+    const afterSuccess = statSync(semaphore);
+    assert.equal(afterSuccess.dev, before.dev);
+    assert.equal(afterSuccess.ino, before.ino);
+
+    const failure = advisoryRun(semaphore, "process.exit(1)");
+    assert.equal(failure.status, 1, failure.stderr);
+    const afterFailure = statSync(semaphore);
+    assert.equal(afterFailure.dev, before.dev);
+    assert.equal(afterFailure.ino, before.ino);
+
+    const signaled = advisoryRun(
+      semaphore,
+      'process.kill(process.pid, "SIGTERM")',
+    );
+    assert.ok(
+      signaled.signal === "SIGTERM" || signaled.status === 143,
+      `unexpected signal result: status=${signaled.status} signal=${signaled.signal}`,
+    );
+    const afterSignal = statSync(semaphore);
+    assert.equal(afterSignal.dev, before.dev);
+    assert.equal(afterSignal.ino, before.ino);
+  } finally {
+    if (held) releaseAdvisoryFileLock(held);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ten concurrent advisory-lock contenders execute exactly one inner command", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-contenders-"));
+  const semaphore = join(directory, "lifecycle.lock");
+  const marker = join(directory, "state-marker.txt");
+  try {
+    writeFileSync(semaphore, "", { mode: 0o600 });
+    const before = statSync(semaphore);
+    const script = `const fs=require("node:fs");fs.appendFileSync(${JSON.stringify(marker)},"entered\\n");await new Promise(resolve=>setTimeout(resolve,300));`;
+    const contenders = Array.from({ length: 10 }, () =>
+      spawnAdvisory(semaphore, script),
+    );
+    const outcomes = await Promise.all(contenders.map(childOutcome));
+    assert.equal(outcomes.filter(({ code }) => code === 0).length, 1);
+    assert.equal(
+      readFileSync(marker, "utf8").trim().split("\n").filter(Boolean).length,
+      1,
+    );
+    const after = statSync(semaphore);
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("active holder blocks state work, SIGKILL releases lock, and another repo remains independent", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-crash-"));
+  const first = join(directory, "repo-a.lock");
+  const second = join(directory, "repo-b.lock");
+  const forbiddenMarker = join(directory, "busy-state-marker.txt");
+  const independentMarker = join(directory, "independent-marker.txt");
+  writeFileSync(first, "", { mode: 0o600 });
+  writeFileSync(second, "", { mode: 0o600 });
+  const before = statSync(first);
+  const holder = spawnAdvisory(
+    first,
+    'console.log("LOCK_READY");setInterval(()=>{},1000);await new Promise(()=>{})',
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  try {
+    await waitForOutput(holder.stdout, "LOCK_READY");
+    const lockHolder = spawnSync(
+      "lsof",
+      ["-nP", "-p", String(holder.pid), "-F", "pn"],
+      { encoding: "utf8" },
+    );
+    assert.equal(lockHolder.status, 0, lockHolder.stderr);
+    assert.match(lockHolder.stdout, new RegExp(`^p${holder.pid}$`, "m"));
+    assert.match(lockHolder.stdout, new RegExp(`^n${realpathSync(first)}$`, "m"));
+    const busy = advisoryRun(
+      first,
+      `require("node:fs").writeFileSync(${JSON.stringify(forbiddenMarker)},"changed")`,
+    );
+    assert.notEqual(busy.status, 0);
+    assert.equal(existsSync(forbiddenMarker), false);
+    assert.equal(statSync(first).ino, before.ino);
+
+    const independent = advisoryRun(
+      second,
+      `require("node:fs").writeFileSync(${JSON.stringify(independentMarker)},"ok")`,
+    );
+    assert.equal(independent.status, 0, independent.stderr);
+    assert.equal(readFileSync(independentMarker, "utf8"), "ok");
+
+    holder.kill("SIGKILL");
+    const killed = await childOutcome(holder);
+    assert.ok(killed.signal === "SIGKILL" || killed.code === 137);
+    assert.throws(() => process.kill(holder.pid, 0), { code: "ESRCH" });
+    const recovered = advisoryRun(first, "process.exit(0)");
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(statSync(first).ino, before.ino);
+  } finally {
+    if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle descriptor is not inherited by detached service-like children", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-grandchild-"));
+  const semaphore = join(directory, "lifecycle.lock");
+  writeFileSync(semaphore, "", { mode: 0o600 });
+  let grandchildPid = null;
+  try {
+    const holder = advisoryRun(
+      semaphore,
+      'const childProcess=await import("node:child_process");const grandchild=childProcess.spawn(process.execPath,["-e","setTimeout(()=>{},30000)"],{detached:true,stdio:"ignore"});grandchild.unref();console.log(`GRANDCHILD:${grandchild.pid}`);',
+    );
+    assert.equal(holder.status, 0, holder.stderr);
+    grandchildPid = Number.parseInt(
+      holder.stdout.match(/GRANDCHILD:(\d+)/)?.[1] ?? "",
+      10,
+    );
+    assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 1);
+    process.kill(grandchildPid, 0);
+    const reacquired = advisoryRun(semaphore, "process.exit(0)");
+    assert.equal(reacquired.status, 0, reacquired.stderr);
+  } finally {
+    if (Number.isInteger(grandchildPid)) {
+      await stopTestPid(grandchildPid);
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("repository-specific advisory lock paths do not collide", () => {
+  const left = lifecycleLockPaths("/synthetic/repository-a");
+  const right = lifecycleLockPaths("/synthetic/repository-b");
+  assert.notEqual(left.directory, right.directory);
+  assert.notEqual(left.semaphore, right.semaphore);
+  assert.equal(left.semaphore, join(left.directory, "lifecycle.lock"));
+});
+
+function lockOwner(overrides = {}) {
+  return {
+    version: 1,
+    command: "status",
+    pid: 7_070,
+    startedAt: "Mon Aug 10 01:02:03 2026",
+    argv: "/synthetic/node tools/demo-local.mjs status",
+    token: "owner-token-0123456789abcdef",
+    acquiredAt: "2026-08-10T01:02:03.000Z",
+    ...overrides,
+  };
+}
+
+test("diagnostic owner blocks active identity, replaces stale identity, and resists ABA release", () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-owner-"));
+  const ownerPath = join(directory, "owner.json");
+  try {
+    const previous = lockOwner();
+    writeFileSync(ownerPath, `${JSON.stringify(previous)}\n`, { mode: 0o600 });
+    assert.equal(
+      classifyLifecycleLockOwner(previous, {
+        startedAt: previous.startedAt,
+        argv: previous.argv,
+        unstable: false,
+      }),
+      "active",
+    );
+    assert.throws(
+      () =>
+        registerLifecycleLockOwner("status", "new-owner-token-0123456789", {
+          ownerPath,
+          owner: lockOwner({
+            pid: 7_071,
+            token: "new-owner-token-0123456789",
+          }),
+          inspectOwner: () => ({
+            startedAt: previous.startedAt,
+            argv: previous.argv,
+            unstable: false,
+          }),
+        }),
+      /diagnostic owner is still active/,
+    );
+    assert.equal(JSON.parse(readFileSync(ownerPath, "utf8")).token, previous.token);
+
+    const replacement = lockOwner({
+      pid: 7_071,
+      token: "replacement-token-0123456789",
+    });
+    const registered = registerLifecycleLockOwner(
+      "status",
+      replacement.token,
+      {
+        ownerPath,
+        owner: replacement,
+        inspectOwner: () => ({
+          startedAt: "Mon Aug 10 01:02:04 2026",
+          argv: "/different/process",
+          unstable: false,
+        }),
+      },
+    );
+    assert.equal(JSON.parse(readFileSync(ownerPath, "utf8")).token, replacement.token);
+
+    const abaOwner = lockOwner({
+      pid: 7_072,
+      token: "aba-owner-token-0123456789",
+    });
+    writeFileSync(ownerPath, `${JSON.stringify(abaOwner)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => releaseLifecycleLockOwner(registered),
+      /owner token or process identity changed/,
+    );
+    assert.equal(JSON.parse(readFileSync(ownerPath, "utf8")).token, abaOwner.token);
+
+    const current = registerLifecycleLockOwner("status", replacement.token, {
+      ownerPath,
+      owner: replacement,
+      inspectOwner: () => null,
+    });
+    releaseLifecycleLockOwner(current);
+    assert.equal(existsSync(ownerPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function pendingFixture({
+  name = "worker",
+  port = null,
+  token = "pending-recovery-unit-token-0001",
+  executable = "/synthetic/node",
+  cwd = "/synthetic/repository",
+} = {}) {
+  const condition = `--conditions=oss-demo-process-${token}`;
+  const entry = name === "worker" ? "apps/worker/dist/worker.js" : "apps/api/dist/server.js";
+  return {
+    name,
+    token,
+    executable,
+    args: [condition, entry],
+    argv: `${executable} ${condition} ${entry}`,
+    cwd,
+    host: port === null ? null : "127.0.0.1",
+    port,
+  };
+}
+
+test("pending recovery handles 0/1/>1 candidates and fails closed on every identity mismatch", () => {
+  const spec = pendingFixture();
+  const pending = pendingProcessRecord(spec);
+  const exactCandidate = { pid: 8_080, argv: spec.argv };
+  const exactObservation = {
+    pid: 8_080,
+    startedAt: "Mon Aug 10 01:02:03 2026",
+    argv: spec.argv,
+    cwd: spec.cwd,
+    listener: null,
+  };
+
+  assert.deepEqual(
+    evaluatePendingProcessRecovery(pending, [], () => null),
+    { action: "clear" },
+  );
+  const promoted = evaluatePendingProcessRecovery(
+    pending,
+    [exactCandidate],
+    () => exactObservation,
+  );
+  assert.equal(promoted.action, "promote");
+  assert.equal(promoted.identity.pid, 8_080);
+  assert.equal(promoted.identity.listenerVerified, true);
+  assert.equal(promoted.identity.token, spec.token);
+
+  assert.throws(
+    () =>
+      evaluatePendingProcessRecovery(
+        pending,
+        [exactCandidate, { ...exactCandidate, pid: 8_081 }],
+        () => exactObservation,
+      ),
+    /2 processes contain its unique argv token/,
+  );
+  assert.throws(
+    () =>
+      evaluatePendingProcessRecovery(
+        pendingProcessRecord(spec, 8_082),
+        [exactCandidate],
+        () => exactObservation,
+      ),
+    /recorded PID 8082 differs/,
+  );
+  assert.throws(
+    () =>
+      evaluatePendingProcessRecovery(
+        pending,
+        [{ pid: 8_080, argv: `${spec.executable} ${spec.args[0]} other.js` }],
+        () => exactObservation,
+      ),
+    /argv does not exactly match/,
+  );
+  assert.throws(
+    () =>
+      evaluatePendingProcessRecovery(pending, [exactCandidate], () => ({
+        ...exactObservation,
+        cwd: "/synthetic/different-repository",
+      })),
+    /exact PID, argv, and cwd identity could not be verified/,
+  );
+  assert.throws(
+    () =>
+      evaluatePendingProcessRecovery(pending, [exactCandidate], () => null),
+    /exact PID, argv, and cwd identity could not be verified/,
+  );
+
+  const apiSpec = pendingFixture({ name: "api", port: 3_000 });
+  const apiPending = pendingProcessRecord(apiSpec, 9_090);
+  assert.throws(
+    () =>
+      evaluatePendingProcessRecovery(
+        apiPending,
+        [{ pid: 9_090, argv: apiSpec.argv }],
+        () => ({
+          pid: 9_090,
+          startedAt: "Mon Aug 10 01:02:04 2026",
+          argv: apiSpec.argv,
+          cwd: apiSpec.cwd,
+          listener: false,
+        }),
+      ),
+    /not listening on 127\.0\.0\.1:3000/,
+  );
+});
+
+test("failed-spawn cleanup clears no-child state, escalates only exact identity, and retains mismatches", async () => {
+  const spec = pendingFixture();
+  const pending = pendingProcessRecord(spec, 8_080);
+  const makeState = () => ({
+    processes: {},
+    pendingProcesses: { worker: pending },
+  });
+
+  const clearedState = makeState();
+  const clearedSignals = [];
+  const cleared = await cleanupExactPendingProcess(pending, clearedState, {
+    inspect: () => ({ action: "clear" }),
+    signal: (...args) => clearedSignals.push(args),
+    persist: (next) => {
+      clearedState.pendingProcesses = next;
+    },
+  });
+  assert.equal(cleared, "cleared_no_child");
+  assert.deepEqual(clearedSignals, []);
+  assert.equal(clearedState.pendingProcesses.worker, undefined);
+
+  const exactState = makeState();
+  const exactSignals = [];
+  let killed = false;
+  let clock = 0;
+  const stopped = await cleanupExactPendingProcess(pending, exactState, {
+    inspect: () => ({
+      action: "promote",
+      identity: {
+        ...spec,
+        pid: 8_080,
+        startedAt: "Mon Aug 10 01:02:03 2026",
+        listenerVerified: true,
+      },
+    }),
+    identityStillMatches: () => !killed,
+    signal: (pid, signalName) => {
+      exactSignals.push([pid, signalName]);
+      if (signalName === "SIGKILL") killed = true;
+    },
+    persist: (next) => {
+      exactState.pendingProcesses = next;
+    },
+    now: () => clock,
+    wait: async (milliseconds) => {
+      clock += milliseconds;
+    },
+    termTimeoutMs: 100,
+    killTimeoutMs: 100,
+  });
+  assert.equal(stopped, "stopped_exact_child");
+  assert.deepEqual(exactSignals, [
+    [8_080, "SIGTERM"],
+    [8_080, "SIGKILL"],
+  ]);
+  assert.equal(exactState.pendingProcesses.worker, undefined);
+
+  const retainedState = makeState();
+  let retainedPersisted = false;
+  const retainedSignals = [];
+  const retained = await cleanupExactPendingProcess(pending, retainedState, {
+    inspect: () => {
+      throw new Error("argv mismatch");
+    },
+    signal: (...args) => retainedSignals.push(args),
+    persist: () => {
+      retainedPersisted = true;
+    },
+  });
+  assert.equal(retained, "retained");
+  assert.deepEqual(retainedSignals, []);
+  assert.equal(retainedPersisted, false);
+  assert.equal(retainedState.pendingProcesses.worker, pending);
+});
+
+test("real detached token-bearing Node child recovers from the pre-PID crash window", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-pending-real-"));
+  const fixture = join(directory, "pending-child.mjs");
+  const token = `real-pending-${process.pid}-${Date.now()}`;
+  writeFileSync(fixture, "setInterval(() => {}, 1000);\n");
+  const spec = pendingFixture({
+    token,
+    executable: process.execPath,
+    cwd: process.cwd(),
+  });
+  spec.args = [spec.args[0], fixture];
+  spec.argv = [spec.executable, ...spec.args].join(" ");
+  const pending = pendingProcessRecord(spec);
+  const child = spawn(spec.executable, spec.args, {
+    cwd: spec.cwd,
+    detached: true,
+    stdio: "ignore",
+  });
+  try {
+    if (!child.pid) await once(child, "spawn");
+    let recovered = null;
+    let lastError = null;
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && recovered?.action !== "promote") {
+      try {
+        const resolution = inspectPendingProcess(pending);
+        if (resolution.action === "promote") recovered = resolution;
+      } catch (error) {
+        lastError = error;
+      }
+      if (recovered?.action !== "promote") {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+      }
+    }
+    assert.equal(recovered?.action, "promote", lastError?.message);
+    assert.equal(recovered.identity.pid, child.pid);
+    assert.equal(recovered.identity.argv, spec.argv);
+    assert.equal(recovered.identity.cwd, spec.cwd);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (child.exitCode === null && child.signalCode === null) await childOutcome(child);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 function git(repository, args) {
   const result = spawnSync("git", args, { cwd: repository, encoding: "utf8" });
