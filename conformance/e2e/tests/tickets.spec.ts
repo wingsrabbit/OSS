@@ -18,6 +18,7 @@ test("customer and staff complete a public ticket conversation while internal no
   await page.getByPlaceholder("Email").first().fill(email);
   await page.getByPlaceholder("Password (12+ characters)").fill(password);
   await page.getByRole("button", { name: "Register", exact: true }).click();
+  await expect(page.getByText(/Account created\. The verification message/)).toBeVisible();
   await page.getByPlaceholder("Email").last().fill(email);
   await page.getByPlaceholder("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();

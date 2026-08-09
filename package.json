@@ -11,10 +11,6 @@
   },
   "scripts": {
     "check": "node --test tools/validate-specifications.test.mjs && node tools/validate-specifications.mjs",
-    "demo:local": "node tools/demo-local.mjs up",
-    "demo:smoke": "node tools/demo-local.mjs smoke",
-    "demo:status": "node tools/demo-local.mjs status",
-    "demo:down": "node tools/demo-local.mjs down",
     "test:specifications": "node --test tools/validate-specifications.test.mjs",
     "validate:specifications": "node tools/validate-specifications.mjs"
   },
