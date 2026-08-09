@@ -28,6 +28,15 @@ const postgresData = join(runtimeDir, "postgres");
 const postgresSocket = join(runtimeDir, "postgres-socket");
 const logsDir = join(runtimeDir, "logs");
 const ownerRole = "oss_demo_owner";
+const processNames = Object.freeze([
+  "provider-payment",
+  "provider-provisioning",
+  "provider-mail",
+  "provider-mailbox",
+  "api",
+  "worker",
+  "web",
+]);
 
 const defaultPorts = Object.freeze({
   postgres: 55_432,
@@ -521,9 +530,13 @@ function createBootstrapToken(config, node, currentState) {
   }
 }
 
-function printResult(config, currentState) {
+function printResult(config, currentState, stackRunning = true) {
   const result = currentState.latestSmoke;
-  console.log("\nOpenSales System local demo is ready.");
+  console.log(
+    stackRunning
+      ? "\nOpenSales System local demo is ready."
+      : "\nOpenSales System local demo is stopped; latest verified synthetic result:",
+  );
   console.log(LAB_WARNING);
   console.log(`URL: http://127.0.0.1:${config.ports.web}/`);
   if (result?.syntheticAccount) {
@@ -544,7 +557,11 @@ function printResult(config, currentState) {
   }
   console.log(`Credentials/state: ${stateFile}`);
   console.log(`Logs: ${logsDir}`);
-  console.log("Stop: node tools/demo-local.mjs down");
+  console.log(
+    stackRunning
+      ? "Stop: node tools/demo-local.mjs down"
+      : "Start: node tools/demo-local.mjs up",
+  );
 }
 
 async function up() {
@@ -553,11 +570,28 @@ async function up() {
   const pgBin = resolvePostgresBin();
   let currentState = state();
   currentState.processes ??= {};
-  buildWorkspace(node);
-  startPostgres(config, pgBin);
-  prepareDatabases(config, pgBin, node);
-  const bootstrapToken = createBootstrapToken(config, node, currentState);
-  await startProcesses(config, node, currentState);
+  const runningProcesses = processNames.filter((name) =>
+    processIsAlive(currentState.processes[name]),
+  );
+  const postgresRunning = postgresIsRunning(pgBin);
+  const stackAlreadyRunning =
+    postgresRunning && runningProcesses.length === processNames.length;
+  if (runningProcesses.length > 0 && !stackAlreadyRunning) {
+    throw new Error(
+      `The local Demo is only partially running (${runningProcesses.join(", ")}). Run node tools/demo-local.mjs down, then run up again.`,
+    );
+  }
+
+  let bootstrapToken;
+  if (stackAlreadyRunning) {
+    console.log("The complete loopback Demo stack is already running; reusing it for a fresh smoke journey.");
+  } else {
+    buildWorkspace(node);
+    startPostgres(config, pgBin);
+    prepareDatabases(config, pgBin, node);
+    bootstrapToken = createBootstrapToken(config, node, currentState);
+    await startProcesses(config, node, currentState);
+  }
   console.log("Running the synthetic register → verify → order → Mock pay → Active smoke journey...");
   const result = await runDemoSmoke({
     baseUrl: `http://127.0.0.1:${config.ports.web}`,
@@ -570,7 +604,7 @@ async function up() {
   }
   currentState.lastStartedAt = new Date().toISOString();
   saveState(currentState);
-  printResult(config, currentState);
+  printResult(config, currentState, true);
 }
 
 async function smoke() {
@@ -588,7 +622,7 @@ async function smoke() {
     refreshed.administratorAccount = result.syntheticAccount;
   }
   saveState(refreshed);
-  printResult(config, refreshed);
+  printResult(config, refreshed, true);
 }
 
 async function stopProcess(pid) {
@@ -638,12 +672,21 @@ async function status() {
   }
   const config = createConfig();
   const currentState = state();
+  const pgBin = resolvePostgresBin();
+  const stackRunning =
+    postgresIsRunning(pgBin) &&
+    processNames.every((name) => processIsAlive(currentState.processes?.[name]));
   console.log(LAB_WARNING);
   console.log(`URL: http://127.0.0.1:${config.ports.web}/`);
-  for (const [name, pid] of Object.entries(currentState.processes ?? {})) {
-    console.log(`${name}: ${processIsAlive(pid) ? "running" : "stopped"} (pid ${pid})`);
+  console.log(`Stack: ${stackRunning ? "running" : "stopped"}`);
+  for (const name of processNames) {
+    const pid = currentState.processes?.[name];
+    console.log(
+      `${name}: ${processIsAlive(pid) ? "running" : "stopped"}${pid ? ` (pid ${pid})` : ""}`,
+    );
   }
-  printResult(config, currentState);
+  console.log(`postgres: ${postgresIsRunning(pgBin) ? "running" : "stopped"}`);
+  printResult(config, currentState, stackRunning);
 }
 
 async function reset() {
