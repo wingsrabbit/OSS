@@ -229,6 +229,23 @@ try {
     sealed: true,
     audit_count: "1",
   });
+  const sealedJournal = await pool.query<{ id: string }>(
+    `SELECT id
+     FROM ledger_journals
+     WHERE source_type = 'manual_receipt' AND source_id = $1`,
+    [first.manualReceiptId],
+  );
+  assert.ok(sealedJournal.rows[0]?.id);
+  await assert.rejects(
+    pool.query(
+      `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+       VALUES
+         ($1, 'cash_clearing', 1, 0),
+         ($1, 'unclaimed_funds_liability', 0, 1)`,
+      [sealedJournal.rows[0].id],
+    ),
+    /Sealed manual receipt journal lines cannot be changed/,
+  );
 
   const replayed = await app.inject({
     method: "POST",
@@ -313,7 +330,52 @@ try {
     payload: fullFeeBody,
   });
   assert.equal(fullFee.statusCode, 201, fullFee.body);
-  assert.equal(responseJson<{ netAmountMinor: string }>(fullFee).netAmountMinor, "0");
+  const fullFeeResult = responseJson<{
+    manualReceiptId: string;
+    fundReceiptId: string;
+    netAmountMinor: string;
+  }>(fullFee);
+  assert.equal(fullFeeResult.netAmountMinor, "0");
+
+  await assert.rejects(
+    pool.query(
+      "UPDATE fund_receipts SET reported_manual_receipt_id = $1 WHERE id = $2",
+      [fullFeeResult.manualReceiptId, first.fundReceiptId],
+    ),
+    /Fund receipt external facts are append-only/,
+  );
+  const originalAssociation = await pool.query<{ reported_manual_receipt_id: string }>(
+    "SELECT reported_manual_receipt_id FROM fund_receipts WHERE id = $1",
+    [first.fundReceiptId],
+  );
+  assert.equal(
+    originalAssociation.rows[0]?.reported_manual_receipt_id,
+    first.manualReceiptId,
+  );
+  await assert.rejects(
+    pool.query(
+      `INSERT INTO fund_receipts(
+         id, provider_installation_id, external_payment_id,
+         reported_payment_attempt_id, reported_add_funds_attempt_id,
+         reported_manual_receipt_id, client_account_id, amount_minor,
+         allocated_minor, currency, occurred_at, disposition, reason
+       ) VALUES ($1, NULL, NULL, NULL, NULL, $2, $3, 250, 0, 'USD', $4, 'unclaimed', $5)`,
+      [
+        randomUUID(),
+        fullFeeResult.manualReceiptId,
+        targetAccountId,
+        receivedAt,
+        "Synthetic duplicate manual receipt association must be rejected",
+      ],
+    ),
+    (error: unknown) =>
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "23505" &&
+      "constraint" in error &&
+      error.constraint === "fund_receipts_reported_manual_receipt_id_key",
+  );
 
   const invalidFee = await app.inject({
     method: "POST",
@@ -332,6 +394,19 @@ try {
     responseJson<{ code: string }>(invalidFee).code,
     "MANUAL_RECEIPT_FEE_EXCEEDS_GROSS",
   );
+
+  const noncanonicalFee = await app.inject({
+    method: "POST",
+    url,
+    headers: { cookie },
+    payload: {
+      ...firstBody,
+      reference: `NONCANONICAL-FEE-${namespace}`,
+      feeMinor: "00",
+      idempotencyKey: `noncanonical-fee-${namespace}`,
+    },
+  });
+  assert.equal(noncanonicalFee.statusCode, 400);
 
   const outOfRange = await app.inject({
     method: "POST",
@@ -470,6 +545,9 @@ try {
       automaticInvoicePayment: false,
       automaticCredit: false,
       automaticServiceActivation: false,
+      sealedJournalAppendRejected: true,
+      fundReceiptReassociationRejected: true,
+      duplicateFundReceiptAssociationRejected: true,
       liveApplicationBlocksMigration: true,
       migrationAllowedAfterShutdown: true,
     })}\n`,

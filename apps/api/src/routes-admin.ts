@@ -55,7 +55,7 @@ const manualReceiptSchema = z.object({
   reference: z.string().trim().min(1).max(200),
   receivedAt: z.iso.datetime({ offset: true }),
   grossAmountMinor: z.string().regex(/^[1-9]\d*$/),
-  feeMinor: z.string().regex(/^\d+$/),
+  feeMinor: z.string().regex(/^(0|[1-9]\d*)$/),
   currency: z.literal("USD"),
   reason: z.string().trim().min(10).max(1_000),
   idempotencyKey: z.string().min(8).max(128),

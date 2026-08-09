@@ -49,6 +49,34 @@ ALTER TABLE fund_receipts
       'charged_back', 'reversed'
     )
   );
+ALTER TABLE fund_receipts
+  ADD CONSTRAINT fund_receipts_reported_manual_receipt_id_key
+    UNIQUE (reported_manual_receipt_id);
+
+CREATE OR REPLACE FUNCTION opensales_guard_fund_receipt_fact_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'Fund receipt external facts are append-only';
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.provider_installation_id IS DISTINCT FROM OLD.provider_installation_id
+     OR NEW.external_payment_id IS DISTINCT FROM OLD.external_payment_id
+     OR NEW.reported_payment_attempt_id IS DISTINCT FROM OLD.reported_payment_attempt_id
+     OR NEW.reported_add_funds_attempt_id IS DISTINCT FROM OLD.reported_add_funds_attempt_id
+     OR NEW.reported_manual_receipt_id IS DISTINCT FROM OLD.reported_manual_receipt_id
+     OR NEW.client_account_id IS DISTINCT FROM OLD.client_account_id
+     OR NEW.amount_minor IS DISTINCT FROM OLD.amount_minor
+     OR NEW.currency IS DISTINCT FROM OLD.currency
+     OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'Fund receipt external facts are append-only';
+  END IF;
+  RETURN NEW;
+END;
+$$;
 
 CREATE TABLE manual_receipt_reversals(
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
@@ -154,6 +182,29 @@ END $$;
 CREATE TRIGGER manual_receipt_facts_append_only
   BEFORE UPDATE OR DELETE ON manual_receipt_facts
   FOR EACH ROW EXECUTE FUNCTION opensales_reject_manual_receipt_mutation();
+CREATE FUNCTION opensales_guard_manual_receipt_ledger_line_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE protected_count integer;
+BEGIN
+  SELECT count(*)
+  INTO protected_count
+  FROM ledger_journals journal
+  WHERE journal.id IN (
+      CASE WHEN TG_OP = 'INSERT' THEN NEW.journal_id ELSE OLD.journal_id END,
+      CASE WHEN TG_OP = 'DELETE' THEN OLD.journal_id ELSE NEW.journal_id END
+    )
+    AND journal.source_type IN (
+      'manual_receipt', 'manual_receipt_reversal', 'manual_receipt_outflow'
+    )
+    AND journal.sealed_at IS NOT NULL;
+  IF protected_count > 0 THEN
+    RAISE EXCEPTION 'Sealed manual receipt journal lines cannot be changed';
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END $$;
+CREATE TRIGGER manual_receipt_ledger_line_mutation_guard
+  BEFORE INSERT OR UPDATE OR DELETE ON ledger_lines
+  FOR EACH ROW EXECUTE FUNCTION opensales_guard_manual_receipt_ledger_line_mutation();
 CREATE FUNCTION opensales_assert_manual_receipt_complete()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE valid boolean;
@@ -179,11 +230,15 @@ BEGIN
   GROUP BY journal.id, journal.sealed_at;
   IF NOT COALESCE(valid, false)
      OR NOT EXISTS (
-       SELECT 1 FROM fund_receipts receipt
-       WHERE receipt.reported_manual_receipt_id = NEW.id
-         AND receipt.amount_minor = NEW.gross_amount_minor
-         AND receipt.currency = NEW.currency
-     ) THEN
+           SELECT 1 FROM fund_receipts receipt
+           WHERE receipt.reported_manual_receipt_id = NEW.id
+             AND receipt.client_account_id = NEW.client_account_id
+             AND receipt.amount_minor = NEW.gross_amount_minor
+             AND receipt.currency = NEW.currency
+             AND receipt.occurred_at = NEW.received_at
+             AND receipt.allocated_minor = 0
+             AND receipt.disposition = 'unclaimed'
+         ) THEN
     RAISE EXCEPTION 'manual receipt ledger/fund fact is incomplete';
   END IF;
   RETURN NULL;

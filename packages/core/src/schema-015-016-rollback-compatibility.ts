@@ -14,7 +14,7 @@ export const SCHEMA_015_016_GUARD =
 export const SCHEMA_016_APPLICATION_GUARD =
   "opensales:schema-016-application" as const;
 export const SCHEMA_016_CATALOG_DIGEST =
-  "5727bf224ccf1e137440f30c34f4e1b685ab0b4eb07d261451eb27d89b10697a" as const;
+  "e621a410b0c56821dd346ea8394e9b2f0253aa8f5b6d8efab9869c2e5f1e09f5" as const;
 
 export type Schema015RollbackPreflightReport = Readonly<{
   installedSchemaVersion: string;
@@ -129,6 +129,8 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
             'disposition', 'reversed', NULL),
          ('fund_receipts', 'fund_receipts_reported_manual_receipt_id_fkey', 'f',
             'reported_manual_receipt_id', 'manual_receipt_facts', NULL),
+         ('fund_receipts', 'fund_receipts_reported_manual_receipt_id_key', 'u',
+            'reported_manual_receipt_id', NULL, NULL),
          ('manual_receipt_facts', 'manual_receipt_facts_client_account_id_fkey', 'f',
             'client_account_id', 'client_accounts', NULL),
          ('manual_receipt_facts', 'manual_receipt_facts_actor_id_fkey', 'f',
@@ -184,6 +186,9 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ('manual_receipt_facts', 'manual_receipt_facts_append_only',
             'opensales_reject_manual_receipt_mutation',
             ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false),
+         ('ledger_lines', 'manual_receipt_ledger_line_mutation_guard',
+            'opensales_guard_manual_receipt_ledger_line_mutation',
+            ARRAY['BEFORE', 'INSERT', 'UPDATE', 'DELETE']::text[], 31, false, false),
          ('manual_receipt_facts', 'manual_receipt_fact_completeness_guard',
             'opensales_assert_manual_receipt_complete', ARRAY['AFTER', 'INSERT']::text[], 5, true, true),
          ('manual_receipt_reversals', 'manual_receipt_reversals_append_only',
@@ -221,7 +226,10 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
             ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('fund_receipts', 'manual_receipt_fund_receipt_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false)
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
+         ('fund_receipts', 'fund_receipts_external_facts_append_only',
+            'opensales_guard_fund_receipt_fact_mutation',
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false)
      ), trigger_shape AS (
        SELECT count(*) = (SELECT count(*) FROM required_triggers) AS valid
        FROM required_triggers required
@@ -258,6 +266,13 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                   'reported_manual_receipt_id', 'reversed']::text[]),
          ('opensales_reject_manual_receipt_mutation',
             ARRAY['RAISE EXCEPTION', 'append-only']::text[]),
+         ('opensales_guard_manual_receipt_ledger_line_mutation',
+            ARRAY['ledger_journals', 'sealed_at', 'manual_receipt',
+                  'manual_receipt_reversal', 'manual_receipt_outflow',
+                  'RAISE EXCEPTION']::text[]),
+         ('opensales_guard_fund_receipt_fact_mutation',
+            ARRAY['Fund receipt external facts are append-only',
+                  'reported_manual_receipt_id']::text[]),
          ('opensales_assert_manual_receipt_complete',
             ARRAY['ledger_journals', 'ledger_lines', 'manual_receipt',
                   'unclaimed_funds_liability', 'cash_clearing', 'sealed_at']::text[]),
@@ -353,6 +368,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
            OR (relation.relname = 'fund_receipts'
              AND actual.conname IN (
                'fund_receipts_reported_manual_receipt_id_fkey',
+               'fund_receipts_reported_manual_receipt_id_key',
                'fund_receipts_exactly_one_source',
                'fund_receipts_source_provider_fields',
                'fund_receipts_disposition_check'
@@ -385,7 +401,9 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
              'manual_receipt_job_write_guard',
              'manual_receipt_inbox_write_guard',
              'manual_receipt_outbox_write_guard',
-             'manual_receipt_fund_receipt_write_guard'
+             'manual_receipt_fund_receipt_write_guard',
+             'manual_receipt_ledger_line_mutation_guard',
+             'fund_receipts_external_facts_append_only'
            )
          )
        UNION ALL
@@ -404,6 +422,8 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
            'opensales_manual_receipt_write_guard',
            'opensales_manual_receipt_marker_write_guard',
            'opensales_reject_manual_receipt_mutation',
+           'opensales_guard_manual_receipt_ledger_line_mutation',
+           'opensales_guard_fund_receipt_fact_mutation',
            'opensales_assert_manual_receipt_complete',
            'opensales_assert_manual_receipt_reversal_complete',
            'opensales_assert_manual_receipt_outflow_complete',
