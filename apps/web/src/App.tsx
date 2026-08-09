@@ -14,6 +14,7 @@ import {
   ManualReceiptOutflowPanel,
   type ManualReceiptOriginalSourceOutflow,
 } from "./ManualReceiptOutflows.js";
+import { ApiError, api, hardResetSession } from "./api.js";
 import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
@@ -49,6 +50,21 @@ type Me = {
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
+
+function parseStaffPermissions(value: unknown): ReadonlySet<string> {
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (permission) =>
+        typeof permission === "string" &&
+        permission.length > 0 &&
+        permission.trim() === permission,
+    )
+  ) {
+    return new Set();
+  }
+  return new Set(value);
+}
 type Price = {
   id: string;
   currency: string;
@@ -652,41 +668,6 @@ const words = {
   },
 } as const;
 
-class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code?: string,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...init?.headers,
-    },
-  });
-  if (!response.ok) {
-    const errorBody = (await response.json().catch(() => ({}))) as {
-      error?: string;
-      code?: string;
-    };
-    throw new ApiError(
-      errorBody.error ?? `Request failed (${response.status})`,
-      response.status,
-      errorBody.code,
-    );
-  }
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
-}
-
 function usd(minor: string): string {
   const value = BigInt(minor);
   const negative = value < 0n;
@@ -913,18 +894,115 @@ export function App() {
   const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
     ReadonlySet<string>
   >(new Set());
+  const staffPermissions = useMemo(
+    () => parseStaffPermissions(me?.staff?.permissions),
+    [me?.staff?.permissions],
+  );
+  const eligibleStaff = me?.eligible === true && me.staff !== null;
+  const canManageStaffTickets =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
+  const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
+  const canOpenAdminWorkspace = canManageStaffTickets || canUseFullAdminWorkspace;
+
+  const clearWorkspaceTransientState = useCallback(() => {
+    setNotice("");
+    setError("");
+    setSelected(null);
+    setOrder(null);
+    setBilling(null);
+    setPaymentSettings(null);
+    setPaymentSettingsPassword("");
+    setPaymentSettingsReauthExpiresAt(null);
+    setPaymentSettingsPending(false);
+    setCancellationReason("");
+    setCancellationPending(false);
+    setRenewals([]);
+    setAdminRenewals([]);
+    setRenewalPaymentPendingId(null);
+    setAutomationEffectiveAt("");
+    setAutomationReason("");
+    setRenewalHoldReason("");
+    setRenewalHoldPendingId(null);
+    setManualSuspensionReason("");
+    setManualSuspensionPendingId(null);
+    setPaymentQuote(null);
+    setAddFundsPrincipalMinor("5000");
+    setAddFundsMethod("card");
+    setAddFundsScenario("success");
+    setAddFundsQuote(null);
+    setAddFundsCommand(null);
+    setChargebackStatus(null);
+    setAdminChargebacks([]);
+    setAdminUnclaimedChargebacks([]);
+    setAdminChargebackHolds([]);
+    setQuantity(1);
+    setMail([]);
+    setManualItems([]);
+    setAdminCancellations([]);
+    setCancellationCompletionReason("");
+    setCancellationCompletionPendingId(null);
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    manualReceiptDefaultedForUser.current = null;
+    setUnclaimedFunds([]);
+    setRefundCandidates([]);
+    setRefundRecords({});
+    setRefundSecurityHolds([]);
+    setRefundDismissalCorrections([]);
+    setRefundReceiptCapacityIncidents([]);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundScenario("success");
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+    setRefundPendingReceiptIds(new Set());
+    setAdminPassword("");
+    setManualReason("");
+    setCreditAdjustmentMinor("5000");
+    setCreditAdjustmentReason("");
+    setFundResolutionMinor("");
+    setFundResolutionInvoiceId("");
+    setFundResolutionReason("");
+    setFundReturnAmountMode("full");
+    setFundReturnAmountMinor("");
+    setFundReturnReason("");
+    setFundReturnScenario("success");
+    setFundResolutionPendingReceiptIds(new Set());
+    paymentSettingsIntentKeys.current.clear();
+    cancellationIntentKeys.current.clear();
+    manualSuspensionIntentKeys.current.clear();
+    cancellationCompletionIntentKeys.current.clear();
+    manualReceiptIntentKeys.current.clear();
+    manualReceiptReversalIntentKeys.current.clear();
+    refundIntentKeys.current.clear();
+  }, []);
+
   const openRoute = useCallback((target: AppRoute, replace = false) => {
+    clearWorkspaceTransientState();
     if (replace) {
       window.history.replaceState({}, "", target);
     } else if (window.location.pathname !== target || window.location.search.length > 0) {
       window.history.pushState({}, "", target);
     }
     setRoute(target);
-    setNotice("");
-    setError("");
-    setSelected(null);
     window.scrollTo({ top: 0, behavior: "auto" });
-  }, []);
+  }, [clearWorkspaceTransientState]);
   const followRouteLink = useCallback(
     (event: ReactMouseEvent<HTMLAnchorElement>, target: AppRoute) => {
       if (
@@ -974,10 +1052,14 @@ export function App() {
     paymentSettingsReauthActive || paymentSettingsPassword.length > 0;
 
   useEffect(() => {
-    const onPopState = () => setRoute(routeFromPath(window.location.pathname));
+    const onPopState = () => {
+      clearWorkspaceTransientState();
+      setRoute(routeFromPath(window.location.pathname));
+      window.scrollTo({ top: 0, behavior: "auto" });
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+  }, [clearWorkspaceTransientState]);
 
   const refreshMe = useCallback(async (): Promise<Me | null> => {
     try {
@@ -1037,7 +1119,7 @@ export function App() {
   }, [me?.eligible, route]);
 
   const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setAdminRenewals([]);
       return [];
     }
@@ -1046,7 +1128,7 @@ export function App() {
     );
     setAdminRenewals(result.items);
     return result.items;
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshChargebackStatus = useCallback(async () => {
     if (route !== "/customer" || !me) {
@@ -1071,7 +1153,7 @@ export function App() {
   }, [locale, refreshMe]);
 
   useEffect(() => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       manualReceiptDefaultedForUser.current = null;
       setManualReceiptClientAccountId("");
       setManualReceiptHistory([]);
@@ -1092,7 +1174,7 @@ export function App() {
     setManualReceiptReversalTargetId(null);
     setManualReceiptReversalReason("");
     setManualReceiptReversalOutcome(null);
-  }, [me, route]);
+  }, [canUseFullAdminWorkspace, me, route]);
 
   useEffect(() => {
     void refreshLatestOrder().catch(() => undefined);
@@ -1276,16 +1358,16 @@ export function App() {
   }, [order, refreshBilling, refreshPaymentSettings, route]);
 
   const refreshManualItems = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setManualItems([]);
       return;
     }
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
     setManualItems(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshAdminCancellations = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setAdminCancellations([]);
       return;
     }
@@ -1293,28 +1375,28 @@ export function App() {
       "/api/v1/admin/services/cancellations",
     );
     setAdminCancellations(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshUnclaimedFunds = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setUnclaimedFunds([]);
       return;
     }
     const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
     setUnclaimedFunds(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundCandidates = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setRefundCandidates([]);
       return;
     }
     const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
     setRefundCandidates(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundRecords = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setRefundRecords({});
       return;
     }
@@ -1322,10 +1404,10 @@ export function App() {
     setRefundRecords(
       Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
     );
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundSecurityHolds = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setRefundSecurityHolds([]);
       return;
     }
@@ -1333,10 +1415,10 @@ export function App() {
       "/api/v1/admin/refund-security-holds",
     );
     setRefundSecurityHolds(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundDismissalCorrections = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setRefundDismissalCorrections([]);
       return;
     }
@@ -1344,10 +1426,10 @@ export function App() {
       "/api/v1/admin/refund-dismissal-corrections",
     );
     setRefundDismissalCorrections(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setRefundReceiptCapacityIncidents([]);
       return;
     }
@@ -1355,10 +1437,10 @@ export function App() {
       "/api/v1/admin/refund-receipt-capacity-incidents",
     );
     setRefundReceiptCapacityIncidents(result.items);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshAdminChargebacks = useCallback(async () => {
-    if (route !== "/admin" || !me?.staff) {
+    if (route !== "/admin" || !canUseFullAdminWorkspace) {
       setAdminChargebacks([]);
       setAdminUnclaimedChargebacks([]);
       setAdminChargebackHolds([]);
@@ -1372,7 +1454,7 @@ export function App() {
     setAdminChargebacks(result.items);
     setAdminUnclaimedChargebacks(result.unclaimedChargebacks);
     setAdminChargebackHolds(result.manualHolds);
-  }, [me?.staff, route]);
+  }, [canUseFullAdminWorkspace, route]);
 
   useEffect(() => {
     void Promise.all([
@@ -1399,7 +1481,7 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (route !== "/admin") return;
+    if (route !== "/admin" || !canUseFullAdminWorkspace) return;
     const active = Object.values(refundRecords).filter((refund) =>
       ["queued", "processing", "unknown"].includes(refund.status),
     );
@@ -1427,6 +1509,7 @@ export function App() {
     refreshRefundCandidates,
     refreshRefundSecurityHolds,
     refreshUnclaimedFunds,
+    canUseFullAdminWorkspace,
     route,
   ]);
 
@@ -1472,7 +1555,12 @@ export function App() {
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
       const viewer = await refreshMe();
-      openRoute(route === "/admin" ? "/admin" : viewer?.staff ? "/admin" : "/customer");
+      const viewerPermissions = parseStaffPermissions(viewer?.staff?.permissions);
+      const viewerCanOpenAdmin =
+        viewer?.eligible === true &&
+        viewer.staff !== null &&
+        (viewerPermissions.has("*") || viewerPermissions.has("support.tickets.manage"));
+      openRoute(route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer");
       setNotice("Signed in.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
@@ -1483,55 +1571,7 @@ export function App() {
     setError("");
     try {
       await api("/api/v1/auth/logout", { method: "POST", body: "{}" });
-      setMe(null);
-      setSessionResolved(true);
-      setSelected(null);
-      setOrder(null);
-      setBilling(null);
-      setPaymentSettings(null);
-      setPaymentSettingsPassword("");
-      setPaymentSettingsReauthExpiresAt(null);
-      setRenewals([]);
-      setChargebackStatus(null);
-      setAddFundsQuote(null);
-      setAddFundsCommand(null);
-      setMail([]);
-      setAdminRenewals([]);
-      setManualItems([]);
-      setAdminCancellations([]);
-      setUnclaimedFunds([]);
-      setAdminChargebacks([]);
-      setAdminUnclaimedChargebacks([]);
-      setAdminChargebackHolds([]);
-      setRefundCandidates([]);
-      setRefundRecords({});
-      setRefundSecurityHolds([]);
-      setRefundDismissalCorrections([]);
-      setRefundReceiptCapacityIncidents([]);
-      setAdminPassword("");
-      setManualReason("");
-      setCreditAdjustmentReason("");
-      setAutomationReason("");
-      setRenewalHoldReason("");
-      setManualSuspensionReason("");
-      setCancellationCompletionReason("");
-      setManualReceiptClientAccountId("");
-      setManualReceiptReference("");
-      setManualReceiptReceivedAt(defaultManualReceiptTime());
-      setManualReceiptGrossMinor("10000");
-      setManualReceiptFeeMinor("0");
-      setManualReceiptReason("");
-      setManualReceiptHistory([]);
-      setManualReceiptTarget(null);
-      setManualReceiptOutcome(null);
-      setManualReceiptReversalTargetId(null);
-      setManualReceiptReversalReason("");
-      setManualReceiptReversalOutcome(null);
-      setFundResolutionReason("");
-      setFundReturnReason("");
-      setRefundReason("");
-      openRoute("/", true);
-      setNotice("Signed out.");
+      hardResetSession();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign out failed");
     }
@@ -1860,7 +1900,7 @@ export function App() {
   }
 
   async function runBillingAutomation() {
-    if (!me?.staff || automationReason.trim().length < 10) return;
+    if (!canUseFullAdminWorkspace || automationReason.trim().length < 10) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -1896,7 +1936,7 @@ export function App() {
 
   async function resolveRenewalHold(renewal: AdminRenewalItem) {
     if (
-      !me?.staff ||
+      !canUseFullAdminWorkspace ||
       renewal.renewalStatus !== "manual_hold" ||
       renewalHoldReason.trim().length < 10 ||
       renewalHoldPendingId
@@ -1936,7 +1976,7 @@ export function App() {
   ) {
     const delinquency = renewal.delinquency;
     if (
-      !me?.staff ||
+      !canUseFullAdminWorkspace ||
       !delinquency?.manualControl?.allowedActions.includes(action) ||
       manualSuspensionReason.trim().length < 10 ||
       manualSuspensionPendingId
@@ -1996,7 +2036,7 @@ export function App() {
 
   async function completeCycleEndCancellation(item: AdminCancellationItem) {
     if (
-      !me?.staff ||
+      !canUseFullAdminWorkspace ||
       !item.interventionRequired ||
       cancellationCompletionReason.trim().length < 10 ||
       cancellationCompletionPendingId
@@ -2114,7 +2154,7 @@ export function App() {
   async function loadManualReceiptHistory() {
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     if (
-      !me?.staff || manualReceiptPending || !looksLikeUuid(clientAccountId)
+      !canUseFullAdminWorkspace || manualReceiptPending || !looksLikeUuid(clientAccountId)
     ) {
       return;
     }
@@ -2135,7 +2175,7 @@ export function App() {
   }
 
   async function recordManualReceipt() {
-    if (!me?.staff || manualReceiptPending || !manualReceiptFormReady) return;
+    if (!canUseFullAdminWorkspace || manualReceiptPending || !manualReceiptFormReady) return;
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     const payload = {
       reference: manualReceiptReference.trim(),
@@ -2217,7 +2257,7 @@ export function App() {
   async function reverseManualReceipt(receipt: ManualReceiptItem) {
     const clientAccountId = manualReceiptTarget?.id;
     if (
-      !me?.staff ||
+      !canUseFullAdminWorkspace ||
       !clientAccountId ||
       manualReceiptReversalPendingId !== null ||
       manualReceiptReversalTargetId !== receipt.manualReceiptId ||
@@ -2325,7 +2365,7 @@ export function App() {
   }
 
   async function adjustCredit(direction: "increase" | "decrease") {
-    if (!me?.staff) return;
+    if (!canUseFullAdminWorkspace || !me) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2355,7 +2395,7 @@ export function App() {
     item: UnclaimedFundItem,
     action: "convert_to_credit" | "allocate_invoice",
   ) {
-    if (!me?.staff) return;
+    if (!canUseFullAdminWorkspace || !me) return;
     if (
       fundResolutionInFlight.current.has(item.receiptId) ||
       refundInFlight.current.has(item.receiptId)
@@ -2431,7 +2471,7 @@ export function App() {
 
   async function returnUnclaimedFunds(item: UnclaimedFundItem) {
     if (
-      !me?.staff ||
+      !canUseFullAdminWorkspace ||
       refundInFlight.current.has(item.receiptId) ||
       fundResolutionInFlight.current.has(item.receiptId)
     ) {
@@ -2517,7 +2557,7 @@ export function App() {
     item: RefundCandidate,
     destination: "original_payment" | "credit" | "none",
   ) {
-    if (!me?.staff || refundInFlight.current.has(item.receiptId)) return;
+    if (!canUseFullAdminWorkspace || refundInFlight.current.has(item.receiptId)) return;
     const amountMode = destination === "none" ? "none" : refundAmountMode;
     const amountMinor =
       destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
@@ -2613,7 +2653,7 @@ export function App() {
       | "record_unexpected_outflow"
       | "dismiss_provider_claim",
   ) {
-    if (!me?.staff || refundAdjudicationInFlight.current.has(hold.holdId)) return;
+    if (!canUseFullAdminWorkspace || refundAdjudicationInFlight.current.has(hold.holdId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
     refundAdjudicationInFlight.current.add(hold.holdId);
@@ -2688,7 +2728,7 @@ export function App() {
     refund: RefundRecord,
     action: "retry_query" | "confirm_no_outflow",
   ) {
-    if (!me?.staff || refundManualActionInFlight.current.has(refund.refundId)) return;
+    if (!canUseFullAdminWorkspace || refundManualActionInFlight.current.has(refund.refundId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       refundId: refund.refundId,
@@ -2761,7 +2801,7 @@ export function App() {
   }
 
   async function correctDismissedRefundOutflow(item: RefundDismissalCorrection) {
-    if (!me?.staff || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
+    if (!canUseFullAdminWorkspace || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       adjudicationId: item.adjudicationId,
@@ -2835,7 +2875,7 @@ export function App() {
     incident: RefundReceiptCapacityIncident,
   ) {
     if (
-      !me?.staff ||
+      !canUseFullAdminWorkspace ||
       refundCapacityAcknowledgementInFlight.current.has(incident.incidentId)
     ) {
       return;
@@ -2950,10 +2990,16 @@ export function App() {
           <button onClick={() => setLocale(locale === "en" ? "zh-CN" : "en")}>
             {locale === "en" ? "简体中文" : "English"}
           </button>
-          <span className={me?.eligible ? "pill good" : "pill"}>
-            {!sessionResolved ? "Checking session" : me ? (route === "/" ? "Signed in" : me.email) : "Guest"}
+          <span className={route === "/" ? "pill" : me?.eligible ? "pill good" : "pill"}>
+            {route === "/"
+              ? "Public access"
+              : !sessionResolved
+                ? "Checking session"
+                : me
+                  ? me.email
+                  : "Guest"}
           </span>
-          {me && <button onClick={() => void logout()}>Sign out</button>}
+          {route !== "/" && me && <button onClick={() => void logout()}>Sign out</button>}
         </div>
       </header>
       <main>
@@ -2988,35 +3034,66 @@ export function App() {
           </div>
         )}
 
-        {(route === "/" || route === "/customer") && (
+        {route === "/" && (
+          <section className="account-grid" data-testid="public-access">
+            <div className="panel">
+              <p className="eyebrow">Access</p>
+              <h2>Open a dedicated workspace</h2>
+              <p>
+                Customer and Staff sessions are handled only inside their dedicated pages. This
+                public page never displays account or permission details.
+              </p>
+              <div className="workspace-actions">
+                <a
+                  className="route-action"
+                  href="/customer"
+                  onClick={(event) => followRouteLink(event, "/customer")}
+                >
+                  Open customer workspace
+                </a>
+                <a
+                  className="route-action"
+                  href="/admin"
+                  onClick={(event) => followRouteLink(event, "/admin")}
+                >
+                  Open Admin workspace
+                </a>
+              </div>
+              <div className="form-columns">
+                <form onSubmit={register}>
+                  <h3>{text.register}</h3>
+                  <input name="clientName" placeholder="Client account name" required />
+                  <input name="email" type="email" placeholder="Email" required />
+                  <input
+                    name="password"
+                    type="password"
+                    minLength={12}
+                    placeholder="Password (12+ characters)"
+                    required
+                  />
+                  <button className="primary" type="submit">
+                    {text.register}
+                  </button>
+                </form>
+                <form onSubmit={login}>
+                  <h3>{text.login}</h3>
+                  <input name="email" type="email" placeholder="Email" required />
+                  <input name="password" type="password" placeholder="Password" required />
+                  <button className="primary" type="submit">
+                    {text.login}
+                  </button>
+                </form>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {route === "/customer" && (
         <section className="account-grid">
           <div className="panel">
-            <p className="eyebrow">{route === "/" ? "Access" : text.account}</p>
+            <p className="eyebrow">{text.account}</p>
             {!sessionResolved ? (
               <p className="muted">Checking the current session…</p>
-            ) : route === "/" && me ? (
-              <div className="home-session-entry">
-                <h2>Choose a workspace</h2>
-                <p>Your signed-in identity and account data are shown only inside the dedicated workspace.</p>
-                <div className="workspace-actions">
-                  <a
-                    className="route-action"
-                    href="/customer"
-                    onClick={(event) => followRouteLink(event, "/customer")}
-                  >
-                    Open customer workspace
-                  </a>
-                  {me.staff && (
-                    <a
-                      className="route-action"
-                      href="/admin"
-                      onClick={(event) => followRouteLink(event, "/admin")}
-                    >
-                      Open Staff workspace
-                    </a>
-                  )}
-                </div>
-              </div>
             ) : me ? (
               <>
                 <h2>{me.email}</h2>
@@ -3096,18 +3173,26 @@ export function App() {
           </section>
         )}
 
-        {route === "/admin" && sessionResolved && !me?.staff && (
+        {route === "/admin" && sessionResolved && !canOpenAdminWorkspace && (
           <section
             className="route-access restricted-access"
             aria-label="Administrator access status"
             data-testid="admin-access-restricted"
           >
             <p className="eyebrow">Restricted Staff workspace</p>
-            <h2>{me ? "Access denied — Staff permission required" : "Sign in required"}</h2>
+            <h2>
+              {!me
+                ? "Sign in required"
+                : !me.eligible
+                  ? "Access denied — eligible Staff account required"
+                  : "Access denied — Staff permission required"}
+            </h2>
             <p>
-              {me
-                ? `${me.email} is signed in without Staff access. No administrative capability has been loaded on this page.`
-                : "Sign in from the public homepage with an authorized Staff account. No administrative capability is shown to guests."}
+              {!me
+                ? "Sign in with an authorized Staff account. No administrative capability is shown to guests."
+                : !me.eligible
+                  ? `${me.email} is not currently eligible. No administrative capability has been loaded on this page.`
+                  : `${me.email} has no recognized Staff permission for this workspace. No administrative capability has been loaded.`}
             </p>
             {!me && (
               <form className="admin-login-form" onSubmit={login}>
@@ -3138,14 +3223,26 @@ export function App() {
           />
         )}
 
-        {route === "/admin" && sessionResolved && me?.staff && (
+        {route === "/admin" && sessionResolved && canManageStaffTickets && (
           <TicketsPanel
             mode="staff"
+            canManageTickets={canManageStaffTickets}
             me={me}
             locale={locale}
             onNotice={showTicketNotice}
             onError={showTicketError}
           />
+        )}
+
+        {route === "/admin" && canManageStaffTickets && !canUseFullAdminWorkspace && (
+          <section className="route-access" data-testid="limited-admin-scope">
+            <p className="eyebrow">Permission-scoped Staff workspace</p>
+            <h2>Ticket support only</h2>
+            <p>
+              This Staff session can manage support tickets. Billing, refunds, money and service
+              administration remain unmounted because wildcard permission is not present.
+            </p>
+          </section>
         )}
 
         {route === "/customer" &&
@@ -3653,8 +3750,8 @@ export function App() {
           </section>
         )}
 
-        {route === "/admin" && sessionResolved && me?.staff && (
-          <section className="admin-panel">
+        {route === "/admin" && sessionResolved && canUseFullAdminWorkspace && me && (
+          <section className="admin-panel" data-testid="full-admin-workspace">
             <div>
               <p className="eyebrow">Administrator · audited billing and fulfillment</p>
               <h2>Credit adjustment and human Ready decisions</h2>

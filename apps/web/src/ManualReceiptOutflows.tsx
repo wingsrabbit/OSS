@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useRef, useState } from "react";
+import { api } from "./api.js";
 
 export type ManualReceiptOutflowReport = {
   outflowReportId: string;
@@ -71,32 +72,6 @@ type ReconciliationDraft = {
   occurredAt: string;
   reason: string;
 };
-
-class RequestError extends Error {
-  constructor(message: string, readonly status: number, readonly code?: string) {
-    super(message);
-  }
-}
-
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as {
-      error?: string;
-      code?: string;
-    };
-    throw new RequestError(
-      body.error ?? `Request failed (${response.status})`,
-      response.status,
-      body.code,
-    );
-  }
-  return (await response.json()) as T;
-}
 
 function newIdempotencyKey(): string {
   if (typeof globalThis.crypto?.randomUUID !== "function") {
@@ -183,12 +158,12 @@ export function ManualReceiptOutflowPanel({
     setPending(true);
     onError("");
     try {
-      await requestJson("/api/v1/auth/reauth", {
+      await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password }),
       });
       onPasswordConsumed();
-      const outcome = await requestJson<Outcome>(
+      const outcome = await api<Outcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/outflow-reports`,
         {
           method: "POST",
@@ -231,12 +206,12 @@ export function ManualReceiptOutflowPanel({
     setPending(true);
     onError("");
     try {
-      await requestJson("/api/v1/auth/reauth", {
+      await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password }),
       });
       onPasswordConsumed();
-      const outcome = await requestJson<Outcome>(
+      const outcome = await api<Outcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/outflow-reports/${reconciliationDraft.reportId}/reconciliation`,
         {
           method: "POST",

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { api } from "./api.js";
 
 type Locale = "en" | "zh-CN";
 
@@ -49,27 +50,16 @@ type Viewer = {
   staff: { roles: string[]; permissions: unknown } | null;
 };
 
-async function ticketApi<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? `Request failed (${response.status})`);
-  }
-  return (await response.json()) as T;
-}
-
 export function TicketsPanel({
   mode,
+  canManageTickets = false,
   me,
   locale,
   onNotice,
   onError,
 }: {
   mode: "customer" | "staff";
+  canManageTickets?: boolean;
   me: Viewer | null;
   locale: Locale;
   onNotice: (message: string) => void;
@@ -95,24 +85,24 @@ export function TicketsPanel({
       return;
     }
     const [ticketResult, serviceResult] = await Promise.all([
-      ticketApi<{ items: TicketSummary[] }>("/api/v1/tickets"),
-      ticketApi<{ items: ServiceOption[] }>("/api/v1/tickets/service-options"),
+      api<{ items: TicketSummary[] }>("/api/v1/tickets"),
+      api<{ items: ServiceOption[] }>("/api/v1/tickets/service-options"),
     ]);
     setTickets(ticketResult.items);
     setServices(serviceResult.items);
   }, [me?.eligible, me?.id]);
 
   const refreshStaff = useCallback(async () => {
-    if (!me?.staff) {
+    if (!me?.staff || !canManageTickets) {
       setStaffTickets([]);
       setStaffSelected(null);
       return;
     }
-    const result = await ticketApi<{ items: StaffTicketSummary[] }>(
+    const result = await api<{ items: StaffTicketSummary[] }>(
       "/api/v1/admin/tickets",
     );
     setStaffTickets(result.items);
-  }, [me?.id, me?.staff]);
+  }, [canManageTickets, me?.id, me?.staff]);
 
   useEffect(() => {
     void (mode === "customer" ? refreshCustomer() : refreshStaff()).catch((caught: unknown) =>
@@ -121,11 +111,11 @@ export function TicketsPanel({
   }, [mode, onError, refreshCustomer, refreshStaff]);
 
   if (mode === "customer" && !me?.eligible) return null;
-  if (mode === "staff" && !me?.staff) return null;
+  if (mode === "staff" && (!me?.staff || !canManageTickets)) return null;
 
   async function openCustomerTicket(ticketId: string) {
     try {
-      setSelected(await ticketApi<CustomerTicketDetail>(`/api/v1/tickets/${ticketId}`));
+      setSelected(await api<CustomerTicketDetail>(`/api/v1/tickets/${ticketId}`));
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Ticket could not be loaded");
     }
@@ -136,7 +126,7 @@ export function TicketsPanel({
     if (pending) return;
     setPending(true);
     try {
-      const created = await ticketApi<CustomerTicketDetail>("/api/v1/tickets", {
+      const created = await api<CustomerTicketDetail>("/api/v1/tickets", {
         method: "POST",
         body: JSON.stringify({
           subject: subject.trim(),
@@ -161,7 +151,7 @@ export function TicketsPanel({
     if (!selected || customerReply.trim().length === 0 || pending) return;
     setPending(true);
     try {
-      const updated = await ticketApi<CustomerTicketDetail>(
+      const updated = await api<CustomerTicketDetail>(
         `/api/v1/tickets/${selected.ticket.id}/replies`,
         { method: "POST", body: JSON.stringify({ message: customerReply.trim() }) },
       );
@@ -179,7 +169,7 @@ export function TicketsPanel({
   async function openStaffTicket(ticketId: string) {
     try {
       setStaffSelected(
-        await ticketApi<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`),
+        await api<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`),
       );
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Staff ticket could not be loaded");
@@ -190,7 +180,7 @@ export function TicketsPanel({
     if (!staffSelected || staffReply.trim().length === 0 || pending) return;
     setPending(true);
     try {
-      const updated = await ticketApi<StaffTicketDetail>(
+      const updated = await api<StaffTicketDetail>(
         `/api/v1/admin/tickets/${staffSelected.ticket.id}/messages`,
         {
           method: "POST",
@@ -317,7 +307,7 @@ export function TicketsPanel({
       </section>
       )}
 
-      {mode === "staff" && me?.staff && (
+      {mode === "staff" && me?.staff && canManageTickets && (
         <section className="admin-panel ticket-center" aria-label="Staff support tickets">
           <div>
             <p className="eyebrow">Staff support workspace</p>
