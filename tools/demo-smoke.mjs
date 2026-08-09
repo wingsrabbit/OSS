@@ -73,46 +73,183 @@ class DemoSession {
   }
 }
 
-function syntheticIdentity() {
+function syntheticIdentity(role = "customer") {
   const marker = `${Date.now()}-${randomBytes(4).toString("hex")}`;
   return {
-    email: `demo-${marker}@example.invalid`,
+    email: `demo-${role}-${marker}@example.invalid`,
     password: `Synthetic-Demo-${randomUUID()}!`,
-    clientName: `Synthetic Demo Client ${marker}`,
+    clientName: `Synthetic Demo ${role === "administrator" ? "Staff" : "Client"} ${marker}`,
+  };
+}
+
+async function registerAndVerify({ session, identity, timeoutMs }) {
+  const registration = await session.request(
+    "/api/v1/auth/register",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        email: identity.email,
+        password: identity.password,
+        clientName: identity.clientName,
+        locale: "en",
+      }),
+    },
+    201,
+  );
+  await session.request(
+    "/api/v1/auth/login",
+    {
+      method: "POST",
+      body: JSON.stringify({ email: identity.email, password: identity.password }),
+    },
+    200,
+  );
+  const beforeVerification = await session.request("/api/v1/auth/me");
+  assert.equal(beforeVerification.eligible, false);
+  assert.equal(beforeVerification.verification.email, "pending");
+
+  const mailbox = await waitFor(
+    `Mock Mail verification delivery for ${identity.email}`,
+    () => session.request("/api/v1/lab/mailbox"),
+    (value) => value.messages.length > 0,
+    timeoutMs,
+  );
+  assert.equal(mailbox.warning, LAB_WARNING);
+  const verificationUrl = mailbox.messages
+    .map((message) => message.body.match(/https?:\/\/\S+/)?.[0])
+    .find(Boolean);
+  assert.ok(verificationUrl, "Mock Mail did not contain a verification URL");
+  const verificationToken = new URL(verificationUrl).searchParams.get("token");
+  assert.ok(verificationToken, "Mock Mail verification URL had no token");
+  await session.request(
+    "/api/v1/auth/verify-email",
+    { method: "POST", body: JSON.stringify({ token: verificationToken }) },
+    200,
+  );
+  const verified = await session.request("/api/v1/auth/me");
+  assert.equal(verified.eligible, true);
+  return {
+    registration,
+    account: {
+      ...identity,
+      userId: registration.userId,
+      clientAccountId: registration.clientAccountId,
+      administrator: false,
+    },
   };
 }
 
 async function administratorSession({
   baseUrl,
-  customerSession,
-  customerIdentity,
-  customerIsAdministrator,
   administratorAccount,
 }) {
-  if (customerIsAdministrator) {
-    return { session: customerSession, password: customerIdentity.password };
+  if (!administratorAccount?.email || !administratorAccount?.password) {
+    throw new Error(
+      "This preserved Demo database has no recoverable synthetic administrator credential. Run `node tools/demo-local.mjs reset --yes`, then `node tools/demo-local.mjs up` to create separate Staff and customer identities.",
+    );
   }
-  if (!administratorAccount?.email || !administratorAccount?.password) return null;
 
   const session = new DemoSession(baseUrl);
-  await session.request("/api/v1/auth/login", {
-    method: "POST",
-    body: JSON.stringify({
-      email: administratorAccount.email,
-      password: administratorAccount.password,
-    }),
-  });
+  try {
+    await session.request("/api/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email: administratorAccount.email,
+        password: administratorAccount.password,
+      }),
+    });
+  } catch (error) {
+    throw new Error(
+      `The stored synthetic administrator credential is no longer usable. Run \`node tools/demo-local.mjs reset --yes\`, then \`node tools/demo-local.mjs up\`. ${error instanceof Error ? error.message : error}`,
+    );
+  }
   const principal = await session.request("/api/v1/auth/me");
   assert.ok(principal.staff, "Stored synthetic administrator is no longer a staff principal");
-  return { session, password: administratorAccount.password };
+  if (administratorAccount.userId) {
+    assert.equal(
+      principal.id,
+      administratorAccount.userId,
+      "Stored synthetic administrator resolved to a different user",
+    );
+  }
+  if (administratorAccount.clientAccountId) {
+    assert.equal(
+      principal.clientAccountId,
+      administratorAccount.clientAccountId,
+      "Stored synthetic administrator resolved to a different Client Account",
+    );
+  }
+  return {
+    session,
+    password: administratorAccount.password,
+    account: {
+      ...administratorAccount,
+      userId: principal.id,
+      clientAccountId: principal.clientAccountId,
+      administrator: true,
+    },
+  };
 }
 
-async function runSupportTicketSmoke({
+async function createAdministrator({ baseUrl, bootstrapToken, timeoutMs, onAdministratorAccount }) {
+  const session = new DemoSession(baseUrl);
+  const identity = syntheticIdentity("administrator");
+  const registered = await registerAndVerify({ session, identity, timeoutMs });
+  await session.request(
+    "/api/v1/admin/bootstrap",
+    { method: "POST", body: JSON.stringify({ bootstrapToken }) },
+    201,
+  );
+  const principal = await session.request("/api/v1/auth/me");
+  assert.ok(principal.staff, "Administrator bootstrap did not create a staff principal");
+  assert.equal(principal.id, registered.account.userId);
+  assert.equal(principal.clientAccountId, registered.account.clientAccountId);
+  const account = { ...registered.account, administrator: true };
+  await onAdministratorAccount?.(account);
+  return { session, password: identity.password, account };
+}
+
+export function assertSeparatedDemoRoles({
+  customerSession,
+  customerUserId,
+  clientAccountId,
+  administrator,
+}) {
+  assert.ok(administrator.account?.userId, "Demo Staff account has no user ID");
+  assert.ok(
+    administrator.account?.clientAccountId,
+    "Demo Staff account has no Client Account ID",
+  );
+  assert.notStrictEqual(
+    administrator.session,
+    customerSession,
+    "Demo Staff and customer journeys must use different authenticated sessions",
+  );
+  assert.notEqual(
+    administrator.account?.userId,
+    customerUserId,
+    "Demo Staff and customer journeys must use different users",
+  );
+  assert.notEqual(
+    administrator.account?.clientAccountId,
+    clientAccountId,
+    "Demo Staff and customer journeys must use different Client Accounts",
+  );
+}
+
+export async function runSupportTicketSmoke({
   customerSession,
   administrator,
+  customerUserId,
   clientAccountId,
   serviceId,
 }) {
+  assertSeparatedDemoRoles({
+    customerSession,
+    customerUserId,
+    clientAccountId,
+    administrator,
+  });
   const marker = randomUUID();
   const subject = `Synthetic active-service ticket ${marker}`;
   const openingMessage =
@@ -147,6 +284,7 @@ async function runSupportTicketSmoke({
   assert.ok(internalNote, "Synthetic Staff internal note is missing from the Staff ticket view");
 
   const customerView = await customerSession.request(`/api/v1/tickets/${created.ticket.id}`);
+  assert.equal(customerView.ticket.id, created.ticket.id);
   assert.equal(customerView.ticket.service?.id, serviceId);
   assert.equal(
     customerView.messages.some((message) => message.id === internalNote.id),
@@ -257,6 +395,7 @@ export async function runDemoSmoke({
   baseUrl = "http://127.0.0.1:5173",
   bootstrapToken,
   administratorAccount,
+  onAdministratorAccount,
   timeoutMs = 90_000,
 } = {}) {
   const parsedBaseUrl = assertLoopbackBaseUrl(baseUrl);
@@ -309,64 +448,21 @@ export async function runDemoSmoke({
   assert.ok(legal.documents?.terms?.version, "Synthetic Terms are missing");
   assert.ok(legal.documents?.aup?.version, "Synthetic AUP is missing");
 
-  const identity = syntheticIdentity();
-  const registration = await session.request(
-    "/api/v1/auth/register",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        email: identity.email,
-        password: identity.password,
-        clientName: identity.clientName,
-        locale: "en",
-      }),
-    },
-    201,
-  );
-  await session.request(
-    "/api/v1/auth/login",
-    {
-      method: "POST",
-      body: JSON.stringify({ email: identity.email, password: identity.password }),
-    },
-    200,
-  );
-  const beforeVerification = await session.request("/api/v1/auth/me");
-  assert.equal(beforeVerification.eligible, false);
-  assert.equal(beforeVerification.verification.email, "pending");
+  const administratorAccess = bootstrapToken
+    ? await createAdministrator({
+        baseUrl: parsedBaseUrl,
+        bootstrapToken,
+        timeoutMs,
+        onAdministratorAccount,
+      })
+    : await administratorSession({
+        baseUrl: parsedBaseUrl,
+        administratorAccount,
+      });
 
-  const mailbox = await waitFor(
-    "Mock Mail verification delivery",
-    () => session.request("/api/v1/lab/mailbox"),
-    (value) => value.messages.length > 0,
-    timeoutMs,
-  );
-  assert.equal(mailbox.warning, LAB_WARNING);
-  const verificationUrl = mailbox.messages
-    .map((message) => message.body.match(/https?:\/\/\S+/)?.[0])
-    .find(Boolean);
-  assert.ok(verificationUrl, "Mock Mail did not contain a verification URL");
-  const verificationToken = new URL(verificationUrl).searchParams.get("token");
-  assert.ok(verificationToken, "Mock Mail verification URL had no token");
-  await session.request(
-    "/api/v1/auth/verify-email",
-    { method: "POST", body: JSON.stringify({ token: verificationToken }) },
-    200,
-  );
-  const verified = await session.request("/api/v1/auth/me");
-  assert.equal(verified.eligible, true);
-
-  let administrator = false;
-  if (bootstrapToken) {
-    await session.request(
-      "/api/v1/admin/bootstrap",
-      { method: "POST", body: JSON.stringify({ bootstrapToken }) },
-      201,
-    );
-    const staff = await session.request("/api/v1/auth/me");
-    assert.ok(staff.staff, "Administrator bootstrap did not create a staff principal");
-    administrator = true;
-  }
+  const identity = syntheticIdentity("customer");
+  const registeredCustomer = await registerAndVerify({ session, identity, timeoutMs });
+  const registration = registeredCustomer.registration;
 
   const created = await session.request(
     "/api/v1/orders",
@@ -411,21 +507,10 @@ export async function runDemoSmoke({
   );
   assert.ok(activeOrder.service.activatedAt, "Active service has no Ready-for-Service time");
 
-  const administratorAccess = await administratorSession({
-    baseUrl: parsedBaseUrl,
-    customerSession: session,
-    customerIdentity: identity,
-    customerIsAdministrator: administrator,
-    administratorAccount,
-  });
-  assert.ok(
-    administratorAccess,
-    "A stored synthetic administrator credential is required for the Demo Staff journeys",
-  );
-
   const supportTicket = await runSupportTicketSmoke({
     customerSession: session,
     administrator: administratorAccess,
+    customerUserId: registration.userId,
     clientAccountId: registration.clientAccountId,
     serviceId: activeOrder.service.id,
   });
@@ -447,12 +532,8 @@ export async function runDemoSmoke({
     urls: { public: publicUrl, customer: customerUrl, admin: adminUrl },
     loginPath: "/customer",
     administratorPanelPath: "/admin",
-    syntheticAccount: {
-      ...identity,
-      userId: registration.userId,
-      clientAccountId: registration.clientAccountId,
-      administrator,
-    },
+    syntheticAccount: registeredCustomer.account,
+    administratorAccount: administratorAccess.account,
     journey: {
       product: automaticProduct.name,
       orderId: activeOrder.order.id,
@@ -475,6 +556,14 @@ if (invokedDirectly) {
   runDemoSmoke({
     baseUrl: process.env.OSS_DEMO_URL ?? "http://127.0.0.1:5173",
     bootstrapToken: process.env.OSS_DEMO_BOOTSTRAP_TOKEN,
+    administratorAccount:
+      process.env.OSS_DEMO_ADMIN_EMAIL && process.env.OSS_DEMO_ADMIN_PASSWORD
+        ? {
+            email: process.env.OSS_DEMO_ADMIN_EMAIL,
+            password: process.env.OSS_DEMO_ADMIN_PASSWORD,
+            administrator: true,
+          }
+        : undefined,
   })
     .then((result) => console.log(JSON.stringify(result, null, 2)))
     .catch((error) => {

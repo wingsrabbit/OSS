@@ -7,18 +7,19 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { LAB_WARNING, runDemoSmoke } from "./demo-smoke.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -136,12 +137,76 @@ function commandResult(binary, args, options = {}) {
   return (result.stdout ?? "").trim();
 }
 
-function repositoryRevision() {
-  const revision = commandResult("git", ["rev-parse", "--verify", "HEAD"]);
+function commandBufferResult(binary, args, options = {}) {
+  const result = spawnSync(binary, args, {
+    cwd: options.cwd ?? root,
+    env: { ...process.env, ...options.env },
+    encoding: null,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr]
+      .filter(Boolean)
+      .map((value) => value.toString("utf8"))
+      .join("\n")
+      .trim();
+    throw new Error(
+      `${binary} ${args.join(" ")} failed${detail ? `:\n${detail}` : ""}`,
+    );
+  }
+  return result.stdout ?? Buffer.alloc(0);
+}
+
+export function repositoryRevision(repositoryRoot = root) {
+  const revision = commandResult("git", ["rev-parse", "--verify", "HEAD"], {
+    cwd: repositoryRoot,
+  });
   if (!/^[0-9a-f]{40}$/.test(revision)) {
     throw new Error(`Unable to identify the local Demo source revision: ${revision}`);
   }
-  return revision;
+
+  const trackedDiff = commandBufferResult(
+    "git",
+    ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--"],
+    { cwd: repositoryRoot },
+  );
+  const untrackedOutput = commandBufferResult(
+    "git",
+    ["ls-files", "--others", "--exclude-standard", "-z"],
+    { cwd: repositoryRoot },
+  );
+  const untrackedPaths = untrackedOutput
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
+  if (trackedDiff.length === 0 && untrackedPaths.length === 0) return revision;
+
+  const fingerprint = createHash("sha256");
+  fingerprint.update("opensales-demo-worktree-v1\0");
+  fingerprint.update(revision);
+  fingerprint.update("\0tracked-diff\0");
+  fingerprint.update(trackedDiff);
+  for (const relativePath of untrackedPaths) {
+    const absolutePath = join(repositoryRoot, relativePath);
+    const metadata = lstatSync(absolutePath);
+    fingerprint.update("\0untracked\0");
+    fingerprint.update(relativePath);
+    fingerprint.update("\0");
+    fingerprint.update(String(metadata.mode));
+    fingerprint.update("\0");
+    if (metadata.isFile()) {
+      fingerprint.update(readFileSync(absolutePath));
+    } else if (metadata.isSymbolicLink()) {
+      fingerprint.update("symlink\0");
+      fingerprint.update(readlinkSync(absolutePath));
+    } else {
+      throw new Error(
+        `Refusing to fingerprint unsupported untracked source entry: ${relativePath}`,
+      );
+    }
+  }
+  return `${revision}+worktree.${fingerprint.digest("hex")}`;
 }
 
 function executableVersion(binary, args = ["--version"]) {
@@ -152,8 +217,19 @@ function executableVersion(binary, args = ["--version"]) {
   }
 }
 
-function resolveExactNode() {
-  const candidates = [process.env.OSS_NODE_BIN, process.execPath];
+function resolveExactNode(currentState = null) {
+  const trackedExecutables = Object.values(currentState?.processes ?? {})
+    .map((identity) =>
+      Number.isInteger(identity)
+        ? processCommand(identity)?.split(" ", 1)[0]
+        : identity?.argv?.split(" ", 1)[0],
+    )
+    .filter((candidate) => candidate?.endsWith("/node"));
+  const candidates = [
+    process.env.OSS_NODE_BIN,
+    ...new Set(trackedExecutables),
+    process.execPath,
+  ];
   const temporaryRoot = "/private/tmp";
   if (existsSync(temporaryRoot)) {
     for (const entry of readdirSync(temporaryRoot)) {
@@ -190,14 +266,14 @@ function resolvePostgresBin() {
   );
 }
 
-function processIsAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+export function recoverAdministratorAccount(current) {
+  return (
+    current.administratorAccount ??
+    current.latestSmoke?.administratorAccount ??
+    (current.latestSmoke?.syntheticAccount?.administrator
+      ? current.latestSmoke.syntheticAccount
+      : null)
+  );
 }
 
 function state() {
@@ -206,12 +282,7 @@ function state() {
     processes: {},
     latestSmoke: null,
   });
-  if (
-    !current.administratorAccount &&
-    current.latestSmoke?.syntheticAccount?.administrator
-  ) {
-    current.administratorAccount = current.latestSmoke.syntheticAccount;
-  }
+  current.administratorAccount ??= recoverAdministratorAccount(current);
   return current;
 }
 
@@ -374,6 +445,58 @@ function buildWorkspace(node) {
   ]);
 }
 
+function assertSourceIdentityUnchanged(expected, phase) {
+  const current = repositoryRevision();
+  if (current !== expected) {
+    throw new Error(
+      `Demo source changed ${phase} (${expected} -> ${current}); refusing to label or reuse a build from mixed source content. Run node tools/demo-local.mjs up again after the worktree settles.`,
+    );
+  }
+}
+
+function processSpecifications(config, node, tokens = {}) {
+  const withToken = (name, args) => [
+    ...(tokens[name] ? [`--conditions=oss-demo-process-${tokens[name]}`] : []),
+    ...args,
+  ];
+  const providerArgs = (name) => withToken(name, ["providers/mock-lab/dist/server.js"]);
+  const specifications = [
+    ["provider-payment", providerArgs("provider-payment"), root, config.ports.payment],
+    ["provider-provisioning", providerArgs("provider-provisioning"), root, config.ports.provisioning],
+    ["provider-mail", providerArgs("provider-mail"), root, config.ports.mail],
+    ["provider-mailbox", providerArgs("provider-mailbox"), root, config.ports.mailbox],
+    ["api", withToken("api", ["apps/api/dist/server.js"]), root, config.ports.api],
+    ["worker", withToken("worker", ["apps/worker/dist/worker.js"]), root, null],
+    [
+      "web",
+      withToken("web", [
+        "node_modules/vite/bin/vite.js",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(config.ports.web),
+      ]),
+      join(root, "apps", "web"),
+      config.ports.web,
+    ],
+  ];
+  return Object.fromEntries(
+    specifications.map(([name, args, cwd, port]) => [
+      name,
+      {
+        name,
+        executable: node,
+        args,
+        argv: [node, ...args].join(" "),
+        cwd,
+        host: port === null ? null : "127.0.0.1",
+        port,
+        token: tokens[name] ?? null,
+      },
+    ]),
+  );
+}
+
 function postgresIsRunning(pgBin) {
   if (!existsSync(join(postgresData, "PG_VERSION"))) return false;
   const result = spawnSync(join(pgBin, "pg_ctl"), ["-D", postgresData, "status"], {
@@ -400,10 +523,211 @@ function processCommand(pid) {
   if (result.status !== 0) {
     const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
     throw new Error(
-      `Unable to inspect tracked Demo PostgreSQL PID ${pid}${detail ? `: ${detail}` : ""}`,
+      `Unable to inspect tracked Demo PID ${pid}${detail ? `: ${detail}` : ""}`,
     );
   }
   return command || null;
+}
+
+function processStartTime(pid) {
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  const startedAt = (result.stdout ?? "").trim();
+  if (result.status === 1 && startedAt.length === 0) return null;
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `Unable to inspect start time for tracked Demo PID ${pid}${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  return startedAt || null;
+}
+
+function processWorkingDirectory(pid) {
+  const result = spawnSync(
+    "lsof",
+    ["-nP", "-a", "-p", String(pid), "-d", "cwd", "-F", "pn"],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (result.status === 1 && !(result.stdout ?? "").trim()) return null;
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `Unable to inspect working directory for tracked Demo PID ${pid}${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  const directory = (result.stdout ?? "")
+    .split("\n")
+    .find((field) => field.startsWith("n"))
+    ?.slice(1);
+  return directory || null;
+}
+
+function processListensOnLoopbackPort(pid, port) {
+  const endpoint = `127.0.0.1:${port}`;
+  const result = spawnSync(
+    "lsof",
+    [
+      "-nP",
+      "-a",
+      "-p",
+      String(pid),
+      `-iTCP@${endpoint}`,
+      "-sTCP:LISTEN",
+      "-F",
+      "pn",
+    ],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (result.status === 1 && !(result.stdout ?? "").trim()) return false;
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `Unable to inspect tracked Demo listener ${endpoint}${detail ? `: ${detail}` : ""}`,
+    );
+  }
+  const fields = (result.stdout ?? "").trim().split("\n");
+  return fields.includes(`p${pid}`) && fields.includes(`n${endpoint}`);
+}
+
+function observeProcess(pid, spec) {
+  const initialStartedAt = processStartTime(pid);
+  if (initialStartedAt === null) return null;
+  const argv = processCommand(pid);
+  if (argv === null) return null;
+  const cwd = processWorkingDirectory(pid);
+  const listener = spec.port === null ? null : processListensOnLoopbackPort(pid, spec.port);
+  const finalStartedAt = processStartTime(pid);
+  const finalArgv = processCommand(pid);
+  if (finalStartedAt === null || finalArgv === null) return null;
+  if (initialStartedAt !== finalStartedAt || argv !== finalArgv) {
+    throw new Error(
+      `Refusing to trust Demo PID ${pid}: process identity changed during inspection`,
+    );
+  }
+  if (!cwd) {
+    throw new Error(`Unable to verify working directory for tracked Demo PID ${pid}`);
+  }
+  return { pid, startedAt: initialStartedAt, argv, cwd, listener };
+}
+
+function storedProcessIdentity(spec, observation, listenerVerified) {
+  return {
+    name: spec.name,
+    pid: observation.pid,
+    startedAt: observation.startedAt,
+    argv: observation.argv,
+    cwd: observation.cwd,
+    host: spec.host,
+    port: spec.port,
+    token: spec.token,
+    listenerVerified,
+  };
+}
+
+export function verifyStoredProcessIdentity(name, stored, spec, observation) {
+  const legacy = Number.isInteger(stored);
+  const storedPid = legacy ? stored : stored?.pid;
+  if (!Number.isInteger(storedPid) || storedPid <= 1) {
+    throw new Error(
+      `Refusing to trust ${name}: stored Demo process identity has no valid PID`,
+    );
+  }
+  if (observation === null) {
+    return { running: false, ready: false, identity: null, migrated: false };
+  }
+  if (
+    observation.pid !== storedPid ||
+    observation.argv !== spec.argv ||
+    observation.cwd !== spec.cwd
+  ) {
+    throw new Error(
+      `Refusing to trust ${name} PID ${storedPid}: current argv or cwd does not exactly match the Demo process specification`,
+    );
+  }
+  if (legacy && spec.port !== null && observation.listener !== true) {
+    throw new Error(
+      `Refusing to trust ${name} PID ${storedPid}: it is not listening on ${spec.host}:${spec.port}`,
+    );
+  }
+  if (!legacy) {
+    if (
+      stored.name !== name ||
+      stored.startedAt !== observation.startedAt ||
+      stored.argv !== spec.argv ||
+      stored.cwd !== spec.cwd ||
+      stored.host !== spec.host ||
+      stored.port !== spec.port ||
+      stored.token !== spec.token ||
+      typeof stored.listenerVerified !== "boolean"
+    ) {
+      throw new Error(
+        `Refusing to trust ${name} PID ${storedPid}: stored identity differs from the current exact process identity`,
+      );
+    }
+    if (stored.listenerVerified && spec.port !== null && observation.listener !== true) {
+      throw new Error(
+        `Refusing to trust ${name} PID ${storedPid}: its previously verified listener is no longer bound to ${spec.host}:${spec.port}`,
+      );
+    }
+  }
+  const listenerVerified = spec.port === null || observation.listener === true;
+  return {
+    running: true,
+    ready: listenerVerified,
+    identity: storedProcessIdentity(spec, observation, listenerVerified),
+    migrated: legacy || stored.listenerVerified !== listenerVerified,
+  };
+}
+
+function inspectTrackedProcesses(config, node, currentState, persist = true) {
+  currentState.processes ??= {};
+  const unexpected = Object.keys(currentState.processes).filter(
+    (name) => !processNames.includes(name),
+  );
+  if (unexpected.length > 0) {
+    throw new Error(
+      `Refusing to trust unknown recorded Demo processes: ${unexpected.join(", ")}`,
+    );
+  }
+  const tokens = Object.fromEntries(
+    processNames
+      .map((name) => [name, currentState.processes[name]?.token])
+      .filter(([, token]) => typeof token === "string" && token.length > 0),
+  );
+  const specs = processSpecifications(config, node, tokens);
+  const identities = {};
+  const readyNames = [];
+  let changed = false;
+  for (const name of processNames) {
+    const stored = currentState.processes[name];
+    if (stored === undefined) continue;
+    const pid = Number.isInteger(stored) ? stored : stored?.pid;
+    const observation = Number.isInteger(pid) && pid > 1
+      ? observeProcess(pid, specs[name])
+      : null;
+    const verified = verifyStoredProcessIdentity(name, stored, specs[name], observation);
+    if (!verified.running) {
+      delete currentState.processes[name];
+      changed = true;
+      continue;
+    }
+    identities[name] = verified.identity;
+    if (verified.ready) readyNames.push(name);
+    if (verified.migrated) {
+      currentState.processes[name] = verified.identity;
+      changed = true;
+    }
+  }
+  if (changed && persist) saveState(currentState);
+  return {
+    specs,
+    identities,
+    runningNames: Object.keys(identities),
+    readyNames,
+  };
 }
 
 function commandHasArgument(command, flag, value) {
@@ -423,48 +747,42 @@ function commandTargetsDemoPostgres(command, config) {
 }
 
 function processListensOnDemoPostgresPort(pid, config) {
-  const endpoint = `127.0.0.1:${config.ports.postgres}`;
-  const result = spawnSync(
-    "lsof",
-    [
-      "-nP",
-      "-a",
-      "-p",
-      String(pid),
-      `-iTCP@${endpoint}`,
-      "-sTCP:LISTEN",
-      "-F",
-      "pcn",
-    ],
-    { cwd: root, encoding: "utf8" },
-  );
-  if (result.status === 1 && !(result.stdout ?? "").trim()) return false;
-  if (result.status !== 0) {
-    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    throw new Error(
-      `Unable to inspect tracked Demo PostgreSQL listener${detail ? `: ${detail}` : ""}`,
-    );
-  }
-  const fields = (result.stdout ?? "").trim().split("\n");
-  return (
-    fields.includes(`p${pid}`) &&
-    fields.includes("cpostgres") &&
-    fields.includes(`n${endpoint}`)
-  );
+  return processListensOnLoopbackPort(pid, config.ports.postgres);
 }
 
 function recordPostgresProcess(config, currentState) {
   const pid = postmasterPid();
   if (!pid) throw new Error("Demo PostgreSQL started without a valid postmaster PID");
   const argv = processCommand(pid);
+  const startedAt = processStartTime(pid);
   if (!argv || !commandTargetsDemoPostgres(argv, config)) {
     throw new Error("Demo PostgreSQL process arguments do not match the configured data directory");
   }
+  if (!startedAt) throw new Error("Demo PostgreSQL process has no verifiable start time");
   if (!processListensOnDemoPostgresPort(pid, config)) {
     throw new Error("Demo PostgreSQL process is not listening on its configured loopback port");
   }
+  if (processCommand(pid) !== argv || processStartTime(pid) !== startedAt) {
+    throw new Error("Demo PostgreSQL process identity changed while it was being recorded");
+  }
+  const existing = currentState.postgresProcess;
+  if (
+    existing &&
+    (existing.pid !== pid ||
+      existing.argv !== argv ||
+      (existing.startedAt && existing.startedAt !== startedAt) ||
+      existing.dataDir !== postgresData ||
+      existing.host !== "127.0.0.1" ||
+      existing.port !== config.ports.postgres ||
+      existing.socketDir !== postgresSocket)
+  ) {
+    throw new Error(
+      "Refusing to replace a mismatched stored Demo PostgreSQL process identity",
+    );
+  }
   currentState.postgresProcess = {
     pid,
+    startedAt,
     argv,
     dataDir: postgresData,
     host: "127.0.0.1",
@@ -498,6 +816,8 @@ function inspectTrackedPostgres(config, currentState) {
   }
   const argv = processCommand(tracked.pid);
   if (argv === null) return { tracked, running: false };
+  const startedAt = processStartTime(tracked.pid);
+  if (!startedAt) return { tracked, running: false };
   if (argv !== tracked.argv || !commandTargetsDemoPostgres(argv, config)) {
     throw new Error(
       "Refusing to stop an unverified PostgreSQL process: current argv does not exactly match the stored Demo process",
@@ -508,7 +828,43 @@ function inspectTrackedPostgres(config, currentState) {
       "Refusing to stop an unverified PostgreSQL process: the stored PID is not listening on the Demo PostgreSQL port",
     );
   }
+  if (tracked.startedAt && tracked.startedAt !== startedAt) {
+    throw new Error(
+      "Refusing to stop an unverified PostgreSQL process: tracked PID was reused by another process",
+    );
+  }
+  if (processCommand(tracked.pid) !== argv || processStartTime(tracked.pid) !== startedAt) {
+    throw new Error(
+      "Refusing to stop an unverified PostgreSQL process: identity changed during inspection",
+    );
+  }
+  if (!tracked.startedAt) {
+    tracked.startedAt = startedAt;
+    saveState(currentState);
+  }
   return { tracked, running: true };
+}
+
+function inspectPostgresRuntime(config, pgBin, currentState) {
+  const controlledByPgCtl = postgresIsRunning(pgBin);
+  if (controlledByPgCtl) recordPostgresProcess(config, currentState);
+  const inspected = inspectTrackedPostgres(config, currentState);
+  if (!inspected.running && inspected.tracked) {
+    delete currentState.postgresProcess;
+    saveState(currentState);
+  }
+  return {
+    controlledByPgCtl,
+    orphanRunning: !controlledByPgCtl && inspected.running,
+    inspected,
+  };
+}
+
+function postgresIdentityStillMatches(tracked) {
+  const argv = processCommand(tracked.pid);
+  const startedAt = processStartTime(tracked.pid);
+  if (argv === null || startedAt === null) return false;
+  return argv === tracked.argv && startedAt === tracked.startedAt;
 }
 
 async function stopTrackedPostgresOrphan(config, currentState) {
@@ -522,23 +878,15 @@ async function stopTrackedPostgresOrphan(config, currentState) {
   console.log(
     `Stopping verified orphaned Demo PostgreSQL process (pid ${inspected.tracked.pid})...`,
   );
+  if (!inspectTrackedPostgres(config, currentState).running) return false;
   process.kill(inspected.tracked.pid, "SIGINT");
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const argv = processCommand(inspected.tracked.pid);
-    if (argv === null) break;
-    if (argv !== inspected.tracked.argv) {
-      throw new Error(
-        "Tracked Demo PostgreSQL PID changed identity while waiting for shutdown; refusing further action",
-      );
-    }
+    if (!postgresIdentityStillMatches(inspected.tracked)) break;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
-  if (processCommand(inspected.tracked.pid) !== null) {
+  if (postgresIdentityStillMatches(inspected.tracked)) {
     throw new Error("Verified orphaned Demo PostgreSQL did not stop within 10 seconds");
-  }
-  if (processListensOnDemoPostgresPort(inspected.tracked.pid, config)) {
-    throw new Error("Verified orphaned Demo PostgreSQL stopped but its loopback listener remains");
   }
   delete currentState.postgresProcess;
   saveState(currentState);
@@ -624,22 +972,64 @@ function tailLog(name, lineCount = 24) {
   return readFileSync(path, "utf8").split("\n").slice(-lineCount).join("\n").trim();
 }
 
-function startDetached(name, node, args, environment, currentState) {
-  const existingPid = currentState.processes?.[name];
-  if (processIsAlive(existingPid)) return existingPid;
-  const logPath = join(logsDir, `${name}.log`);
+async function waitForSpawnIdentity(spec, pid, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const observation = observeProcess(pid, spec);
+    if (observation) {
+      if (observation.argv !== spec.argv || observation.cwd !== spec.cwd) {
+        throw new Error(
+          `Refusing to record ${spec.name} PID ${pid}: spawned argv or cwd differs from the exact specification`,
+        );
+      }
+      return observation;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+  throw new Error(`${spec.name} exited before its exact process identity could be recorded`);
+}
+
+async function startDetached(spec, environment, currentState) {
+  if (currentState.processes?.[spec.name] !== undefined) {
+    throw new Error(`Refusing to overwrite an existing tracked ${spec.name} process identity`);
+  }
+  const logPath = join(logsDir, `${spec.name}.log`);
   const logFd = openSync(logPath, "a", 0o600);
-  const child = spawn(node, args, {
-    cwd: name === "web" ? join(root, "apps", "web") : root,
+  const child = spawn(spec.executable, spec.args, {
+    cwd: spec.cwd,
     env: { ...process.env, ...environment },
     detached: true,
     stdio: ["ignore", logFd, logFd],
   });
   closeSync(logFd);
   child.unref();
-  currentState.processes = { ...currentState.processes, [name]: child.pid };
+  if (!Number.isInteger(child.pid) || child.pid <= 1) {
+    throw new Error(`${spec.name} started without a valid PID`);
+  }
+  const observation = await waitForSpawnIdentity(spec, child.pid);
+  currentState.processes = {
+    ...currentState.processes,
+    [spec.name]: storedProcessIdentity(
+      spec,
+      observation,
+      spec.port === null || observation.listener === true,
+    ),
+  };
   saveState(currentState);
-  return child.pid;
+  return currentState.processes[spec.name];
+}
+
+function markProcessReady(spec, currentState) {
+  const stored = currentState.processes?.[spec.name];
+  const observation = observeProcess(stored?.pid, spec);
+  const verified = verifyStoredProcessIdentity(spec.name, stored, spec, observation);
+  if (!verified.running || !verified.ready) {
+    throw new Error(
+      `${spec.name} health endpoint responded but its exact loopback listener identity was not verified`,
+    );
+  }
+  currentState.processes[spec.name] = verified.identity;
+  saveState(currentState);
 }
 
 async function waitForHttp(name, url, timeoutMs = 45_000) {
@@ -662,16 +1052,15 @@ async function waitForHttp(name, url, timeoutMs = 45_000) {
 }
 
 async function startProcesses(config, node, currentState) {
-  const mockServer = ["providers/mock-lab/dist/server.js"];
-  startDetached("provider-payment", node, mockServer, providerEnvironment(config, "payment"), currentState);
-  startDetached(
-    "provider-provisioning",
-    node,
-    mockServer,
+  const tokens = Object.fromEntries(processNames.map((name) => [name, secureToken(18)]));
+  const specs = processSpecifications(config, node, tokens);
+  await startDetached(specs["provider-payment"], providerEnvironment(config, "payment"), currentState);
+  await startDetached(
+    specs["provider-provisioning"],
     providerEnvironment(config, "provisioning"),
     currentState,
   );
-  startDetached("provider-mail", node, mockServer, providerEnvironment(config, "mail"), currentState);
+  await startDetached(specs["provider-mail"], providerEnvironment(config, "mail"), currentState);
   await Promise.all([
     waitForHttp("provider-payment", `http://127.0.0.1:${config.ports.payment}/health/ready`),
     waitForHttp(
@@ -680,32 +1069,41 @@ async function startProcesses(config, node, currentState) {
     ),
     waitForHttp("provider-mail", `http://127.0.0.1:${config.ports.mail}/health/ready`),
   ]);
+  for (const name of ["provider-payment", "provider-provisioning", "provider-mail"]) {
+    markProcessReady(specs[name], currentState);
+  }
 
   // Mail and mailbox intentionally share one Mock-only database. Starting them
   // serially avoids a PostgreSQL CREATE EXTENSION bootstrap race.
-  startDetached("provider-mailbox", node, mockServer, providerEnvironment(config, "mailbox"), currentState);
+  await startDetached(
+    specs["provider-mailbox"],
+    providerEnvironment(config, "mailbox"),
+    currentState,
+  );
   await waitForHttp(
     "provider-mailbox",
     `http://127.0.0.1:${config.ports.mailbox}/health/ready`,
   );
+  markProcessReady(specs["provider-mailbox"], currentState);
 
-  startDetached("api", node, ["apps/api/dist/server.js"], apiEnvironment(config), currentState);
+  await startDetached(specs.api, apiEnvironment(config), currentState);
   await waitForHttp("api", `http://127.0.0.1:${config.ports.api}/health/ready`);
+  markProcessReady(specs.api, currentState);
 
-  startDetached("worker", node, ["apps/worker/dist/worker.js"], workerEnvironment(config), currentState);
-  startDetached(
-    "web",
-    node,
-    ["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", String(config.ports.web)],
+  await startDetached(specs.worker, workerEnvironment(config), currentState);
+  await startDetached(
+    specs.web,
     { OSS_API_PROXY_TARGET: `http://127.0.0.1:${config.ports.api}` },
     currentState,
   );
   await waitForHttp("web", `http://127.0.0.1:${config.ports.web}/`);
+  markProcessReady(specs.web, currentState);
 }
 
 function createBootstrapToken(config, node, currentState) {
   if (
-    currentState.administratorAccount?.administrator ||
+    (currentState.administratorAccount?.email &&
+      currentState.administratorAccount?.password) ||
     currentState.latestSmoke?.syntheticAccount?.administrator
   ) {
     return undefined;
@@ -716,12 +1114,18 @@ function createBootstrapToken(config, node, currentState) {
       env: { ...apiEnvironment(config), BOOTSTRAP_TOKEN_OUTPUT_FILE: outputFile },
     });
     const token = readJson(outputFile, null)?.token;
-    return typeof token === "string" ? token : undefined;
+    if (typeof token !== "string") {
+      throw new Error("Staff bootstrap token command produced no credential");
+    }
+    return token;
   } catch (error) {
-    console.warn(
-      "Administrator bootstrap was skipped; the database may already contain a first administrator.",
-    );
-    return undefined;
+    const detail = error instanceof Error ? error.message : String(error);
+    if (detail.includes("Staff bootstrap is already complete")) {
+      throw new Error(
+        "This preserved Demo database already has Staff, but no recoverable synthetic administrator credential remains in .demo/local/state.json. Run `node tools/demo-local.mjs reset --yes`, then `node tools/demo-local.mjs up` to create separate synthetic Staff and customer identities.",
+      );
+    }
+    throw error;
   } finally {
     if (existsSync(outputFile)) rmSync(outputFile);
   }
@@ -736,11 +1140,13 @@ function printResult(config, currentState, stackRunning = true) {
   );
   console.log(LAB_WARNING);
   printDemoUrls(config);
-  console.log(`Code revision: ${currentState.runtimeRevision ?? "unknown"}`);
+  console.log(`Runtime source identity: ${currentState.runtimeRevision ?? "unknown"}`);
   if (result?.syntheticAccount) {
     console.log(`Latest synthetic customer login: ${result.syntheticAccount.email}`);
     console.log(`Latest synthetic customer password: ${result.syntheticAccount.password}`);
     console.log(`Latest synthetic customer Client Account ID: ${result.syntheticAccount.clientAccountId}`);
+    console.log(`Synthetic order ID: ${result.journey.orderId}`);
+    console.log(`Synthetic invoice ID: ${result.journey.invoiceId}`);
     console.log(
       `Smoke: order ${result.journey.orderStatus}, invoice ${result.journey.invoiceStatus}, payment ${result.journey.paymentStatus}, service ${result.journey.serviceStatus}`,
     );
@@ -756,6 +1162,7 @@ function printResult(config, currentState, stackRunning = true) {
   }
   const administrator =
     currentState.administratorAccount ??
+    result?.administratorAccount ??
     (result?.syntheticAccount?.administrator ? result.syntheticAccount : null);
   if (administrator) {
     console.log(`Synthetic administrator login: ${administrator.email}`);
@@ -787,28 +1194,27 @@ function printResult(config, currentState, stackRunning = true) {
 
 async function up() {
   const config = createConfig();
-  const node = resolveExactNode();
+  let currentState = state();
+  const node = resolveExactNode(currentState);
   const pgBin = resolvePostgresBin();
   const sourceRevision = repositoryRevision();
-  let currentState = state();
   currentState.processes ??= {};
-  let runningProcesses = processNames.filter((name) =>
-    processIsAlive(currentState.processes[name]),
-  );
-  let postgresRunning = postgresIsRunning(pgBin);
-  if (!postgresRunning && currentState.postgresProcess) {
+  let processRuntime = inspectTrackedProcesses(config, node, currentState);
+  let runningProcesses = processRuntime.runningNames;
+  let postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
+  if (postgresRuntime.orphanRunning) {
     await down();
     currentState = state();
     currentState.processes ??= {};
-    runningProcesses = processNames.filter((name) =>
-      processIsAlive(currentState.processes[name]),
-    );
-    postgresRunning = false;
+    processRuntime = inspectTrackedProcesses(config, node, currentState);
+    runningProcesses = processRuntime.runningNames;
+    postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
   }
   let stackAlreadyRunning =
-    postgresRunning && runningProcesses.length === processNames.length;
+    postgresRuntime.controlledByPgCtl &&
+    processRuntime.readyNames.length === processNames.length;
   if (
-    (postgresRunning || runningProcesses.length > 0) &&
+    (postgresRuntime.controlledByPgCtl || runningProcesses.length > 0) &&
     currentState.runtimeRevision !== sourceRevision
   ) {
     console.log(
@@ -818,7 +1224,11 @@ async function up() {
     currentState = state();
     currentState.processes ??= {};
     runningProcesses = [];
-    postgresRunning = false;
+    postgresRuntime = {
+      controlledByPgCtl: false,
+      orphanRunning: false,
+      inspected: { tracked: null, running: false },
+    };
     stackAlreadyRunning = false;
   }
   if (runningProcesses.length > 0 && !stackAlreadyRunning) {
@@ -834,9 +1244,11 @@ async function up() {
     );
   } else {
     buildWorkspace(node);
+    assertSourceIdentityUnchanged(sourceRevision, "while the workspace was building");
     startPostgres(config, pgBin, currentState);
     prepareDatabases(config, pgBin, node);
     bootstrapToken = createBootstrapToken(config, node, currentState);
+    assertSourceIdentityUnchanged(sourceRevision, "while the Demo database was preparing");
     currentState.runtimeRevision = sourceRevision;
     saveState(currentState);
     await startProcesses(config, node, currentState);
@@ -848,13 +1260,16 @@ async function up() {
     baseUrl: `http://127.0.0.1:${config.ports.web}`,
     bootstrapToken,
     administratorAccount: currentState.administratorAccount,
+    onAdministratorAccount: (administratorAccount) => {
+      const refreshed = state();
+      refreshed.administratorAccount = administratorAccount;
+      saveState(refreshed);
+    },
   });
   currentState = state();
   currentState.runtimeRevision = sourceRevision;
   currentState.latestSmoke = result;
-  if (result.syntheticAccount.administrator) {
-    currentState.administratorAccount = result.syntheticAccount;
-  }
+  currentState.administratorAccount = result.administratorAccount;
   currentState.lastStartedAt = new Date().toISOString();
   saveState(currentState);
   printResult(config, currentState, true);
@@ -862,37 +1277,79 @@ async function up() {
 
 async function smoke() {
   const config = createConfig();
-  const node = resolveExactNode();
   const currentState = state();
+  const node = resolveExactNode(currentState);
   const sourceRevision = repositoryRevision();
   if (currentState.runtimeRevision !== sourceRevision) {
     throw new Error(
       `The Demo runtime revision ${currentState.runtimeRevision ?? "unknown"} differs from source ${sourceRevision}; run node tools/demo-local.mjs up to rebuild and migrate it first.`,
     );
   }
+  const processRuntime = inspectTrackedProcesses(config, node, currentState);
+  const pgBin = resolvePostgresBin();
+  const postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
+  if (
+    !postgresRuntime.controlledByPgCtl ||
+    processRuntime.readyNames.length !== processNames.length
+  ) {
+    throw new Error("The exact Demo process identities are not fully running; run node tools/demo-local.mjs up");
+  }
   const bootstrapToken = createBootstrapToken(config, node, currentState);
   const result = await runDemoSmoke({
     baseUrl: `http://127.0.0.1:${config.ports.web}`,
     bootstrapToken,
     administratorAccount: currentState.administratorAccount,
+    onAdministratorAccount: (administratorAccount) => {
+      const refreshed = state();
+      refreshed.administratorAccount = administratorAccount;
+      saveState(refreshed);
+    },
   });
   const refreshed = state();
   refreshed.latestSmoke = result;
-  if (result.syntheticAccount.administrator) {
-    refreshed.administratorAccount = result.syntheticAccount;
-  }
+  refreshed.administratorAccount = result.administratorAccount;
   saveState(refreshed);
   printResult(config, refreshed, true);
 }
 
-async function stopProcess(pid) {
-  if (!processIsAlive(pid)) return;
-  process.kill(pid, "SIGTERM");
+function trackedProcessIdentityStillMatches(identity, spec) {
+  const observation = observeProcess(identity.pid, spec);
+  return (
+    observation !== null &&
+    observation.pid === identity.pid &&
+    observation.startedAt === identity.startedAt &&
+    observation.argv === identity.argv &&
+    observation.cwd === identity.cwd
+  );
+}
+
+async function stopProcess(name, identity, spec, currentState) {
+  if (!identity) return;
+  const beforeSignal = observeProcess(identity.pid, spec);
+  const verified = verifyStoredProcessIdentity(name, identity, spec, beforeSignal);
+  if (!verified.running) return;
+  process.kill(identity.pid, "SIGTERM");
   const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline && processIsAlive(pid)) {
+  while (Date.now() < deadline && trackedProcessIdentityStillMatches(identity, spec)) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
-  if (processIsAlive(pid)) process.kill(pid, "SIGKILL");
+  if (trackedProcessIdentityStillMatches(identity, spec)) {
+    if (trackedProcessIdentityStillMatches(identity, spec)) {
+      process.kill(identity.pid, "SIGKILL");
+      const killDeadline = Date.now() + 2_000;
+      while (
+        Date.now() < killDeadline &&
+        trackedProcessIdentityStillMatches(identity, spec)
+      ) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+      }
+      if (trackedProcessIdentityStillMatches(identity, spec)) {
+        throw new Error(`${name} did not stop after verified SIGKILL`);
+      }
+    }
+  }
+  delete currentState.processes[name];
+  saveState(currentState);
 }
 
 async function down() {
@@ -902,6 +1359,12 @@ async function down() {
   }
   const config = createConfig();
   const currentState = state();
+  const node = resolveExactNode(currentState);
+  const processRuntime = inspectTrackedProcesses(config, node, currentState);
+  const pgBin = resolvePostgresBin();
+  const postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
+  // No signal is sent until every recorded child and PostgreSQL identity has
+  // passed the exact preflight above.
   for (const name of [
     "web",
     "worker",
@@ -911,13 +1374,24 @@ async function down() {
     "provider-provisioning",
     "provider-payment",
   ]) {
-    await stopProcess(currentState.processes?.[name]);
+    await stopProcess(
+      name,
+      processRuntime.identities[name],
+      processRuntime.specs[name],
+      currentState,
+    );
   }
-  const pgBin = resolvePostgresBin();
-  if (postgresIsRunning(pgBin)) {
+  if (postgresRuntime.controlledByPgCtl) {
+    const immediatelyBeforeStop = inspectTrackedPostgres(config, currentState);
+    if (!immediatelyBeforeStop.running) {
+      throw new Error("Demo PostgreSQL changed identity before pg_ctl stop; refusing further action");
+    }
     commandResult(join(pgBin, "pg_ctl"), ["-D", postgresData, "-m", "fast", "-w", "stop"]);
+    if (postgresIdentityStillMatches(immediatelyBeforeStop.tracked)) {
+      throw new Error("Verified Demo PostgreSQL remained alive after pg_ctl stop");
+    }
     delete currentState.postgresProcess;
-  } else {
+  } else if (postgresRuntime.orphanRunning) {
     await stopTrackedPostgresOrphan(config, currentState);
   }
   currentState.processes = {};
@@ -935,22 +1409,28 @@ async function status() {
   }
   const config = createConfig();
   const currentState = state();
+  const node = resolveExactNode(currentState);
   const pgBin = resolvePostgresBin();
+  const processRuntime = inspectTrackedProcesses(config, node, currentState);
+  const postgresRuntime = inspectPostgresRuntime(config, pgBin, currentState);
   const stackRunning =
-    postgresIsRunning(pgBin) &&
-    processNames.every((name) => processIsAlive(currentState.processes?.[name]));
+    postgresRuntime.controlledByPgCtl &&
+    processRuntime.readyNames.length === processNames.length;
   const sourceRevision = repositoryRevision();
   console.log(LAB_WARNING);
   console.log(`Stack: ${stackRunning ? "running" : "stopped"}`);
   console.log(`Source revision: ${sourceRevision}`);
   console.log(`Runtime revision: ${currentState.runtimeRevision ?? "unknown"}`);
   for (const name of processNames) {
-    const pid = currentState.processes?.[name];
+    const identity = processRuntime.identities[name];
+    const ready = processRuntime.readyNames.includes(name);
     console.log(
-      `${name}: ${processIsAlive(pid) ? "running" : "stopped"}${pid ? ` (pid ${pid})` : ""}`,
+      `${name}: ${identity ? (ready ? "running" : "starting/unready") : "stopped"}${identity ? ` (pid ${identity.pid})` : ""}`,
     );
   }
-  console.log(`postgres: ${postgresIsRunning(pgBin) ? "running" : "stopped"}`);
+  console.log(
+    `postgres: ${postgresRuntime.controlledByPgCtl ? "running" : postgresRuntime.orphanRunning ? "verified orphan" : "stopped"}`,
+  );
   printResult(config, currentState, stackRunning);
 }
 
@@ -970,16 +1450,22 @@ function help() {
   console.log(`${LAB_WARNING}\n\nUsage:\n  node tools/demo-local.mjs up       Build, start, seed, and smoke-test the three-page local Demo\n  node tools/demo-local.mjs smoke    Create another synthetic paid/Active, ticket, and outflow journey\n  node tools/demo-local.mjs status   Show loopback services and the latest synthetic logins and IDs\n  node tools/demo-local.mjs down     Stop services and preserve synthetic Demo data\n  node tools/demo-local.mjs reset --yes\n                                     Stop and delete only .demo/local\n\nSurfaces:\n  http://127.0.0.1:5173/\n  http://127.0.0.1:5173/customer\n  http://127.0.0.1:5173/admin\n\nNo Docker, VPS, GitHub, real Provider, real credential, or real customer data is used.`);
 }
 
-const command = process.argv[2] ?? "up";
-try {
-  if (command === "up") await up();
-  else if (command === "smoke") await smoke();
-  else if (command === "status") await status();
-  else if (command === "down") await down();
-  else if (command === "reset") await reset();
-  else if (["help", "--help", "-h"].includes(command)) help();
-  else throw new Error(`Unknown Demo command: ${command}`);
-} catch (error) {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
+async function main() {
+  const command = process.argv[2] ?? "up";
+  try {
+    if (command === "up") await up();
+    else if (command === "smoke") await smoke();
+    else if (command === "status") await status();
+    else if (command === "down") await down();
+    else if (command === "reset") await reset();
+    else if (["help", "--help", "-h"].includes(command)) help();
+    else throw new Error(`Unknown Demo command: ${command}`);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  }
 }
+
+const invokedDirectly =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) await main();

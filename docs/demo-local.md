@@ -35,16 +35,19 @@ The command:
    `seed-termrat.ts`;
 4. starts the API, Worker, Vite Web app, and separate Mock payment,
    provisioning, mail, and mailbox processes on loopback;
-5. runs `register -> Mock Mail verification -> order -> Mock payment -> Mock
-   provisioning -> Ready for Service -> Active -> service-linked customer
-   ticket`; the synthetic administrator adds one internal note, and the
-   customer API view proves that note is not visible; the same administrator
-   then records one manual receipt and one confirmed `original_source` outflow
+5. on a fresh database, registers and Mock-Mail-verifies a dedicated synthetic
+   administrator, consumes the one-time Staff bootstrap token, and immediately
+   saves that credential; it then uses a different session, user, and Client
+   Account for `register -> Mock Mail verification -> order -> Mock payment ->
+   Mock provisioning -> Ready for Service -> Active -> service-linked customer
+   ticket`; the administrator adds one internal note, and the distinct customer
+   API session proves that note is not visible; the same administrator then
+   records one manual receipt and one confirmed `original_source` outflow
    without calling a Provider;
 6. proves that `/`, `/customer`, and `/admin` each return the Vite SPA HTML,
-   then writes the source revision, generated synthetic credentials, Client
-   Account IDs, and exact order, service, ticket, internal-note, receipt, and
-   outflow IDs to
+   then writes the commit/worktree source fingerprint, separate generated
+   synthetic credentials, Client Account IDs, and exact order, invoice,
+   service, ticket, internal-note, receipt, and outflow IDs to
    `.demo/local/state.json` with mode `0600` and prints them in the terminal.
 
 The launcher prints three product surfaces:
@@ -79,11 +82,15 @@ including the synthetic logins and database.
 
 ### Revision-aware upgrades
 
-The state file records the exact Git revision used by the running processes.
-When `up` sees a complete or partial stack from another revision, it performs a
-controlled `down`, rebuilds, applies forward migrations through the latest
-native schema, and starts the stack again. Synthetic data is preserved. A stack
-already running at the current revision is reused for another smoke journey.
+The state file records the exact source identity used by the running processes:
+the Git commit plus a SHA-256 fingerprint of every tracked diff and every
+unignored untracked path, mode, and file content. Consequently, an uncommitted
+source edit cannot masquerade as the already-built runtime merely because HEAD
+did not change. When `up` sees a complete or partial stack from another source
+identity, it performs a controlled `down`, rebuilds, applies forward migrations
+through the latest native schema, and starts the stack again. Synthetic data is
+preserved. Only a complete stack at the same clean or dirty source fingerprint
+is reused for another smoke journey.
 
 The launcher never resets the database automatically. Applied migrations are
 immutable: a schema correction must use a new numbered forward migration. If a
@@ -91,12 +98,35 @@ revision cannot migrate the preserved Demo database safely, startup fails
 closed so the migration can be fixed. `reset --yes` remains a separate,
 explicit option only for a deliberately disposable synthetic Demo runtime.
 
-The private state file also records the Demo PostgreSQL PID, exact process
-arguments, data directory, loopback host/port, and socket directory. If a stale
-process survives after its PostgreSQL PID file disappears, `up` or `down` stops
-it only when every stored field, the current full process arguments, and the
-actual listening endpoint still match. A missing or different identity fails
-closed instead of signaling an unrelated process.
+The private state file records a verifiable identity for every process. Each
+Node child has its logical name, PID, process start identity, exact argv,
+working directory, and (where applicable) exact loopback listener. Newly
+started children also receive a random per-process argv token. Legacy numeric
+PIDs are migrated only after their expected name/argv/cwd and listener all
+match. PostgreSQL records its PID, start identity, exact process arguments,
+data directory, loopback host/port, and socket directory. Normal `pg_ctl stop`
+and orphan recovery both preflight this identity; TERM/KILL escalation rechecks
+the immutable identity before and after signaling. A missing, reused, or
+different identity fails closed instead of signaling an unrelated process.
+
+An older preserved database may already contain Staff after the old launcher
+has overwritten its only synthetic administrator password. That credential
+cannot be reconstructed. The launcher stops with an explicit message instead
+of weakening the Staff journey; because this runtime contains synthetic Demo
+data only, use `node tools/demo-local.mjs reset --yes` and then `up` when you
+deliberately choose to replace that unrecoverable old Demo runtime.
+
+The launcher lifecycle regression suite is independently runnable and is also
+part of `product-static` CI:
+
+```bash
+node --test tools/demo-local.test.mjs
+```
+
+It covers dirty tracked/untracked source fingerprints, legacy PID migration,
+argv mismatch and PID-reuse refusal, separate Staff/customer identities, and a
+negative assertion that fails if a customer ticket response exposes the Staff
+internal note.
 
 To explicitly delete only that generated Demo runtime:
 
