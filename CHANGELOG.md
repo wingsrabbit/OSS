@@ -24,6 +24,12 @@ All notable project changes will be documented here. Project release numbering a
   expense to the gross unclaimed-funds liability. Idempotency replay returns the
   original result, while reused keys and concurrent duplicate references fail
   with an explicit conflict.
+- Billing staff with both manual-receipt and unclaimed-funds authority can
+  reverse a wholly untouched receipt entered by mistake after password
+  reconfirmation and impact review. The original receipt stays immutable; Core
+  appends one balanced compensating journal, removes the reversed item from the
+  actionable unclaimed queue, safely replays a lost response, and sends no money
+  or Provider request.
 - Eligible recurring-service customers can schedule cancellation for the exact
   end of their current paid term. The service remains available until that
   instant, future renewal generation stops, and a still-pristine issued renewal

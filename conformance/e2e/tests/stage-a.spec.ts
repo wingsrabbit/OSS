@@ -345,6 +345,98 @@ test("staff records received funds manually and sees the immutable unclaimed res
     .filter({ hasText: reference });
   await expect(persisted).toHaveCount(1);
   await expect(persisted).toHaveAttribute("data-source", "manual");
+
+  const manualReceiptAfterReload = admin.locator('div[aria-label="Record manual receipt"]');
+  await manualReceiptAfterReload
+    .getByLabel("Manual receipt Client Account ID")
+    .fill(targetClientAccountId);
+  await manualReceiptAfterReload
+    .getByRole("button", { name: "Verify account & load history" })
+    .click();
+  const reversible = manualReceiptAfterReload
+    .getByTestId("manual-receipt-history-item")
+    .filter({ hasText: reference });
+  await expect(reversible).toHaveCount(1);
+  await reversible.getByRole("button", { name: "Review reversal" }).click();
+  await expect(reversible.getByTestId("manual-receipt-reversal-impact")).toContainText(
+    "Dr unclaimed liability $100.00; Cr cash $96.50; Cr fee expense $3.50",
+  );
+  const reversalReason =
+    "Synthetic browser billing review proves the entire untouched receipt was entered by mistake";
+  const reversalReasonInput = reversible.getByLabel("Manual receipt reversal reason");
+  await reversalReasonInput.fill(reversalReason);
+  await passwordInput.fill(staffPassword);
+  const reverseButton = reversible.getByRole("button", {
+    name: "Reverse incorrect receipt",
+  });
+  await expect(reverseButton).toBeEnabled();
+
+  const reversalPattern = "**/api/v1/admin/client-accounts/*/manual-receipts/*/reversal";
+  let committedReversalId = "";
+  const loseFirstReversalResponse = async (route: Route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    const body = (await response.json()) as { reversalId: string };
+    expect(response.status(), JSON.stringify(body)).toBe(201);
+    committedReversalId = body.reversalId;
+    await route.abort("connectionfailed");
+  };
+  await page.route(reversalPattern, loseFirstReversalResponse);
+  await reverseButton.click();
+  await expect(passwordInput).toHaveValue("");
+  await expect(reversalReasonInput).toHaveValue(reversalReason);
+  await expect(reverseButton).toBeDisabled();
+  expect(committedReversalId).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  await page.unroute(reversalPattern, loseFirstReversalResponse);
+
+  await passwordInput.fill(staffPassword);
+  const reversalReplayPromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" && response.url().endsWith("/reversal"),
+  );
+  await expect(reverseButton).toBeEnabled();
+  await reverseButton.click();
+  const reversalReplay = await reversalReplayPromise;
+  const reversalReplayBody = (await reversalReplay.json()) as {
+    reversalId: string;
+    replayed: boolean;
+  };
+  expect(reversalReplay.status(), JSON.stringify(reversalReplayBody)).toBe(200);
+  expect(reversalReplayBody.replayed).toBe(true);
+  expect(reversalReplayBody.reversalId).toBe(committedReversalId);
+  await expect(
+    page.getByText(
+      "This exact reversal was replayed safely; no second journal or money change was created.",
+    ),
+  ).toBeVisible();
+
+  const reversalOutcome = manualReceiptAfterReload.getByTestId(
+    "manual-receipt-reversal-outcome",
+  );
+  await expect(reversalOutcome).toContainText("Reversal · $100.00 · replayed safely");
+  await expect(reversalOutcome).toContainText(
+    "Original receipt remains immutable. This correction sent no money",
+  );
+  await expect(reversalOutcome).toHaveAttribute("data-reversal-id", committedReversalId);
+  await expect(reversible).toHaveAttribute("data-disposition", "reversed");
+  await expect(reversible.getByTestId("manual-receipt-reversal")).toHaveCount(1);
+  await expect(reversible).toContainText(reversalReason);
+  await expect(
+    admin.getByTestId("unclaimed-fund-item").filter({ hasText: reference }),
+  ).toHaveCount(0);
+
+  await page.reload();
+  await expect(
+    page
+      .locator("section.admin-panel")
+      .getByTestId("unclaimed-fund-item")
+      .filter({ hasText: reference }),
+  ).toHaveCount(0);
 });
 
 test("staff records a manual refund decision and reloads its history", async ({ page }) => {
