@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assert015RollbackBridgeSafe,
+  assertSchema016NativeSafe,
   SCHEMA_016,
 } from "./schema-015-016-rollback-compatibility.js";
 import {
@@ -91,6 +92,17 @@ test("schema 016 requires exact opt-in and its complete semantic catalog", async
     assert015RollbackBridgeSafe(fakeDatabase({ version: SCHEMA_016, shape: true }), {
       enable016RollbackBridge: true,
     }),
+    /catalog digest .* does not match reviewed digest/,
+  );
+});
+
+test("schema 016 native mode rejects older and counterfeit schemas", async () => {
+  await assert.rejects(
+    assertSchema016NativeSafe(fakeDatabase({ version: SCHEMA_015 })),
+    /incompatible with application schema 016_stage_b_manual_receipts/,
+  );
+  await assert.rejects(
+    assertSchema016NativeSafe(fakeDatabase({ version: SCHEMA_016, shape: true })),
     /catalog digest .* does not match reviewed digest/,
   );
 });

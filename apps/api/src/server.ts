@@ -13,9 +13,7 @@ try {
   const built = await buildApp(config);
   app = built.app;
   const { pool } = built;
-  const schemaPreflight = await assertSchemaCompatible(pool, {
-    enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
-  });
+  const schemaPreflight = await assertSchemaCompatible(pool);
   app.log.info(
     {
       installedSchemaVersion: schemaPreflight.installedSchemaVersion,

@@ -51,6 +51,17 @@ const fundResolutionSchema = z
     }
   });
 
+const manualReceiptSchema = z.object({
+  reference: z.string().trim().min(1).max(200),
+  receivedAt: z.iso.datetime({ offset: true }),
+  grossAmountMinor: z.string().regex(/^[1-9]\d*$/),
+  feeMinor: z.string().regex(/^(0|[1-9]\d*)$/),
+  currency: z.literal("USD"),
+  reason: z.string().trim().min(10).max(1_000),
+  idempotencyKey: z.string().min(8).max(128),
+});
+const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
+
 export async function requireStaffPermission(
   pool: DatabasePool,
   user: AuthenticatedUser,
@@ -190,6 +201,314 @@ export async function registerAdminRoutes(
   pool: DatabasePool,
   config: Config,
 ): Promise<void> {
+  app.get(
+    "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts",
+    async (request) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
+      const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const account = await pool.query<{ id: string; name: string }>(
+        "SELECT id, name FROM client_accounts WHERE id = $1",
+        [params.clientAccountId],
+      );
+      const target = account.rows[0];
+      if (!target) {
+        throw Object.assign(new Error("Client account not found"), { statusCode: 404 });
+      }
+      const receipts = await pool.query<{
+        id: string;
+        reference: string;
+        received_at: Date;
+        gross_amount_minor: string;
+        fee_minor: string;
+        currency: string;
+        actor_id: string;
+        reason: string;
+        created_at: Date;
+        fund_receipt_id: string;
+        allocated_minor: string;
+        disposition: string;
+        available_minor: string;
+        capacity_frozen: boolean;
+      }>(
+        `SELECT
+           fact.id,
+           fact.reference,
+           fact.received_at,
+           fact.gross_amount_minor::text,
+           fact.fee_minor::text,
+           fact.currency,
+           fact.actor_id,
+           fact.reason,
+           fact.created_at,
+           receipt.id AS fund_receipt_id,
+           receipt.allocated_minor::text,
+           receipt.disposition,
+           capacity.available_minor::text,
+           capacity.capacity_frozen
+         FROM manual_receipt_facts fact
+         JOIN fund_receipts receipt ON receipt.reported_manual_receipt_id = fact.id
+         JOIN unclaimed_fund_refund_capacity capacity
+           ON capacity.fund_receipt_id = receipt.id
+         WHERE fact.client_account_id = $1
+         ORDER BY fact.received_at DESC, fact.id DESC`,
+        [params.clientAccountId],
+      );
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        clientAccount: target,
+        items: receipts.rows.map((row) => ({
+          manualReceiptId: row.id,
+          fundReceiptId: row.fund_receipt_id,
+          reference: row.reference,
+          receivedAt: row.received_at.toISOString(),
+          grossAmountMinor: row.gross_amount_minor,
+          feeMinor: row.fee_minor,
+          netAmountMinor: (
+            BigInt(row.gross_amount_minor) - BigInt(row.fee_minor)
+          ).toString(),
+          allocatedMinor: row.allocated_minor,
+          availableMinor: row.available_minor,
+          capacityFrozen: row.capacity_frozen,
+          currency: row.currency,
+          disposition: row.disposition,
+          actorId: row.actor_id,
+          reason: row.reason,
+          createdAt: row.created_at.toISOString(),
+        })),
+      };
+    },
+  );
+
+  app.post(
+    "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts",
+    async (request, reply) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
+      await requireRecentReauth(pool, user);
+      const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const body = manualReceiptSchema.parse(request.body);
+      const grossAmount = BigInt(body.grossAmountMinor);
+      const fee = BigInt(body.feeMinor);
+      if (grossAmount > POSTGRES_BIGINT_MAX || fee > POSTGRES_BIGINT_MAX) {
+        throw Object.assign(new Error("Manual receipt amount is outside the supported range"), {
+          statusCode: 400,
+          code: "MANUAL_RECEIPT_AMOUNT_OUT_OF_RANGE",
+        });
+      }
+      if (fee > grossAmount) {
+        throw Object.assign(new Error("Fee cannot exceed the received gross amount"), {
+          statusCode: 400,
+          code: "MANUAL_RECEIPT_FEE_EXCEEDS_GROSS",
+        });
+      }
+      const receivedAt = new Date(body.receivedAt);
+      if (receivedAt.getTime() > Date.now() + 5 * 60_000) {
+        throw Object.assign(new Error("Received time cannot be in the future"), {
+          statusCode: 400,
+          code: "MANUAL_RECEIPT_FUTURE_DATE",
+        });
+      }
+      const fingerprint = requestFingerprint("admin.manual-receipt:v1", {
+        clientAccountId: params.clientAccountId,
+        reference: body.reference,
+        receivedAt: receivedAt.toISOString(),
+        grossAmountMinor: body.grossAmountMinor,
+        feeMinor: body.feeMinor,
+        currency: body.currency,
+        reason: body.reason,
+      });
+
+      const outcome = await transaction(pool, async (client) => {
+        const locks = [
+          `manual-receipt:idempotency:${body.idempotencyKey}`,
+          `manual-receipt:reference:${params.clientAccountId}:${body.reference}`,
+        ].sort();
+        for (const lock of locks) {
+          await client.query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))",
+            [lock],
+          );
+        }
+
+        const replayResult = await client.query<{
+          client_account_id: string;
+          request_fingerprint: string;
+          result: Record<string, unknown>;
+        }>(
+          `SELECT client_account_id, request_fingerprint, result
+           FROM manual_receipt_facts
+           WHERE idempotency_key = $1
+           FOR UPDATE`,
+          [body.idempotencyKey],
+        );
+        const replay = replayResult.rows[0];
+        if (replay) {
+          if (
+            replay.client_account_id !== params.clientAccountId ||
+            replay.request_fingerprint !== fingerprint
+          ) {
+            throw Object.assign(
+              new Error("The idempotency key was used for a different manual receipt"),
+              { statusCode: 409, code: "IDEMPOTENCY_CONFLICT" },
+            );
+          }
+          await requireStaffActionLocked(
+            client,
+            user,
+            "billing.manual_receipt_manage",
+          );
+          return { ...replay.result, replayed: true };
+        }
+
+        await requireStaffActionLocked(client, user, "billing.manual_receipt_manage");
+        const target = await client.query<{ id: string }>(
+          "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+          [params.clientAccountId],
+        );
+        if (!target.rows[0]) {
+          throw Object.assign(new Error("Client account not found"), { statusCode: 404 });
+        }
+
+        const conflictingReference = await client.query(
+          `SELECT id
+           FROM manual_receipt_facts
+           WHERE client_account_id = $1 AND reference = $2
+           FOR UPDATE`,
+          [params.clientAccountId, body.reference],
+        );
+        if (conflictingReference.rowCount !== 0) {
+          throw Object.assign(
+            new Error("This client account already has a manual receipt with that reference"),
+            { statusCode: 409, code: "MANUAL_RECEIPT_REFERENCE_CONFLICT" },
+          );
+        }
+
+        const manualReceiptId = randomUUID();
+        const fundReceiptId = randomUUID();
+        const netAmount = grossAmount - fee;
+        const result = {
+          manualReceiptId,
+          fundReceiptId,
+          clientAccountId: params.clientAccountId,
+          reference: body.reference,
+          receivedAt: receivedAt.toISOString(),
+          grossAmountMinor: body.grossAmountMinor,
+          feeMinor: body.feeMinor,
+          netAmountMinor: netAmount.toString(),
+          currency: body.currency,
+          disposition: "unclaimed",
+          allocatedMinor: "0",
+          providerUsed: false,
+        };
+        await client.query(
+          `INSERT INTO manual_receipt_facts(
+             id, client_account_id, reference, received_at,
+             gross_amount_minor, fee_minor, currency, actor_id, reason,
+             idempotency_key, request_fingerprint, result
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [
+            manualReceiptId,
+            params.clientAccountId,
+            body.reference,
+            receivedAt,
+            body.grossAmountMinor,
+            body.feeMinor,
+            body.currency,
+            user.userId,
+            body.reason,
+            body.idempotencyKey,
+            fingerprint,
+            result,
+          ],
+        );
+        await client.query(
+          `INSERT INTO fund_receipts(
+             id, provider_installation_id, external_payment_id,
+             reported_payment_attempt_id, reported_add_funds_attempt_id,
+             reported_manual_receipt_id, client_account_id, amount_minor,
+             allocated_minor, currency, occurred_at, disposition, reason
+           ) VALUES (
+             $1, NULL, NULL, NULL, NULL, $2, $3, $4,
+             0, $5, $6, 'unclaimed', $7
+           )`,
+          [
+            fundReceiptId,
+            manualReceiptId,
+            params.clientAccountId,
+            body.grossAmountMinor,
+            body.currency,
+            receivedAt,
+            body.reason,
+          ],
+        );
+        const journal = await client.query<{ id: string }>(
+          `INSERT INTO ledger_journals(
+             source_type, source_id, currency, description
+           ) VALUES (
+             'manual_receipt', $1, $2, 'Audited manual receipt recorded as unclaimed funds'
+           ) RETURNING id`,
+          [manualReceiptId, body.currency],
+        );
+        const journalId = journal.rows[0]?.id;
+        if (!journalId) throw new Error("Unable to create manual receipt journal");
+        if (netAmount > 0n) {
+          await client.query(
+            `INSERT INTO ledger_lines(
+               journal_id, account_code, debit_minor, credit_minor
+             ) VALUES ($1, 'cash_clearing', $2, 0)`,
+            [journalId, netAmount.toString()],
+          );
+        }
+        if (fee > 0n) {
+          await client.query(
+            `INSERT INTO ledger_lines(
+               journal_id, account_code, debit_minor, credit_minor
+             ) VALUES ($1, 'payment_processing_expense', $2, 0)`,
+            [journalId, fee.toString()],
+          );
+        }
+        await client.query(
+          `INSERT INTO ledger_lines(
+             journal_id, account_code, debit_minor, credit_minor
+           ) VALUES ($1, 'unclaimed_funds_liability', 0, $2)`,
+          [journalId, body.grossAmountMinor],
+        );
+        await client.query(
+          "UPDATE ledger_journals SET sealed_at = now() WHERE id = $1",
+          [journalId],
+        );
+        await client.query(
+          `INSERT INTO audit_events(
+             actor_type, actor_id, action, target_type, target_id, reason, metadata
+           ) VALUES (
+             'staff', $1, 'billing.manual_receipt_recorded',
+             'manual_receipt', $2, $3, $4
+           )`,
+          [
+            user.userId,
+            manualReceiptId,
+            body.reason,
+            {
+              fundReceiptId,
+              clientAccountId: params.clientAccountId,
+              reference: body.reference,
+              receivedAt: receivedAt.toISOString(),
+              grossAmountMinor: body.grossAmountMinor,
+              feeMinor: body.feeMinor,
+              netAmountMinor: netAmount.toString(),
+              currency: body.currency,
+              disposition: "unclaimed",
+              providerUsed: false,
+            },
+          ],
+        );
+        return { ...result, replayed: false };
+      });
+      return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+    },
+  );
+
   app.get("/api/v1/admin/funds/unclaimed", async (request) => {
     const user = await requireUser(request, pool, config);
     await requireStaffPermission(pool, user, "billing.unclaimed_manage");
@@ -197,8 +516,10 @@ export async function registerAdminRoutes(
       id: string;
       client_account_id: string;
       client_account_name: string;
-      provider_installation_id: string;
-      external_payment_id: string;
+      provider_installation_id: string | null;
+      external_payment_id: string | null;
+      reported_manual_receipt_id: string | null;
+      manual_reference: string | null;
       amount_minor: string;
       allocated_minor: string;
       remaining_minor: string;
@@ -219,6 +540,8 @@ export async function registerAdminRoutes(
          account.name AS client_account_name,
          receipt.provider_installation_id,
          receipt.external_payment_id,
+         receipt.reported_manual_receipt_id,
+         manual.reference AS manual_reference,
          receipt.amount_minor::text,
          receipt.allocated_minor::text,
          GREATEST(
@@ -243,6 +566,8 @@ export async function registerAdminRoutes(
          ON capacity.fund_receipt_id = receipt.id
        LEFT JOIN payment_attempts payment
          ON payment.id = receipt.reported_payment_attempt_id
+       LEFT JOIN manual_receipt_facts manual
+         ON manual.id = receipt.reported_manual_receipt_id
        WHERE capacity.available_minor > 0
           OR capacity.reserved_refund_minor > 0
           OR capacity.capacity_frozen
@@ -256,6 +581,9 @@ export async function registerAdminRoutes(
         clientAccountName: row.client_account_name,
         providerInstallationId: row.provider_installation_id,
         externalPaymentId: row.external_payment_id,
+        source: row.reported_manual_receipt_id ? "manual" : "provider",
+        manualReceiptId: row.reported_manual_receipt_id,
+        manualReference: row.manual_reference,
         amountMinor: row.amount_minor,
         allocatedMinor: row.allocated_minor,
         remainingMinor: row.remaining_minor,

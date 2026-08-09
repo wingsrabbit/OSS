@@ -6,9 +6,7 @@ import { assertSchemaCompatible, createPool } from "./database.js";
 const config = loadConfig();
 const pool = createPool(config);
 try {
-  const report = await assertSchemaCompatible(pool, {
-    enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
-  });
+  const report = await assertSchemaCompatible(pool);
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } finally {
   await pool.end();

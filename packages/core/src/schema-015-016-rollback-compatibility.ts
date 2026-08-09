@@ -11,8 +11,10 @@ import {
 export const SCHEMA_016 = "016_stage_b_manual_receipts" as const;
 export const SCHEMA_015_016_GUARD =
   "opensales:schema-015-016-rollback-bridge" as const;
+export const SCHEMA_016_APPLICATION_GUARD =
+  "opensales:schema-016-application" as const;
 export const SCHEMA_016_CATALOG_DIGEST =
-  "1d2d65ad265a749cb2ff7ce5074a820130d2ef5675b53c5c37dd85e1dfd54ce6" as const;
+  "7b832420a692160278bded019b70d5bc245bec2b007efc34c70620bb7f5a2099" as const;
 
 export type Schema015RollbackPreflightReport = Readonly<{
   installedSchemaVersion: string;
@@ -20,6 +22,14 @@ export type Schema015RollbackPreflightReport = Readonly<{
   mode: "native" | "rollback_bridge";
   safe: true;
   blockers: readonly SchemaRollbackBlocker[];
+}>;
+
+export type Schema016NativePreflightReport = Readonly<{
+  installedSchemaVersion: typeof SCHEMA_016;
+  applicationSchemaVersion: typeof SCHEMA_016;
+  mode: "native";
+  safe: true;
+  blockers: readonly [];
 }>;
 
 function rowRecord(row: unknown): Record<string, unknown> {
@@ -119,6 +129,8 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
             'disposition', 'reversed', NULL),
          ('fund_receipts', 'fund_receipts_reported_manual_receipt_id_fkey', 'f',
             'reported_manual_receipt_id', 'manual_receipt_facts', NULL),
+         ('fund_receipts', 'fund_receipts_reported_manual_receipt_id_key', 'u',
+            'reported_manual_receipt_id', NULL, NULL),
          ('manual_receipt_facts', 'manual_receipt_facts_client_account_id_fkey', 'f',
             'client_account_id', 'client_accounts', NULL),
          ('manual_receipt_facts', 'manual_receipt_facts_actor_id_fkey', 'f',
@@ -174,6 +186,12 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ('manual_receipt_facts', 'manual_receipt_facts_append_only',
             'opensales_reject_manual_receipt_mutation',
             ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false),
+         ('ledger_lines', 'manual_receipt_ledger_line_mutation_guard',
+            'opensales_guard_manual_receipt_ledger_line_mutation',
+            ARRAY['BEFORE', 'INSERT', 'UPDATE', 'DELETE']::text[], 31, false, false),
+         ('ledger_journals', 'ledger_journals_append_only',
+            'opensales_reject_ledger_mutation',
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false),
          ('manual_receipt_facts', 'manual_receipt_fact_completeness_guard',
             'opensales_assert_manual_receipt_complete', ARRAY['AFTER', 'INSERT']::text[], 5, true, true),
          ('manual_receipt_reversals', 'manual_receipt_reversals_append_only',
@@ -211,7 +229,10 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
             ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
          ('fund_receipts', 'manual_receipt_fund_receipt_write_guard',
             'opensales_manual_receipt_marker_write_guard',
-            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false)
+            ARRAY['BEFORE', 'INSERT', 'UPDATE']::text[], 23, false, false),
+         ('fund_receipts', 'fund_receipts_external_facts_append_only',
+            'opensales_guard_fund_receipt_fact_mutation',
+            ARRAY['BEFORE', 'UPDATE', 'DELETE']::text[], 27, false, false)
      ), trigger_shape AS (
        SELECT count(*) = (SELECT count(*) FROM required_triggers) AS valid
        FROM required_triggers required
@@ -248,6 +269,16 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                   'reported_manual_receipt_id', 'reversed']::text[]),
          ('opensales_reject_manual_receipt_mutation',
             ARRAY['RAISE EXCEPTION', 'append-only']::text[]),
+         ('opensales_guard_manual_receipt_ledger_line_mutation',
+            ARRAY['ledger_journals', 'sealed_at', 'manual_receipt',
+                  'manual_receipt_reversal', 'manual_receipt_outflow',
+                  'RAISE EXCEPTION']::text[]),
+         ('opensales_guard_fund_receipt_fact_mutation',
+            ARRAY['Fund receipt external facts are append-only',
+                  'reported_manual_receipt_id']::text[]),
+         ('opensales_reject_ledger_mutation',
+            ARRAY['ledger_journals', 'OLD.sealed_at IS NULL',
+                  'NEW.sealed_at IS NOT NULL', 'append-only']::text[]),
          ('opensales_assert_manual_receipt_complete',
             ARRAY['ledger_journals', 'ledger_lines', 'manual_receipt',
                   'unclaimed_funds_liability', 'cash_clearing', 'sealed_at']::text[]),
@@ -329,7 +360,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                         actual.contype::text, actual.convalidated::text,
                         actual.condeferrable::text, actual.condeferred::text,
                         actual.connoinherit::text,
-                        regexp_replace(pg_get_constraintdef(actual.oid), '\s+', ' ', 'g'))
+                        regexp_replace(pg_get_constraintdef(actual.oid), '\\s+', ' ', 'g'))
        FROM pg_namespace namespace
        JOIN pg_class relation ON relation.relnamespace = namespace.oid
        JOIN pg_constraint actual ON actual.conrelid = relation.oid
@@ -343,6 +374,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
            OR (relation.relname = 'fund_receipts'
              AND actual.conname IN (
                'fund_receipts_reported_manual_receipt_id_fkey',
+               'fund_receipts_reported_manual_receipt_id_key',
                'fund_receipts_exactly_one_source',
                'fund_receipts_source_provider_fields',
                'fund_receipts_disposition_check'
@@ -353,7 +385,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                         actual.tgenabled::text, actual.tgtype::text,
                         actual.tgdeferrable::text, actual.tginitdeferred::text,
                         procedure_namespace.nspname, procedure.proname,
-                        regexp_replace(pg_get_triggerdef(actual.oid, true), '\s+', ' ', 'g'))
+                        regexp_replace(pg_get_triggerdef(actual.oid, true), '\\s+', ' ', 'g'))
        FROM pg_namespace namespace
        JOIN pg_class relation ON relation.relnamespace = namespace.oid
        JOIN pg_trigger actual ON actual.tgrelid = relation.oid
@@ -375,7 +407,10 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
              'manual_receipt_job_write_guard',
              'manual_receipt_inbox_write_guard',
              'manual_receipt_outbox_write_guard',
-             'manual_receipt_fund_receipt_write_guard'
+             'manual_receipt_fund_receipt_write_guard',
+             'manual_receipt_ledger_line_mutation_guard',
+             'fund_receipts_external_facts_append_only',
+             'ledger_journals_append_only'
            )
          )
        UNION ALL
@@ -385,7 +420,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                         COALESCE(array_to_string(actual.proconfig, ','), ''),
                         pg_get_function_identity_arguments(actual.oid),
                         pg_get_function_result(actual.oid),
-                        regexp_replace(btrim(actual.prosrc), '\s+', ' ', 'g'))
+                        regexp_replace(btrim(actual.prosrc), '\\s+', ' ', 'g'))
        FROM pg_namespace namespace
        JOIN pg_proc actual ON actual.pronamespace = namespace.oid
        JOIN pg_language language ON language.oid = actual.prolang
@@ -394,6 +429,9 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
            'opensales_manual_receipt_write_guard',
            'opensales_manual_receipt_marker_write_guard',
            'opensales_reject_manual_receipt_mutation',
+           'opensales_guard_manual_receipt_ledger_line_mutation',
+           'opensales_guard_fund_receipt_fact_mutation',
+           'opensales_reject_ledger_mutation',
            'opensales_assert_manual_receipt_complete',
            'opensales_assert_manual_receipt_reversal_complete',
            'opensales_assert_manual_receipt_outflow_complete',
@@ -404,7 +442,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
        SELECT concat_ws('|', 'view', 'unclaimed_fund_refund_capacity',
                         regexp_replace(
                           pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true),
-                          '\s+', ' ', 'g'
+                          '\\s+', ' ', 'g'
                         ))
      ), catalog_fingerprint(value) AS (
        SELECT string_agg(item, E'\n' ORDER BY item)
@@ -440,7 +478,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
       : null;
   if (catalogDigest !== SCHEMA_016_CATALOG_DIGEST) {
     throw new SchemaRollbackPreflightError(
-      `Schema 016 is incomplete or counterfeit: catalog digest ${String(catalogDigest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start the 015 rollback bridge.`,
+      `Schema 016 is incomplete or counterfeit: catalog digest ${String(catalogDigest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start a schema-016 application or the 015 rollback bridge.`,
       SCHEMA_016,
     );
   }
@@ -453,10 +491,32 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
     shape.has_capacity_view !== true
   ) {
     throw new SchemaRollbackPreflightError(
-      "Schema 016 is incomplete or counterfeit; do not start the 015 rollback bridge. Deploy a compatible application and repair forward without a down migration.",
+      "Schema 016 is incomplete or counterfeit; do not start a schema-016 application or the 015 rollback bridge. Deploy a compatible application and repair forward without a down migration.",
       SCHEMA_016,
     );
   }
+}
+
+export async function assertSchema016NativeSafe(
+  database: RollbackPreflightQueryable,
+): Promise<Schema016NativePreflightReport> {
+  const installed = await installedSchemaVersion(database);
+  if (installed !== SCHEMA_016) {
+    throw new SchemaRollbackPreflightError(
+      installed === null
+        ? `Database schema is missing; application schema ${SCHEMA_016} requires a forward migration.`
+        : `Database schema ${installed} is incompatible with application schema ${SCHEMA_016}; run the dedicated forward migration or the matching application version.`,
+      installed,
+    );
+  }
+  await assertSchema016Shape(database);
+  return {
+    installedSchemaVersion: SCHEMA_016,
+    applicationSchemaVersion: SCHEMA_016,
+    mode: "native",
+    safe: true,
+    blockers: [],
+  };
 }
 
 async function schema016Blockers(

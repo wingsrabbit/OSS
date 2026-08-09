@@ -14,8 +14,8 @@ import {
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
 import {
-  assert015RollbackBridgeSafe,
-  SCHEMA_015_016_GUARD,
+  assertSchema016NativeSafe,
+  SCHEMA_016_APPLICATION_GUARD,
 } from "@opensales/core/schema-015-016-rollback-compatibility";
 import pg from "pg";
 import { z } from "zod";
@@ -104,7 +104,9 @@ async function cleanupWorkerResources(): Promise<void> {
     tokenRegistryGuard = null;
   }
   if (schemaCompatibilityGuard) {
-    releases.push(releaseWorkerGuard(schemaCompatibilityGuard, SCHEMA_015_016_GUARD));
+    releases.push(
+      releaseWorkerGuard(schemaCompatibilityGuard, SCHEMA_016_APPLICATION_GUARD),
+    );
     schemaCompatibilityGuard = null;
   }
   for (const result of await Promise.allSettled(releases)) {
@@ -7377,7 +7379,7 @@ try {
   await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
   await schemaCompatibilityGuard.query(
     "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
-    [SCHEMA_015_016_GUARD],
+    [SCHEMA_016_APPLICATION_GUARD],
   );
   await schemaCompatibilityGuard.query("RESET lock_timeout");
   try {
@@ -7385,12 +7387,9 @@ try {
       "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
     );
     await schemaCompatibilityGuard.query("SET LOCAL search_path TO pg_catalog, public");
-    await assert015RollbackBridgeSafe(
+    await assertSchema016NativeSafe(
       {
         query: async (text, values) => schemaCompatibilityGuard!.query(text, values),
-      },
-      {
-        enable016RollbackBridge: config.OSS_SCHEMA_ROLLBACK_BRIDGE === "015-to-016",
       },
     );
     await schemaCompatibilityGuard.query("COMMIT");

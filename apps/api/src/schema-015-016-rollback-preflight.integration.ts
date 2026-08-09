@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import {
   assert015RollbackBridgeSafe,
+  assertSchema016NativeSafe,
   SCHEMA_015_016_GUARD,
   SCHEMA_016,
   SCHEMA_016_CATALOG_DIGEST,
@@ -13,7 +14,7 @@ import {
 } from "@opensales/core/schema-rollback-compatibility";
 import pg from "pg";
 import {
-  assertSchemaCompatible,
+  assertSchema015ApplicationCompatible,
   holdSchema015RollbackBridgeGuard,
   runMigrations,
 } from "./database.js";
@@ -38,7 +39,7 @@ try {
     "SELECT max(version) AS version FROM schema_migrations",
   );
   assert.equal(installed.rows[0]?.version, SCHEMA_015);
-  const native = await assertSchemaCompatible(pool);
+  const native = await assertSchema015ApplicationCompatible(pool);
   assert.equal(native.mode, "native");
 
   await client.query(`
@@ -127,7 +128,7 @@ try {
       DROP CONSTRAINT fund_receipts_disposition_check;
 
     CREATE TABLE manual_receipt_facts(
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
       client_account_id uuid NOT NULL REFERENCES client_accounts(id),
       reference text NOT NULL,
       received_at timestamptz NOT NULL,
@@ -167,9 +168,37 @@ try {
           'charged_back', 'reversed'
         )
       );
+    ALTER TABLE fund_receipts
+      ADD CONSTRAINT fund_receipts_reported_manual_receipt_id_key
+        UNIQUE (reported_manual_receipt_id);
+
+    CREATE OR REPLACE FUNCTION opensales_guard_fund_receipt_fact_mutation()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'Fund receipt external facts are append-only';
+      END IF;
+      IF NEW.id IS DISTINCT FROM OLD.id
+         OR NEW.provider_installation_id IS DISTINCT FROM OLD.provider_installation_id
+         OR NEW.external_payment_id IS DISTINCT FROM OLD.external_payment_id
+         OR NEW.reported_payment_attempt_id IS DISTINCT FROM OLD.reported_payment_attempt_id
+         OR NEW.reported_add_funds_attempt_id IS DISTINCT FROM OLD.reported_add_funds_attempt_id
+         OR NEW.reported_manual_receipt_id IS DISTINCT FROM OLD.reported_manual_receipt_id
+         OR NEW.client_account_id IS DISTINCT FROM OLD.client_account_id
+         OR NEW.amount_minor IS DISTINCT FROM OLD.amount_minor
+         OR NEW.currency IS DISTINCT FROM OLD.currency
+         OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'Fund receipt external facts are append-only';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
 
     CREATE TABLE manual_receipt_reversals(
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
       manual_receipt_id uuid NOT NULL UNIQUE REFERENCES manual_receipt_facts(id),
       fund_receipt_id uuid NOT NULL UNIQUE REFERENCES fund_receipts(id),
       actor_id uuid NOT NULL REFERENCES users(id),
@@ -180,7 +209,7 @@ try {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE TABLE manual_receipt_outflows(
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
       manual_receipt_id uuid NOT NULL REFERENCES manual_receipt_facts(id),
       fund_receipt_id uuid NOT NULL REFERENCES fund_receipts(id),
       amount_minor bigint NOT NULL CHECK (amount_minor > 0),
@@ -272,6 +301,29 @@ try {
     CREATE TRIGGER manual_receipt_facts_append_only
       BEFORE UPDATE OR DELETE ON manual_receipt_facts
       FOR EACH ROW EXECUTE FUNCTION opensales_reject_manual_receipt_mutation();
+    CREATE FUNCTION opensales_guard_manual_receipt_ledger_line_mutation()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE protected_count integer;
+    BEGIN
+      SELECT count(*)
+      INTO protected_count
+      FROM ledger_journals journal
+      WHERE journal.id IN (
+          CASE WHEN TG_OP = 'INSERT' THEN NEW.journal_id ELSE OLD.journal_id END,
+          CASE WHEN TG_OP = 'DELETE' THEN OLD.journal_id ELSE NEW.journal_id END
+        )
+        AND journal.source_type IN (
+          'manual_receipt', 'manual_receipt_reversal', 'manual_receipt_outflow'
+        )
+        AND journal.sealed_at IS NOT NULL;
+      IF protected_count > 0 THEN
+        RAISE EXCEPTION 'Sealed manual receipt journal lines cannot be changed';
+      END IF;
+      RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END $$;
+    CREATE TRIGGER manual_receipt_ledger_line_mutation_guard
+      BEFORE INSERT OR UPDATE OR DELETE ON ledger_lines
+      FOR EACH ROW EXECUTE FUNCTION opensales_guard_manual_receipt_ledger_line_mutation();
     CREATE FUNCTION opensales_assert_manual_receipt_complete()
     RETURNS trigger LANGUAGE plpgsql AS $$
     DECLARE valid boolean;
@@ -297,11 +349,15 @@ try {
       GROUP BY journal.id, journal.sealed_at;
       IF NOT COALESCE(valid, false)
          OR NOT EXISTS (
-           SELECT 1 FROM fund_receipts receipt
-           WHERE receipt.reported_manual_receipt_id = NEW.id
-             AND receipt.amount_minor = NEW.gross_amount_minor
-             AND receipt.currency = NEW.currency
-         ) THEN
+               SELECT 1 FROM fund_receipts receipt
+               WHERE receipt.reported_manual_receipt_id = NEW.id
+                 AND receipt.client_account_id = NEW.client_account_id
+                 AND receipt.amount_minor = NEW.gross_amount_minor
+                 AND receipt.currency = NEW.currency
+                 AND receipt.occurred_at = NEW.received_at
+                 AND receipt.allocated_minor = 0
+                 AND receipt.disposition = 'unclaimed'
+             ) THEN
         RAISE EXCEPTION 'manual receipt ledger/fund fact is incomplete';
       END IF;
       RETURN NULL;
@@ -701,6 +757,8 @@ try {
     enable016RollbackBridge: true,
   });
   assert.equal(empty016.mode, "rollback_bridge");
+  const emptyNative016 = await assertSchema016NativeSafe(database);
+  assert.equal(emptyNative016.mode, "native");
 
   await client.query("ALTER TABLE manual_receipt_facts DISABLE TRIGGER manual_receipt_facts_append_only");
   await assert.rejects(
@@ -708,6 +766,39 @@ try {
     /incomplete or counterfeit/,
   );
   await client.query("ALTER TABLE manual_receipt_facts ENABLE TRIGGER manual_receipt_facts_append_only");
+
+  await client.query(
+    "ALTER TABLE ledger_lines DISABLE TRIGGER manual_receipt_ledger_line_mutation_guard",
+  );
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query(
+    "ALTER TABLE ledger_lines ENABLE TRIGGER manual_receipt_ledger_line_mutation_guard",
+  );
+
+  await client.query(
+    "ALTER TABLE ledger_journals DISABLE TRIGGER ledger_journals_append_only",
+  );
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query(
+    "ALTER TABLE ledger_journals ENABLE TRIGGER ledger_journals_append_only",
+  );
+
+  await client.query(
+    "ALTER TABLE fund_receipts DISABLE TRIGGER fund_receipts_external_facts_append_only",
+  );
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query(
+    "ALTER TABLE fund_receipts ENABLE TRIGGER fund_receipts_external_facts_append_only",
+  );
 
   await client.query("SAVEPOINT replica_trigger");
   await client.query(
@@ -870,6 +961,8 @@ try {
   );
 
   let blocked: unknown;
+  const populatedNative016 = await assertSchema016NativeSafe(database);
+  assert.equal(populatedNative016.mode, "native");
   try {
     await assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true });
   } catch (error) {
@@ -897,6 +990,7 @@ try {
       publicFunctionShadowRejected: true,
       incompleteSchema016Rejected: true,
       emptySchema016Accepted: true,
+      populatedSchema016AcceptedNatively: true,
       disabledTriggerRejected: true,
       replicaTriggerRejected: true,
       counterfeitConstraintRejected: true,
