@@ -153,8 +153,11 @@ type UnclaimedFundItem = {
   receiptId: string;
   clientAccountId: string;
   clientAccountName: string;
-  providerInstallationId: string;
-  externalPaymentId: string;
+  providerInstallationId: string | null;
+  externalPaymentId: string | null;
+  source: "manual" | "provider";
+  manualReceiptId: string | null;
+  manualReference: string | null;
   amountMinor: string;
   allocatedMinor: string;
   remainingMinor: string;
@@ -167,6 +170,38 @@ type UnclaimedFundItem = {
   disposition: string;
   reason: string | null;
   suggestedInvoiceId: string | null;
+};
+type ManualReceiptItem = {
+  manualReceiptId: string;
+  fundReceiptId: string;
+  reference: string;
+  receivedAt: string;
+  grossAmountMinor: string;
+  feeMinor: string;
+  netAmountMinor: string;
+  allocatedMinor: string;
+  availableMinor: string;
+  capacityFrozen: boolean;
+  currency: "USD";
+  disposition: string;
+  actorId: string;
+  reason: string;
+  createdAt: string;
+};
+type ManualReceiptOutcome = {
+  manualReceiptId: string;
+  fundReceiptId: string;
+  clientAccountId: string;
+  reference: string;
+  receivedAt: string;
+  grossAmountMinor: string;
+  feeMinor: string;
+  netAmountMinor: string;
+  currency: "USD";
+  disposition: "unclaimed";
+  allocatedMinor: "0";
+  providerUsed: false;
+  replayed: boolean;
 };
 type RefundCandidate = {
   receiptId: string;
@@ -612,10 +647,12 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function usd(minor: string): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-  }).format(Number(minor) / 100);
+  const value = BigInt(minor);
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  const dollars = absolute / 100n;
+  const cents = (absolute % 100n).toString().padStart(2, "0");
+  return `${negative ? "-" : ""}$${dollars.toLocaleString("en-US")}.${cents}`;
 }
 
 function reminderLabel(reminder: RenewalReminder): string {
@@ -644,6 +681,31 @@ async function refundIntentStorageKey(requestIdentity: string): Promise<string> 
     byte.toString(16).padStart(2, "0"),
   ).join("");
   return `opensales:refund-intent:${fingerprint}`;
+}
+
+async function manualReceiptIntentStorageKey(requestIdentity: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(requestIdentity),
+  );
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `opensales:manual-receipt-intent:${fingerprint}`;
+}
+
+function defaultManualReceiptTime(): string {
+  const instant = new Date(Date.now() - 60_000);
+  const localWallClock = new Date(
+    instant.getTime() - instant.getTimezoneOffset() * 60_000,
+  );
+  return localWallClock.toISOString().slice(0, 16);
+}
+
+function looksLikeUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    value.trim(),
+  );
 }
 
 export function App() {
@@ -704,6 +766,24 @@ export function App() {
     string | null
   >(null);
   const cancellationCompletionIntentKeys = useRef(new Map<string, string>());
+  const [manualReceiptClientAccountId, setManualReceiptClientAccountId] = useState("");
+  const [manualReceiptReference, setManualReceiptReference] = useState("");
+  const [manualReceiptReceivedAt, setManualReceiptReceivedAt] = useState(
+    defaultManualReceiptTime,
+  );
+  const [manualReceiptGrossMinor, setManualReceiptGrossMinor] = useState("10000");
+  const [manualReceiptFeeMinor, setManualReceiptFeeMinor] = useState("0");
+  const [manualReceiptReason, setManualReceiptReason] = useState("");
+  const [manualReceiptPending, setManualReceiptPending] = useState(false);
+  const [manualReceiptHistory, setManualReceiptHistory] = useState<ManualReceiptItem[]>([]);
+  const [manualReceiptTarget, setManualReceiptTarget] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+  const [manualReceiptOutcome, setManualReceiptOutcome] =
+    useState<ManualReceiptOutcome | null>(null);
+  const manualReceiptIntentKeys = useRef(new Map<string, string>());
+  const manualReceiptDefaultedForUser = useRef<string | null>(null);
   const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
   const [refundRecords, setRefundRecords] = useState<Record<string, RefundRecord>>({});
@@ -759,6 +839,24 @@ export function App() {
   >(new Set());
   const [bootstrapToken, setBootstrapToken] = useState("");
   const text = words[locale];
+  const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const manualReceiptAmountsValid =
+    /^[1-9]\d*$/.test(manualReceiptGrossMinor) &&
+    /^(0|[1-9]\d*)$/.test(manualReceiptFeeMinor) &&
+    BigInt(manualReceiptFeeMinor) <= BigInt(manualReceiptGrossMinor);
+  const manualReceiptNetMinor = manualReceiptAmountsValid
+    ? (BigInt(manualReceiptGrossMinor) - BigInt(manualReceiptFeeMinor)).toString()
+    : null;
+  const manualReceiptFormReady =
+    looksLikeUuid(manualReceiptClientAccountId) &&
+    manualReceiptTarget?.id === manualReceiptClientAccountId.trim().toLowerCase() &&
+    manualReceiptReference.trim().length > 0 &&
+    manualReceiptReference.trim().length <= 200 &&
+    manualReceiptReceivedAt.length > 0 &&
+    manualReceiptAmountsValid &&
+    manualReceiptReason.trim().length >= 10 &&
+    manualReceiptReason.trim().length <= 1_000 &&
+    adminPassword.length > 0;
   const paymentSettingsReauthActive =
     paymentSettingsReauthExpiresAt !== null && paymentSettingsReauthExpiresAt > Date.now();
   const paymentSettingsReauthReady =
@@ -849,6 +947,24 @@ export function App() {
       setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
     );
   }, [locale, refreshMe]);
+
+  useEffect(() => {
+    if (!me?.staff) {
+      manualReceiptDefaultedForUser.current = null;
+      setManualReceiptClientAccountId("");
+      setManualReceiptHistory([]);
+      setManualReceiptTarget(null);
+      setManualReceiptOutcome(null);
+      return;
+    }
+    if (manualReceiptDefaultedForUser.current === me.id) return;
+    manualReceiptDefaultedForUser.current = me.id;
+    setManualReceiptClientAccountId("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+  }, [me]);
 
   useEffect(() => {
     void refreshLatestOrder().catch(() => undefined);
@@ -1802,6 +1918,121 @@ export function App() {
       setNotice("Administrator role created. The bootstrap token is now unusable.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Administrator bootstrap failed");
+    }
+  }
+
+  async function fetchManualReceiptHistory(clientAccountId: string): Promise<{
+    clientAccount: { id: string; name: string };
+    items: ManualReceiptItem[];
+  }> {
+    return api<{
+      clientAccount: { id: string; name: string };
+      items: ManualReceiptItem[];
+    }>(
+      `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
+    );
+  }
+
+  async function loadManualReceiptHistory() {
+    const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
+    if (
+      !me?.staff || manualReceiptPending || !looksLikeUuid(clientAccountId)
+    ) {
+      return;
+    }
+    setError("");
+    setManualReceiptPending(true);
+    try {
+      const result = await fetchManualReceiptHistory(clientAccountId);
+      setManualReceiptTarget(result.clientAccount);
+      setManualReceiptHistory(result.items);
+      setNotice(
+        `Verified ${result.clientAccount.name} (${result.clientAccount.id}) and refreshed its manual receipt history.`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Manual receipt history is unavailable");
+    } finally {
+      setManualReceiptPending(false);
+    }
+  }
+
+  async function recordManualReceipt() {
+    if (!me?.staff || manualReceiptPending || !manualReceiptFormReady) return;
+    const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
+    const payload = {
+      reference: manualReceiptReference.trim(),
+      receivedAt: new Date(manualReceiptReceivedAt).toISOString(),
+      grossAmountMinor: manualReceiptGrossMinor,
+      feeMinor: manualReceiptFeeMinor,
+      currency: "USD" as const,
+      reason: manualReceiptReason.trim(),
+    };
+    const requestIdentity = JSON.stringify({ clientAccountId, ...payload });
+    setError("");
+    setManualReceiptPending(true);
+    try {
+      const storageKey = await manualReceiptIntentStorageKey(requestIdentity);
+      let storedKey: string | null = null;
+      try {
+        storedKey = window.localStorage.getItem(storageKey);
+      } catch {
+        storedKey = null;
+      }
+      const idempotencyKey =
+        manualReceiptIntentKeys.current.get(requestIdentity) ??
+        storedKey ??
+        newIdempotencyKey();
+      manualReceiptIntentKeys.current.set(requestIdentity, idempotencyKey);
+      try {
+        window.localStorage.setItem(storageKey, idempotencyKey);
+      } catch {
+        // The in-memory key still makes a retry in this page replay-safe.
+      }
+
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      setAdminPassword("");
+      const outcome = await api<ManualReceiptOutcome>(
+        `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
+        {
+          method: "POST",
+          body: JSON.stringify({ ...payload, idempotencyKey }),
+        },
+      );
+      manualReceiptIntentKeys.current.delete(requestIdentity);
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // A successful Core response is authoritative even if browser storage is unavailable.
+      }
+      setManualReceiptOutcome(outcome);
+      setManualReceiptReference("");
+      setManualReceiptGrossMinor("10000");
+      setManualReceiptFeeMinor("0");
+      setManualReceiptReason("");
+      setManualReceiptReceivedAt(defaultManualReceiptTime());
+      const [historyRefresh, unclaimedRefresh] = await Promise.allSettled([
+        fetchManualReceiptHistory(clientAccountId),
+        refreshUnclaimedFunds(),
+      ]);
+      if (historyRefresh.status === "fulfilled") {
+        setManualReceiptTarget(historyRefresh.value.clientAccount);
+        setManualReceiptHistory(historyRefresh.value.items);
+      }
+      setNotice(
+        outcome.replayed
+          ? "This exact manual receipt was already recorded; no second cash or liability entry was created."
+          : "Manual receipt recorded as unclaimed funds. No Provider, invoice payment, Credit, or service action was triggered.",
+      );
+      if (historyRefresh.status === "rejected" || unclaimedRefresh.status === "rejected") {
+        setError("The receipt was saved, but one of the administrator lists could not be refreshed.");
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
+    } finally {
+      setManualReceiptPending(false);
     }
   }
 
@@ -3522,6 +3753,173 @@ export function App() {
                 ))}
               </>
             )}
+            <div className="admin-subsection" aria-label="Record manual receipt">
+              <div>
+                <p className="eyebrow">Audited offline or manual money fact</p>
+                <h3>Record received funds manually</h3>
+                <p>
+                  Use this only after staff independently confirms that money arrived. Core records
+                  immutable gross, fee, net cash, and unclaimed liability facts. It does not call a
+                  Provider, pay an invoice, add Credit, or activate a service.
+                </p>
+              </div>
+              <div className="manual-receipt-form">
+                <label>
+                  <span>Client Account ID</span>
+                  <input
+                    aria-label="Manual receipt Client Account ID"
+                    disabled={manualReceiptPending}
+                    value={manualReceiptClientAccountId}
+                    onChange={(event) => {
+                      setManualReceiptClientAccountId(event.target.value);
+                      setManualReceiptHistory([]);
+                      setManualReceiptTarget(null);
+                      setManualReceiptOutcome(null);
+                    }}
+                    placeholder="Client Account UUID"
+                  />
+                </label>
+                <label>
+                  <span>Receipt reference</span>
+                  <input
+                    aria-label="Manual receipt reference"
+                    disabled={manualReceiptPending}
+                    value={manualReceiptReference}
+                    onChange={(event) => setManualReceiptReference(event.target.value)}
+                    maxLength={200}
+                    placeholder="Bank or offline receipt reference"
+                  />
+                </label>
+                <label>
+                  <span>Received at ({browserTimeZone})</span>
+                  <input
+                    aria-label="Manual receipt received at"
+                    type="datetime-local"
+                    disabled={manualReceiptPending}
+                    value={manualReceiptReceivedAt}
+                    onChange={(event) => setManualReceiptReceivedAt(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Gross received (USD cents)</span>
+                  <input
+                    aria-label="Manual receipt gross amount in cents"
+                    inputMode="numeric"
+                    disabled={manualReceiptPending}
+                    maxLength={19}
+                    value={manualReceiptGrossMinor}
+                    onChange={(event) => setManualReceiptGrossMinor(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Actual processing fee (USD cents)</span>
+                  <input
+                    aria-label="Manual receipt fee in cents"
+                    inputMode="numeric"
+                    disabled={manualReceiptPending}
+                    maxLength={19}
+                    value={manualReceiptFeeMinor}
+                    onChange={(event) => setManualReceiptFeeMinor(event.target.value)}
+                  />
+                </label>
+                <label className="manual-receipt-reason">
+                  <span>Reason and independent evidence</span>
+                  <textarea
+                    aria-label="Manual receipt reason"
+                    disabled={manualReceiptPending}
+                    value={manualReceiptReason}
+                    onChange={(event) => setManualReceiptReason(event.target.value)}
+                    maxLength={1_000}
+                    placeholder="What was checked, where the money arrived, and why it belongs to this Client Account (10+ characters)"
+                  />
+                </label>
+              </div>
+              {manualReceiptTarget ? (
+                <p className="notice" data-testid="manual-receipt-target">
+                  Verified target: {manualReceiptTarget.name} · {manualReceiptTarget.id}
+                </p>
+              ) : (
+                <p className="muted">
+                  Verify the Client Account ID and review its name before recording money.
+                </p>
+              )}
+              {manualReceiptNetMinor === null ? (
+                <p className="notice error">
+                  Gross must be positive; fee must be zero or positive and cannot exceed gross.
+                </p>
+              ) : (
+                <p className="notice" data-testid="manual-receipt-impact">
+                  Preview: gross {usd(manualReceiptGrossMinor)} · fee {usd(manualReceiptFeeMinor)} ·
+                  net cash {usd(manualReceiptNetMinor)} · unclaimed liability {usd(manualReceiptGrossMinor)}
+                </p>
+              )}
+              <div className="fund-actions">
+                <button
+                  className="primary"
+                  disabled={manualReceiptPending || !manualReceiptFormReady}
+                  onClick={() => void recordManualReceipt()}
+                >
+                  {manualReceiptPending ? "Recording…" : "Record manual receipt"}
+                </button>
+                <button
+                  disabled={manualReceiptPending || !looksLikeUuid(manualReceiptClientAccountId)}
+                  onClick={() => void loadManualReceiptHistory()}
+                >
+                  Verify account &amp; load history
+                </button>
+              </div>
+              {manualReceiptOutcome && (
+                <article
+                  className="manual-item"
+                  data-testid="manual-receipt-outcome"
+                  data-manual-receipt-id={manualReceiptOutcome.manualReceiptId}
+                >
+                  <div>
+                    <strong>
+                      {manualReceiptOutcome.reference} · {usd(manualReceiptOutcome.grossAmountMinor)}
+                      {manualReceiptOutcome.replayed ? " · replayed safely" : " · recorded"}
+                    </strong>
+                    <span>
+                      Fee {usd(manualReceiptOutcome.feeMinor)} · net cash {usd(manualReceiptOutcome.netAmountMinor)} ·
+                      disposition {manualReceiptOutcome.disposition}
+                    </span>
+                    <span>
+                      {manualReceiptTarget?.name ?? "Verified Client Account"} · {manualReceiptOutcome.clientAccountId}
+                    </span>
+                    <span>No Provider or automatic customer balance/service action was used.</span>
+                    <span className="mono">
+                      receipt {manualReceiptOutcome.manualReceiptId} · fund {manualReceiptOutcome.fundReceiptId}
+                    </span>
+                  </div>
+                </article>
+              )}
+              {manualReceiptHistory.length > 0 && (
+                <div data-testid="manual-receipt-history">
+                  {manualReceiptHistory.map((receipt) => (
+                    <article
+                      className="manual-item"
+                      data-testid="manual-receipt-history-item"
+                      data-manual-receipt-id={receipt.manualReceiptId}
+                      data-received-at={receipt.receivedAt}
+                      key={receipt.manualReceiptId}
+                    >
+                      <div>
+                        <strong>
+                          {receipt.reference} · {usd(receipt.grossAmountMinor)} gross
+                        </strong>
+                        <span>
+                          Fee {usd(receipt.feeMinor)} · net {usd(receipt.netAmountMinor)} · available {usd(receipt.availableMinor)}
+                        </span>
+                        <span>
+                          Received {new Date(receipt.receivedAt).toLocaleString()} · {receipt.disposition}
+                        </span>
+                        <span>{receipt.reason}</span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="admin-subsection">
               <div>
                 <p className="eyebrow">Money received but not yet assigned</p>
@@ -3612,6 +4010,7 @@ export function App() {
                       className="manual-item"
                       data-testid="unclaimed-fund-item"
                       data-receipt-id={item.receiptId}
+                      data-source={item.source}
                       key={item.receiptId}
                     >
                       <div>
@@ -3619,14 +4018,20 @@ export function App() {
                           {item.clientAccountName} · actionable {usd(item.availableMinor)}
                         </strong>
                         <span>
-                          Received {usd(item.amountMinor)} via {item.providerInstallationId}
+                          Received {usd(item.amountMinor)} via {item.source === "manual"
+                            ? `manual receipt ${item.manualReference ?? "without reference"}`
+                            : `Provider ${item.providerInstallationId ?? "unknown"}`}
                         </span>
                         <span>
                           Allocated {usd(item.allocatedMinor)} · pending return{" "}
                           {usd(item.reservedRefundMinor)} · confirmed returned{" "}
                           {usd(item.confirmedOutflowMinor)}
                         </span>
-                        <span className="mono">{item.externalPaymentId}</span>
+                        <span className="mono">
+                          {item.source === "manual"
+                            ? `manual ${item.manualReceiptId ?? "unknown"}`
+                            : item.externalPaymentId}
+                        </span>
                         <span>{item.reason ?? "Awaiting operator classification"}</span>
                         {item.capacityFrozen && (
                           <span>
@@ -3665,22 +4070,28 @@ export function App() {
                         >
                           Allocate amount to invoice
                         </button>
-                        <button
-                          data-testid="return-unclaimed-funds"
-                          disabled={
-                            fundResolutionPendingReceiptIds.has(item.receiptId) ||
-                            refundPendingReceiptIds.has(item.receiptId) ||
-                            item.capacityFrozen ||
-                            BigInt(item.availableMinor) <= 0n ||
-                            adminPassword.length === 0 ||
-                            fundReturnReason.trim().length < 10 ||
-                            (fundReturnAmountMode === "partial" &&
-                              !/^[1-9]\d*$/.test(fundReturnAmountMinor))
-                          }
-                          onClick={() => returnUnclaimedFunds(item)}
-                        >
-                          Return to original payment
-                        </button>
+                        {item.source === "provider" ? (
+                          <button
+                            data-testid="return-unclaimed-funds"
+                            disabled={
+                              fundResolutionPendingReceiptIds.has(item.receiptId) ||
+                              refundPendingReceiptIds.has(item.receiptId) ||
+                              item.capacityFrozen ||
+                              BigInt(item.availableMinor) <= 0n ||
+                              adminPassword.length === 0 ||
+                              fundReturnReason.trim().length < 10 ||
+                              (fundReturnAmountMode === "partial" &&
+                                !/^[1-9]\d*$/.test(fundReturnAmountMinor))
+                            }
+                            onClick={() => returnUnclaimedFunds(item)}
+                          >
+                            Return to original payment
+                          </button>
+                        ) : (
+                          <span data-testid="manual-receipt-no-provider-return">
+                            No Provider refund target. Use an audited manual outflow decision.
+                          </span>
+                        )}
                       </div>
                     </article>
                   ))}

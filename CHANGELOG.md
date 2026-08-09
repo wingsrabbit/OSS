@@ -14,6 +14,12 @@ All notable project changes will be documented here. Project release numbering a
   append-only facts, exposes the receipt in the unclaimed-funds queue, and does
   not involve a Provider or automatically pay an invoice, create Credit, or
   activate a service.
+- The administrator page resolves and displays the exact target Client Account
+  before manual receipt submission, previews gross, actual fee, net cash, and
+  unclaimed liability with bigint-safe USD formatting, records the browser-local
+  receipt time with its named timezone, and safely replays an ambiguous response
+  without a second money entry. Manual receipts never expose the Provider-only
+  original-payment return action.
 - Manual receipts post one balanced journal from net cash and actual processing
   expense to the gross unclaimed-funds liability. Idempotency replay returns the
   original result, while reused keys and concurrent duplicate references fail
