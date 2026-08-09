@@ -295,6 +295,7 @@ export async function schema017CatalogFingerprintInput(
            'opensales_guard_credit_balance',
            'opensales_validate_unclaimed_funds_credit',
            'opensales_validate_fund_receipt_resolution',
+           'opensales_guard_manual_outflow_resolution_capacity',
            'opensales_reject_fund_resolution_mutation',
            'opensales_validate_fund_resolution_request',
            'opensales_validate_fund_receipt_allocation',

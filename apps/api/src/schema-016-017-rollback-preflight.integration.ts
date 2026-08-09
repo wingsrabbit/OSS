@@ -206,6 +206,447 @@ test("manual outflow authorization requires both manual-receipt and refund permi
   }
 });
 
+test("unknown converted Credit is held, then consumed Credit becomes audited debt", async () => {
+  const client = await pool.connect();
+  const userId = randomUUID();
+  const clientAccountId = randomUUID();
+  const sessionId = randomUUID();
+  const reauthId = randomUUID();
+  const manualReceiptId = randomUUID();
+  const fundReceiptId = randomUUID();
+  const resolutionId = randomUUID();
+  const creditAccountId = randomUUID();
+  const amountMinor = 600;
+  const baseOccurredAt = new Date(Date.now() - 60_000).toISOString();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.users(id, email, password_hash, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', pg_catalog.now())`,
+      [userId, `schema-017-financial-${userId}@example.invalid`],
+    );
+    await client.query(
+      `INSERT INTO public.client_accounts(id, name, owner_user_id)
+       VALUES ($1, 'Synthetic schema 017 financial account', $2)`,
+      [clientAccountId, userId],
+    );
+    await client.query(
+      `INSERT INTO public.sessions(id, user_id, token_digest, expires_at)
+       VALUES ($1, $2, $3, pg_catalog.now() + interval '1 hour')`,
+      [sessionId, userId, `schema-017-financial-${sessionId}`],
+    );
+    await client.query(
+      `INSERT INTO public.reauth_grants(
+         id, user_id, session_id, created_at, expires_at
+       ) VALUES ($1, $2, $3, pg_catalog.now(), pg_catalog.now() + interval '15 minutes')`,
+      [reauthId, userId, sessionId],
+    );
+    await client.query(
+      `INSERT INTO public.staff_members(user_id, roles, permissions)
+       VALUES (
+         $1, ARRAY['Billing'],
+         '["billing.manual_receipt_manage", "billing.refund_manage"]'::jsonb
+       )`,
+      [userId],
+    );
+    await client.query(
+      `INSERT INTO public.add_funds_policies(
+         currency, enabled, min_principal_minor, max_principal_minor,
+         balance_cap_minor
+       ) VALUES ('USD', true, 1, 1000000, 1000000)
+       ON CONFLICT (currency) DO UPDATE SET balance_cap_minor = EXCLUDED.balance_cap_minor`,
+    );
+    await client.query(
+      `INSERT INTO public.manual_receipt_facts(
+         id, client_account_id, reference, received_at, gross_amount_minor,
+         fee_minor, currency, actor_id, reason, idempotency_key,
+         request_fingerprint, result
+       ) VALUES (
+         $1, $2, $3, $4, $5, 0, 'USD', $6,
+         'Synthetic manual receipt for schema 017 Credit debt regression',
+         $7, $8, '{}'::jsonb
+       )`,
+      [
+        manualReceiptId,
+        clientAccountId,
+        `SCHEMA-017-${manualReceiptId}`,
+        baseOccurredAt,
+        amountMinor,
+        userId,
+        `schema-017-receipt-${manualReceiptId}`,
+        `schema-017-receipt-fingerprint-${manualReceiptId}`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.fund_receipts(
+         id, provider_installation_id, external_payment_id,
+         reported_payment_attempt_id, reported_add_funds_attempt_id,
+         reported_manual_receipt_id, client_account_id, amount_minor,
+         allocated_minor, currency, occurred_at, disposition, reason
+       ) VALUES (
+         $1, NULL, NULL, NULL, NULL, $2, $3, $4, 0, 'USD', $5,
+         'unclaimed', 'Synthetic schema 017 manual receipt source'
+       )`,
+      [fundReceiptId, manualReceiptId, clientAccountId, amountMinor, baseOccurredAt],
+    );
+    const receiptJournal = await client.query<{ id: string }>(
+      `INSERT INTO public.ledger_journals(source_type, source_id, currency, description)
+       VALUES ('manual_receipt', $1, 'USD', 'Synthetic schema 017 manual receipt')
+       RETURNING id`,
+      [manualReceiptId],
+    );
+    await client.query(
+      `INSERT INTO public.ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+       VALUES
+         ($1, 'cash_clearing', $2, 0),
+         ($1, 'unclaimed_funds_liability', 0, $2)`,
+      [receiptJournal.rows[0]?.id, amountMinor],
+    );
+    await client.query(
+      "UPDATE public.ledger_journals SET sealed_at = pg_catalog.now() WHERE id = $1",
+      [receiptJournal.rows[0]?.id],
+    );
+    await client.query("COMMIT");
+
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.credit_accounts(id, client_account_id, currency)
+       VALUES ($1, $2, 'USD')`,
+      [creditAccountId, clientAccountId],
+    );
+    const resolutionResult = {
+      resolutionId,
+      amountMinor: amountMinor.toString(),
+      currency: "USD",
+    };
+    await client.query(
+      `INSERT INTO public.fund_receipt_resolutions(
+         id, fund_receipt_id, client_account_id, action, amount_minor,
+         currency, invoice_id, actor_id, reason, idempotency_key,
+         request_fingerprint, result
+       ) VALUES (
+         $1, $2, $3, 'convert_to_credit', $4, 'USD', NULL, $5,
+         'Synthetic conversion for schema 017 Credit debt regression',
+         $6, $7, $8::jsonb
+       )`,
+      [
+        resolutionId,
+        fundReceiptId,
+        clientAccountId,
+        amountMinor,
+        userId,
+        `schema-017-resolution-${resolutionId}`,
+        `schema-017-resolution-fingerprint-${resolutionId}`,
+        JSON.stringify(resolutionResult),
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.credit_transactions(
+         credit_account_id, kind, credit_minor, debit_minor,
+         source_type, source_id, actor_type, actor_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, 'unclaimed_funds', $2, 0,
+         'fund_receipt_resolution', $3, 'staff', $4,
+         'Synthetic conversion for schema 017 Credit debt regression',
+         $5, $6, $7::jsonb
+       )`,
+      [
+        creditAccountId,
+        amountMinor,
+        resolutionId,
+        userId,
+        `schema-017-credit-${resolutionId}`,
+        `schema-017-resolution-fingerprint-${resolutionId}`,
+        JSON.stringify(resolutionResult),
+      ],
+    );
+    await client.query(
+      `UPDATE public.fund_receipts
+       SET allocated_minor = $2, disposition = 'allocated', updated_at = pg_catalog.now()
+       WHERE id = $1`,
+      [fundReceiptId, amountMinor],
+    );
+    await client.query("COMMIT");
+
+    const unknownReportId = randomUUID();
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.manual_receipt_outflow_reports(
+         id, manual_receipt_id, fund_receipt_id, client_account_id,
+         source_context, fund_receipt_resolution_id, amount_minor, currency,
+         destination, destination_reference, observed_outcome, occurred_at,
+         actor_id, actor_session_id, reauth_grant_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, $2, $3, $4, 'converted_credit', $5, $6, 'USD',
+         'original_source', $7, 'unknown', NULL, $8, $9, $10,
+         'Synthetic unknown outflow reserves converted Credit safely',
+         $11, $12, '{}'::jsonb
+       )`,
+      [
+        unknownReportId,
+        manualReceiptId,
+        fundReceiptId,
+        clientAccountId,
+        resolutionId,
+        amountMinor,
+        `UNKNOWN-${unknownReportId}`,
+        userId,
+        sessionId,
+        reauthId,
+        `schema-017-unknown-${unknownReportId}`,
+        `schema-017-unknown-fingerprint-${unknownReportId}`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.manual_receipt_credit_holds(
+         report_id, credit_account_id, amount_minor, currency
+       ) VALUES ($1, $2, $3, 'USD')`,
+      [unknownReportId, creditAccountId, amountMinor],
+    );
+    await client.query("COMMIT");
+
+    await assert.rejects(
+      client.query(
+        `INSERT INTO public.credit_transactions(
+           credit_account_id, kind, credit_minor, debit_minor,
+           source_type, source_id, actor_type, actor_id, reason,
+           idempotency_key, request_fingerprint, result
+         ) VALUES (
+           $1, 'manual_adjustment', 0, 1,
+           'schema_017_test_spend', $2, 'staff', $3,
+           'Synthetic spend must be blocked by unresolved outflow hold',
+           $4, $5, '{}'::jsonb
+         )`,
+        [
+          creditAccountId,
+          randomUUID(),
+          userId,
+          `schema-017-held-spend-${unknownReportId}`,
+          `schema-017-held-spend-fingerprint-${unknownReportId}`,
+        ],
+      ),
+      /net of unresolved manual outflow holds cannot become negative/,
+    );
+
+    const reconciliationId = randomUUID();
+    await client.query(
+      `INSERT INTO public.manual_receipt_outflow_reconciliations(
+         id, report_id, outcome, occurred_at, actor_id, actor_session_id,
+         reauth_grant_id, reason, idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, $2, 'confirm_no_outflow', NULL, $3, $4, $5,
+         'Synthetic reconciliation confirms no external outflow occurred',
+         $6, $7, '{}'::jsonb
+       )`,
+      [
+        reconciliationId,
+        unknownReportId,
+        userId,
+        sessionId,
+        reauthId,
+        `schema-017-no-outflow-${reconciliationId}`,
+        `schema-017-no-outflow-fingerprint-${reconciliationId}`,
+      ],
+    );
+
+    await client.query(
+      `INSERT INTO public.credit_transactions(
+         credit_account_id, kind, credit_minor, debit_minor,
+         source_type, source_id, actor_type, actor_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, 'manual_adjustment', 0, $2,
+         'schema_017_test_spend', $3, 'staff', $4,
+         'Synthetic customer consumed converted Credit before confirmed outflow',
+         $5, $6, '{}'::jsonb
+       )`,
+      [
+        creditAccountId,
+        amountMinor,
+        randomUUID(),
+        userId,
+        `schema-017-consumed-credit-${resolutionId}`,
+        `schema-017-consumed-credit-fingerprint-${resolutionId}`,
+      ],
+    );
+
+    const reportId = randomUUID();
+    const outflowId = randomUUID();
+    const effectId = randomUUID();
+    const outflowOccurredAt = new Date().toISOString();
+    const outflowResult = { outflowId, amountMinor: amountMinor.toString() };
+    const outflowIdempotencyKey = `schema-017-confirmed-${reportId}`;
+    const outflowFingerprint = `schema-017-confirmed-fingerprint-${reportId}`;
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.manual_receipt_outflow_reports(
+         id, manual_receipt_id, fund_receipt_id, client_account_id,
+         source_context, fund_receipt_resolution_id, amount_minor, currency,
+         destination, destination_reference, observed_outcome, occurred_at,
+         actor_id, actor_session_id, reauth_grant_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, $2, $3, $4, 'converted_credit', $5, $6, 'USD',
+         'original_source', $7, 'confirmed', $8, $9, $10, $11,
+         'Synthetic confirmed outflow after converted Credit was consumed',
+         $12, $13, $14::jsonb
+       )`,
+      [
+        reportId,
+        manualReceiptId,
+        fundReceiptId,
+        clientAccountId,
+        resolutionId,
+        amountMinor,
+        `CONFIRMED-${reportId}`,
+        outflowOccurredAt,
+        userId,
+        sessionId,
+        reauthId,
+        outflowIdempotencyKey,
+        outflowFingerprint,
+        JSON.stringify(outflowResult),
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.manual_receipt_outflows(
+         id, report_id, manual_receipt_id, fund_receipt_id,
+         client_account_id, source_context, fund_receipt_resolution_id,
+         amount_minor, currency, destination_reference, occurred_at,
+         actor_id, actor_session_id, reauth_grant_id, reason,
+         idempotency_key, request_fingerprint, result
+       ) VALUES (
+         $1, $2, $3, $4, $5, 'converted_credit', $6, $7, 'USD', $8, $9,
+         $10, $11, $12,
+         'Synthetic confirmed outflow after converted Credit was consumed',
+         $13, $14, $15::jsonb
+       )`,
+      [
+        outflowId,
+        reportId,
+        manualReceiptId,
+        fundReceiptId,
+        clientAccountId,
+        resolutionId,
+        amountMinor,
+        `CONFIRMED-${reportId}`,
+        outflowOccurredAt,
+        userId,
+        sessionId,
+        reauthId,
+        outflowIdempotencyKey,
+        outflowFingerprint,
+        JSON.stringify(outflowResult),
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.manual_receipt_credit_outflow_effects(
+         id, outflow_id, credit_account_id, client_account_id,
+         credit_recovered_minor, debt_minor, currency
+       ) VALUES ($1, $2, $3, $4, 0, $5, 'USD')`,
+      [effectId, outflowId, creditAccountId, clientAccountId, amountMinor],
+    );
+    await client.query(
+      `INSERT INTO public.client_account_debt_accounts(client_account_id, currency)
+       VALUES ($1, 'USD') ON CONFLICT (client_account_id, currency) DO NOTHING`,
+      [clientAccountId],
+    );
+    const debtAccount = await client.query<{ id: string }>(
+      `SELECT id FROM public.client_account_debt_accounts
+       WHERE client_account_id = $1 AND currency = 'USD' FOR UPDATE`,
+      [clientAccountId],
+    );
+    await client.query(
+      `INSERT INTO public.client_account_debt_transactions(
+         debt_account_id, kind, debit_minor, credit_minor, source_type,
+         source_id, actor_type, actor_id, reason, idempotency_key
+       ) VALUES (
+         $1, 'manual_receipt_outflow', $2, 0,
+         'manual_receipt_credit_outflow_effect', $3, 'staff', $4,
+         'Converted Credit was consumed before confirmed external outflow', $5
+       )`,
+      [
+        debtAccount.rows[0]?.id,
+        amountMinor,
+        effectId,
+        userId,
+        `schema-017-outflow-debt-${effectId}`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO public.manual_receipt_credit_outflow_restrictions(
+         effect_id, client_account_id, reason
+       ) VALUES (
+         $1, $2, 'Outstanding debt after confirmed manual receipt outflow'
+       )`,
+      [effectId, clientAccountId],
+    );
+    const outflowJournal = await client.query<{ id: string }>(
+      `INSERT INTO public.ledger_journals(source_type, source_id, currency, description)
+       VALUES (
+         'manual_receipt_outflow', $1, 'USD',
+         'Confirmed manual receipt outflow with consumed Credit debt'
+       ) RETURNING id`,
+      [outflowId],
+    );
+    await client.query(
+      `INSERT INTO public.ledger_lines(journal_id, account_code, debit_minor, credit_minor)
+       VALUES
+         ($1, 'chargeback_receivable', $2, 0),
+         ($1, 'cash_clearing', 0, $2)`,
+      [outflowJournal.rows[0]?.id, amountMinor],
+    );
+    await client.query(
+      "UPDATE public.ledger_journals SET sealed_at = pg_catalog.now() WHERE id = $1",
+      [outflowJournal.rows[0]?.id],
+    );
+    await client.query("COMMIT");
+
+    const result = await client.query<{
+      credit_balance_minor: string;
+      debt_minor: string;
+      restricted: boolean;
+      journal_debit_minor: string;
+      journal_credit_minor: string;
+    }>(
+      `SELECT
+         (SELECT COALESCE(pg_catalog.sum(credit_minor - debit_minor), 0)::text
+          FROM public.credit_transactions
+          WHERE credit_account_id = $1) AS credit_balance_minor,
+         (SELECT COALESCE(pg_catalog.sum(transaction.debit_minor - transaction.credit_minor), 0)::text
+          FROM public.client_account_debt_transactions transaction
+          JOIN public.client_account_debt_accounts account
+            ON account.id = transaction.debt_account_id
+          WHERE account.client_account_id = $2 AND account.currency = 'USD') AS debt_minor,
+         (SELECT restricted_at IS NOT NULL FROM public.client_accounts WHERE id = $2)
+           AS restricted,
+         (SELECT pg_catalog.sum(line.debit_minor)::text
+          FROM public.ledger_journals journal
+          JOIN public.ledger_lines line ON line.journal_id = journal.id
+          WHERE journal.source_type = 'manual_receipt_outflow'
+            AND journal.source_id = $3) AS journal_debit_minor,
+         (SELECT pg_catalog.sum(line.credit_minor)::text
+          FROM public.ledger_journals journal
+          JOIN public.ledger_lines line ON line.journal_id = journal.id
+          WHERE journal.source_type = 'manual_receipt_outflow'
+            AND journal.source_id = $3) AS journal_credit_minor`,
+      [creditAccountId, clientAccountId, outflowId],
+    );
+    assert.deepEqual(result.rows[0], {
+      credit_balance_minor: "0",
+      debt_minor: amountMinor.toString(),
+      restricted: true,
+      journal_debit_minor: amountMinor.toString(),
+      journal_credit_minor: amountMinor.toString(),
+    });
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+});
+
 test("role-schema and public built-in shadows cannot spoof schema 017", async () => {
   const client = await pool.connect();
   try {

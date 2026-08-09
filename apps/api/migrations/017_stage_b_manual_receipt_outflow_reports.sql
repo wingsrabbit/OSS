@@ -1546,6 +1546,43 @@ LEFT JOIN LATERAL (
     ) AS present
 ) blocked ON true;
 
+CREATE FUNCTION public.opensales_guard_manual_outflow_resolution_capacity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  manual_receipt_id uuid;
+DECLARE
+  capacity_row record;
+BEGIN
+  SELECT reported_manual_receipt_id
+  INTO manual_receipt_id
+  FROM public.fund_receipts
+  WHERE id = NEW.fund_receipt_id
+  FOR UPDATE;
+
+  IF manual_receipt_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT capacity_frozen, available_minor
+  INTO capacity_row
+  FROM public.unclaimed_fund_refund_capacity
+  WHERE fund_receipt_id = NEW.fund_receipt_id;
+
+  IF capacity_row IS NULL
+     OR capacity_row.capacity_frozen
+     OR NEW.amount_minor > capacity_row.available_minor THEN
+    RAISE EXCEPTION 'manual receipt resolution is frozen or exceeds outflow-adjusted capacity';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER manual_receipt_outflow_resolution_capacity_guard
+  BEFORE INSERT ON public.fund_receipt_resolutions
+  FOR EACH ROW EXECUTE FUNCTION public.opensales_guard_manual_outflow_resolution_capacity();
+
 CREATE OR REPLACE VIEW public.invoice_allocation_totals AS
 SELECT
   invoice.id AS invoice_id,
