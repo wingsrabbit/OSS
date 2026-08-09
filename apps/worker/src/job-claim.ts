@@ -84,8 +84,9 @@ export type StaleJobIdentity = {
   readonly job_type: string;
   readonly unique_key: string;
   readonly payload: Readonly<Record<string, unknown>>;
+  readonly payload_snapshot: string;
   readonly attempts: number;
-  readonly locked_at: Date;
+  readonly locked_at_epoch: string;
   readonly locked_by: string | null;
 };
 
@@ -97,7 +98,11 @@ export async function findSchema016GenericRecoveryCandidates<
   limit = 50,
 ): Promise<T[]> {
   const result = await pool.query<T>(
-    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM public.durable_jobs
      WHERE status = 'running'
        AND locked_at < now() - make_interval(secs => $1)
@@ -115,7 +120,11 @@ export async function lockSchema016StaleJob<T extends pg.QueryResultRow>(
   lockTimeoutSeconds: number,
 ): Promise<T | null> {
   const result = await client.query<T>(
-    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM public.durable_jobs
      WHERE id = $1
        AND status = 'running'
@@ -123,8 +132,8 @@ export async function lockSchema016StaleJob<T extends pg.QueryResultRow>(
        AND locked_at < now() - make_interval(secs => $3)
        AND job_type = $4
        AND unique_key = $5
-       AND payload = $6::jsonb
-       AND locked_at = $7
+       AND payload::text = $6
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $7
        AND locked_by IS NOT DISTINCT FROM $8
        AND job_type = ANY($9::text[])
      FOR UPDATE`,
@@ -134,8 +143,8 @@ export async function lockSchema016StaleJob<T extends pg.QueryResultRow>(
       lockTimeoutSeconds,
       candidate.job_type,
       candidate.unique_key,
-      JSON.stringify(candidate.payload),
-      candidate.locked_at,
+      candidate.payload_snapshot,
+      candidate.locked_at_epoch,
       candidate.locked_by,
       [...SCHEMA_016_SUPPORTED_JOB_TYPES],
     ],

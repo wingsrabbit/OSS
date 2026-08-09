@@ -138,7 +138,8 @@ type Job = {
 };
 
 type StaleJob = Job & {
-  locked_at: Date;
+  payload_snapshot: string;
+  locked_at_epoch: string;
   locked_by: string | null;
 };
 
@@ -678,7 +679,11 @@ async function recoverOneStaleRefundJob(candidate: StaleJob): Promise<boolean> {
 
 async function recoverStaleRefundJobs(): Promise<number> {
   const candidates = await pool.query<StaleJob>(
-    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN ('refund.start', 'refund.reconcile')
@@ -5829,7 +5834,11 @@ async function recoverOneStaleServiceActionJob(candidate: StaleJob): Promise<boo
 
 async function recoverStaleServiceActionJobs(): Promise<number> {
   const candidates = await pool.query<StaleJob>(
-    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN (
@@ -6098,7 +6107,11 @@ async function recoverOneStaleCancellationJob(candidate: StaleJob): Promise<bool
 
 async function recoverStaleCancellationJobs(): Promise<number> {
   const candidates = await pool.query<StaleJob>(
-    `SELECT id, job_type, unique_key, payload, attempts, locked_at, locked_by
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN ('service.cancellation.due', 'service.cancellation.reconcile')

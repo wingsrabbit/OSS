@@ -18,7 +18,8 @@ type ClaimedJob = pg.QueryResultRow & {
 };
 
 type StaleJob = ClaimedJob & {
-  locked_at: Date;
+  payload_snapshot: string;
+  locked_at_epoch: string;
   locked_by: string | null;
 };
 
@@ -46,8 +47,9 @@ try {
     job_type: string;
     unique_key: string;
     payload: Record<string, unknown>;
+    payload_snapshot: string;
     attempts: number;
-    locked_at: Date | null;
+    locked_at_epoch: string | null;
     locked_by: string | null;
   }>(
     `INSERT INTO public.durable_jobs(
@@ -62,14 +64,18 @@ try {
         now() - interval '2 minutes', 7, now() - interval '2 minutes', 'future-worker'),
        ('notification.send', $4, $8::jsonb, 'running',
         now() - interval '1 minute', 3, now() - interval '1 minute', 'stale-schema016-worker')
-     RETURNING id, job_type, unique_key, payload, attempts, locked_at, locked_by`,
+     RETURNING id, job_type, unique_key, payload,
+               payload::text AS payload_snapshot,
+               attempts,
+               EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+               locked_by`,
     [
       unknownKey,
       knownKey,
       unknownStaleKey,
       knownStaleKey,
       JSON.stringify({ marker: "future-017", nested: { amountMinor: "1250" } }),
-      JSON.stringify({ notificationId: randomUUID() }),
+      `{"notificationId":"${randomUUID()}","large":900719925474099312345}`,
       JSON.stringify({ marker: "future-017-running", externalFactId: randomUUID() }),
       JSON.stringify({ notificationId: randomUUID() }),
     ],
@@ -82,15 +88,15 @@ try {
   );
   const knownStaleRow = inserted.rows.find((row) => row.unique_key === knownStaleKey);
   assert.ok(unknownId);
-  assert.ok(unknownStaleRow?.locked_at);
-  assert.ok(knownStaleRow?.locked_at);
+  assert.ok(unknownStaleRow?.locked_at_epoch);
+  assert.ok(knownStaleRow?.locked_at_epoch);
   const unknownStale: StaleJob = {
     ...unknownStaleRow,
-    locked_at: unknownStaleRow.locked_at,
+    locked_at_epoch: unknownStaleRow.locked_at_epoch,
   };
   const knownStale: StaleJob = {
     ...knownStaleRow,
-    locked_at: knownStaleRow.locked_at,
+    locked_at_epoch: knownStaleRow.locked_at_epoch,
   };
 
   const before = await pool.query(
@@ -129,6 +135,25 @@ try {
     recoveryCandidates.some((candidate) => candidate.id === knownStale.id),
     true,
   );
+
+  const unchangedClient = await pool.connect();
+  try {
+    await unchangedClient.query("BEGIN");
+    const lockedKnown = await lockSchema016StaleJob<StaleJob>(
+      unchangedClient,
+      knownStale,
+      1,
+    );
+    assert.equal(lockedKnown?.id, knownStale.id);
+    assert.equal(lockedKnown?.payload_snapshot, knownStale.payload_snapshot);
+    assert.equal(lockedKnown?.locked_at_epoch, knownStale.locked_at_epoch);
+    await unchangedClient.query("ROLLBACK");
+  } catch (error) {
+    await unchangedClient.query("ROLLBACK");
+    throw error;
+  } finally {
+    unchangedClient.release();
+  }
 
   await pool.query(
     `UPDATE public.durable_jobs
@@ -197,6 +222,7 @@ try {
       knownJobClaimed: true,
       unknownPendingJobUntouched: true,
       unknownStaleRunningJobUntouched: true,
+      unchangedKnownStaleJobLocks: true,
       staleRowLockRechecksKnownType: true,
       candidateTypeSwapRejected: true,
       candidateSnapshotRechecked: true,
