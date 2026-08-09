@@ -927,7 +927,10 @@ export async function registerProviderEventRoutes(
           `INSERT INTO durable_jobs(job_type, unique_key, payload)
            VALUES ('payment.reconcile', $1, $2)
            ON CONFLICT (job_type, unique_key) DO UPDATE
-             SET payload = EXCLUDED.payload,
+             SET payload = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.payload
+                   ELSE EXCLUDED.payload
+                 END,
                  status = CASE
                    WHEN durable_jobs.status = 'manual' THEN 'manual'
                    WHEN durable_jobs.status = 'running' THEN 'running'

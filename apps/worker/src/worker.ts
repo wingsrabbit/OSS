@@ -241,17 +241,28 @@ async function enqueueReconcileWithClient(
     `INSERT INTO durable_jobs(job_type, unique_key, payload, available_at)
      VALUES ($1, $2, $3, now() + make_interval(secs => $4))
      ON CONFLICT (job_type, unique_key) DO UPDATE
-       SET payload = EXCLUDED.payload,
+       SET payload = CASE
+             WHEN durable_jobs.status = 'running' THEN durable_jobs.payload
+             ELSE EXCLUDED.payload
+           END,
            status = CASE
              WHEN durable_jobs.status = 'manual' THEN 'manual'
+             WHEN durable_jobs.status = 'running' THEN 'running'
              ELSE 'pending'
            END,
            available_at = CASE
-             WHEN durable_jobs.status = 'manual' THEN durable_jobs.available_at
+             WHEN durable_jobs.status IN ('manual', 'running')
+               THEN durable_jobs.available_at
              ELSE EXCLUDED.available_at
            END,
-           locked_at = NULL,
-           locked_by = NULL,
+           locked_at = CASE
+             WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_at
+             ELSE NULL
+           END,
+           locked_by = CASE
+             WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_by
+             ELSE NULL
+           END,
            updated_at = now()`,
     [jobType, uniqueKey, payload, delaySeconds],
   );

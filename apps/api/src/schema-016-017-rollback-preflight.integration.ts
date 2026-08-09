@@ -204,6 +204,19 @@ test("a claimed running job cannot be changed into a schema-017 job", async () =
        WHERE id = $1`,
       [jobId],
     );
+    await client.query(
+      `UPDATE public.durable_jobs
+       SET last_error = 'legitimate running lease metadata update',
+           updated_at = pg_catalog.now()
+       WHERE id = $1`,
+      [jobId],
+    );
+    await client.query("SAVEPOINT before_running_delete");
+    await assert.rejects(
+      client.query("DELETE FROM public.durable_jobs WHERE id = $1", [jobId]),
+      /running durable job cannot be deleted/,
+    );
+    await client.query("ROLLBACK TO SAVEPOINT before_running_delete");
     await client.query("SAVEPOINT before_identity_attack");
     await assert.rejects(
       client.query(

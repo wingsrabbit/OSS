@@ -1816,7 +1816,8 @@ export async function registerRefundRoutes(
                ON CONFLICT (job_type, unique_key) DO UPDATE
                SET payload = EXCLUDED.payload, status = 'pending', available_at = now(),
                    attempts = 0, locked_at = NULL, locked_by = NULL,
-                   last_error = NULL, updated_at = now()`,
+                   last_error = NULL, updated_at = now()
+               WHERE durable_jobs.status <> 'running'`,
               [
                 `refund:${competing.id}`,
                 { refundId: competing.id, operationId: competing.operation_id },
@@ -2955,7 +2956,8 @@ export async function registerRefundRoutes(
            VALUES ('refund.reconcile', $1, $2, 'pending')
            ON CONFLICT (job_type, unique_key) DO UPDATE
            SET payload = EXCLUDED.payload, status = 'pending', available_at = now(), attempts = 0,
-               locked_at = NULL, locked_by = NULL, last_error = NULL, updated_at = now()`,
+               locked_at = NULL, locked_by = NULL, last_error = NULL, updated_at = now()
+           WHERE durable_jobs.status <> 'running'`,
           [
             `refund:${params.refundId}`,
             { refundId: params.refundId, operationId: state.operation_id },

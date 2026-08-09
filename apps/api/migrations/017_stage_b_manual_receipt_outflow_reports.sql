@@ -23,19 +23,22 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF OLD.status = 'running' AND (
-    NEW.job_type IS DISTINCT FROM OLD.job_type
-    OR NEW.unique_key IS DISTINCT FROM OLD.unique_key
-    OR NEW.payload IS DISTINCT FROM OLD.payload
-  ) THEN
-    RAISE EXCEPTION 'a running durable job cannot change type, identity, or payload';
+  IF OLD.status = 'running' THEN
+    IF TG_OP = 'DELETE' THEN
+      RAISE EXCEPTION 'a running durable job cannot be deleted';
+    END IF;
+    IF NEW.job_type IS DISTINCT FROM OLD.job_type
+       OR NEW.unique_key IS DISTINCT FROM OLD.unique_key
+       OR NEW.payload IS DISTINCT FROM OLD.payload THEN
+      RAISE EXCEPTION 'a running durable job cannot change type, identity, or payload';
+    END IF;
   END IF;
-  RETURN NEW;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END
 $$;
 
 CREATE TRIGGER b_schema_017_running_job_identity_guard
-  BEFORE UPDATE ON public.durable_jobs
+  BEFORE UPDATE OR DELETE ON public.durable_jobs
   FOR EACH ROW EXECUTE FUNCTION public.opensales_guard_running_durable_job_identity();
 
 CREATE TABLE public.manual_receipt_outflow_reports(
