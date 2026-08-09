@@ -655,6 +655,13 @@ test("unknown converted Credit is held, then consumed Credit becomes audited deb
       journal_debit_minor: amountMinor.toString(),
       journal_credit_minor: amountMinor.toString(),
     });
+    await assert.rejects(
+      client.query(
+        "UPDATE public.client_accounts SET restricted_at = NULL WHERE id = $1",
+        [clientAccountId],
+      ),
+      /active financial restriction cannot be changed directly/,
+    );
   } finally {
     await client.query("ROLLBACK").catch(() => undefined);
     client.release();

@@ -151,23 +151,6 @@ CREATE TABLE public.manual_receipt_outflow_reconciliations(
   )
 );
 
--- Retained as an immutable audit artifact for the currently reviewed 017
--- contract; invoice balance semantics are finalized by the outflow
--- completeness and allocation-total views below.
-CREATE TABLE public.manual_receipt_invoice_allocation_reversals(
-  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
-  outflow_id uuid NOT NULL UNIQUE REFERENCES public.manual_receipt_outflows(id)
-    DEFERRABLE INITIALLY DEFERRED,
-  fund_receipt_resolution_id uuid NOT NULL
-    REFERENCES public.fund_receipt_resolutions(id),
-  fund_receipt_allocation_id uuid NOT NULL
-    REFERENCES public.fund_receipt_allocations(id),
-  invoice_id uuid NOT NULL REFERENCES public.invoices(id),
-  amount_minor bigint NOT NULL CHECK (amount_minor > 0),
-  currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
-  created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
-);
-
 CREATE TABLE public.manual_receipt_credit_holds(
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   report_id uuid NOT NULL UNIQUE
@@ -199,6 +182,37 @@ CREATE TABLE public.manual_receipt_credit_outflow_restrictions(
   reason text NOT NULL CHECK (pg_catalog.length(reason) BETWEEN 10 AND 1000),
   created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
 );
+
+-- The existing account guard protects unresolved Chargeback restrictions.
+-- Extend the same projection boundary to the dedicated manual-outflow debt
+-- restriction. The BEFORE INSERT source guard sets restricted_at before the
+-- new restriction row becomes visible; subsequent direct changes are denied.
+CREATE OR REPLACE FUNCTION public.opensales_guard_active_account_restriction()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.restricted_at IS DISTINCT FROM OLD.restricted_at
+     AND (
+       EXISTS (
+         SELECT 1
+         FROM public.client_account_restrictions restriction
+         LEFT JOIN public.client_account_restriction_releases release
+           ON release.restriction_id = restriction.id
+         WHERE restriction.client_account_id = OLD.id
+           AND release.id IS NULL
+       )
+       OR EXISTS (
+         SELECT 1
+         FROM public.manual_receipt_credit_outflow_restrictions restriction
+         WHERE restriction.client_account_id = OLD.id
+       )
+     ) THEN
+    RAISE EXCEPTION 'an active financial restriction cannot be changed directly';
+  END IF;
+  RETURN NEW;
+END
+$$;
 
 ALTER TABLE public.manual_receipt_outflows
   ADD COLUMN report_id uuid NOT NULL UNIQUE
@@ -277,9 +291,6 @@ CREATE TRIGGER manual_receipt_outflow_reports_append_only
 CREATE TRIGGER manual_receipt_outflow_reconciliations_append_only
   BEFORE UPDATE OR DELETE ON public.manual_receipt_outflow_reconciliations
   FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
-CREATE TRIGGER manual_receipt_invoice_allocation_reversals_append_only
-  BEFORE UPDATE OR DELETE ON public.manual_receipt_invoice_allocation_reversals
-  FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
 CREATE TRIGGER manual_receipt_credit_holds_append_only
   BEFORE UPDATE OR DELETE ON public.manual_receipt_credit_holds
   FOR EACH ROW EXECUTE FUNCTION public.opensales_reject_manual_receipt_outflow_mutation();
@@ -308,7 +319,6 @@ BEGIN
       TG_TABLE_NAME IN (
         'manual_receipt_outflow_reports',
         'manual_receipt_outflow_reconciliations',
-        'manual_receipt_invoice_allocation_reversals',
         'manual_receipt_credit_holds',
         'manual_receipt_credit_outflow_effects',
         'manual_receipt_credit_outflow_restrictions',
@@ -414,10 +424,6 @@ CREATE TRIGGER a_schema_017_credit_outflow_effect_marker_guard
 CREATE TRIGGER a_schema_017_credit_outflow_restriction_marker_guard
   BEFORE INSERT OR UPDATE ON public.manual_receipt_credit_outflow_restrictions
   FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
-CREATE TRIGGER a_schema_017_invoice_allocation_reversal_marker_guard
-  BEFORE INSERT OR UPDATE ON public.manual_receipt_invoice_allocation_reversals
-  FOR EACH ROW EXECUTE FUNCTION public.opensales_schema_017_marker_guard();
-
 CREATE FUNCTION public.opensales_validate_manual_receipt_outflow_authorization(
   staff_user_id uuid,
   staff_session_id uuid,
@@ -962,69 +968,6 @@ CREATE TRIGGER manual_receipt_outflow_fact_guard
   BEFORE INSERT ON public.manual_receipt_outflows
   FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_outflow_fact();
 
-CREATE FUNCTION public.opensales_validate_manual_receipt_invoice_allocation_reversal()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  source_row record;
-DECLARE
-  already_reversed_minor bigint;
-BEGIN
-  SELECT
-    outflow.id AS outflow_id,
-    outflow.source_context,
-    outflow.fund_receipt_resolution_id,
-    outflow.amount_minor,
-    outflow.currency,
-    report.client_account_id,
-    resolution.action,
-    resolution.invoice_id AS resolution_invoice_id,
-    resolution.currency AS resolution_currency,
-    allocation.id AS allocation_id,
-    allocation.invoice_id AS allocation_invoice_id,
-    allocation.amount_minor AS allocation_amount_minor,
-    invoice.client_account_id AS invoice_client_account_id,
-    invoice.currency AS invoice_currency
-  INTO source_row
-  FROM public.manual_receipt_outflows outflow
-  JOIN public.manual_receipt_outflow_reports report ON report.id = outflow.report_id
-  JOIN public.fund_receipt_resolutions resolution
-    ON resolution.id = outflow.fund_receipt_resolution_id
-  JOIN public.fund_receipt_allocations allocation
-    ON allocation.resolution_id = resolution.id
-  JOIN public.invoices invoice ON invoice.id = allocation.invoice_id
-  WHERE outflow.id = NEW.outflow_id
-  FOR UPDATE OF outflow, resolution, allocation, invoice;
-
-  SELECT COALESCE(pg_catalog.sum(reversal.amount_minor), 0)::bigint
-  INTO already_reversed_minor
-  FROM public.manual_receipt_invoice_allocation_reversals reversal
-  WHERE reversal.fund_receipt_allocation_id = NEW.fund_receipt_allocation_id;
-
-  IF source_row IS NULL
-     OR source_row.source_context <> 'allocated_invoice'
-     OR source_row.action <> 'allocate_invoice'
-     OR NEW.fund_receipt_resolution_id <> source_row.fund_receipt_resolution_id
-     OR NEW.fund_receipt_allocation_id <> source_row.allocation_id
-     OR NEW.invoice_id <> source_row.resolution_invoice_id
-     OR NEW.invoice_id <> source_row.allocation_invoice_id
-     OR NEW.amount_minor <> source_row.amount_minor
-     OR NEW.currency <> source_row.currency
-     OR NEW.currency <> source_row.resolution_currency
-     OR NEW.currency <> source_row.invoice_currency
-     OR source_row.client_account_id <> source_row.invoice_client_account_id
-     OR already_reversed_minor + NEW.amount_minor > source_row.allocation_amount_minor THEN
-    RAISE EXCEPTION 'manual receipt invoice allocation reversal mismatches its confirmed outflow source';
-  END IF;
-  RETURN NEW;
-END
-$$;
-
-CREATE TRIGGER manual_receipt_invoice_allocation_reversal_guard
-  BEFORE INSERT ON public.manual_receipt_invoice_allocation_reversals
-  FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_invoice_allocation_reversal();
-
 CREATE FUNCTION public.opensales_validate_manual_receipt_credit_outflow_effect()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1265,16 +1208,6 @@ BEGIN
     ))
   ) THEN
     RAISE EXCEPTION 'converted Credit manual receipt outflow is missing its exact compensating Credit debit';
-  END IF;
-  IF NEW.source_context = 'allocated_invoice' AND NOT EXISTS (
-    SELECT 1
-    FROM public.manual_receipt_invoice_allocation_reversals reversal
-    WHERE reversal.outflow_id = NEW.id
-      AND reversal.fund_receipt_resolution_id = NEW.fund_receipt_resolution_id
-      AND reversal.amount_minor = NEW.amount_minor
-      AND reversal.currency = NEW.currency
-  ) THEN
-    RAISE EXCEPTION 'allocated invoice manual receipt outflow is missing its immutable allocation reversal';
   END IF;
   RETURN NULL;
 END
@@ -1583,43 +1516,6 @@ CREATE TRIGGER manual_receipt_outflow_resolution_capacity_guard
   BEFORE INSERT ON public.fund_receipt_resolutions
   FOR EACH ROW EXECUTE FUNCTION public.opensales_guard_manual_outflow_resolution_capacity();
 
-CREATE OR REPLACE VIEW public.invoice_allocation_totals AS
-SELECT
-  invoice.id AS invoice_id,
-  (
-    COALESCE(payment.amount_minor, 0)
-    + COALESCE(unclaimed.amount_minor, 0)
-  )::bigint AS payment_minor,
-  COALESCE(credit.amount_minor, 0)::bigint AS credit_minor,
-  (
-    COALESCE(payment.amount_minor, 0)
-    + COALESCE(unclaimed.amount_minor, 0)
-    + COALESCE(credit.amount_minor, 0)
-  )::bigint AS allocated_minor,
-  COALESCE(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
-FROM public.invoices invoice
-LEFT JOIN LATERAL (
-  SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
-  FROM public.payment_allocations allocation
-  WHERE allocation.invoice_id = invoice.id
-) payment ON true
-LEFT JOIN LATERAL (
-  SELECT
-    pg_catalog.sum(allocation.amount_minor)
-      - COALESCE((
-          SELECT pg_catalog.sum(reversal.amount_minor)
-          FROM public.manual_receipt_invoice_allocation_reversals reversal
-          WHERE reversal.invoice_id = invoice.id
-        ), 0) AS amount_minor
-  FROM public.fund_receipt_allocations allocation
-  WHERE allocation.invoice_id = invoice.id
-) unclaimed ON true
-LEFT JOIN LATERAL (
-  SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
-  FROM public.credit_allocations allocation
-  WHERE allocation.invoice_id = invoice.id
-) credit ON true;
-
 CREATE FUNCTION public.opensales_validate_manual_receipt_reversal_017()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1670,47 +1566,3 @@ $$;
 CREATE TRIGGER z_schema_017_manual_receipt_reversal_eligibility_guard
   BEFORE INSERT ON public.manual_receipt_reversals
   FOR EACH ROW EXECUTE FUNCTION public.opensales_validate_manual_receipt_reversal_017();
-
-CREATE OR REPLACE VIEW public.invoice_delinquency_allocation_totals AS
-SELECT
-  invoice.id AS invoice_id,
-  (
-    COALESCE(payment.principal_minor, 0)
-    + COALESCE(unclaimed.amount_minor, 0)
-  )::bigint AS payment_minor,
-  COALESCE(credit.amount_minor, 0)::bigint AS credit_minor,
-  (
-    COALESCE(payment.principal_minor, 0)
-    + COALESCE(unclaimed.amount_minor, 0)
-    + COALESCE(credit.amount_minor, 0)
-  )::bigint AS allocated_minor,
-  COALESCE(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
-FROM public.invoices invoice
-LEFT JOIN LATERAL (
-  SELECT pg_catalog.sum(
-    GREATEST(
-      allocation.amount_minor - COALESCE(fee.amount_minor, 0), 0
-    )
-  ) AS principal_minor
-  FROM public.payment_allocations allocation
-  LEFT JOIN public.invoice_fee_charges fee
-    ON fee.payment_attempt_id = allocation.payment_attempt_id
-   AND fee.invoice_id = allocation.invoice_id
-  WHERE allocation.invoice_id = invoice.id
-) payment ON true
-LEFT JOIN LATERAL (
-  SELECT
-    pg_catalog.sum(allocation.amount_minor)
-      - COALESCE((
-          SELECT pg_catalog.sum(reversal.amount_minor)
-          FROM public.manual_receipt_invoice_allocation_reversals reversal
-          WHERE reversal.invoice_id = invoice.id
-        ), 0) AS amount_minor
-  FROM public.fund_receipt_allocations allocation
-  WHERE allocation.invoice_id = invoice.id
-) unclaimed ON true
-LEFT JOIN LATERAL (
-  SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
-  FROM public.credit_allocations allocation
-  WHERE allocation.invoice_id = invoice.id
-) credit ON true;

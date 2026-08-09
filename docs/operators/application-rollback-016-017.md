@@ -11,9 +11,11 @@ Schema 017 adds append-only reports for manual money returned to its original so
 records either a confirmed outflow or an unknown outcome. Unknown outcomes freeze capacity until
 an audited reconciliation confirms an outflow or confirms that no outflow occurred. Confirmed
 facts bind the manual receipt, Fund Receipt, Client Account, currency, source bucket, destination,
-current staff permission, Session, 15-minute reauthentication grant, and reason. An invoice claim
-gets an allocation reversal; a Credit claim gets a compensating Credit debit. No Payment Provider
-operation is allowed for this administrator-recorded external fact.
+current staff permission, Session, 15-minute reauthentication grant, and reason. Returning funds
+whose original claim paid an invoice is a separate refund fact: it does not reverse the historical
+invoice allocation, reopen the invoice, cancel a service, or terminate it. A Credit claim recovers
+available Credit and records any already-consumed remainder as Client Account debt. No Payment
+Provider operation is allowed for this administrator-recorded external fact.
 
 ## Forward rollout
 
@@ -40,7 +42,7 @@ operation is allowed for this administrator-recorded external fact.
    unknowns with the native-017 application. Stop every native-017 API and Worker.
 2. Set `OSS_SCHEMA_ROLLBACK_BRIDGE=016-to-017` only on the reviewed bridge artifact and run the
    preflight. A valid result names schema 017, mode `rollback_bridge`, and an empty blocker list.
-3. Any manual outflow report, reconciliation, confirmed fact, allocation reversal, Ledger/Credit
+3. Any manual outflow report, reconciliation, confirmed fact, Ledger/Credit
    marker, job, inbox, outbox, or Provider-operation marker blocks the rollback. Do not delete or
    rewrite facts to make it pass. Repair forward or place the affected funds under manual control.
 4. Start the bridge API and Worker. Both hold the schema-016/017 bridge guard for their entire

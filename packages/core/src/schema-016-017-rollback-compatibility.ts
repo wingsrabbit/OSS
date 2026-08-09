@@ -124,7 +124,6 @@ export async function schema017CatalogFingerprintInput(
            'manual_receipt_credit_holds',
            'manual_receipt_credit_outflow_effects',
            'manual_receipt_credit_outflow_restrictions',
-           'manual_receipt_invoice_allocation_reversals',
            'manual_receipt_outflows'
          )
        UNION ALL
@@ -157,7 +156,6 @@ export async function schema017CatalogFingerprintInput(
            'manual_receipt_credit_holds',
            'manual_receipt_credit_outflow_effects',
            'manual_receipt_credit_outflow_restrictions',
-           'manual_receipt_invoice_allocation_reversals',
            'manual_receipt_outflows'
          )
        UNION ALL
@@ -200,7 +198,6 @@ export async function schema017CatalogFingerprintInput(
              'manual_receipt_credit_holds',
              'manual_receipt_credit_outflow_effects',
              'manual_receipt_credit_outflow_restrictions',
-             'manual_receipt_invoice_allocation_reversals',
              'manual_receipt_outflows'
            )
          )
@@ -241,7 +238,6 @@ export async function schema017CatalogFingerprintInput(
              'manual_receipt_credit_holds',
              'manual_receipt_credit_outflow_effects',
              'manual_receipt_credit_outflow_restrictions',
-             'manual_receipt_invoice_allocation_reversals',
              'manual_receipt_outflows'
            )
            OR actual.tgname IN (
@@ -315,7 +311,6 @@ export async function schema017CatalogFingerprintInput(
            'opensales_assert_manual_receipt_outflow_reconciliation_complete',
            'opensales_validate_manual_receipt_outflow_fact',
            'opensales_validate_manual_receipt_credit_hold',
-           'opensales_validate_manual_receipt_invoice_allocation_reversal',
            'opensales_validate_manual_receipt_credit_outflow_effect',
            'opensales_validate_manual_receipt_outflow_credit',
            'opensales_validate_manual_receipt_outflow_debt',
@@ -336,9 +331,7 @@ export async function schema017CatalogFingerprintInput(
          AND relation.relkind = 'v'
          AND relation.relname IN (
            'manual_receipt_outflow_capacity',
-           'unclaimed_fund_refund_capacity',
-           'invoice_allocation_totals',
-           'invoice_delinquency_allocation_totals'
+           'unclaimed_fund_refund_capacity'
          )
      ), fingerprint(value) AS (
        SELECT pg_catalog.string_agg(item, E'\\n' ORDER BY item COLLATE "C")
@@ -398,9 +391,6 @@ async function schema017Blockers(
        UNION ALL
        SELECT 'manual_receipt_credit_outflow_restrictions', pg_catalog.count(*)::bigint
        FROM public.manual_receipt_credit_outflow_restrictions
-       UNION ALL
-       SELECT 'manual_receipt_invoice_allocation_reversals', pg_catalog.count(*)::bigint
-       FROM public.manual_receipt_invoice_allocation_reversals
        UNION ALL
        SELECT 'manual_receipt_outflows', pg_catalog.count(*)::bigint
        FROM public.manual_receipt_outflows
