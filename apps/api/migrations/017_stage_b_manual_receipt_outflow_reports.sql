@@ -289,7 +289,7 @@ WITH source_buckets AS (
     'unclaimed_funds'::text AS source_context,
     NULL::uuid AS fund_receipt_resolution_id,
     receipt.currency,
-    pg_catalog.greatest(0, receipt.amount_minor - receipt.allocated_minor)::bigint
+    GREATEST(0, receipt.amount_minor - receipt.allocated_minor)::bigint
       AS source_amount_minor
   FROM public.manual_receipt_facts fact
   JOIN public.fund_receipts receipt ON receipt.reported_manual_receipt_id = fact.id
@@ -343,9 +343,9 @@ SELECT
   source.fund_receipt_resolution_id,
   source.currency,
   source.source_amount_minor,
-  pg_catalog.coalesce(confirmed.amount_minor, 0)::bigint AS confirmed_outflow_minor,
+  COALESCE(confirmed.amount_minor, 0)::bigint AS confirmed_outflow_minor,
   (
-    pg_catalog.coalesce(blocked.present, false)
+    COALESCE(blocked.present, false)
     OR EXISTS (
       SELECT 1
       FROM public.manual_receipt_reversals reversal
@@ -354,7 +354,7 @@ SELECT
     )
   ) AS capacity_frozen,
   CASE
-    WHEN pg_catalog.coalesce(blocked.present, false)
+    WHEN COALESCE(blocked.present, false)
       OR EXISTS (
         SELECT 1
         FROM public.manual_receipt_reversals reversal
@@ -362,9 +362,9 @@ SELECT
           AND reversal.fund_receipt_id = source.fund_receipt_id
       )
       THEN 0
-    ELSE pg_catalog.greatest(
+    ELSE GREATEST(
       0,
-      source.source_amount_minor - pg_catalog.coalesce(confirmed.amount_minor, 0)
+      source.source_amount_minor - COALESCE(confirmed.amount_minor, 0)
     )
   END::bigint AS available_minor
 FROM source_buckets source
@@ -653,7 +653,7 @@ BEGIN
   WHERE outflow.id = NEW.outflow_id
   FOR UPDATE OF outflow, resolution, allocation, invoice;
 
-  SELECT pg_catalog.coalesce(pg_catalog.sum(reversal.amount_minor), 0)::bigint
+  SELECT COALESCE(pg_catalog.sum(reversal.amount_minor), 0)::bigint
   INTO already_reversed_minor
   FROM public.manual_receipt_invoice_allocation_reversals reversal
   WHERE reversal.fund_receipt_allocation_id = NEW.fund_receipt_allocation_id;
@@ -699,12 +699,12 @@ BEGIN
   SELECT
     journal.sealed_at IS NOT NULL
     AND pg_catalog.count(*) = 2
-    AND pg_catalog.coalesce(pg_catalog.sum(line.debit_minor), 0) = NEW.amount_minor
-    AND pg_catalog.coalesce(pg_catalog.sum(line.credit_minor), 0) = NEW.amount_minor
-    AND pg_catalog.coalesce(pg_catalog.sum(line.debit_minor) FILTER (
+    AND COALESCE(pg_catalog.sum(line.debit_minor), 0) = NEW.amount_minor
+    AND COALESCE(pg_catalog.sum(line.credit_minor), 0) = NEW.amount_minor
+    AND COALESCE(pg_catalog.sum(line.debit_minor) FILTER (
       WHERE line.account_code = expected_debit_account
         AND line.credit_minor = 0), 0) = NEW.amount_minor
-    AND pg_catalog.coalesce(pg_catalog.sum(line.credit_minor) FILTER (
+    AND COALESCE(pg_catalog.sum(line.credit_minor) FILTER (
       WHERE line.account_code = 'cash_clearing'
         AND line.debit_minor = 0), 0) = NEW.amount_minor
   INTO valid
@@ -715,7 +715,7 @@ BEGIN
     AND journal.currency = NEW.currency
   GROUP BY journal.id, journal.sealed_at;
 
-  IF NOT pg_catalog.coalesce(valid, false) THEN
+  IF NOT COALESCE(valid, false) THEN
     RAISE EXCEPTION 'manual receipt outflow fact ledger is incomplete';
   END IF;
 
@@ -773,27 +773,27 @@ SELECT
   receipt.id AS fund_receipt_id,
   receipt.amount_minor,
   receipt.allocated_minor,
-  pg_catalog.coalesce(reserved.amount_minor, 0)::bigint AS reserved_refund_minor,
-  pg_catalog.coalesce(confirmed.amount_minor, 0)::bigint AS confirmed_outflow_minor,
+  COALESCE(reserved.amount_minor, 0)::bigint AS reserved_refund_minor,
+  COALESCE(confirmed.amount_minor, 0)::bigint AS confirmed_outflow_minor,
   blocked.present AS capacity_frozen,
   CASE WHEN blocked.present THEN 0
-       ELSE pg_catalog.greatest(
+       ELSE GREATEST(
          0,
          receipt.amount_minor - receipt.allocated_minor
-           - pg_catalog.coalesce(reserved.amount_minor, 0)
-           - pg_catalog.coalesce(confirmed.amount_minor, 0)
+           - COALESCE(reserved.amount_minor, 0)
+           - COALESCE(confirmed.amount_minor, 0)
        )
   END::bigint AS available_minor
 FROM public.fund_receipts receipt
 LEFT JOIN LATERAL (
-  SELECT pg_catalog.coalesce(pg_catalog.sum(refund.amount_minor), 0)::bigint AS amount_minor
+  SELECT COALESCE(pg_catalog.sum(refund.amount_minor), 0)::bigint AS amount_minor
   FROM public.refunds refund
   WHERE refund.source_fund_receipt_id = receipt.id
     AND refund.source_context = 'unclaimed_funds'
     AND refund.status IN ('queued', 'processing')
 ) reserved ON true
 LEFT JOIN LATERAL (
-  SELECT pg_catalog.coalesce(pg_catalog.sum(outflow.amount_minor), 0)::bigint AS amount_minor
+  SELECT COALESCE(pg_catalog.sum(outflow.amount_minor), 0)::bigint AS amount_minor
   FROM (
     SELECT settlement.amount_minor
     FROM public.refunds refund
@@ -872,16 +872,16 @@ CREATE OR REPLACE VIEW public.invoice_allocation_totals AS
 SELECT
   invoice.id AS invoice_id,
   (
-    pg_catalog.coalesce(payment.amount_minor, 0)
-    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
+    COALESCE(payment.amount_minor, 0)
+    + COALESCE(unclaimed.amount_minor, 0)
   )::bigint AS payment_minor,
-  pg_catalog.coalesce(credit.amount_minor, 0)::bigint AS credit_minor,
+  COALESCE(credit.amount_minor, 0)::bigint AS credit_minor,
   (
-    pg_catalog.coalesce(payment.amount_minor, 0)
-    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
-    + pg_catalog.coalesce(credit.amount_minor, 0)
+    COALESCE(payment.amount_minor, 0)
+    + COALESCE(unclaimed.amount_minor, 0)
+    + COALESCE(credit.amount_minor, 0)
   )::bigint AS allocated_minor,
-  pg_catalog.coalesce(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
+  COALESCE(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
 FROM public.invoices invoice
 LEFT JOIN LATERAL (
   SELECT pg_catalog.sum(allocation.amount_minor) AS amount_minor
@@ -891,7 +891,7 @@ LEFT JOIN LATERAL (
 LEFT JOIN LATERAL (
   SELECT
     pg_catalog.sum(allocation.amount_minor)
-      - pg_catalog.coalesce((
+      - COALESCE((
           SELECT pg_catalog.sum(reversal.amount_minor)
           FROM public.manual_receipt_invoice_allocation_reversals reversal
           WHERE reversal.invoice_id = invoice.id
@@ -909,21 +909,21 @@ CREATE OR REPLACE VIEW public.invoice_delinquency_allocation_totals AS
 SELECT
   invoice.id AS invoice_id,
   (
-    pg_catalog.coalesce(payment.principal_minor, 0)
-    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
+    COALESCE(payment.principal_minor, 0)
+    + COALESCE(unclaimed.amount_minor, 0)
   )::bigint AS payment_minor,
-  pg_catalog.coalesce(credit.amount_minor, 0)::bigint AS credit_minor,
+  COALESCE(credit.amount_minor, 0)::bigint AS credit_minor,
   (
-    pg_catalog.coalesce(payment.principal_minor, 0)
-    + pg_catalog.coalesce(unclaimed.amount_minor, 0)
-    + pg_catalog.coalesce(credit.amount_minor, 0)
+    COALESCE(payment.principal_minor, 0)
+    + COALESCE(unclaimed.amount_minor, 0)
+    + COALESCE(credit.amount_minor, 0)
   )::bigint AS allocated_minor,
-  pg_catalog.coalesce(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
+  COALESCE(unclaimed.amount_minor, 0)::bigint AS fund_receipt_minor
 FROM public.invoices invoice
 LEFT JOIN LATERAL (
   SELECT pg_catalog.sum(
-    pg_catalog.greatest(
-      allocation.amount_minor - pg_catalog.coalesce(fee.amount_minor, 0), 0
+    GREATEST(
+      allocation.amount_minor - COALESCE(fee.amount_minor, 0), 0
     )
   ) AS principal_minor
   FROM public.payment_allocations allocation
@@ -935,7 +935,7 @@ LEFT JOIN LATERAL (
 LEFT JOIN LATERAL (
   SELECT
     pg_catalog.sum(allocation.amount_minor)
-      - pg_catalog.coalesce((
+      - COALESCE((
           SELECT pg_catalog.sum(reversal.amount_minor)
           FROM public.manual_receipt_invoice_allocation_reversals reversal
           WHERE reversal.invoice_id = invoice.id

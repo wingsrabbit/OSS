@@ -119,10 +119,10 @@ export async function schema017CatalogFingerprintInput(
        SELECT pg_catalog.concat_ws('|', 'column', actual.table_name,
                 actual.ordinal_position::text, actual.column_name,
                 actual.data_type, actual.udt_name, actual.is_nullable,
-                pg_catalog.coalesce(actual.column_default, ''),
-                actual.is_identity, pg_catalog.coalesce(actual.identity_generation, ''),
-                actual.is_generated, pg_catalog.coalesce(actual.generation_expression, ''),
-                pg_catalog.coalesce(actual.collation_name, ''))
+                COALESCE(actual.column_default, ''),
+                actual.is_identity, COALESCE(actual.identity_generation, ''),
+                actual.is_generated, COALESCE(actual.generation_expression, ''),
+                COALESCE(actual.collation_name, ''))
        FROM information_schema.columns actual
        WHERE actual.table_schema = 'public'
          AND actual.table_name IN (
@@ -216,7 +216,7 @@ export async function schema017CatalogFingerprintInput(
        SELECT pg_catalog.concat_ws('|', 'function', namespace.nspname, actual.proname,
                 language.lanname, actual.provolatile::text,
                 actual.prosecdef::text, actual.proleakproof::text,
-                pg_catalog.coalesce(pg_catalog.array_to_string(actual.proconfig, ','), ''),
+                COALESCE(pg_catalog.array_to_string(actual.proconfig, ','), ''),
                 pg_catalog.pg_get_function_identity_arguments(actual.oid),
                 pg_catalog.pg_get_function_result(actual.oid),
                 pg_catalog.regexp_replace(pg_catalog.btrim(actual.prosrc), '\\s+', ' ', 'g'))
