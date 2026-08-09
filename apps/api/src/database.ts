@@ -47,6 +47,7 @@ export function createPool(
   return new Pool({
     connectionString: config.DATABASE_URL,
     max: 20,
+    connectionTimeoutMillis: 5_000,
     options: "-c search_path=pg_catalog,public",
     statement_timeout: 15_000,
     query_timeout: 20_000,
