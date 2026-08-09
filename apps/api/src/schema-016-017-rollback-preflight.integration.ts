@@ -97,6 +97,16 @@ test("schema-017 marker INSERT and UPDATE conflict with a live rollback bridge",
   const writer = await pool.connect();
   const updateTarget = randomUUID();
   try {
+    await pool.query(
+      `INSERT INTO public.durable_jobs(
+         id, job_type, unique_key, payload, status
+       ) VALUES ($1, 'notification.send', $2, $3::jsonb, 'pending')`,
+      [
+        updateTarget,
+        `schema-017-marker-update-${updateTarget}`,
+        JSON.stringify({ messageId: updateTarget }),
+      ],
+    );
     await guard.query(
       "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
       [SCHEMA_016_017_GUARD],
@@ -104,12 +114,6 @@ test("schema-017 marker INSERT and UPDATE conflict with a live rollback bridge",
 
     await writer.query("BEGIN");
     await writer.query("SET LOCAL lock_timeout = '250ms'");
-    await writer.query(
-      `INSERT INTO public.ledger_journals(
-         id, source_type, source_id, currency, description
-       ) VALUES ($1, 'schema_017_marker_test', $2, 'USD', 'synthetic marker update test')`,
-      [updateTarget, randomUUID()],
-    );
     await assert.rejects(
       writer.query(
         `INSERT INTO public.ledger_journals(
@@ -127,8 +131,13 @@ test("schema-017 marker INSERT and UPDATE conflict with a live rollback bridge",
     await writer.query("SET LOCAL lock_timeout = '250ms'");
     await assert.rejects(
       writer.query(
-        "UPDATE public.ledger_journals SET source_type = 'manual_receipt_outflow' WHERE id = $1",
-        [updateTarget],
+        `UPDATE public.durable_jobs
+         SET payload = $2::jsonb
+         WHERE id = $1`,
+        [
+          updateTarget,
+          JSON.stringify({ manualReceiptOutflowReportId: randomUUID() }),
+        ],
       ),
       (error: unknown) =>
         typeof error === "object" && error !== null && "code" in error
@@ -143,6 +152,7 @@ test("schema-017 marker INSERT and UPDATE conflict with a live rollback bridge",
       [SCHEMA_016_017_GUARD],
     ).catch(() => undefined);
     guard.release();
+    await pool.query("DELETE FROM public.durable_jobs WHERE id = $1", [updateTarget]);
   }
 });
 

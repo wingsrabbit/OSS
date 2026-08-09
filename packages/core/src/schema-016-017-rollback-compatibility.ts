@@ -17,10 +17,8 @@ export const SCHEMA_016_017_GUARD =
 export const SCHEMA_017_APPLICATION_GUARD =
   "opensales:schema-017-application" as const;
 
-// Filled only from the catalog fingerprint emitted by the real PG18 migration
-// integration. A placeholder intentionally makes every schema-017 start fail.
 export const SCHEMA_017_CATALOG_DIGEST =
-  "PENDING_REAL_PG18_CATALOG_DIGEST" as const;
+  "2c0c9578c1a05c9292ceb8c1adcb14e5636f7a229733fda026df9d673daa799e" as const;
 
 const EXPECTED_MIGRATION_HISTORY = [
   "001_stage_a",
