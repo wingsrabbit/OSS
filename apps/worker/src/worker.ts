@@ -20,7 +20,14 @@ import {
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
-import { attemptJobClaim } from "./job-claim.js";
+import {
+  attemptJobClaim,
+  claimSchema016Job,
+  findSchema016GenericRecoveryCandidates,
+  isSchema016GenericRecoveryJobType,
+  lockSchema016ActiveJob,
+  lockSchema016StaleJob,
+} from "./job-claim.js";
 
 const config = z
   .object({
@@ -65,6 +72,7 @@ const paymentTokenEncryptionKeyring = createProviderTokenKeyring(
 const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
   max: 10,
+  connectionTimeoutMillis: 5_000,
   options: "-c search_path=pg_catalog,public",
   statement_timeout: 15_000,
   application_name: "opensales-worker",
@@ -127,8 +135,13 @@ type Job = {
   job_type: string;
   unique_key: string;
   payload: Record<string, string>;
+  payload_snapshot: string;
   attempts: number;
+  locked_at_epoch: string;
+  locked_by: string | null;
 };
+
+type StaleJob = Job;
 
 type DatabaseClient = pg.PoolClient;
 
@@ -161,17 +174,10 @@ async function lockProviderOperation(client: DatabaseClient, operationId: string
 }
 
 async function assertJobLeaseWithClient(client: DatabaseClient, job: Job): Promise<void> {
-  const result = await client.query(
-    `SELECT id
-     FROM durable_jobs
-     WHERE id = $1
-       AND status = 'running'
-       AND locked_by = $2
-       AND attempts = $3
-     FOR UPDATE`,
-    [job.id, config.WORKER_ID, job.attempts],
-  );
-  if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
+  const locked = await lockSchema016ActiveJob<Job>(client, job);
+  if (!locked || locked.locked_by !== config.WORKER_ID) {
+    throw new LostJobLeaseError(job.id);
+  }
 }
 
 function reconcileDelaySeconds(attempts: number): number {
@@ -190,8 +196,20 @@ async function completeJobWithClient(client: DatabaseClient, job: Job): Promise<
        AND status = 'running'
        AND locked_by = $2
        AND attempts = $3
+       AND job_type = $4
+       AND unique_key = $5
+       AND payload::text = $6
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $7
      RETURNING id`,
-    [job.id, config.WORKER_ID, job.attempts],
+    [
+      job.id,
+      config.WORKER_ID,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+    ],
   );
   if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
@@ -209,8 +227,21 @@ async function manualJobWithClient(
        AND status = 'running'
        AND locked_by = $3
        AND attempts = $4
+       AND job_type = $5
+       AND unique_key = $6
+       AND payload::text = $7
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $8
      RETURNING id`,
-    [job.id, reason.slice(0, 1_000), config.WORKER_ID, job.attempts],
+    [
+      job.id,
+      reason.slice(0, 1_000),
+      config.WORKER_ID,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+    ],
   );
   if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
@@ -251,19 +282,13 @@ async function enqueueReconcileWithClient(
 
 async function lockStaleJobWithClient(
   client: DatabaseClient,
-  candidate: Job,
-): Promise<Job | null> {
-  const result = await client.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
-     FROM durable_jobs
-     WHERE id = $1
-       AND status = 'running'
-       AND attempts = $2
-       AND locked_at < now() - make_interval(secs => $3)
-     FOR UPDATE`,
-    [candidate.id, candidate.attempts, config.JOB_LOCK_TIMEOUT_SECONDS],
+  candidate: StaleJob,
+): Promise<StaleJob | null> {
+  return lockSchema016StaleJob<StaleJob>(
+    client,
+    candidate,
+    config.JOB_LOCK_TIMEOUT_SECONDS,
   );
-  return result.rows[0] ?? null;
 }
 
 async function completeRecoveredJobWithClient(client: DatabaseClient, job: Job): Promise<void> {
@@ -290,13 +315,18 @@ async function manualRecoveredJobWithClient(
   );
 }
 
-async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleJob(candidate: StaleJob): Promise<boolean> {
+  if (!isSchema016GenericRecoveryJobType(candidate.job_type)) return false;
   const sideEffecting = ["payment.start", "add_funds.start", "provision.start"].includes(
     candidate.job_type,
   );
   if (!sideEffecting) {
     return transaction(async (client) => {
-      const job = await lockStaleJobWithClient(client, candidate);
+      const job = await lockSchema016StaleJob<StaleJob>(
+        client,
+        candidate,
+        config.JOB_LOCK_TIMEOUT_SECONDS,
+      );
       if (!job) return false;
       const maxAttempts = job.job_type.endsWith(".reconcile")
         ? config.RECONCILE_MAX_ATTEMPTS
@@ -330,7 +360,11 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
   const operationId = candidate.payload.providerOperationId;
   if (!subjectId || !operationId) {
     return transaction(async (client) => {
-      const job = await lockStaleJobWithClient(client, candidate);
+      const job = await lockSchema016StaleJob<StaleJob>(
+        client,
+        candidate,
+        config.JOB_LOCK_TIMEOUT_SECONDS,
+      );
       if (!job) return false;
       await manualRecoveredJobWithClient(
         client,
@@ -350,7 +384,11 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
        FOR UPDATE`,
       [operationId],
     );
-    const job = await lockStaleJobWithClient(client, candidate);
+    const job = await lockSchema016StaleJob<StaleJob>(
+      client,
+      candidate,
+      config.JOB_LOCK_TIMEOUT_SECONDS,
+    );
     if (!job) return false;
     const operationRecord = operation.rows[0];
     if (!operationRecord) {
@@ -452,29 +490,18 @@ async function recoverOneStaleJob(candidate: Job): Promise<boolean> {
 }
 
 async function recoverStaleJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
-     FROM durable_jobs
-     WHERE status = 'running'
-       AND locked_at < now() - make_interval(secs => $1)
-       AND job_type NOT IN (
-         'refund.start', 'refund.reconcile',
-         'service.suspend.start', 'service.suspend.reconcile',
-         'service.resume.start', 'service.resume.reconcile',
-         'service.cancellation.due', 'service.cancellation.reconcile'
-       )
-     ORDER BY locked_at, created_at
-     LIMIT 50`,
-    [config.JOB_LOCK_TIMEOUT_SECONDS],
+  const candidates = await findSchema016GenericRecoveryCandidates<StaleJob>(
+    pool,
+    config.JOB_LOCK_TIMEOUT_SECONDS,
   );
   let recovered = 0;
-  for (const candidate of candidates.rows) {
+  for (const candidate of candidates) {
     if (await recoverOneStaleJob(candidate)) recovered += 1;
   }
   return recovered;
 }
 
-async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleRefundJob(candidate: StaleJob): Promise<boolean> {
   const refundId = candidate.payload.refundId;
   const operationId = candidate.payload.operationId ?? candidate.payload.providerOperationId;
   if (!refundId || !operationId) {
@@ -521,17 +548,11 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
        FOR UPDATE OF refund, operation`,
       [refundId, operationId],
     );
-    const currentJob = await client.query<Job>(
-      `SELECT id, job_type, unique_key, payload, attempts
-       FROM durable_jobs
-       WHERE id = $1
-         AND status = 'running'
-         AND attempts = $2
-         AND locked_at < now() - make_interval(secs => $3)
-       FOR UPDATE`,
-      [candidate.id, candidate.attempts, config.JOB_LOCK_TIMEOUT_SECONDS],
+    const job = await lockSchema016StaleJob<StaleJob>(
+      client,
+      candidate,
+      config.JOB_LOCK_TIMEOUT_SECONDS,
     );
-    const job = currentJob.rows[0];
     if (!job) return false;
     const record = state.rows[0];
     if (!receiptId || !record) {
@@ -675,8 +696,12 @@ async function recoverOneStaleRefundJob(candidate: Job): Promise<boolean> {
 }
 
 async function recoverStaleRefundJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
+  const candidates = await pool.query<StaleJob>(
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN ('refund.start', 'refund.reconcile')
@@ -693,27 +718,7 @@ async function recoverStaleRefundJobs(): Promise<number> {
 }
 
 async function claimJob(): Promise<Job | null> {
-  const result = await pool.query<Job>(
-    `WITH candidate AS (
-       SELECT id
-       FROM durable_jobs
-       WHERE status = 'pending' AND available_at <= now()
-       ORDER BY available_at, created_at
-       FOR UPDATE SKIP LOCKED
-       LIMIT 1
-     )
-     UPDATE durable_jobs job
-     SET status = 'running',
-         attempts = job.attempts + 1,
-         locked_at = now(),
-         locked_by = $1,
-         updated_at = now()
-     FROM candidate
-     WHERE job.id = candidate.id
-     RETURNING job.id, job.job_type, job.unique_key, job.payload, job.attempts`,
-    [config.WORKER_ID],
-  );
-  return result.rows[0] ?? null;
+  return claimSchema016Job<Job>(pool, config.WORKER_ID);
 }
 
 async function completeJob(job: Job): Promise<void> {
@@ -725,8 +730,20 @@ async function completeJob(job: Job): Promise<void> {
        AND status = 'running'
        AND locked_by = $2
        AND attempts = $3
+       AND job_type = $4
+       AND unique_key = $5
+       AND payload::text = $6
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $7
      RETURNING id`,
-    [job.id, config.WORKER_ID, job.attempts],
+    [
+      job.id,
+      config.WORKER_ID,
+      job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
+    ],
   );
   if (result.rowCount !== 1) throw new LostJobLeaseError(job.id);
 }
@@ -749,7 +766,11 @@ async function failJob(job: Job, error: unknown): Promise<void> {
      WHERE id = $1
        AND status = 'running'
        AND locked_by = $5
-       AND attempts = $6`,
+       AND attempts = $6
+       AND job_type = $7
+       AND unique_key = $8
+       AND payload::text = $9
+       AND EXTRACT(epoch FROM locked_at)::numeric::text = $10`,
     [
       job.id,
       manual ? "manual" : "pending",
@@ -757,6 +778,10 @@ async function failJob(job: Job, error: unknown): Promise<void> {
       message,
       config.WORKER_ID,
       job.attempts,
+      job.job_type,
+      job.unique_key,
+      job.payload_snapshot,
+      job.locked_at_epoch,
     ],
   );
   if (result.rowCount !== 1) {
@@ -5596,7 +5621,7 @@ async function reconcileCancellation(job: Job): Promise<void> {
   await completeJob(job);
 }
 
-async function recoverOneStaleServiceActionJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleServiceActionJob(candidate: StaleJob): Promise<boolean> {
   const action: ServiceAction | null = candidate.job_type.startsWith("service.suspend.")
     ? "suspend"
     : candidate.job_type.startsWith("service.resume.")
@@ -5846,8 +5871,12 @@ async function recoverOneStaleServiceActionJob(candidate: Job): Promise<boolean>
 }
 
 async function recoverStaleServiceActionJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
+  const candidates = await pool.query<StaleJob>(
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN (
@@ -5866,7 +5895,7 @@ async function recoverStaleServiceActionJobs(): Promise<number> {
   return recovered;
 }
 
-async function recoverOneStaleCancellationJob(candidate: Job): Promise<boolean> {
+async function recoverOneStaleCancellationJob(candidate: StaleJob): Promise<boolean> {
   const requestId = candidate.payload.cancellationRequestId ?? candidate.payload.requestId;
   const executionId = candidate.payload.executionId;
   const serviceId = candidate.payload.serviceId;
@@ -6115,8 +6144,12 @@ async function recoverOneStaleCancellationJob(candidate: Job): Promise<boolean> 
 }
 
 async function recoverStaleCancellationJobs(): Promise<number> {
-  const candidates = await pool.query<Job>(
-    `SELECT id, job_type, unique_key, payload, attempts
+  const candidates = await pool.query<StaleJob>(
+    `SELECT id, job_type, unique_key, payload,
+            payload::text AS payload_snapshot,
+            attempts,
+            EXTRACT(epoch FROM locked_at)::numeric::text AS locked_at_epoch,
+            locked_by
      FROM durable_jobs
      WHERE status = 'running'
        AND job_type IN ('service.cancellation.due', 'service.cancellation.reconcile')
