@@ -5,6 +5,7 @@ import {
   assert015RollbackBridgeSafe,
   SCHEMA_015_016_GUARD,
   SCHEMA_016,
+  SCHEMA_016_CATALOG_DIGEST,
 } from "@opensales/core/schema-015-016-rollback-compatibility";
 import {
   SCHEMA_015,
@@ -752,6 +753,35 @@ try {
   );
   await client.query("ROLLBACK TO SAVEPOINT counterfeit_function");
 
+  await client.query("SAVEPOINT forged_database_digest");
+  await client.query(`
+    CREATE OR REPLACE FUNCTION public.digest(text, text)
+    RETURNS bytea LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+      SELECT pg_catalog.decode(
+        '${SCHEMA_016_CATALOG_DIGEST}',
+        'hex'
+      )
+    $$;
+    CREATE OR REPLACE FUNCTION public.opensales_manual_receipt_write_guard()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF false THEN
+        PERFORM pg_catalog.pg_advisory_xact_lock(
+          pg_catalog.hashtextextended(
+            'opensales:schema-015-016-rollback-bridge',
+            0
+          )
+        );
+      END IF;
+      RETURN NEW;
+    END $$;
+  `);
+  await assert.rejects(
+    assert015RollbackBridgeSafe(database, { enable016RollbackBridge: true }),
+    /incomplete or counterfeit/,
+  );
+  await client.query("ROLLBACK TO SAVEPOINT forged_database_digest");
+
   await client.query("SAVEPOINT privileged_function");
   await client.query(
     "ALTER FUNCTION public.opensales_manual_receipt_write_guard() SECURITY DEFINER",
@@ -872,6 +902,7 @@ try {
       counterfeitConstraintRejected: true,
       counterfeitColumnRejected: true,
       counterfeitFunctionRejected: true,
+      forgedDatabaseDigestRejected: true,
       securityDefinerFunctionRejected: true,
       counterfeitViewRejected: true,
       lifetimeGuardBlocksWriter: true,

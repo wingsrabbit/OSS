@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import {
   SCHEMA_015,
   SchemaRollbackPreflightError,
@@ -405,11 +406,8 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                           pg_get_viewdef('public.unclaimed_fund_refund_capacity'::regclass, true),
                           '\s+', ' ', 'g'
                         ))
-     ), catalog_digest(value) AS (
-       SELECT encode(
-         public.digest(string_agg(item, E'\n' ORDER BY item), 'sha256'),
-         'hex'
-       )
+     ), catalog_fingerprint(value) AS (
+       SELECT string_agg(item, E'\n' ORDER BY item)
        FROM catalog_items
      )
      SELECT
@@ -426,7 +424,7 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
        (SELECT valid FROM constraint_shape) AS has_constraints,
        (SELECT valid FROM trigger_shape) AS has_triggers,
        (SELECT valid FROM function_shape) AS has_functions,
-       (SELECT value FROM catalog_digest) AS catalog_digest,
+       (SELECT value FROM catalog_fingerprint) AS catalog_fingerprint_input,
        to_regclass('public.unclaimed_fund_refund_capacity') IS NOT NULL
          AND NOT EXISTS (
            SELECT 1 FROM required_view_fragments required
@@ -435,9 +433,14 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
          ) AS has_capacity_view`,
   );
   const shape = rowRecord(result.rows[0]);
-  if (shape.catalog_digest !== SCHEMA_016_CATALOG_DIGEST) {
+  const catalogFingerprintInput = shape.catalog_fingerprint_input;
+  const catalogDigest =
+    typeof catalogFingerprintInput === "string"
+      ? createHash("sha256").update(catalogFingerprintInput, "utf8").digest("hex")
+      : null;
+  if (catalogDigest !== SCHEMA_016_CATALOG_DIGEST) {
     throw new SchemaRollbackPreflightError(
-      `Schema 016 is incomplete or counterfeit: catalog digest ${String(shape.catalog_digest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start the 015 rollback bridge.`,
+      `Schema 016 is incomplete or counterfeit: catalog digest ${String(catalogDigest)} does not match reviewed digest ${SCHEMA_016_CATALOG_DIGEST}; do not start the 015 rollback bridge.`,
       SCHEMA_016,
     );
   }

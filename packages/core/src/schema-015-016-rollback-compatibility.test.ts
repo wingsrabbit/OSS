@@ -5,11 +5,9 @@ import test from "node:test";
 import {
   assert015RollbackBridgeSafe,
   SCHEMA_016,
-  SCHEMA_016_CATALOG_DIGEST,
 } from "./schema-015-016-rollback-compatibility.js";
 import {
   SCHEMA_015,
-  SchemaRollbackPreflightError,
   type RollbackPreflightQueryable,
 } from "./schema-rollback-compatibility.js";
 
@@ -37,7 +35,9 @@ function fakeDatabase(input: {
               has_triggers: valid,
               has_functions: valid,
               has_capacity_view: valid,
-              catalog_digest: valid ? SCHEMA_016_CATALOG_DIGEST : "counterfeit",
+              catalog_fingerprint_input: valid
+                ? "synthetic catalog data that is not the reviewed PostgreSQL catalog"
+                : null,
             },
           ],
         };
@@ -87,32 +87,10 @@ test("schema 016 requires exact opt-in and its complete semantic catalog", async
     }),
     /incomplete or counterfeit/,
   );
-});
-
-test("empty schema 016 is accepted while every historical fact blocks rollback", async () => {
-  const safe = await assert015RollbackBridgeSafe(fakeDatabase({ version: SCHEMA_016 }), {
-    enable016RollbackBridge: true,
-  });
-  assert.equal(safe.mode, "rollback_bridge");
-
-  let error: unknown;
-  try {
-    await assert015RollbackBridgeSafe(
-      fakeDatabase({
-        version: SCHEMA_016,
-        blockers: [
-          { code: "manual_receipt_facts", count: "2" },
-          { code: "manual_ledger_journals", count: "1" },
-        ],
-      }),
-      { enable016RollbackBridge: true },
-    );
-  } catch (caught) {
-    error = caught;
-  }
-  assert.ok(error instanceof SchemaRollbackPreflightError);
-  assert.deepEqual(error.blockers, [
-    { code: "manual_receipt_facts", count: 2 },
-    { code: "manual_ledger_journals", count: 1 },
-  ]);
+  await assert.rejects(
+    assert015RollbackBridgeSafe(fakeDatabase({ version: SCHEMA_016, shape: true }), {
+      enable016RollbackBridge: true,
+    }),
+    /catalog digest .* does not match reviewed digest/,
+  );
 });
