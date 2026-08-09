@@ -2,7 +2,6 @@
 
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   assertSchema016RollbackBridgeSafe,
@@ -13,6 +12,11 @@ import {
   schema017CatalogFingerprintInput,
 } from "@opensales/core/schema-016-017-rollback-compatibility";
 import pg from "pg";
+import {
+  holdSchema016RollbackBridgeGuard,
+  holdSchema017ApplicationGuard,
+  runMigrations,
+} from "./database.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required for schema 016/017 integration");
@@ -35,40 +39,26 @@ async function currentVersion(): Promise<string | null> {
   return result.rows[0]?.version ?? null;
 }
 
-async function applyActualMigration017(): Promise<void> {
-  const migrationPath = new URL(
-    "../migrations/017_stage_b_manual_receipt_outflow_reports.sql",
-    import.meta.url,
-  );
-  const migration = await readFile(migrationPath, "utf8");
-  const client = await pool.connect();
-  try {
-    await client.query("SET search_path TO public");
-    await client.query("BEGIN");
-    await client.query(migration);
-    await client.query(
-      "INSERT INTO public.schema_migrations(version) VALUES ($1)",
-      [SCHEMA_017],
-    );
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 test("explicit schema-016 bridge accepts exact native 016 before migration", async () => {
   assert.equal(await currentVersion(), "016_stage_b_manual_receipts");
   const report = await assertSchema016RollbackBridgeSafe(queryable, {
     enable017RollbackBridge: true,
   });
   assert.equal(report.mode, "native");
+
+  const releaseGuard = await holdSchema016RollbackBridgeGuard(pool);
+  try {
+    await assert.rejects(
+      runMigrations(pool),
+      /running schema-016\/017 bridge API or Worker/,
+    );
+  } finally {
+    await releaseGuard();
+  }
 });
 
 test("actual migration 017 file applies and emits its PG18 catalog digest", async () => {
-  await applyActualMigration017();
+  await runMigrations(pool);
   assert.equal(await currentVersion(), SCHEMA_017);
   const catalog = await schema017CatalogFingerprintInput(queryable);
   assert.equal(catalog.historyExact, true);
@@ -90,6 +80,81 @@ test("native 017 and an empty explicit 016 bridge use the exact catalog", async 
     enable017RollbackBridge: true,
   });
   assert.equal(bridge.mode, "rollback_bridge");
+
+  const releaseGuard = await holdSchema017ApplicationGuard(pool);
+  try {
+    await assert.rejects(
+      runMigrations(pool),
+      /running schema-017 API or Worker/,
+    );
+  } finally {
+    await releaseGuard();
+  }
+  await runMigrations(pool);
+});
+
+test("role-schema and public built-in shadows cannot spoof schema 017", async () => {
+  const client = await pool.connect();
+  try {
+    const role = await client.query<{ current_user: string }>(
+      "SELECT current_user",
+    );
+    const roleName = role.rows[0]?.current_user;
+    assert.ok(roleName);
+    const quotedRoleSchema = `"${roleName.replaceAll('"', '""')}"`;
+    await client.query("BEGIN");
+    await client.query(`CREATE SCHEMA ${quotedRoleSchema}`);
+    await client.query(
+      `CREATE TABLE ${quotedRoleSchema}.schema_migrations(
+         version text PRIMARY KEY, applied_at timestamptz NOT NULL
+       )`,
+    );
+    await client.query(
+      `INSERT INTO ${quotedRoleSchema}.schema_migrations(version, applied_at)
+       VALUES ('999_counterfeit', pg_catalog.now())`,
+    );
+    await client.query(
+      `CREATE FUNCTION public.max(text) RETURNS text
+       LANGUAGE sql IMMUTABLE AS 'SELECT $1'`,
+    );
+    await client.query(`SET LOCAL search_path TO "$user", public`);
+    assert.equal(
+      (await assertSchema017NativeSafe({
+        query: async (text, values) => client.query(text, values),
+      })).installedSchemaVersion,
+      SCHEMA_017,
+    );
+    await client.query("ROLLBACK");
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+});
+
+test("known pending job claims have the pinned selective index path", async () => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN READ ONLY");
+    await client.query("SET LOCAL enable_seqscan = off");
+    const explained = await client.query<{ "QUERY PLAN": unknown }>(
+      `EXPLAIN (FORMAT JSON)
+       SELECT id
+       FROM public.durable_jobs
+       WHERE status = 'pending'
+         AND job_type IN ('notification.send', 'payment.start')
+         AND available_at <= pg_catalog.now()
+       ORDER BY available_at, created_at
+       LIMIT 1`,
+    );
+    assert.match(
+      JSON.stringify(explained.rows[0]?.["QUERY PLAN"]),
+      /durable_jobs_pending_type_available_created_idx/,
+    );
+    await client.query("ROLLBACK");
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
 });
 
 test("schema-017 marker INSERT and UPDATE conflict with a live rollback bridge", async () => {
