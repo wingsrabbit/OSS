@@ -50,6 +50,11 @@ type Viewer = {
   staff: { roles: string[]; permissions: unknown } | null;
 };
 
+function surfaceIsActive(surface: "customer" | "staff"): boolean {
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  return path === (surface === "customer" ? "/customer" : "/admin");
+}
+
 export function TicketsPanel({
   mode,
   canManageTickets = false,
@@ -78,7 +83,7 @@ export function TicketsPanel({
   const [pending, setPending] = useState(false);
 
   const refreshCustomer = useCallback(async () => {
-    if (!me?.eligible) {
+    if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible) {
       setTickets([]);
       setServices([]);
       setSelected(null);
@@ -88,12 +93,18 @@ export function TicketsPanel({
       api<{ items: TicketSummary[] }>("/api/v1/tickets"),
       api<{ items: ServiceOption[] }>("/api/v1/tickets/service-options"),
     ]);
+    if (!surfaceIsActive("customer")) return;
     setTickets(ticketResult.items);
     setServices(serviceResult.items);
-  }, [me?.eligible, me?.id]);
+  }, [me?.eligible, me?.id, mode]);
 
   const refreshStaff = useCallback(async () => {
-    if (!me?.staff || !canManageTickets) {
+    if (
+      mode !== "staff" ||
+      !surfaceIsActive("staff") ||
+      !me?.staff ||
+      !canManageTickets
+    ) {
       setStaffTickets([]);
       setStaffSelected(null);
       return;
@@ -101,8 +112,9 @@ export function TicketsPanel({
     const result = await api<{ items: StaffTicketSummary[] }>(
       "/api/v1/admin/tickets",
     );
+    if (!surfaceIsActive("staff")) return;
     setStaffTickets(result.items);
-  }, [canManageTickets, me?.id, me?.staff]);
+  }, [canManageTickets, me?.id, me?.staff, mode]);
 
   useEffect(() => {
     void (mode === "customer" ? refreshCustomer() : refreshStaff()).catch((caught: unknown) =>
@@ -114,8 +126,11 @@ export function TicketsPanel({
   if (mode === "staff" && (!me?.staff || !canManageTickets)) return null;
 
   async function openCustomerTicket(ticketId: string) {
+    if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible) return;
     try {
-      setSelected(await api<CustomerTicketDetail>(`/api/v1/tickets/${ticketId}`));
+      const detail = await api<CustomerTicketDetail>(`/api/v1/tickets/${ticketId}`);
+      if (!surfaceIsActive("customer")) return;
+      setSelected(detail);
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Ticket could not be loaded");
     }
@@ -123,7 +138,7 @@ export function TicketsPanel({
 
   async function createTicket(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (pending) return;
+    if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible || pending) return;
     setPending(true);
     try {
       const created = await api<CustomerTicketDetail>("/api/v1/tickets", {
@@ -134,6 +149,7 @@ export function TicketsPanel({
           serviceId: serviceId || null,
         }),
       });
+      if (!surfaceIsActive("customer")) return;
       setSubject("");
       setOpeningMessage("");
       setServiceId("");
@@ -148,13 +164,21 @@ export function TicketsPanel({
   }
 
   async function replyAsCustomer() {
-    if (!selected || customerReply.trim().length === 0 || pending) return;
+    if (
+      mode !== "customer" ||
+      !surfaceIsActive("customer") ||
+      !me?.eligible ||
+      !selected ||
+      customerReply.trim().length === 0 ||
+      pending
+    ) return;
     setPending(true);
     try {
       const updated = await api<CustomerTicketDetail>(
         `/api/v1/tickets/${selected.ticket.id}/replies`,
         { method: "POST", body: JSON.stringify({ message: customerReply.trim() }) },
       );
+      if (!surfaceIsActive("customer")) return;
       setCustomerReply("");
       setSelected(updated);
       await refreshCustomer();
@@ -167,17 +191,31 @@ export function TicketsPanel({
   }
 
   async function openStaffTicket(ticketId: string) {
+    if (
+      mode !== "staff" ||
+      !surfaceIsActive("staff") ||
+      !me?.staff ||
+      !canManageTickets
+    ) return;
     try {
-      setStaffSelected(
-        await api<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`),
-      );
+      const detail = await api<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`);
+      if (!surfaceIsActive("staff")) return;
+      setStaffSelected(detail);
     } catch (caught) {
       onError(caught instanceof Error ? caught.message : "Staff ticket could not be loaded");
     }
   }
 
   async function sendStaffMessage(kind: "public_reply" | "internal_note") {
-    if (!staffSelected || staffReply.trim().length === 0 || pending) return;
+    if (
+      mode !== "staff" ||
+      !surfaceIsActive("staff") ||
+      !me?.staff ||
+      !canManageTickets ||
+      !staffSelected ||
+      staffReply.trim().length === 0 ||
+      pending
+    ) return;
     setPending(true);
     try {
       const updated = await api<StaffTicketDetail>(
@@ -187,6 +225,7 @@ export function TicketsPanel({
           body: JSON.stringify({ kind, message: staffReply.trim() }),
         },
       );
+      if (!surfaceIsActive("staff")) return;
       setStaffReply("");
       setStaffSelected(updated);
       await refreshStaff();

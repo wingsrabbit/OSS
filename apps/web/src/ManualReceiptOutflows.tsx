@@ -138,7 +138,7 @@ export function ManualReceiptOutflowPanel({
     password.length > 0;
 
   async function submitReport(): Promise<void> {
-    if (!reportDraft || !reportReady || pending) return;
+    if (!reportDraft || !reportReady || pending || disabled) return;
     const payload = {
       expectedAvailableMinor: source.availableMinor,
       amountMinor: reportDraft.amountMinor,
@@ -186,7 +186,7 @@ export function ManualReceiptOutflowPanel({
   }
 
   async function submitReconciliation(): Promise<void> {
-    if (!reconciliationDraft || !reconciliationReady || pending) return;
+    if (!reconciliationDraft || !reconciliationReady || pending || disabled) return;
     const payload = {
       outcome: reconciliationDraft.outcome,
       occurredAt:

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 type MockViewer = {
   id: string;
@@ -37,13 +37,19 @@ function mockViewer({
 async function installMockApi(
   page: Page,
   viewer: MockViewer | null,
-  options: { unauthorizedPath?: string } = {},
+  options: {
+    unauthorizedPath?: string;
+    unauthorizedError?: string;
+    intercept?: (path: string, route: Route) => Promise<boolean>;
+  } = {},
 ): Promise<string[]> {
   const requests: string[] = [];
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     requests.push(path);
+
+    if (options.intercept && await options.intercept(path, route)) return;
 
     if (path === "/api/v1/auth/me") {
       if (viewer) {
@@ -54,7 +60,10 @@ async function installMockApi(
       return;
     }
     if (path === options.unauthorizedPath) {
-      await route.fulfill({ status: 401, json: { error: "Session expired" } });
+      await route.fulfill({
+        status: 401,
+        json: { error: options.unauthorizedError ?? "Session expired" },
+      });
       return;
     }
     if (path === "/api/v1/auth/logout") {
@@ -181,15 +190,39 @@ async function installMockApi(
       await route.fulfill({ json: { items: [] } });
       return;
     }
+    if (
+      path.startsWith("/api/v1/billing/payment-methods/") &&
+      path.endsWith("/default")
+    ) {
+      await route.fulfill({ json: {} });
+      return;
+    }
     if (path === "/api/v1/admin/add-funds-chargebacks") {
       await route.fulfill({ json: { items: [], unclaimedChargebacks: [], manualHolds: [] } });
       return;
     }
-    if (path.startsWith("/api/v1/admin/")) {
+    if (
+      [
+        "/api/v1/admin/tickets",
+        "/api/v1/admin/billing/renewals",
+        "/api/v1/admin/manual-fulfillment",
+        "/api/v1/admin/services/cancellations",
+        "/api/v1/admin/funds/unclaimed",
+        "/api/v1/admin/refund-candidates",
+        "/api/v1/admin/refunds",
+        "/api/v1/admin/refund-security-holds",
+        "/api/v1/admin/refund-dismissal-corrections",
+        "/api/v1/admin/refund-receipt-capacity-incidents",
+      ].includes(path)
+    ) {
       await route.fulfill({ json: { items: [] } });
       return;
     }
-    await route.fulfill({ json: {} });
+    await route.fulfill({
+      status: 501,
+      json: { error: `Unexpected mock API request: ${request.method()} ${path}` },
+    });
+    throw new Error(`Unexpected mock API request: ${request.method()} ${path}`);
   });
   return requests;
 }
@@ -304,7 +337,15 @@ test("public Home stays session-neutral for a signed-in wildcard Staff account",
   await expect(page.getByRole("link", { name: "Open Admin workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Register", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
-  expect(requests.filter((path) => path.startsWith("/api/v1/admin/"))).toEqual([]);
+  expect(new Set(requests)).toEqual(
+    new Set(["/api/v1/catalog", "/api/v1/legal/current"]),
+  );
+  const requestCountBeforeLocaleChange = requests.length;
+  await page.getByRole("button", { name: "简体中文" }).click();
+  await expect.poll(() => requests.length).toBeGreaterThan(requestCountBeforeLocaleChange);
+  expect(new Set(requests)).toEqual(
+    new Set(["/api/v1/catalog", "/api/v1/legal/current"]),
+  );
 });
 
 test("restricted wildcard Staff mounts no Admin capability or Admin fetch", async ({ page }) => {
@@ -323,6 +364,24 @@ test("restricted wildcard Staff mounts no Admin capability or Admin fetch", asyn
   );
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
+  expect(requests.filter((path) => path.startsWith("/api/v1/admin/"))).toEqual([]);
+});
+
+test("malformed Staff permissions fail closed without Admin fetches", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "malformed-permissions@example.invalid",
+      permissions: { wildcard: "*", tickets: true },
+    }),
+  );
+
+  await page.goto("/admin");
+  await expect(page.getByTestId("admin-access-restricted")).toContainText(
+    "Access denied — Staff permission required",
+  );
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
+  await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
   expect(requests.filter((path) => path.startsWith("/api/v1/admin/"))).toEqual([]);
 });
 
@@ -406,6 +465,200 @@ test("guest auth check does not hard-reload or loop", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Sign in to open the customer workspace" })).toBeVisible();
   await expect(page).toHaveURL(/\/customer$/);
   expect(documents).toEqual(["/customer"]);
+});
+
+test("reauth password rejection stays in the current workspace", async ({ page }) => {
+  await installMockApi(
+    page,
+    mockViewer({ email: "wrong-reauth-password@example.invalid" }),
+    {
+      unauthorizedPath: "/api/v1/auth/reauth",
+      unauthorizedError: "Password confirmation failed",
+    },
+  );
+  const documents: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "document") documents.push(new URL(request.url()).pathname);
+  });
+
+  await page.goto("/customer");
+  await page.getByTestId("payment-settings-password").fill("Synthetic-Wrong-Password!");
+  await page.getByRole("button", { name: "Set as default only" }).click();
+  await expect(page.locator(".notice.error")).toContainText("Password confirmation failed");
+  await expect(page).toHaveURL(/\/customer$/);
+  expect(documents).toEqual(["/customer"]);
+});
+
+for (const sessionError of ["Session is invalid or expired", "Authentication required"]) {
+  test(`reauth session error hard-navigates: ${sessionError}`, async ({ page }) => {
+    await installMockApi(
+      page,
+      mockViewer({ email: "expired-reauth-session@example.invalid" }),
+      {
+        unauthorizedPath: "/api/v1/auth/reauth",
+        unauthorizedError: sessionError,
+      },
+    );
+
+    await page.goto("/customer");
+    const rootDocument = page.waitForRequest(
+      (request) => request.resourceType() === "document" && new URL(request.url()).pathname === "/",
+    );
+    await page.getByTestId("payment-settings-password").fill("Synthetic-Expired-Session!");
+    await page.getByRole("button", { name: "Set as default only" }).click();
+    await rootDocument;
+    await expect(page).toHaveURL(/\/$/);
+  });
+}
+
+test("delayed customer completion cannot leak notice or DOM after navigating Home", async ({
+  page,
+}) => {
+  let releaseResponse!: () => void;
+  let markRequestStarted!: () => void;
+  let markResponseFulfilled!: () => void;
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  const requestStarted = new Promise<void>((resolve) => { markRequestStarted = resolve; });
+  const responseFulfilled = new Promise<void>((resolve) => { markResponseFulfilled = resolve; });
+  const ticketId = "00000000-0000-4000-8000-000000000010";
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  await installMockApi(
+    page,
+    mockViewer({ email: "delayed-customer@example.invalid" }),
+    {
+      intercept: async (path, route) => {
+        if (path !== "/api/v1/tickets" || route.request().method() !== "POST") return false;
+        markRequestStarted();
+        await responseGate;
+        await route.fulfill({
+          status: 201,
+          json: {
+            ticket: {
+              id: ticketId,
+              subject: "Delayed customer ticket",
+              status: "awaiting_staff",
+              service: null,
+              publicMessageCount: 1,
+              createdAt,
+              updatedAt: createdAt,
+            },
+            messages: [
+              { id: ticketId, authorType: "customer", body: "Delayed body", createdAt },
+            ],
+          },
+        });
+        markResponseFulfilled();
+        return true;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  await page.getByLabel("Ticket subject").fill("Delayed customer ticket");
+  await page.getByLabel("Opening message").fill("Delayed body");
+  await page.getByRole("button", { name: "Create ticket" }).click();
+  await requestStarted;
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseResponse();
+  await responseFulfilled;
+  await page.waitForTimeout(50);
+  await expect(page.locator(".notice")).toHaveCount(0);
+  await expect(page.locator('section[aria-label="Customer support tickets"]')).toHaveCount(0);
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
+  await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
+});
+
+test("delayed Staff completion cannot leak or refetch after navigating to customer", async ({
+  page,
+}) => {
+  let releaseResponse!: () => void;
+  let markRequestStarted!: () => void;
+  let markResponseFulfilled!: () => void;
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  const requestStarted = new Promise<void>((resolve) => { markRequestStarted = resolve; });
+  const responseFulfilled = new Promise<void>((resolve) => { markResponseFulfilled = resolve; });
+  const ticketId = "00000000-0000-4000-8000-000000000020";
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const ticket = {
+    id: ticketId,
+    subject: "Delayed Staff ticket",
+    status: "awaiting_staff",
+    service: null,
+    publicMessageCount: 1,
+    createdAt,
+    updatedAt: createdAt,
+    clientAccount: {
+      id: "00000000-0000-4000-8000-000000000002",
+      name: "Delayed account",
+    },
+    internalMessageCount: 0,
+  };
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "delayed-staff@example.invalid",
+      permissions: ["support.tickets.manage"],
+    }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/tickets" && route.request().method() === "GET") {
+          await route.fulfill({ json: { items: [ticket] } });
+          return true;
+        }
+        if (path === `/api/v1/admin/tickets/${ticketId}`) {
+          await route.fulfill({ json: { ticket, messages: [] } });
+          return true;
+        }
+        if (
+          path === `/api/v1/admin/tickets/${ticketId}/messages` &&
+          route.request().method() === "POST"
+        ) {
+          markRequestStarted();
+          await responseGate;
+          await route.fulfill({
+            status: 201,
+            json: {
+              ticket: { ...ticket, status: "awaiting_customer" },
+              messages: [
+                {
+                  id: ticketId,
+                  authorType: "staff",
+                  visibility: "public",
+                  authorEmail: "delayed-staff@example.invalid",
+                  body: "Delayed public reply",
+                  createdAt,
+                },
+              ],
+            },
+          });
+          markResponseFulfilled();
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  await page.getByTestId("staff-ticket-list").getByRole("button", { name: /Delayed Staff ticket/ }).click();
+  const thread = page.getByTestId("staff-ticket-thread");
+  await thread.getByLabel("Staff ticket message").fill("Delayed public reply");
+  await thread.getByRole("button", { name: "Send public reply" }).click();
+  await requestStarted;
+  const staffListFetchesBeforeRelease = requests.filter(
+    (path) => path === "/api/v1/admin/tickets",
+  ).length;
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  await expect(page.locator('section[aria-label="Customer support tickets"]')).toBeVisible();
+  releaseResponse();
+  await responseFulfilled;
+  await page.waitForTimeout(50);
+  await expect(page.locator(".notice")).toHaveCount(0);
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
+  await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
+  expect(requests.filter((path) => path === "/api/v1/admin/tickets").length).toBe(
+    staffListFetchesBeforeRelease,
+  );
 });
 
 test("History navigation clears selected checkout, reauth grant, passwords and Admin drafts", async ({

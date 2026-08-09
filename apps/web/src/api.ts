@@ -23,8 +23,16 @@ function isProtectedApiPath(path: string): boolean {
   return (
     path.startsWith("/api/v1/") &&
     !path.startsWith("/api/v1/auth/") &&
-    !path.startsWith("/api/v1/catalog") &&
+    path !== "/api/v1/catalog" &&
     !path.startsWith("/api/v1/legal/")
+  );
+}
+
+function reauthenticationMeansSessionExpired(path: string, status: number, message?: string): boolean {
+  return (
+    path === "/api/v1/auth/reauth" &&
+    status === 401 &&
+    (message === "Session is invalid or expired" || message === "Authentication required")
   );
 }
 
@@ -42,7 +50,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       error?: string;
       code?: string;
     };
-    if (response.status === 401 && isProtectedApiPath(path)) {
+    if (
+      (response.status === 401 && isProtectedApiPath(path)) ||
+      reauthenticationMeansSessionExpired(path, response.status, errorBody.error)
+    ) {
       hardResetSession();
     }
     throw new ApiError(

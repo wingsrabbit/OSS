@@ -762,8 +762,10 @@ export function App() {
   const [sessionResolved, setSessionResolved] = useState(false);
   const [selected, setSelected] = useState<{ product: Product; price: Price } | null>(null);
   const [order, setOrder] = useState<OrderDetail | null>(null);
-  const [notice, setNotice] = useState<string>("");
-  const [error, setError] = useState<string>("");
+  const [notice, setNoticeRaw] = useState<string>("");
+  const [error, setErrorRaw] = useState<string>("");
+  const activeRouteRef = useRef<AppRoute>(route);
+  const routeGenerationRef = useRef(0);
   const [paymentScenario, setPaymentScenario] = useState("success");
   const [paymentMethod, setPaymentMethod] = useState("card");
   const [applyCredit, setApplyCredit] = useState(true);
@@ -894,6 +896,24 @@ export function App() {
   const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
     ReadonlySet<string>
   >(new Set());
+  const renderRoute = route;
+  const renderRouteGeneration = routeGenerationRef.current;
+  const setNotice = useCallback((message: string) => {
+    if (
+      activeRouteRef.current === renderRoute &&
+      routeGenerationRef.current === renderRouteGeneration
+    ) {
+      setNoticeRaw(message);
+    }
+  }, [renderRoute, renderRouteGeneration]);
+  const setError = useCallback((message: string) => {
+    if (
+      activeRouteRef.current === renderRoute &&
+      routeGenerationRef.current === renderRouteGeneration
+    ) {
+      setErrorRaw(message);
+    }
+  }, [renderRoute, renderRouteGeneration]);
   const staffPermissions = useMemo(
     () => parseStaffPermissions(me?.staff?.permissions),
     [me?.staff?.permissions],
@@ -904,10 +924,11 @@ export function App() {
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
   const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
   const canOpenAdminWorkspace = canManageStaffTickets || canUseFullAdminWorkspace;
+  const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
 
   const clearWorkspaceTransientState = useCallback(() => {
-    setNotice("");
-    setError("");
+    setNoticeRaw("");
+    setErrorRaw("");
     setSelected(null);
     setOrder(null);
     setBilling(null);
@@ -994,7 +1015,10 @@ export function App() {
   }, []);
 
   const openRoute = useCallback((target: AppRoute, replace = false) => {
+    routeGenerationRef.current += 1;
+    activeRouteRef.current = target;
     clearWorkspaceTransientState();
+    if (target !== "/") setSessionResolved(false);
     if (replace) {
       window.history.replaceState({}, "", target);
     } else if (window.location.pathname !== target || window.location.search.length > 0) {
@@ -1022,11 +1046,11 @@ export function App() {
   const showTicketNotice = useCallback((message: string) => {
     setError("");
     setNotice(message);
-  }, []);
+  }, [setError, setNotice]);
   const showTicketError = useCallback((message: string) => {
     setNotice("");
     setError(message);
-  }, []);
+  }, [setError, setNotice]);
   const text = words[locale];
   const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const manualReceiptAmountsValid =
@@ -1053,8 +1077,12 @@ export function App() {
 
   useEffect(() => {
     const onPopState = () => {
+      const target = routeFromPath(window.location.pathname);
+      routeGenerationRef.current += 1;
+      activeRouteRef.current = target;
       clearWorkspaceTransientState();
-      setRoute(routeFromPath(window.location.pathname));
+      if (target !== "/") setSessionResolved(false);
+      setRoute(target);
       window.scrollTo({ top: 0, behavior: "auto" });
     };
     window.addEventListener("popstate", onPopState);
@@ -1077,7 +1105,7 @@ export function App() {
   }, []);
 
   const refreshLatestOrder = useCallback(async () => {
-    if (route !== "/customer" || !me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
       setOrder(null);
       return;
     }
@@ -1091,7 +1119,7 @@ export function App() {
   }, [me?.clientAccountId, me?.eligible, route]);
 
   const refreshBilling = useCallback(async () => {
-    if (route !== "/customer" || !me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
       setBilling(null);
       return;
     }
@@ -1099,7 +1127,11 @@ export function App() {
   }, [me, route]);
 
   const refreshPaymentSettings = useCallback(async () => {
-    if (route !== "/customer" || me?.verification.email !== "passed") {
+    if (
+      route !== "/customer" ||
+      activeRouteRef.current !== "/customer" ||
+      me?.verification.email !== "passed"
+    ) {
       setPaymentSettings(null);
       return;
     }
@@ -1109,7 +1141,7 @@ export function App() {
   }, [me?.clientAccountId, me?.verification.email, route]);
 
   const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
-    if (route !== "/customer" || !me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
       setRenewals([]);
       return [];
     }
@@ -1119,7 +1151,11 @@ export function App() {
   }, [me?.eligible, route]);
 
   const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setAdminRenewals([]);
       return [];
     }
@@ -1131,7 +1167,7 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshChargebackStatus = useCallback(async () => {
-    if (route !== "/customer" || !me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
       setChargebackStatus(null);
       return;
     }
@@ -1146,14 +1182,23 @@ export function App() {
         setProducts(data.products),
       ),
       api<Legal>(`/api/v1/legal/current?locale=${locale}`).then(setLegal),
-      refreshMe(),
     ]).catch((caught: unknown) =>
       setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
     );
-  }, [locale, refreshMe]);
+  }, [locale, setError]);
 
   useEffect(() => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (route === "/") return;
+    setSessionResolved(false);
+    void refreshMe();
+  }, [refreshMe, route]);
+
+  useEffect(() => {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       manualReceiptDefaultedForUser.current = null;
       setManualReceiptClientAccountId("");
       setManualReceiptHistory([]);
@@ -1325,12 +1370,12 @@ export function App() {
         const visibleStatus = result.status === "already_verified" ? "verified" : result.status;
         await refreshMe();
         openRoute("/customer", true);
-        setNotice(`Email verification: ${visibleStatus}`);
+        setNoticeRaw(`Email verification: ${visibleStatus}`);
       })
       .catch((caught: unknown) =>
         setError(caught instanceof Error ? caught.message : "Verification failed"),
       );
-  }, [openRoute, refreshMe]);
+  }, [openRoute, refreshMe, setError]);
 
   useEffect(() => {
     if (
@@ -1358,7 +1403,11 @@ export function App() {
   }, [order, refreshBilling, refreshPaymentSettings, route]);
 
   const refreshManualItems = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setManualItems([]);
       return;
     }
@@ -1367,7 +1416,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshAdminCancellations = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setAdminCancellations([]);
       return;
     }
@@ -1378,7 +1431,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshUnclaimedFunds = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setUnclaimedFunds([]);
       return;
     }
@@ -1387,7 +1444,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundCandidates = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundCandidates([]);
       return;
     }
@@ -1396,7 +1457,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundRecords = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundRecords({});
       return;
     }
@@ -1407,7 +1472,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundSecurityHolds = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundSecurityHolds([]);
       return;
     }
@@ -1418,7 +1487,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundDismissalCorrections = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundDismissalCorrections([]);
       return;
     }
@@ -1429,7 +1502,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundReceiptCapacityIncidents([]);
       return;
     }
@@ -1440,7 +1517,11 @@ export function App() {
   }, [canUseFullAdminWorkspace, route]);
 
   const refreshAdminChargebacks = useCallback(async () => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setAdminChargebacks([]);
       setAdminUnclaimedChargebacks([]);
       setAdminChargebackHolds([]);
@@ -1481,7 +1562,11 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (route !== "/admin" || !canUseFullAdminWorkspace) return;
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) return;
     const active = Object.values(refundRecords).filter((refund) =>
       ["queued", "processing", "unknown"].includes(refund.status),
     );
@@ -1560,8 +1645,11 @@ export function App() {
         viewer?.eligible === true &&
         viewer.staff !== null &&
         (viewerPermissions.has("*") || viewerPermissions.has("support.tickets.manage"));
-      openRoute(route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer");
-      setNotice("Signed in.");
+      const target = route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer";
+      const staysOnResolvedRoute = route === target;
+      openRoute(target);
+      if (staysOnResolvedRoute) setSessionResolved(true);
+      setNoticeRaw("Signed in.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
     }
@@ -1900,7 +1988,7 @@ export function App() {
   }
 
   async function runBillingAutomation() {
-    if (!canUseFullAdminWorkspace || automationReason.trim().length < 10) return;
+    if (!canUseFullAdminRoute || automationReason.trim().length < 10) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -1936,7 +2024,7 @@ export function App() {
 
   async function resolveRenewalHold(renewal: AdminRenewalItem) {
     if (
-      !canUseFullAdminWorkspace ||
+      !canUseFullAdminRoute ||
       renewal.renewalStatus !== "manual_hold" ||
       renewalHoldReason.trim().length < 10 ||
       renewalHoldPendingId
@@ -1976,7 +2064,7 @@ export function App() {
   ) {
     const delinquency = renewal.delinquency;
     if (
-      !canUseFullAdminWorkspace ||
+      !canUseFullAdminRoute ||
       !delinquency?.manualControl?.allowedActions.includes(action) ||
       manualSuspensionReason.trim().length < 10 ||
       manualSuspensionPendingId
@@ -2036,7 +2124,7 @@ export function App() {
 
   async function completeCycleEndCancellation(item: AdminCancellationItem) {
     if (
-      !canUseFullAdminWorkspace ||
+      !canUseFullAdminRoute ||
       !item.interventionRequired ||
       cancellationCompletionReason.trim().length < 10 ||
       cancellationCompletionPendingId
@@ -2143,6 +2231,9 @@ export function App() {
     clientAccount: { id: string; name: string };
     items: ManualReceiptItem[];
   }> {
+    if (!canUseFullAdminRoute) {
+      throw new Error("Full administrator permission is required");
+    }
     return api<{
       clientAccount: { id: string; name: string };
       items: ManualReceiptItem[];
@@ -2154,7 +2245,7 @@ export function App() {
   async function loadManualReceiptHistory() {
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     if (
-      !canUseFullAdminWorkspace || manualReceiptPending || !looksLikeUuid(clientAccountId)
+      !canUseFullAdminRoute || manualReceiptPending || !looksLikeUuid(clientAccountId)
     ) {
       return;
     }
@@ -2175,7 +2266,7 @@ export function App() {
   }
 
   async function recordManualReceipt() {
-    if (!canUseFullAdminWorkspace || manualReceiptPending || !manualReceiptFormReady) return;
+    if (!canUseFullAdminRoute || manualReceiptPending || !manualReceiptFormReady) return;
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     const payload = {
       reference: manualReceiptReference.trim(),
@@ -2257,7 +2348,7 @@ export function App() {
   async function reverseManualReceipt(receipt: ManualReceiptItem) {
     const clientAccountId = manualReceiptTarget?.id;
     if (
-      !canUseFullAdminWorkspace ||
+      !canUseFullAdminRoute ||
       !clientAccountId ||
       manualReceiptReversalPendingId !== null ||
       manualReceiptReversalTargetId !== receipt.manualReceiptId ||
@@ -2344,6 +2435,7 @@ export function App() {
   }
 
   async function completeManual(serviceId: string) {
+    if (!canUseFullAdminRoute) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2365,7 +2457,7 @@ export function App() {
   }
 
   async function adjustCredit(direction: "increase" | "decrease") {
-    if (!canUseFullAdminWorkspace || !me) return;
+    if (!canUseFullAdminRoute || !me) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2395,7 +2487,7 @@ export function App() {
     item: UnclaimedFundItem,
     action: "convert_to_credit" | "allocate_invoice",
   ) {
-    if (!canUseFullAdminWorkspace || !me) return;
+    if (!canUseFullAdminRoute || !me) return;
     if (
       fundResolutionInFlight.current.has(item.receiptId) ||
       refundInFlight.current.has(item.receiptId)
@@ -2471,7 +2563,7 @@ export function App() {
 
   async function returnUnclaimedFunds(item: UnclaimedFundItem) {
     if (
-      !canUseFullAdminWorkspace ||
+      !canUseFullAdminRoute ||
       refundInFlight.current.has(item.receiptId) ||
       fundResolutionInFlight.current.has(item.receiptId)
     ) {
@@ -2557,7 +2649,7 @@ export function App() {
     item: RefundCandidate,
     destination: "original_payment" | "credit" | "none",
   ) {
-    if (!canUseFullAdminWorkspace || refundInFlight.current.has(item.receiptId)) return;
+    if (!canUseFullAdminRoute || refundInFlight.current.has(item.receiptId)) return;
     const amountMode = destination === "none" ? "none" : refundAmountMode;
     const amountMinor =
       destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
@@ -2653,7 +2745,7 @@ export function App() {
       | "record_unexpected_outflow"
       | "dismiss_provider_claim",
   ) {
-    if (!canUseFullAdminWorkspace || refundAdjudicationInFlight.current.has(hold.holdId)) return;
+    if (!canUseFullAdminRoute || refundAdjudicationInFlight.current.has(hold.holdId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
     refundAdjudicationInFlight.current.add(hold.holdId);
@@ -2728,7 +2820,7 @@ export function App() {
     refund: RefundRecord,
     action: "retry_query" | "confirm_no_outflow",
   ) {
-    if (!canUseFullAdminWorkspace || refundManualActionInFlight.current.has(refund.refundId)) return;
+    if (!canUseFullAdminRoute || refundManualActionInFlight.current.has(refund.refundId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       refundId: refund.refundId,
@@ -2801,7 +2893,7 @@ export function App() {
   }
 
   async function correctDismissedRefundOutflow(item: RefundDismissalCorrection) {
-    if (!canUseFullAdminWorkspace || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
+    if (!canUseFullAdminRoute || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       adjudicationId: item.adjudicationId,
@@ -2875,7 +2967,7 @@ export function App() {
     incident: RefundReceiptCapacityIncident,
   ) {
     if (
-      !canUseFullAdminWorkspace ||
+      !canUseFullAdminRoute ||
       refundCapacityAcknowledgementInFlight.current.has(incident.incidentId)
     ) {
       return;
