@@ -1,9 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LAB_BANNER } from "@opensales/core";
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  ManualReceiptOutflowPanel,
+  type ManualReceiptOriginalSourceOutflow,
+} from "./ManualReceiptOutflows.js";
+import { ApiError, api, hardResetSession } from "./api.js";
+import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
+type AppRoute = "/" | "/customer" | "/admin";
+
+function routeFromPath(pathname: string): AppRoute {
+  const normalized = pathname.replace(/\/+$/, "") || "/";
+  if (normalized === "/customer" || normalized === "/admin") return normalized;
+  return "/";
+}
 
 function newIdempotencyKey(): string {
   const cryptoApi = globalThis.crypto;
@@ -29,6 +50,21 @@ type Me = {
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
+
+function parseStaffPermissions(value: unknown): ReadonlySet<string> {
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (permission) =>
+        typeof permission === "string" &&
+        permission.length > 0 &&
+        permission.trim() === permission,
+    )
+  ) {
+    return new Set();
+  }
+  return new Set(value);
+}
 type Price = {
   id: string;
   currency: string;
@@ -184,6 +220,7 @@ type ManualReceiptItem = {
   capacityFrozen: boolean;
   currency: "USD";
   disposition: string;
+  originalSourceOutflow: ManualReceiptOriginalSourceOutflow;
   reversal: {
     reversalId: string;
     actorId: string;
@@ -631,41 +668,6 @@ const words = {
   },
 } as const;
 
-class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code?: string,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...init?.headers,
-    },
-  });
-  if (!response.ok) {
-    const errorBody = (await response.json().catch(() => ({}))) as {
-      error?: string;
-      code?: string;
-    };
-    throw new ApiError(
-      errorBody.error ?? `Request failed (${response.status})`,
-      response.status,
-      errorBody.code,
-    );
-  }
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
-}
-
 function usd(minor: string): string {
   const value = BigInt(minor);
   const negative = value < 0n;
@@ -752,14 +754,18 @@ function manualReceiptIsUntouched(receipt: ManualReceiptItem): boolean {
 }
 
 export function App() {
+  const [route, setRoute] = useState<AppRoute>(() => routeFromPath(window.location.pathname));
   const [locale, setLocale] = useState<Locale>("en");
   const [products, setProducts] = useState<Product[]>([]);
   const [legal, setLegal] = useState<Legal | null>(null);
   const [me, setMe] = useState<Me | null>(null);
+  const [sessionResolved, setSessionResolved] = useState(false);
   const [selected, setSelected] = useState<{ product: Product; price: Price } | null>(null);
   const [order, setOrder] = useState<OrderDetail | null>(null);
-  const [notice, setNotice] = useState<string>("");
-  const [error, setError] = useState<string>("");
+  const [notice, setNoticeRaw] = useState<string>("");
+  const [error, setErrorRaw] = useState<string>("");
+  const activeRouteRef = useRef<AppRoute>(route);
+  const routeGenerationRef = useRef(0);
   const [paymentScenario, setPaymentScenario] = useState("success");
   const [paymentMethod, setPaymentMethod] = useState("card");
   const [applyCredit, setApplyCredit] = useState(true);
@@ -890,7 +896,162 @@ export function App() {
   const [fundResolutionPendingReceiptIds, setFundResolutionPendingReceiptIds] = useState<
     ReadonlySet<string>
   >(new Set());
-  const [bootstrapToken, setBootstrapToken] = useState("");
+  const renderRoute = route;
+  const renderRouteGeneration = routeGenerationRef.current;
+  const setNotice = useCallback((message: string) => {
+    if (
+      activeRouteRef.current === renderRoute &&
+      routeGenerationRef.current === renderRouteGeneration
+    ) {
+      setNoticeRaw(message);
+    }
+  }, [renderRoute, renderRouteGeneration]);
+  const setError = useCallback((message: string) => {
+    if (
+      activeRouteRef.current === renderRoute &&
+      routeGenerationRef.current === renderRouteGeneration
+    ) {
+      setErrorRaw(message);
+    }
+  }, [renderRoute, renderRouteGeneration]);
+  const staffPermissions = useMemo(
+    () => parseStaffPermissions(me?.staff?.permissions),
+    [me?.staff?.permissions],
+  );
+  const eligibleStaff = me?.eligible === true && me.staff !== null;
+  const canManageStaffTickets =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
+  const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
+  const canOpenAdminWorkspace = canManageStaffTickets || canUseFullAdminWorkspace;
+  const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
+
+  const clearWorkspaceTransientState = useCallback(() => {
+    setNoticeRaw("");
+    setErrorRaw("");
+    setSelected(null);
+    setOrder(null);
+    setBilling(null);
+    setPaymentSettings(null);
+    setPaymentSettingsPassword("");
+    setPaymentSettingsReauthExpiresAt(null);
+    setPaymentSettingsPending(false);
+    setCancellationReason("");
+    setCancellationPending(false);
+    setRenewals([]);
+    setAdminRenewals([]);
+    setRenewalPaymentPendingId(null);
+    setAutomationEffectiveAt("");
+    setAutomationReason("");
+    setRenewalHoldReason("");
+    setRenewalHoldPendingId(null);
+    setManualSuspensionReason("");
+    setManualSuspensionPendingId(null);
+    setPaymentQuote(null);
+    setAddFundsPrincipalMinor("5000");
+    setAddFundsMethod("card");
+    setAddFundsScenario("success");
+    setAddFundsQuote(null);
+    setAddFundsCommand(null);
+    setChargebackStatus(null);
+    setAdminChargebacks([]);
+    setAdminUnclaimedChargebacks([]);
+    setAdminChargebackHolds([]);
+    setQuantity(1);
+    setMail([]);
+    setManualItems([]);
+    setAdminCancellations([]);
+    setCancellationCompletionReason("");
+    setCancellationCompletionPendingId(null);
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    manualReceiptDefaultedForUser.current = null;
+    setUnclaimedFunds([]);
+    setRefundCandidates([]);
+    setRefundRecords({});
+    setRefundSecurityHolds([]);
+    setRefundDismissalCorrections([]);
+    setRefundReceiptCapacityIncidents([]);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundScenario("success");
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+    setRefundPendingReceiptIds(new Set());
+    setAdminPassword("");
+    setManualReason("");
+    setCreditAdjustmentMinor("5000");
+    setCreditAdjustmentReason("");
+    setFundResolutionMinor("");
+    setFundResolutionInvoiceId("");
+    setFundResolutionReason("");
+    setFundReturnAmountMode("full");
+    setFundReturnAmountMinor("");
+    setFundReturnReason("");
+    setFundReturnScenario("success");
+    setFundResolutionPendingReceiptIds(new Set());
+    paymentSettingsIntentKeys.current.clear();
+    cancellationIntentKeys.current.clear();
+    manualSuspensionIntentKeys.current.clear();
+    cancellationCompletionIntentKeys.current.clear();
+    manualReceiptIntentKeys.current.clear();
+    manualReceiptReversalIntentKeys.current.clear();
+    refundIntentKeys.current.clear();
+  }, []);
+
+  const openRoute = useCallback((target: AppRoute, replace = false) => {
+    const routeChanged = activeRouteRef.current !== target;
+    routeGenerationRef.current += 1;
+    activeRouteRef.current = target;
+    clearWorkspaceTransientState();
+    if (target !== "/" && routeChanged) setSessionResolved(false);
+    if (replace) {
+      window.history.replaceState({}, "", target);
+    } else if (window.location.pathname !== target || window.location.search.length > 0) {
+      window.history.pushState({}, "", target);
+    }
+    setRoute(target);
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [clearWorkspaceTransientState]);
+  const followRouteLink = useCallback(
+    (event: ReactMouseEvent<HTMLAnchorElement>, target: AppRoute) => {
+      if (
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return;
+      }
+      event.preventDefault();
+      openRoute(target);
+    },
+    [openRoute],
+  );
+  const showTicketNotice = useCallback((message: string) => {
+    setError("");
+    setNotice(message);
+  }, [setError, setNotice]);
+  const showTicketError = useCallback((message: string) => {
+    setNotice("");
+    setError(message);
+  }, [setError, setNotice]);
   const text = words[locale];
   const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const manualReceiptAmountsValid =
@@ -915,18 +1076,38 @@ export function App() {
   const paymentSettingsReauthReady =
     paymentSettingsReauthActive || paymentSettingsPassword.length > 0;
 
-  const refreshMe = useCallback(async () => {
+  useEffect(() => {
+    const onPopState = () => {
+      const target = routeFromPath(window.location.pathname);
+      const routeChanged = activeRouteRef.current !== target;
+      routeGenerationRef.current += 1;
+      activeRouteRef.current = target;
+      clearWorkspaceTransientState();
+      if (target !== "/" && routeChanged) setSessionResolved(false);
+      setRoute(target);
+      window.scrollTo({ top: 0, behavior: "auto" });
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [clearWorkspaceTransientState]);
+
+  const refreshMe = useCallback(async (): Promise<Me | null> => {
     try {
-      setMe(await api<Me>("/api/v1/auth/me"));
+      const viewer = await api<Me>("/api/v1/auth/me");
+      setMe(viewer);
+      setSessionResolved(true);
+      return viewer;
     } catch {
       setMe(null);
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
+      setSessionResolved(true);
+      return null;
     }
   }, []);
 
   const refreshLatestOrder = useCallback(async () => {
-    if (!me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
       setOrder(null);
       return;
     }
@@ -937,38 +1118,46 @@ export function App() {
       return;
     }
     setOrder(await api<OrderDetail>(`/api/v1/orders/${latest.orderId}`));
-  }, [me?.clientAccountId, me?.eligible]);
+  }, [me?.clientAccountId, me?.eligible, route]);
 
   const refreshBilling = useCallback(async () => {
-    if (!me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
       setBilling(null);
       return;
     }
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
-  }, [me]);
+  }, [me, route]);
 
   const refreshPaymentSettings = useCallback(async () => {
-    if (me?.verification.email !== "passed") {
+    if (
+      route !== "/customer" ||
+      activeRouteRef.current !== "/customer" ||
+      me?.verification.email !== "passed"
+    ) {
       setPaymentSettings(null);
       return;
     }
     setPaymentSettings(
       await api<PaymentSettings>("/api/v1/billing/payment-settings"),
     );
-  }, [me?.clientAccountId, me?.verification.email]);
+  }, [me?.clientAccountId, me?.verification.email, route]);
 
   const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
-    if (!me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
       setRenewals([]);
       return [];
     }
     const result = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
     setRenewals(result.items);
     return result.items;
-  }, [me?.eligible]);
+  }, [me?.eligible, route]);
 
   const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setAdminRenewals([]);
       return [];
     }
@@ -977,17 +1166,17 @@ export function App() {
     );
     setAdminRenewals(result.items);
     return result.items;
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshChargebackStatus = useCallback(async () => {
-    if (!me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
       setChargebackStatus(null);
       return;
     }
     setChargebackStatus(
       await api<ChargebackStatus>("/api/v1/billing/chargeback-status"),
     );
-  }, [me]);
+  }, [me, route]);
 
   useEffect(() => {
     void Promise.all([
@@ -995,14 +1184,23 @@ export function App() {
         setProducts(data.products),
       ),
       api<Legal>(`/api/v1/legal/current?locale=${locale}`).then(setLegal),
-      refreshMe(),
     ]).catch((caught: unknown) =>
       setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
     );
-  }, [locale, refreshMe]);
+  }, [locale, setError]);
 
   useEffect(() => {
-    if (!me?.staff) {
+    if (route === "/") return;
+    setSessionResolved(false);
+    void refreshMe();
+  }, [refreshMe, route]);
+
+  useEffect(() => {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       manualReceiptDefaultedForUser.current = null;
       setManualReceiptClientAccountId("");
       setManualReceiptHistory([]);
@@ -1023,7 +1221,7 @@ export function App() {
     setManualReceiptReversalTargetId(null);
     setManualReceiptReversalReason("");
     setManualReceiptReversalOutcome(null);
-  }, [me]);
+  }, [canUseFullAdminWorkspace, me, route]);
 
   useEffect(() => {
     void refreshLatestOrder().catch(() => undefined);
@@ -1074,6 +1272,7 @@ export function App() {
 
   useEffect(() => {
     if (
+      route !== "/customer" ||
       !me?.eligible ||
       !billing?.addFunds.enabled ||
       !billing.addFunds.allowed ||
@@ -1114,10 +1313,12 @@ export function App() {
     billing?.addFunds.minimumMinor,
     billing?.creditBalanceMinor,
     me?.eligible,
+    route,
   ]);
 
   useEffect(() => {
     if (
+      route !== "/customer" ||
       !addFundsCommand ||
       ["succeeded", "failed", "cancelled", "expired", "manual"].includes(
         addFundsCommand.status,
@@ -1142,10 +1343,10 @@ export function App() {
         .catch(() => undefined);
     }, 750);
     return () => window.clearInterval(timer);
-  }, [addFundsCommand, refreshBilling]);
+  }, [addFundsCommand, refreshBilling, route]);
 
   useEffect(() => {
-    if (!order || order.invoice.status === "paid" || !me?.eligible) {
+    if (route !== "/customer" || !order || order.invoice.status === "paid" || !me?.eligible) {
       setPaymentQuote(null);
       return;
     }
@@ -1158,7 +1359,7 @@ export function App() {
         setPaymentQuote(null);
         setError(caught instanceof Error ? caught.message : "Payment quote is unavailable");
       });
-  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod]);
+  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod, route]);
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("token");
@@ -1169,17 +1370,18 @@ export function App() {
     })
       .then(async (result) => {
         const visibleStatus = result.status === "already_verified" ? "verified" : result.status;
-        setNotice(`Email verification: ${visibleStatus}`);
-        window.history.replaceState({}, "", window.location.pathname);
         await refreshMe();
+        openRoute("/customer", true);
+        setNoticeRaw(`Email verification: ${visibleStatus}`);
       })
       .catch((caught: unknown) =>
         setError(caught instanceof Error ? caught.message : "Verification failed"),
       );
-  }, [refreshMe]);
+  }, [openRoute, refreshMe, setError]);
 
   useEffect(() => {
     if (
+      route !== "/customer" ||
       !order ||
       (order.service.cancellation
         ? ["manual", "terminated"].includes(order.service.cancellation.status)
@@ -1200,19 +1402,27 @@ export function App() {
         .catch(() => undefined);
     }, 1_000);
     return () => window.clearInterval(timer);
-  }, [order, refreshBilling, refreshPaymentSettings]);
+  }, [order, refreshBilling, refreshPaymentSettings, route]);
 
   const refreshManualItems = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setManualItems([]);
       return;
     }
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
     setManualItems(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshAdminCancellations = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setAdminCancellations([]);
       return;
     }
@@ -1220,28 +1430,40 @@ export function App() {
       "/api/v1/admin/services/cancellations",
     );
     setAdminCancellations(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshUnclaimedFunds = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setUnclaimedFunds([]);
       return;
     }
     const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
     setUnclaimedFunds(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundCandidates = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundCandidates([]);
       return;
     }
     const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
     setRefundCandidates(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundRecords = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundRecords({});
       return;
     }
@@ -1249,10 +1471,14 @@ export function App() {
     setRefundRecords(
       Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
     );
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundSecurityHolds = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundSecurityHolds([]);
       return;
     }
@@ -1260,10 +1486,14 @@ export function App() {
       "/api/v1/admin/refund-security-holds",
     );
     setRefundSecurityHolds(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundDismissalCorrections = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundDismissalCorrections([]);
       return;
     }
@@ -1271,10 +1501,14 @@ export function App() {
       "/api/v1/admin/refund-dismissal-corrections",
     );
     setRefundDismissalCorrections(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setRefundReceiptCapacityIncidents([]);
       return;
     }
@@ -1282,10 +1516,14 @@ export function App() {
       "/api/v1/admin/refund-receipt-capacity-incidents",
     );
     setRefundReceiptCapacityIncidents(result.items);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   const refreshAdminChargebacks = useCallback(async () => {
-    if (!me?.staff) {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) {
       setAdminChargebacks([]);
       setAdminUnclaimedChargebacks([]);
       setAdminChargebackHolds([]);
@@ -1299,7 +1537,7 @@ export function App() {
     setAdminChargebacks(result.items);
     setAdminUnclaimedChargebacks(result.unclaimedChargebacks);
     setAdminChargebackHolds(result.manualHolds);
-  }, [me?.staff]);
+  }, [canUseFullAdminWorkspace, route]);
 
   useEffect(() => {
     void Promise.all([
@@ -1326,6 +1564,11 @@ export function App() {
   ]);
 
   useEffect(() => {
+    if (
+      route !== "/admin" ||
+      activeRouteRef.current !== "/admin" ||
+      !canUseFullAdminWorkspace
+    ) return;
     const active = Object.values(refundRecords).filter((refund) =>
       ["queued", "processing", "unknown"].includes(refund.status),
     );
@@ -1353,6 +1596,8 @@ export function App() {
     refreshRefundCandidates,
     refreshRefundSecurityHolds,
     refreshUnclaimedFunds,
+    canUseFullAdminWorkspace,
+    route,
   ]);
 
   const groups = useMemo(() => {
@@ -1396,10 +1641,29 @@ export function App() {
       });
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
-      await refreshMe();
-      setNotice("Signed in.");
+      const viewer = await refreshMe();
+      const viewerPermissions = parseStaffPermissions(viewer?.staff?.permissions);
+      const viewerCanOpenAdmin =
+        viewer?.eligible === true &&
+        viewer.staff !== null &&
+        (viewerPermissions.has("*") || viewerPermissions.has("support.tickets.manage"));
+      const target = route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer";
+      const staysOnResolvedRoute = route === target;
+      openRoute(target);
+      if (staysOnResolvedRoute) setSessionResolved(true);
+      setNoticeRaw("Signed in.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
+    }
+  }
+
+  async function logout() {
+    setError("");
+    try {
+      await api("/api/v1/auth/logout", { method: "POST", body: "{}" });
+      hardResetSession();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Sign out failed");
     }
   }
 
@@ -1726,7 +1990,7 @@ export function App() {
   }
 
   async function runBillingAutomation() {
-    if (!me?.staff || automationReason.trim().length < 10) return;
+    if (!canUseFullAdminRoute || automationReason.trim().length < 10) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -1762,7 +2026,7 @@ export function App() {
 
   async function resolveRenewalHold(renewal: AdminRenewalItem) {
     if (
-      !me?.staff ||
+      !canUseFullAdminRoute ||
       renewal.renewalStatus !== "manual_hold" ||
       renewalHoldReason.trim().length < 10 ||
       renewalHoldPendingId
@@ -1802,7 +2066,7 @@ export function App() {
   ) {
     const delinquency = renewal.delinquency;
     if (
-      !me?.staff ||
+      !canUseFullAdminRoute ||
       !delinquency?.manualControl?.allowedActions.includes(action) ||
       manualSuspensionReason.trim().length < 10 ||
       manualSuspensionPendingId
@@ -1862,7 +2126,7 @@ export function App() {
 
   async function completeCycleEndCancellation(item: AdminCancellationItem) {
     if (
-      !me?.staff ||
+      !canUseFullAdminRoute ||
       !item.interventionRequired ||
       cancellationCompletionReason.trim().length < 10 ||
       cancellationCompletionPendingId
@@ -1965,25 +2229,17 @@ export function App() {
     }
   }
 
-  async function bootstrapAdministrator() {
-    setError("");
-    try {
-      await api("/api/v1/admin/bootstrap", {
-        method: "POST",
-        body: JSON.stringify({ bootstrapToken }),
-      });
-      setBootstrapToken("");
-      await refreshMe();
-      setNotice("Administrator role created. The bootstrap token is now unusable.");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Administrator bootstrap failed");
-    }
-  }
-
   async function fetchManualReceiptHistory(clientAccountId: string): Promise<{
     clientAccount: { id: string; name: string };
     items: ManualReceiptItem[];
   }> {
+    if (
+      !canUseFullAdminRoute ||
+      activeRouteRef.current !== "/admin" ||
+      routeGenerationRef.current !== renderRouteGeneration
+    ) {
+      throw new Error("Full administrator permission is required");
+    }
     return api<{
       clientAccount: { id: string; name: string };
       items: ManualReceiptItem[];
@@ -1995,7 +2251,7 @@ export function App() {
   async function loadManualReceiptHistory() {
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     if (
-      !me?.staff || manualReceiptPending || !looksLikeUuid(clientAccountId)
+      !canUseFullAdminRoute || manualReceiptPending || !looksLikeUuid(clientAccountId)
     ) {
       return;
     }
@@ -2016,7 +2272,7 @@ export function App() {
   }
 
   async function recordManualReceipt() {
-    if (!me?.staff || manualReceiptPending || !manualReceiptFormReady) return;
+    if (!canUseFullAdminRoute || manualReceiptPending || !manualReceiptFormReady) return;
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     const payload = {
       reference: manualReceiptReference.trim(),
@@ -2098,7 +2354,7 @@ export function App() {
   async function reverseManualReceipt(receipt: ManualReceiptItem) {
     const clientAccountId = manualReceiptTarget?.id;
     if (
-      !me?.staff ||
+      !canUseFullAdminRoute ||
       !clientAccountId ||
       manualReceiptReversalPendingId !== null ||
       manualReceiptReversalTargetId !== receipt.manualReceiptId ||
@@ -2185,6 +2441,7 @@ export function App() {
   }
 
   async function completeManual(serviceId: string) {
+    if (!canUseFullAdminRoute) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2206,7 +2463,7 @@ export function App() {
   }
 
   async function adjustCredit(direction: "increase" | "decrease") {
-    if (!me?.staff) return;
+    if (!canUseFullAdminRoute || !me) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2236,7 +2493,7 @@ export function App() {
     item: UnclaimedFundItem,
     action: "convert_to_credit" | "allocate_invoice",
   ) {
-    if (!me?.staff) return;
+    if (!canUseFullAdminRoute || !me) return;
     if (
       fundResolutionInFlight.current.has(item.receiptId) ||
       refundInFlight.current.has(item.receiptId)
@@ -2312,7 +2569,7 @@ export function App() {
 
   async function returnUnclaimedFunds(item: UnclaimedFundItem) {
     if (
-      !me?.staff ||
+      !canUseFullAdminRoute ||
       refundInFlight.current.has(item.receiptId) ||
       fundResolutionInFlight.current.has(item.receiptId)
     ) {
@@ -2398,7 +2655,7 @@ export function App() {
     item: RefundCandidate,
     destination: "original_payment" | "credit" | "none",
   ) {
-    if (!me?.staff || refundInFlight.current.has(item.receiptId)) return;
+    if (!canUseFullAdminRoute || refundInFlight.current.has(item.receiptId)) return;
     const amountMode = destination === "none" ? "none" : refundAmountMode;
     const amountMinor =
       destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
@@ -2494,7 +2751,7 @@ export function App() {
       | "record_unexpected_outflow"
       | "dismiss_provider_claim",
   ) {
-    if (!me?.staff || refundAdjudicationInFlight.current.has(hold.holdId)) return;
+    if (!canUseFullAdminRoute || refundAdjudicationInFlight.current.has(hold.holdId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
     refundAdjudicationInFlight.current.add(hold.holdId);
@@ -2569,7 +2826,7 @@ export function App() {
     refund: RefundRecord,
     action: "retry_query" | "confirm_no_outflow",
   ) {
-    if (!me?.staff || refundManualActionInFlight.current.has(refund.refundId)) return;
+    if (!canUseFullAdminRoute || refundManualActionInFlight.current.has(refund.refundId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       refundId: refund.refundId,
@@ -2642,7 +2899,7 @@ export function App() {
   }
 
   async function correctDismissedRefundOutflow(item: RefundDismissalCorrection) {
-    if (!me?.staff || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
+    if (!canUseFullAdminRoute || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       adjudicationId: item.adjudicationId,
@@ -2716,7 +2973,7 @@ export function App() {
     incident: RefundReceiptCapacityIncident,
   ) {
     if (
-      !me?.staff ||
+      !canUseFullAdminRoute ||
       refundCapacityAcknowledgementInFlight.current.has(incident.incidentId)
     ) {
       return;
@@ -2800,26 +3057,71 @@ export function App() {
     <>
       <div className="lab-banner">{LAB_BANNER}</div>
       <header>
-        <a className="brand" href="/">
+        <a className="brand" href="/" onClick={(event) => followRouteLink(event, "/")}>
           <span>OSS</span>
           OpenSales System
         </a>
+        <nav className="app-nav" aria-label="Primary navigation">
+          <a
+            aria-current={route === "/" ? "page" : undefined}
+            href="/"
+            onClick={(event) => followRouteLink(event, "/")}
+          >
+            Home
+          </a>
+          <a
+            aria-current={route === "/customer" ? "page" : undefined}
+            href="/customer"
+            onClick={(event) => followRouteLink(event, "/customer")}
+          >
+            Customer
+          </a>
+          <a
+            aria-current={route === "/admin" ? "page" : undefined}
+            href="/admin"
+            onClick={(event) => followRouteLink(event, "/admin")}
+          >
+            Admin
+          </a>
+        </nav>
         <div className="header-actions">
           <button onClick={() => setLocale(locale === "en" ? "zh-CN" : "en")}>
             {locale === "en" ? "简体中文" : "English"}
           </button>
-          <span className={me?.eligible ? "pill good" : "pill"}>
-            {me ? me.email : "Guest"}
+          <span className={route === "/" ? "pill" : me?.eligible ? "pill good" : "pill"}>
+            {route === "/"
+              ? "Public access"
+              : !sessionResolved
+                ? "Checking session"
+                : me
+                  ? me.email
+                  : "Guest"}
           </span>
+          {route !== "/" && me && <button onClick={() => void logout()}>Sign out</button>}
         </div>
       </header>
       <main>
-        <section className="hero">
-          <p className="eyebrow">Mock-only laboratory release</p>
-          <h1>Customer, billing and service operations — without vendor lock-in.</h1>
+        <section className="hero" aria-label="Current workspace">
+          <p className="eyebrow">
+            {route === "/"
+              ? "Public · Mock-only laboratory"
+              : route === "/customer"
+                ? "Customer workspace · Mock-only"
+                : "Staff workspace · Mock-only"}
+          </p>
+          <h1>
+            {route === "/"
+              ? "Customer, billing and service operations — without vendor lock-in."
+              : route === "/customer"
+                ? "Orders, billing, services and support in one customer workspace."
+                : "Audited support, money and service operations for Staff."}
+          </h1>
           <p>
-            This synthetic environment separates orders, money, provider operations and services so
-            that failures remain visible and recoverable.
+            {route === "/"
+              ? "Explore the synthetic catalog, create an account or sign in. Customer and Staff data stay inside their dedicated workspaces."
+              : route === "/customer"
+                ? "Continue the real Mock Provider journey: open tickets, manage billing and follow each order through service delivery."
+                : "Public replies, internal notes, manual receipts, refunds and operational decisions remain explicit and reviewable."}
           </p>
         </section>
 
@@ -2830,10 +3132,67 @@ export function App() {
           </div>
         )}
 
+        {route === "/" && (
+          <section className="account-grid" data-testid="public-access">
+            <div className="panel">
+              <p className="eyebrow">Access</p>
+              <h2>Open a dedicated workspace</h2>
+              <p>
+                Customer and Staff sessions are handled only inside their dedicated pages. This
+                public page never displays account or permission details.
+              </p>
+              <div className="workspace-actions">
+                <a
+                  className="route-action"
+                  href="/customer"
+                  onClick={(event) => followRouteLink(event, "/customer")}
+                >
+                  Open customer workspace
+                </a>
+                <a
+                  className="route-action"
+                  href="/admin"
+                  onClick={(event) => followRouteLink(event, "/admin")}
+                >
+                  Open Admin workspace
+                </a>
+              </div>
+              <div className="form-columns">
+                <form onSubmit={register}>
+                  <h3>{text.register}</h3>
+                  <input name="clientName" placeholder="Client account name" required />
+                  <input name="email" type="email" placeholder="Email" required />
+                  <input
+                    name="password"
+                    type="password"
+                    minLength={12}
+                    placeholder="Password (12+ characters)"
+                    required
+                  />
+                  <button className="primary" type="submit">
+                    {text.register}
+                  </button>
+                </form>
+                <form onSubmit={login}>
+                  <h3>{text.login}</h3>
+                  <input name="email" type="email" placeholder="Email" required />
+                  <input name="password" type="password" placeholder="Password" required />
+                  <button className="primary" type="submit">
+                    {text.login}
+                  </button>
+                </form>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {route === "/customer" && (
         <section className="account-grid">
           <div className="panel">
             <p className="eyebrow">{text.account}</p>
-            {me ? (
+            {!sessionResolved ? (
+              <p className="muted">Checking the current session…</p>
+            ) : me ? (
               <>
                 <h2>{me.email}</h2>
                 <p>{me.eligible ? text.ready : text.pending}</p>
@@ -2890,8 +3249,102 @@ export function App() {
             )}
           </div>
         </section>
+        )}
 
-        {me &&
+        {route === "/customer" && !me?.eligible && (
+          <section className="route-access" aria-label="Customer access status">
+            <p className="eyebrow">Customer access</p>
+            <h2>{me ? "Verify your email to continue" : "Sign in to open the customer workspace"}</h2>
+            <p>
+              {me
+                ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
+                : "Use the account forms above. Successful sign-in returns directly to this customer page."}
+            </p>
+          </section>
+        )}
+
+        {route === "/admin" && !sessionResolved && (
+          <section className="route-access" aria-label="Administrator session status">
+            <p className="eyebrow">Restricted Staff workspace</p>
+            <h2>Checking Staff access…</h2>
+            <p>The administrative workspace remains unmounted until the current session is resolved.</p>
+          </section>
+        )}
+
+        {route === "/admin" && sessionResolved && !canOpenAdminWorkspace && (
+          <section
+            className="route-access restricted-access"
+            aria-label="Administrator access status"
+            data-testid="admin-access-restricted"
+          >
+            <p className="eyebrow">Restricted Staff workspace</p>
+            <h2>
+              {!me
+                ? "Sign in required"
+                : !me.eligible
+                  ? "Access denied — eligible Staff account required"
+                  : "Access denied — Staff permission required"}
+            </h2>
+            <p>
+              {!me
+                ? "Sign in with an authorized Staff account. No administrative capability is shown to guests."
+                : !me.eligible
+                  ? `${me.email} is not currently eligible. No administrative capability has been loaded on this page.`
+                  : `${me.email} has no recognized Staff permission for this workspace. No administrative capability has been loaded.`}
+            </p>
+            {!me && (
+              <form className="admin-login-form" onSubmit={login}>
+                <label>
+                  Staff email
+                  <input name="email" type="email" placeholder="Staff email" required />
+                </label>
+                <label>
+                  Password
+                  <input name="password" type="password" placeholder="Staff password" required />
+                </label>
+                <button className="primary" type="submit">Sign in to Staff workspace</button>
+              </form>
+            )}
+            <a className="route-action" href="/" onClick={(event) => followRouteLink(event, "/")}>
+              Go to public sign in
+            </a>
+          </section>
+        )}
+
+        {route === "/customer" && (
+          <TicketsPanel
+            mode="customer"
+            me={me}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canManageStaffTickets && (
+          <TicketsPanel
+            mode="staff"
+            canManageTickets={canManageStaffTickets}
+            me={me}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && canManageStaffTickets && !canUseFullAdminWorkspace && (
+          <section className="route-access" data-testid="limited-admin-scope">
+            <p className="eyebrow">Permission-scoped Staff workspace</p>
+            <h2>Ticket support only</h2>
+            <p>
+              This Staff session can manage support tickets. Billing, refunds, money and service
+              administration remain unmounted because wildcard permission is not present.
+            </p>
+          </section>
+        )}
+
+        {route === "/customer" &&
+          me &&
           chargebackStatus &&
           (chargebackStatus.chargebacks.length > 0 ||
             chargebackStatus.unclaimedChargebacks.length > 0 ||
@@ -2969,7 +3422,7 @@ export function App() {
             </section>
           )}
 
-        {me?.eligible && paymentSettings && (
+        {route === "/customer" && me?.eligible && paymentSettings && (
           <section className="order-panel" aria-label="Payment methods and automatic renewal">
             <div>
               <p className="eyebrow">Customer billing · payment permissions</p>
@@ -3127,7 +3580,7 @@ export function App() {
           </section>
         )}
 
-        {me?.eligible && renewals.length > 0 && (
+        {route === "/customer" && me?.eligible && renewals.length > 0 && (
           <section className="order-panel" aria-label="Service renewals">
             <div>
               <p className="eyebrow">Customer billing · renewals</p>
@@ -3279,7 +3732,7 @@ export function App() {
           </section>
         )}
 
-        {me?.eligible && billing?.addFunds.enabled && (
+        {route === "/customer" && me?.eligible && billing?.addFunds.enabled && (
           <section className="order-panel" aria-label="Add Funds">
             <div>
               <p className="eyebrow">Customer billing · Mock Add Funds</p>
@@ -3395,36 +3848,8 @@ export function App() {
           </section>
         )}
 
-        {me?.eligible && !me.staff && (
-          <section className="bootstrap-panel">
-            <div>
-              <p className="eyebrow">One-time laboratory setup</p>
-              <h2>Establish the first administrator</h2>
-              <p>
-                Generate a 15-minute, single-use token with the server-side CLI. There is no fixed
-                default administrator password.
-              </p>
-            </div>
-            <div className="inline-form">
-              <input
-                type="password"
-                value={bootstrapToken}
-                onChange={(event) => setBootstrapToken(event.target.value)}
-                placeholder="Single-use bootstrap token"
-              />
-              <button
-                className="primary"
-                disabled={bootstrapToken.length < 32}
-                onClick={bootstrapAdministrator}
-              >
-                Create administrator
-              </button>
-            </div>
-          </section>
-        )}
-
-        {me?.staff && (
-          <section className="admin-panel">
+        {route === "/admin" && sessionResolved && canUseFullAdminWorkspace && me && (
+          <section className="admin-panel" data-testid="full-admin-workspace">
             <div>
               <p className="eyebrow">Administrator · audited billing and fulfillment</p>
               <h2>Credit adjustment and human Ready decisions</h2>
@@ -4120,6 +4545,27 @@ export function App() {
                             {receipt.disposition}
                           </span>
                           <span>{receipt.reason}</span>
+                          {manualReceiptTarget && (
+                            <ManualReceiptOutflowPanel
+                              clientAccountId={manualReceiptTarget.id}
+                              receipt={receipt}
+                              password={adminPassword}
+                              disabled={
+                                manualReceiptPending ||
+                                manualReceiptReversalPendingId !== null
+                              }
+                              onPasswordConsumed={() => setAdminPassword("")}
+                              onRefresh={async () => {
+                                const refreshed = await fetchManualReceiptHistory(
+                                  manualReceiptTarget.id,
+                                );
+                                setManualReceiptTarget(refreshed.clientAccount);
+                                setManualReceiptHistory(refreshed.items);
+                              }}
+                              onNotice={setNotice}
+                              onError={setError}
+                            />
+                          )}
                           {receipt.reversal && (
                             <span data-testid="manual-receipt-reversal">
                               Reversed {new Date(receipt.reversal.createdAt).toLocaleString()} · {" "}
@@ -4815,7 +5261,7 @@ export function App() {
           </section>
         )}
 
-        {order && (
+        {route === "/customer" && order && (
           <section className="order-panel">
             <div>
               <p className="eyebrow">Live customer journey</p>
@@ -5046,6 +5492,7 @@ export function App() {
           </section>
         )}
 
+        {(route === "/" || route === "/customer") && (
         <section className="catalog">
           <p className="eyebrow">{text.catalog}</p>
           <h2>TermRat synthetic acceptance configuration</h2>
@@ -5089,9 +5536,10 @@ export function App() {
             </div>
           ))}
         </section>
+        )}
       </main>
 
-      {selected && (
+      {(route === "/" || route === "/customer") && selected && (
         <div className="modal-backdrop" role="presentation" onClick={() => setSelected(null)}>
           <section className="modal" role="dialog" onClick={(event) => event.stopPropagation()}>
             <button className="close" onClick={() => setSelected(null)}>
@@ -5127,9 +5575,21 @@ export function App() {
               <strong>{legal?.documents.aup.title}</strong>
               <p>{legal?.documents.aup.body}</p>
             </div>
-            <button className="primary wide" disabled={!me?.eligible} onClick={createOrder}>
-              {me?.eligible ? text.buy : text.pending}
-            </button>
+            {route === "/" ? (
+              <button
+                className="primary wide"
+                onClick={() => {
+                  setSelected(null);
+                  openRoute("/customer");
+                }}
+              >
+                Continue in customer workspace
+              </button>
+            ) : (
+              <button className="primary wide" disabled={!me?.eligible} onClick={createOrder}>
+                {me?.eligible ? text.buy : text.pending}
+              </button>
+            )}
           </section>
         </div>
       )}

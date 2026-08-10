@@ -10,7 +10,8 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema016ApplicationGuard,
+  holdSchema016RollbackBridgeGuard,
+  holdSchema017ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -21,11 +22,13 @@ import { registerCatalogRoutes } from "./routes-catalog.js";
 import { registerBillingRoutes } from "./routes-billing.js";
 import { registerChargebackRoutes } from "./routes-chargebacks.js";
 import { registerOrderRoutes } from "./routes-orders.js";
+import { registerManualReceiptOutflowRoutes } from "./routes-manual-receipt-outflows.js";
 import { registerPaymentMethodRoutes } from "./routes-payment-methods.js";
 import { registerProviderEventRoutes } from "./routes-provider-events.js";
 import { registerRefundRoutes } from "./routes-refunds.js";
 import { registerRenewalRoutes } from "./routes-renewals.js";
 import { registerServiceRoutes } from "./routes-services.js";
+import { registerTicketRoutes } from "./routes-tickets.js";
 
 export async function buildApp(
   config: Config,
@@ -79,7 +82,9 @@ export async function buildApp(
   };
 
   try {
-    releaseSchemaRollbackGuard = await holdSchema016ApplicationGuard(pool);
+    releaseSchemaRollbackGuard = config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017"
+      ? await holdSchema016RollbackBridgeGuard(pool)
+      : await holdSchema017ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
@@ -165,6 +170,7 @@ export async function buildApp(
 
   await registerAuthRoutes(app, pool, config);
   await registerAdminRoutes(app, pool, config);
+  await registerManualReceiptOutflowRoutes(app, pool, config);
   await registerBillingRoutes(app, pool, config);
   await registerChargebackRoutes(app, pool, config);
   await registerAddFundsRoutes(app, pool, config);
@@ -174,6 +180,7 @@ export async function buildApp(
   await registerRefundRoutes(app, pool, config);
   await registerRenewalRoutes(app, pool, config);
   await registerServiceRoutes(app, pool, config);
+  await registerTicketRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
     return { app, pool };

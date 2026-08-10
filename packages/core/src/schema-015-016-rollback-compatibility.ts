@@ -67,7 +67,9 @@ async function installedSchemaVersion(
   return typeof value === "string" ? value : null;
 }
 
-async function assertSchema016Shape(database: RollbackPreflightQueryable): Promise<void> {
+export async function assertSchema016CatalogShape(
+  database: RollbackPreflightQueryable,
+): Promise<void> {
   const result = await database.query(
     `WITH required_columns(table_name, column_name, data_type, nullable) AS (
        VALUES
@@ -445,16 +447,29 @@ async function assertSchema016Shape(database: RollbackPreflightQueryable): Promi
                           '\\s+', ' ', 'g'
                         ))
      ), catalog_fingerprint(value) AS (
-       SELECT string_agg(item, E'\n' ORDER BY item)
+       SELECT string_agg(item, E'\n' ORDER BY item COLLATE "C")
        FROM catalog_items
      )
      SELECT
-       (SELECT count(*) = 2
-        FROM public.schema_migrations
-        WHERE version IN (
+       (SELECT array_agg(version ORDER BY version COLLATE "C")
+        FROM public.schema_migrations) = ARRAY[
+          '001_stage_a',
+          '002_staff_stage_a',
+          '003_stage_a_financial_hardening',
+          '004_stage_b_credit_and_fees',
+          '005_stage_b_add_funds',
+          '006_stage_b_unclaimed_funds',
+          '007_stage_b_manual_refunds',
+          '008_stage_b_refund_reconciliation',
+          '009_stage_b_refund_capacity_incidents',
+          '010_stage_b_unclaimed_refunds',
+          '011_stage_b_add_funds_chargebacks',
+          '012_stage_b_renewal_lifecycle',
+          '013_stage_b_late_fee_suspension',
+          '014_stage_b_cycle_end_cancellation',
           '015_stage_b_saved_payment_auto_renew',
           '016_stage_b_manual_receipts'
-        )) AS has_contiguous_history,
+        ]::text[] AS has_contiguous_history,
        to_regclass('public.manual_receipt_facts') IS NOT NULL
          AND to_regclass('public.manual_receipt_reversals') IS NOT NULL
          AND to_regclass('public.manual_receipt_outflows') IS NOT NULL
@@ -509,7 +524,7 @@ export async function assertSchema016NativeSafe(
       installed,
     );
   }
-  await assertSchema016Shape(database);
+  await assertSchema016CatalogShape(database);
   return {
     installedSchemaVersion: SCHEMA_016,
     applicationSchemaVersion: SCHEMA_016,
@@ -579,7 +594,7 @@ async function schema016Blockers(
      SELECT code, count::text AS count
      FROM blocker_counts
      WHERE count > 0
-     ORDER BY code`,
+     ORDER BY code COLLATE "C"`,
   );
   return result.rows.map((row) => {
     const record = rowRecord(row);
@@ -631,7 +646,7 @@ export async function assert015RollbackBridgeSafe(
     );
   }
 
-  await assertSchema016Shape(database);
+  await assertSchema016CatalogShape(database);
   const blockers = await schema016Blockers(database);
   if (blockers.length > 0) {
     throw new SchemaRollbackPreflightError(

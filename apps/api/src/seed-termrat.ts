@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { assertRuntimeDatabaseRoleSafe } from "@opensales/core";
 import { loadConfig } from "./config.js";
 import {
-  bootstrapPaymentMethodTokenKeyrings,
   createPool,
-  runMigrations,
   transaction,
 } from "./database.js";
 
@@ -188,9 +187,14 @@ function cyclePrice(monthlyMinor: number, months: number): number {
 }
 
 const config = loadConfig();
+if (!config.DATABASE_RUNTIME_ROLE) {
+  throw new Error("TermRat seed requires DATABASE_RUNTIME_ROLE");
+}
 const pool = createPool(config);
-await runMigrations(pool);
-await bootstrapPaymentMethodTokenKeyrings(pool, config);
+await assertRuntimeDatabaseRoleSafe(
+  { query: async (text, values) => pool.query(text, values) },
+  config.DATABASE_RUNTIME_ROLE,
+);
 
 await transaction(pool, async (client) => {
   for (const [id, sortOrder, names] of groups) {

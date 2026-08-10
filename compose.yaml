@@ -6,7 +6,6 @@ x-core-env: &core-env
   OSS_ENV: ${OSS_ENV:-development}
   OSS_PUBLIC_URL: ${OSS_PUBLIC_URL:-http://localhost:8080}
   WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
-  DATABASE_URL: postgresql://oss:${CORE_DATABASE_PASSWORD:?required}@core-db:5432/oss
   MOCK_MAILBOX_URL: http://mailbox-gateway:8082
   LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
   PROVIDER_OPERATION_CAPABILITY_SECRET: ${PROVIDER_OPERATION_CAPABILITY_SECRET:?required}
@@ -49,13 +48,13 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_DB: oss
-      POSTGRES_USER: oss
-      POSTGRES_PASSWORD: ${CORE_DATABASE_PASSWORD:?required}
+      POSTGRES_USER: oss_migrator
+      POSTGRES_PASSWORD: ${CORE_DATABASE_MIGRATOR_PASSWORD:?required}
     volumes:
       - core-db-data:/var/lib/postgresql
     networks: [core-data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U oss -d oss"]
+      test: ["CMD-SHELL", "pg_isready -U oss_migrator -d oss"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -122,7 +121,13 @@ services:
         "-c",
         "node apps/api/dist/migrate.js && node apps/api/dist/seed-termrat.js",
       ]
-    environment: *core-env
+    environment:
+      <<: *core-env
+      DATABASE_URL: postgresql://oss_api:${CORE_DATABASE_API_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_api
+      MIGRATION_DATABASE_URL: postgresql://oss_migrator:${CORE_DATABASE_MIGRATOR_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_API_ROLE_PASSWORD: ${CORE_DATABASE_API_PASSWORD:?required}
+      DATABASE_WORKER_ROLE_PASSWORD: ${CORE_DATABASE_WORKER_PASSWORD:?required}
     depends_on:
       core-db:
         condition: service_healthy
@@ -136,7 +141,10 @@ services:
       target: runtime
     command: ["node", "apps/api/dist/server.js"]
     restart: unless-stopped
-    environment: *core-env
+    environment:
+      <<: *core-env
+      DATABASE_URL: postgresql://oss_api:${CORE_DATABASE_API_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_api
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -167,6 +175,8 @@ services:
     restart: unless-stopped
     environment:
       <<: *core-env
+      DATABASE_URL: postgresql://oss_worker:${CORE_DATABASE_WORKER_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_worker
       CORE_INTERNAL_URL: http://api:3000
       MOCK_PAYMENT_PROVIDER_URL: http://provider-payment:4000
       MOCK_PROVISIONING_PROVIDER_URL: http://provider-provisioning:4000

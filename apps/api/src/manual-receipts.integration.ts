@@ -56,7 +56,10 @@ let app: Awaited<ReturnType<typeof buildApp>>["app"] | null = null;
 try {
   await runMigrations(pool);
   const schema = await assertSchemaCompatible(pool);
-  assert.equal(schema.installedSchemaVersion, "016_stage_b_manual_receipts");
+  assert.equal(
+    schema.installedSchemaVersion,
+    "018_stage_c_support_tickets",
+  );
   assert.equal(schema.mode, "native");
 
   await pool.query(
@@ -815,6 +818,265 @@ try {
     "MANUAL_RECEIPT_AMOUNT_OUT_OF_RANGE",
   );
 
+  await pool.query(
+    `UPDATE staff_members
+     SET permissions = '["billing.manual_receipt_manage", "billing.unclaimed_manage", "billing.refund_manage"]'::jsonb,
+         updated_at = now()
+     WHERE user_id = $1`,
+    [userId],
+  );
+  await pool.query(
+    `INSERT INTO reauth_grants(user_id, session_id, expires_at)
+     VALUES ($1, $2, now() + interval '15 minutes')`,
+    [userId, sessionId],
+  );
+  const outflowUrl = `${url}/${first.manualReceiptId}/outflow-reports`;
+  const confirmedOutflowBody = {
+    expectedAvailableMinor: "10000",
+    amountMinor: "1200",
+    currency: "USD",
+    destination: "original_source",
+    destinationReference: `RETURN-CONFIRMED-${namespace}`,
+    observedOutcome: "confirmed",
+    occurredAt: new Date().toISOString(),
+    reason: "Synthetic bank evidence confirms the original-source return completed",
+    idempotencyKey: `outflow-confirmed-${namespace}`,
+  };
+  const confirmedOutflowResponse = await app.inject({
+    method: "POST",
+    url: outflowUrl,
+    headers: { cookie },
+    payload: confirmedOutflowBody,
+  });
+  assert.equal(confirmedOutflowResponse.statusCode, 201, confirmedOutflowResponse.body);
+  const confirmedOutflow = responseJson<{
+    outflowReportId: string;
+    outflowId: string;
+    status: string;
+    destination: string;
+    providerUsed: boolean;
+    replayed: boolean;
+  }>(confirmedOutflowResponse);
+  assert.deepEqual(
+    {
+      status: confirmedOutflow.status,
+      destination: confirmedOutflow.destination,
+      providerUsed: confirmedOutflow.providerUsed,
+      replayed: confirmedOutflow.replayed,
+    },
+    {
+      status: "confirmed",
+      destination: "original_source",
+      providerUsed: false,
+      replayed: false,
+    },
+  );
+  assert.ok(confirmedOutflow.outflowReportId);
+  assert.ok(confirmedOutflow.outflowId);
+  const confirmedOutflowReplay = await app.inject({
+    method: "POST",
+    url: outflowUrl,
+    headers: { cookie },
+    payload: confirmedOutflowBody,
+  });
+  assert.equal(confirmedOutflowReplay.statusCode, 200, confirmedOutflowReplay.body);
+  assert.equal(
+    responseJson<{ outflowId: string }>(confirmedOutflowReplay).outflowId,
+    confirmedOutflow.outflowId,
+  );
+  assert.equal(
+    responseJson<{ replayed: boolean }>(confirmedOutflowReplay).replayed,
+    true,
+  );
+  const confirmedOutflowIdempotencyConflict = await app.inject({
+    method: "POST",
+    url: outflowUrl,
+    headers: { cookie },
+    payload: { ...confirmedOutflowBody, amountMinor: "1201" },
+  });
+  assert.equal(confirmedOutflowIdempotencyConflict.statusCode, 409);
+  assert.equal(
+    responseJson<{ code: string }>(confirmedOutflowIdempotencyConflict).code,
+    "IDEMPOTENCY_CONFLICT",
+  );
+
+  const unknownNoOutflowBody = {
+    expectedAvailableMinor: "8800",
+    amountMinor: "800",
+    currency: "USD",
+    destination: "original_source",
+    destinationReference: `RETURN-UNKNOWN-NO-${namespace}`,
+    observedOutcome: "unknown",
+    occurredAt: null,
+    reason: "Synthetic transfer evidence is incomplete and requires reconciliation",
+    idempotencyKey: `outflow-unknown-no-${namespace}`,
+  };
+  const unknownNoOutflowResponse = await app.inject({
+    method: "POST",
+    url: outflowUrl,
+    headers: { cookie },
+    payload: unknownNoOutflowBody,
+  });
+  assert.equal(unknownNoOutflowResponse.statusCode, 201, unknownNoOutflowResponse.body);
+  const unknownNoOutflow = responseJson<{
+    outflowReportId: string;
+    outflowId: null;
+    status: string;
+  }>(unknownNoOutflowResponse);
+  assert.equal(unknownNoOutflow.status, "unknown");
+  assert.equal(unknownNoOutflow.outflowId, null);
+  const whileUnknown = await app.inject({
+    method: "POST",
+    url: outflowUrl,
+    headers: { cookie },
+    payload: {
+      ...unknownNoOutflowBody,
+      expectedAvailableMinor: "0",
+      amountMinor: "1",
+      destinationReference: `RETURN-BLOCKED-${namespace}`,
+      reason: "Synthetic second return is blocked while prior evidence is unknown",
+      idempotencyKey: `outflow-blocked-${namespace}`,
+    },
+  });
+  assert.equal(whileUnknown.statusCode, 409, whileUnknown.body);
+  assert.equal(
+    responseJson<{ code: string }>(whileUnknown).code,
+    "MANUAL_RECEIPT_OUTFLOW_RECONCILIATION_REQUIRED",
+  );
+  const noOutflowReconciliationBody = {
+    outcome: "confirm_no_outflow",
+    occurredAt: null,
+    reason: "Synthetic bank trace proves no original-source transfer ever left",
+    idempotencyKey: `outflow-reconcile-no-${namespace}`,
+  };
+  const noOutflowReconciliationUrl =
+    `${outflowUrl}/${unknownNoOutflow.outflowReportId}/reconciliation`;
+  const noOutflowReconciliationResponse = await app.inject({
+    method: "POST",
+    url: noOutflowReconciliationUrl,
+    headers: { cookie },
+    payload: noOutflowReconciliationBody,
+  });
+  assert.equal(
+    noOutflowReconciliationResponse.statusCode,
+    201,
+    noOutflowReconciliationResponse.body,
+  );
+  assert.equal(
+    responseJson<{ status: string }>(noOutflowReconciliationResponse).status,
+    "no_outflow",
+  );
+  const noOutflowReconciliationReplay = await app.inject({
+    method: "POST",
+    url: noOutflowReconciliationUrl,
+    headers: { cookie },
+    payload: noOutflowReconciliationBody,
+  });
+  assert.equal(noOutflowReconciliationReplay.statusCode, 200);
+  assert.equal(
+    responseJson<{ replayed: boolean }>(noOutflowReconciliationReplay).replayed,
+    true,
+  );
+  const conflictingReconciliation = await app.inject({
+    method: "POST",
+    url: noOutflowReconciliationUrl,
+    headers: { cookie },
+    payload: {
+      outcome: "confirm_outflow",
+      occurredAt: new Date().toISOString(),
+      reason: "Synthetic contradictory decision must not replace the final reconciliation",
+      idempotencyKey: `outflow-reconcile-conflict-${namespace}`,
+    },
+  });
+  assert.equal(conflictingReconciliation.statusCode, 409);
+  assert.equal(
+    responseJson<{ code: string }>(conflictingReconciliation).code,
+    "MANUAL_RECEIPT_OUTFLOW_ALREADY_RECONCILED",
+  );
+
+  const unknownConfirmedBody = {
+    expectedAvailableMinor: "8800",
+    amountMinor: "600",
+    currency: "USD",
+    destination: "original_source",
+    destinationReference: `RETURN-UNKNOWN-YES-${namespace}`,
+    observedOutcome: "unknown",
+    occurredAt: null,
+    reason: "Synthetic transfer result is unknown until an independent bank trace arrives",
+    idempotencyKey: `outflow-unknown-yes-${namespace}`,
+  };
+  const unknownConfirmedResponse = await app.inject({
+    method: "POST",
+    url: outflowUrl,
+    headers: { cookie },
+    payload: unknownConfirmedBody,
+  });
+  assert.equal(unknownConfirmedResponse.statusCode, 201, unknownConfirmedResponse.body);
+  const unknownConfirmed = responseJson<{ outflowReportId: string }>(
+    unknownConfirmedResponse,
+  );
+  const confirmOutflowReconciliation = await app.inject({
+    method: "POST",
+    url: `${outflowUrl}/${unknownConfirmed.outflowReportId}/reconciliation`,
+    headers: { cookie },
+    payload: {
+      outcome: "confirm_outflow",
+      occurredAt: new Date().toISOString(),
+      reason: "Synthetic bank trace now proves the original-source transfer completed",
+      idempotencyKey: `outflow-reconcile-yes-${namespace}`,
+    },
+  });
+  assert.equal(
+    confirmOutflowReconciliation.statusCode,
+    201,
+    confirmOutflowReconciliation.body,
+  );
+  assert.equal(
+    responseJson<{ status: string }>(confirmOutflowReconciliation).status,
+    "confirmed_outflow",
+  );
+  assert.ok(responseJson<{ outflowId: string }>(confirmOutflowReconciliation).outflowId);
+  const outflowFinancial = await pool.query<{
+    report_count: string;
+    reconciliation_count: string;
+    outflow_count: string;
+    journal_count: string;
+    debit_minor: string;
+    credit_minor: string;
+    provider_operation_count: string;
+  }>(
+    `SELECT
+       (SELECT count(*)::text FROM manual_receipt_outflow_reports
+        WHERE manual_receipt_id = $1) AS report_count,
+       (SELECT count(*)::text
+        FROM manual_receipt_outflow_reconciliations reconciliation
+        JOIN manual_receipt_outflow_reports report ON report.id = reconciliation.report_id
+        WHERE report.manual_receipt_id = $1) AS reconciliation_count,
+       (SELECT count(*)::text FROM manual_receipt_outflows
+        WHERE manual_receipt_id = $1) AS outflow_count,
+       count(DISTINCT journal.id)::text AS journal_count,
+       sum(line.debit_minor)::text AS debit_minor,
+       sum(line.credit_minor)::text AS credit_minor,
+       (SELECT count(*)::text FROM provider_operations
+        WHERE subject_type IN ('manual_receipt_outflow_report', 'manual_receipt_outflow'))
+         AS provider_operation_count
+     FROM manual_receipt_outflows outflow
+     JOIN ledger_journals journal
+       ON journal.source_type = 'manual_receipt_outflow' AND journal.source_id = outflow.id
+     JOIN ledger_lines line ON line.journal_id = journal.id
+     WHERE outflow.manual_receipt_id = $1`,
+    [first.manualReceiptId],
+  );
+  assert.deepEqual(outflowFinancial.rows[0], {
+    report_count: "3",
+    reconciliation_count: "2",
+    outflow_count: "2",
+    journal_count: "2",
+    debit_minor: "1800",
+    credit_minor: "1800",
+    provider_operation_count: "0",
+  });
+
   const listed = await app.inject({ method: "GET", url, headers: { cookie } });
   assert.equal(listed.statusCode, 200, listed.body);
   assert.equal(
@@ -829,6 +1091,37 @@ try {
         item.reversal?.reversalId === reversal.reversalId,
     ),
     true,
+  );
+  const listedOutflowReceipt = responseJson<{
+    items: Array<{
+      manualReceiptId: string;
+      originalSourceOutflow: {
+        sourceAmountMinor: string;
+        confirmedOutflowMinor: string;
+        availableMinor: string;
+        capacityFrozen: boolean;
+        reports: Array<{ status: string }>;
+      };
+    }>;
+  }>(listed).items.find((item) => item.manualReceiptId === first.manualReceiptId);
+  assert.deepEqual(
+    {
+      sourceAmountMinor: listedOutflowReceipt?.originalSourceOutflow.sourceAmountMinor,
+      confirmedOutflowMinor:
+        listedOutflowReceipt?.originalSourceOutflow.confirmedOutflowMinor,
+      availableMinor: listedOutflowReceipt?.originalSourceOutflow.availableMinor,
+      capacityFrozen: listedOutflowReceipt?.originalSourceOutflow.capacityFrozen,
+      reportStatuses: listedOutflowReceipt?.originalSourceOutflow.reports
+        .map((report) => report.status)
+        .sort(),
+    },
+    {
+      sourceAmountMinor: "10000",
+      confirmedOutflowMinor: "1800",
+      availableMinor: "8200",
+      capacityFrozen: false,
+      reportStatuses: ["confirmed", "confirmed_outflow", "no_outflow"],
+    },
   );
   const visibleUnclaimed = await app.inject({
     method: "GET",
@@ -919,7 +1212,7 @@ try {
 
   await assert.rejects(
     runMigrations(pool),
-    /running schema-016 API or Worker/,
+    /running schema-017 API or Worker/,
   );
   await app.close();
   app = null;
@@ -928,7 +1221,7 @@ try {
 
   process.stdout.write(
     `${JSON.stringify({
-      schema016Native: true,
+      schema018Native: true,
       manualReceiptRecorded: true,
       mistakenManualReceiptReversed: true,
       reversalRequiresBothPermissions: true,
@@ -943,6 +1236,12 @@ try {
       fixedWindowReauthRequired: true,
       permissionRevocationEnforced: true,
       idempotencyReplaySafe: true,
+      confirmedOriginalSourceOutflowRecorded: true,
+      unknownOutflowFreezesCapacity: true,
+      unknownOutflowConfirmedNoOutflow: true,
+      unknownOutflowConfirmedOutflow: true,
+      outflowReplaySafe: true,
+      outflowProviderUsed: false,
       optimisticReferenceConflict: true,
       concurrentReferenceCreates: 1,
       balancedGrossMinor: "10000",

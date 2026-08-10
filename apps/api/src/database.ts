@@ -3,6 +3,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertMigrationDatabaseRoleSafe } from "@opensales/core";
 import {
   assertProviderTokenKeyringCoversVersions,
   fingerprintProviderTokenKey,
@@ -21,13 +22,24 @@ import {
   SCHEMA_016_APPLICATION_GUARD,
   type Schema015RollbackPreflightReport,
 } from "@opensales/core/schema-015-016-rollback-compatibility";
+import {
+  assertSchema016RollbackBridgeSafe,
+  SCHEMA_016_017_GUARD,
+  SCHEMA_017_APPLICATION_GUARD,
+  type Schema016BridgePreflightReport,
+} from "@opensales/core/schema-016-017-rollback-compatibility";
+import {
+  assertSchema018NativeSafe,
+  SCHEMA_018,
+  type Schema018NativePreflightReport,
+} from "@opensales/core/schema-017-018-native-compatibility";
 import pg from "pg";
 import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = SCHEMA_016;
+export const REQUIRED_SCHEMA_VERSION = SCHEMA_018;
 const TOKEN_REGISTRY_EXTENSION_GUARD =
   "opensales:payment-method-token-registry-extension";
 
@@ -35,8 +47,15 @@ export function createPool(
   config: Config,
   applicationName = "opensales-api",
 ): DatabasePool {
+  return createPoolForConnection(config.DATABASE_URL, applicationName);
+}
+
+export function createPoolForConnection(
+  connectionString: string,
+  applicationName: string,
+): DatabasePool {
   return new Pool({
-    connectionString: config.DATABASE_URL,
+    connectionString,
     max: 20,
     connectionTimeoutMillis: 5_000,
     options: "-c search_path=pg_catalog,public",
@@ -165,6 +184,54 @@ export async function holdSchema016ApplicationGuard(
   };
 }
 
+export async function holdSchema016RollbackBridgeGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SET lock_timeout = '15s'");
+    await client.query(
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_016_017_GUARD],
+    );
+    await client.query("RESET lock_timeout");
+    held = true;
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    await releaseGuardClient(client, SCHEMA_016_017_GUARD);
+  };
+}
+
+export async function holdSchema017ApplicationGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SET lock_timeout = '15s'");
+    await client.query(
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_017_APPLICATION_GUARD],
+    );
+    await client.query("RESET lock_timeout");
+    held = true;
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    await releaseGuardClient(client, SCHEMA_017_APPLICATION_GUARD);
+  };
+}
+
 export async function tryLockPaymentMethodTokenRegistryExtension(
   client: DatabaseClient,
 ): Promise<boolean> {
@@ -175,15 +242,23 @@ export async function tryLockPaymentMethodTokenRegistryExtension(
   return result.rows[0]?.locked === true;
 }
 
-export async function runMigrations(pool: DatabasePool): Promise<void> {
+export async function runMigrations(
+  pool: DatabasePool,
+  input: Readonly<{ throughVersion?: string }> = {},
+): Promise<void> {
   const client = await pool.connect();
   let migrationLockHeld = false;
   let compatibilityLockHeld = false;
   let schema016ApplicationLockHeld = false;
+  let schema016017BridgeLockHeld = false;
+  let schema017ApplicationLockHeld = false;
   let failed = false;
   let failure: unknown;
   try {
     await client.query("SET search_path TO public");
+    await assertMigrationDatabaseRoleSafe({
+      query: async (text, values) => client.query(text, values),
+    });
     await client.query(
       "SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended('opensales:schema-migrations', 0))",
     );
@@ -208,13 +283,41 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       );
     }
     schema016ApplicationLockHeld = true;
+    const schema016017BridgeGuard = await client.query<{ locked: boolean }>(
+      "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
+      [SCHEMA_016_017_GUARD],
+    );
+    if (schema016017BridgeGuard.rows[0]?.locked !== true) {
+      throw new Error(
+        "Schema migration is blocked by a running schema-016/017 bridge API or Worker; stop every application process before migrating",
+      );
+    }
+    schema016017BridgeLockHeld = true;
+    const schema017ApplicationGuard = await client.query<{ locked: boolean }>(
+      "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
+      [SCHEMA_017_APPLICATION_GUARD],
+    );
+    if (schema017ApplicationGuard.rows[0]?.locked !== true) {
+      throw new Error(
+        "Schema migration is blocked by a running schema-017 API or Worker; stop every application process before migrating",
+      );
+    }
+    schema017ApplicationLockHeld = true;
     await client.query(
       "CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
     const migrationsDirectory = fileURLToPath(new URL("../migrations/", import.meta.url));
-    const migrationFiles = (await readdir(migrationsDirectory))
+    let migrationFiles = (await readdir(migrationsDirectory))
       .filter((file) => /^\d{3}_[a-z0-9_]+\.sql$/.test(file))
       .sort();
+    if (input.throughVersion) {
+      const targetFile = `${input.throughVersion}.sql`;
+      const targetIndex = migrationFiles.indexOf(targetFile);
+      if (targetIndex === -1) {
+        throw new Error(`Migration target ${input.throughVersion} does not exist`);
+      }
+      migrationFiles = migrationFiles.slice(0, targetIndex + 1);
+    }
     for (const migrationFile of migrationFiles) {
       const version = migrationFile.replace(/\.sql$/, "");
       const migration = await readFile(resolve(migrationsDirectory, migrationFile), "utf8");
@@ -260,6 +363,18 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
       discardClient = true;
     }
   };
+  if (schema017ApplicationLockHeld) {
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [SCHEMA_017_APPLICATION_GUARD],
+    );
+  }
+  if (schema016017BridgeLockHeld) {
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [SCHEMA_016_017_GUARD],
+    );
+  }
   if (schema016ApplicationLockHeld) {
     await unlock(
       "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
@@ -291,24 +406,142 @@ export async function runMigrations(pool: DatabasePool): Promise<void> {
   }
 }
 
+export type RuntimeDatabaseRole = Readonly<{
+  name: string;
+  password: string;
+}>;
+
+function assertRuntimeRoleInput(role: RuntimeDatabaseRole): void {
+  if (!/^[a-z][a-z0-9_]{0,62}$/.test(role.name)) {
+    throw new Error(`Invalid runtime database role identifier ${role.name}`);
+  }
+  if (role.password.length < 32) {
+    throw new Error(`Runtime database role ${role.name} requires a 32-character password`);
+  }
+}
+
+async function formattedRoleSql(
+  client: DatabaseClient,
+  template: string,
+  values: readonly unknown[],
+): Promise<string> {
+  const result = await client.query<{ statement: string }>(
+    "SELECT pg_catalog.format($1, VARIADIC $2::text[]) AS statement",
+    [template, values.map(String)],
+  );
+  const statement = result.rows[0]?.statement;
+  if (!statement) throw new Error("Unable to format database role boundary statement");
+  return statement;
+}
+
+export async function configureRuntimeDatabaseRoles(
+  pool: DatabasePool,
+  roles: readonly RuntimeDatabaseRole[],
+): Promise<void> {
+  if (roles.length === 0) throw new Error("At least one runtime database role is required");
+  const names = new Set<string>();
+  for (const role of roles) {
+    assertRuntimeRoleInput(role);
+    if (names.has(role.name)) throw new Error(`Duplicate runtime database role ${role.name}`);
+    names.add(role.name);
+  }
+  await transaction(pool, async (client) => {
+    await assertMigrationDatabaseRoleSafe({
+      query: async (text, values) => client.query(text, values),
+    });
+    await client.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await client.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC");
+    await client.query(
+      "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+    );
+    const databaseName = (await client.query<{ database_name: string }>(
+      "SELECT pg_catalog.current_database() AS database_name",
+    )).rows[0]?.database_name;
+    const migrationRole = (await client.query<{ role_name: string }>(
+      "SELECT current_user AS role_name",
+    )).rows[0]?.role_name;
+    if (!databaseName || !migrationRole) {
+      throw new Error("Unable to resolve migration database identity");
+    }
+    for (const role of roles) {
+      const existing = await client.query(
+        "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1",
+        [role.name],
+      );
+      if (existing.rowCount === 0) {
+        await client.query(
+          await formattedRoleSql(
+            client,
+            "CREATE ROLE %I LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L",
+            [role.name, role.password],
+          ),
+        );
+      } else {
+        await client.query(
+          await formattedRoleSql(
+            client,
+            "ALTER ROLE %I LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L",
+            [role.name, role.password],
+          ),
+        );
+      }
+      await client.query(
+        await formattedRoleSql(
+          client,
+          "REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I",
+          [databaseName, role.name],
+        ),
+      );
+      await client.query(
+        await formattedRoleSql(client, "GRANT CONNECT ON DATABASE %I TO %I", [
+          databaseName,
+          role.name,
+        ]),
+      );
+      await client.query(
+        await formattedRoleSql(client, "REVOKE %I FROM %I", [migrationRole, role.name]),
+      );
+      const statements = [
+        "REVOKE ALL PRIVILEGES ON SCHEMA public FROM %I",
+        "GRANT USAGE ON SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %I",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %I",
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM %I",
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO %I",
+        "REVOKE ALL PRIVILEGES ON TABLE public.schema_migrations FROM %I",
+        "GRANT SELECT ON TABLE public.schema_migrations TO %I",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO %I",
+      ] as const;
+      for (const template of statements) {
+        await client.query(await formattedRoleSql(client, template, [role.name]));
+      }
+    }
+  });
+}
+
 export async function assertSchemaCompatible(
   pool: DatabasePool,
-): Promise<Readonly<{
-  installedSchemaVersion: typeof SCHEMA_016;
-  applicationSchemaVersion: typeof SCHEMA_016;
-  mode: "native";
-  safe: true;
-  blockers: readonly [];
-}>> {
+  input: Readonly<{ enable017RollbackBridge?: boolean }> = {},
+): Promise<Schema018NativePreflightReport | Schema016BridgePreflightReport> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await client.query("SET LOCAL search_path TO pg_catalog, public");
-    const report = await assertSchema016NativeSafe(
-      {
-        query: async (text, values) => client.query(text, values),
-      },
-    );
+    let report: Schema018NativePreflightReport | Schema016BridgePreflightReport;
+    if (input.enable017RollbackBridge === true) {
+      report = await assertSchema016RollbackBridgeSafe(
+        { query: async (text: string, values?: unknown[]) => client.query(text, values) },
+        { enable017RollbackBridge: true },
+      );
+    } else {
+      report = await assertSchema018NativeSafe(
+        { query: async (text: string, values?: unknown[]) => client.query(text, values) },
+      );
+    }
     await client.query("COMMIT");
     return report;
   } catch (error) {

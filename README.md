@@ -75,6 +75,42 @@ Candidate.
 
 Use only synthetic identities and data.
 
+### Fast local Demo on macOS (no Docker)
+
+With PostgreSQL 18, the frozen workspace dependencies, and Node 24.18.0
+available locally, one command builds the applications, initializes an isolated
+PostgreSQL cluster under `.demo/local`, starts API/Worker/Web plus all four Mock
+Provider processes on loopback, creates distinct synthetic Staff and customer
+accounts with separate authenticated sessions, and proves the Stage A happy
+path through an Active service, a service-linked support ticket whose Staff
+internal note stays customer-hidden, plus one Provider-free manual
+receipt/original-source outflow:
+
+```bash
+node tools/demo-local.mjs up
+```
+
+The command prints the public `http://127.0.0.1:5173/`, customer
+`http://127.0.0.1:5173/customer`, and Staff
+`http://127.0.0.1:5173/admin` URLs, generated `.example.invalid` customer and
+administrator logins, Client Account IDs, commit/worktree source fingerprint,
+and exact order, invoice, service, ticket, internal-note, receipt, and outflow
+IDs. Use those printed `127.0.0.1` URLs consistently rather than substituting
+`localhost`. Every lifecycle command is serialized by a repository-scoped OS
+advisory lock, and a pre-spawn pending record lets the next command safely
+recover or reject an interrupted synthetic child start before normal tracked-
+process inspection or any action.
+Stop the stack without deleting the synthetic data:
+
+```bash
+node tools/demo-local.mjs down
+```
+
+See [docs/demo-local.md](docs/demo-local.md) for status, repeat-smoke, reset,
+ports, reused product components, and limitations.
+
+### Docker Compose alternative
+
 ```bash
 cp .env.example .env
 # Replace every __GENERATE_* placeholder with an independent random value.

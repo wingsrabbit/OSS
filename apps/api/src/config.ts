@@ -9,6 +9,10 @@ import {
 
 const schema = z.object({
   DATABASE_URL: z.string().min(1),
+  DATABASE_RUNTIME_ROLE: z.string().regex(/^[a-z][a-z0-9_]{0,62}$/).optional(),
+  MIGRATION_DATABASE_URL: z.string().min(1).optional(),
+  DATABASE_API_ROLE_PASSWORD: z.string().min(32).optional(),
+  DATABASE_WORKER_ROLE_PASSWORD: z.string().min(32).optional(),
   OSS_ENV: z.enum(["development", "test", "laboratory"]).default("development"),
   OSS_LOG_LEVEL: z
     .enum(["silent", "fatal", "error", "warn", "info", "debug", "trace"])
@@ -30,7 +34,9 @@ const schema = z.object({
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: z.coerce.number().int().positive().optional(),
   PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: z.string().optional(),
-  OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "015-to-016"]).optional(),
+  OSS_SCHEMA_ROLLBACK_BRIDGE: z
+    .enum(["disabled", "016-to-017"])
+    .optional(),
   MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32),
   MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32),
   LAB_MAILBOX_ENABLED: z

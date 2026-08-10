@@ -2,6 +2,12 @@
 
 export const LAB_BANNER = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY" as const;
 
+export {
+  assertMigrationDatabaseRoleSafe,
+  assertRuntimeDatabaseRoleSafe,
+  type DatabaseRoleBoundaryQueryable,
+} from "./database-role-boundary.js";
+
 export type BillingCycle = "monthly" | "quarterly" | "semiannual" | "annual" | "one_time";
 export type FulfillmentMode = "automatic" | "review" | "manual" | "quote";
 export type OrderStatus =

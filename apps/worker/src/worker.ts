@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHmac, randomUUID } from "node:crypto";
-import { isPaymentBusinessStatePayable } from "@opensales/core";
+import {
+  assertRuntimeDatabaseRoleSafe,
+  isPaymentBusinessStatePayable,
+} from "@opensales/core";
 import {
   providerOperationCapability,
   providerOperationCapabilityMatches,
@@ -14,9 +17,11 @@ import {
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
 import {
-  assertSchema016NativeSafe,
-  SCHEMA_016_APPLICATION_GUARD,
-} from "@opensales/core/schema-015-016-rollback-compatibility";
+  assertSchema016RollbackBridgeSafe,
+  SCHEMA_016_017_GUARD,
+  SCHEMA_017_APPLICATION_GUARD,
+} from "@opensales/core/schema-016-017-rollback-compatibility";
+import { assertSchema018NativeSafe } from "@opensales/core/schema-017-018-native-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -32,6 +37,7 @@ import {
 const config = z
   .object({
     DATABASE_URL: z.string().min(1),
+    DATABASE_RUNTIME_ROLE: z.string().regex(/^[a-z][a-z0-9_]{0,62}$/),
     MOCK_PAYMENT_PROVIDER_URL: z.url(),
     MOCK_PROVISIONING_PROVIDER_URL: z.url(),
     MOCK_MAIL_PROVIDER_URL: z.url(),
@@ -39,7 +45,9 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
-    OSS_SCHEMA_ROLLBACK_BRIDGE: z.enum(["disabled", "015-to-016"]).optional(),
+    OSS_SCHEMA_ROLLBACK_BRIDGE: z
+      .enum(["disabled", "016-to-017"])
+      .optional(),
     PAYMENT_METHOD_TOKEN_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     PAYMENT_METHOD_TOKEN_KEY_VERSION: z.coerce.number().int().positive().optional(),
     PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: z.string().optional(),
@@ -78,6 +86,10 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
+const schemaCompatibilityGuardName =
+  config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017"
+    ? SCHEMA_016_017_GUARD
+    : SCHEMA_017_APPLICATION_GUARD;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 
 async function releaseWorkerGuard(
@@ -113,7 +125,7 @@ async function cleanupWorkerResources(): Promise<void> {
   }
   if (schemaCompatibilityGuard) {
     releases.push(
-      releaseWorkerGuard(schemaCompatibilityGuard, SCHEMA_016_APPLICATION_GUARD),
+      releaseWorkerGuard(schemaCompatibilityGuard, schemaCompatibilityGuardName),
     );
     schemaCompatibilityGuard = null;
   }
@@ -264,17 +276,28 @@ async function enqueueReconcileWithClient(
     `INSERT INTO durable_jobs(job_type, unique_key, payload, available_at)
      VALUES ($1, $2, $3, now() + make_interval(secs => $4))
      ON CONFLICT (job_type, unique_key) DO UPDATE
-       SET payload = EXCLUDED.payload,
+       SET payload = CASE
+             WHEN durable_jobs.status = 'running' THEN durable_jobs.payload
+             ELSE EXCLUDED.payload
+           END,
            status = CASE
              WHEN durable_jobs.status = 'manual' THEN 'manual'
+             WHEN durable_jobs.status = 'running' THEN 'running'
              ELSE 'pending'
            END,
            available_at = CASE
-             WHEN durable_jobs.status = 'manual' THEN durable_jobs.available_at
+             WHEN durable_jobs.status IN ('manual', 'running')
+               THEN durable_jobs.available_at
              ELSE EXCLUDED.available_at
            END,
-           locked_at = NULL,
-           locked_by = NULL,
+           locked_at = CASE
+             WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_at
+             ELSE NULL
+           END,
+           locked_by = CASE
+             WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_by
+             ELSE NULL
+           END,
            updated_at = now()`,
     [jobType, uniqueKey, payload, delaySeconds],
   );
@@ -7408,11 +7431,15 @@ process.on("SIGINT", () => {
 let workerFailure: unknown;
 let cleanupFailure: unknown;
 try {
+  await assertRuntimeDatabaseRoleSafe(
+    { query: async (text, values) => pool.query(text, values) },
+    config.DATABASE_RUNTIME_ROLE,
+  );
   schemaCompatibilityGuard = await pool.connect();
   await schemaCompatibilityGuard.query("SET lock_timeout = '15s'");
   await schemaCompatibilityGuard.query(
     "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
-    [SCHEMA_016_APPLICATION_GUARD],
+    [schemaCompatibilityGuardName],
   );
   await schemaCompatibilityGuard.query("RESET lock_timeout");
   try {
@@ -7420,11 +7447,17 @@ try {
       "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
     );
     await schemaCompatibilityGuard.query("SET LOCAL search_path TO pg_catalog, public");
-    await assertSchema016NativeSafe(
-      {
-        query: async (text, values) => schemaCompatibilityGuard!.query(text, values),
-      },
-    );
+    const queryable = {
+      query: async (text: string, values?: unknown[]) =>
+        schemaCompatibilityGuard!.query(text, values),
+    };
+    if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
+      await assertSchema016RollbackBridgeSafe(queryable, {
+        enable017RollbackBridge: true,
+      });
+    } else {
+      await assertSchema018NativeSafe(queryable);
+    }
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {
     await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);

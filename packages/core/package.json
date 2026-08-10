@@ -24,6 +24,14 @@
     "./schema-015-016-rollback-compatibility": {
       "types": "./dist/schema-015-016-rollback-compatibility.d.ts",
       "default": "./dist/schema-015-016-rollback-compatibility.js"
+    },
+    "./schema-016-017-rollback-compatibility": {
+      "types": "./dist/schema-016-017-rollback-compatibility.d.ts",
+      "default": "./dist/schema-016-017-rollback-compatibility.js"
+    },
+    "./schema-017-018-native-compatibility": {
+      "types": "./dist/schema-017-018-native-compatibility.d.ts",
+      "default": "./dist/schema-017-018-native-compatibility.js"
     }
   },
   "scripts": {

@@ -27,6 +27,9 @@ jobs:
         with:
           node-version: 24.18.0
 
+      - name: Demo launcher lifecycle regressions
+        run: node --test tools/demo-local.test.mjs
+
       - name: Install pinned dependencies
         shell: bash
         run: |
@@ -69,6 +72,9 @@ jobs:
     env:
       ADMIN_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/oss
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/oss
+      DATABASE_API_ROLE_PASSWORD: ci-only-api-database-password-000000000000
+      DATABASE_WORKER_ROLE_PASSWORD: ci-only-worker-database-password-000000000
       PROVIDER_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/provider
       OSS_ENV: test
       OSS_PUBLIC_URL: http://127.0.0.1:5173
@@ -145,9 +151,11 @@ jobs:
           await client.connect();
           await client.query('CREATE DATABASE payment_token_rotation');
           await client.query('CREATE DATABASE manual_receipts');
+          await client.query('CREATE DATABASE support_tickets');
           await client.query('CREATE DATABASE worker_job_claim');
           await client.query('CREATE DATABASE schema_rollback');
           await client.query('CREATE DATABASE schema_015_016_rollback');
+          await client.query('CREATE DATABASE schema_016_017_rollback');
           await client.end();"
 
       - name: Run renewal lifecycle PostgreSQL journey
@@ -165,11 +173,44 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/manual_receipts
         run: pnpm --filter @opensales/api test:integration:manual-receipts
 
+      - name: Run support ticket PostgreSQL and API journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/support_tickets
+        run: pnpm --filter @opensales/api test:integration:tickets
+
+      - name: Prepare and run schema 016 Worker job boundary PostgreSQL journey
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-6])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
       - name: Run schema 016 Worker job boundary PostgreSQL journey
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
         run: |
-          pnpm --filter @opensales/api migrate
           pnpm --filter @opensales/worker test:integration:job-claim
 
       - name: Prepare schema 014 rollback database
@@ -241,21 +282,62 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
         run: pnpm --filter @opensales/api test:integration:schema-015-016-rollback-preflight
 
+      - name: Prepare schema 016 rollback bridge database
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-6])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
+      - name: Run schema 016 to 017 rollback bridge PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+        run: pnpm --filter @opensales/api test:integration:schema-016-017-rollback-preflight
+
       - name: Apply forward migrations and synthetic configuration
         shell: bash
         run: |
           set -euo pipefail
           pnpm --filter @opensales/api migrate
-          pnpm --filter @opensales/api seed:termrat
+          DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_api pnpm --filter @opensales/api seed:termrat
+
+      - name: Prove migration and runtime database role separation
+        run: pnpm --filter @opensales/api test:integration:database-role-boundary
 
       - name: Start API, Worker, and Mock Provider
         shell: bash
         run: |
           set -euo pipefail
           node providers/mock-lab/dist/server.js > provider.log 2>&1 &
-          node apps/api/dist/server.js > api.log 2>&1 &
+          DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_api node apps/api/dist/server.js > api.log 2>&1 &
           echo "$!" > api.pid
-          MOCK_RESOURCE_ACTION_SCENARIO=timeout_success node apps/worker/dist/worker.js > worker.log 2>&1 &
+          DATABASE_URL=postgresql://oss_worker:${DATABASE_WORKER_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_worker MOCK_RESOURCE_ACTION_SCENARIO=timeout_success \
+            node apps/worker/dist/worker.js > worker.log 2>&1 &
           echo "$!" > worker.pid
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
@@ -288,7 +370,9 @@ jobs:
             echo "Worker process did not stop cleanly"
             exit 1
           fi
-          node apps/worker/dist/worker.js > worker-browser.log 2>&1 &
+          DATABASE_URL=postgresql://oss_worker:${DATABASE_WORKER_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_worker node apps/worker/dist/worker.js \
+            > worker-browser.log 2>&1 &
           echo "$!" > worker.pid
 
       - name: Install pinned Chromium runtime
@@ -312,7 +396,9 @@ jobs:
             echo "API process did not stop cleanly"
             exit 1
           fi
-          node apps/api/dist/server.js > api-browser.log 2>&1 &
+          DATABASE_URL=postgresql://oss_api:${DATABASE_API_ROLE_PASSWORD}@127.0.0.1:5432/oss \
+            DATABASE_RUNTIME_ROLE=oss_api node apps/api/dist/server.js \
+            > api-browser.log 2>&1 &
           echo "$!" > api.pid
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null; then
