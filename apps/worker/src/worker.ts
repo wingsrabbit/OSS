@@ -19,9 +19,9 @@ import {
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
 import {
-  assertSchema019NativeSafe,
-  SCHEMA_019_APPLICATION_GUARD,
-} from "@opensales/core/schema-018-019-native-compatibility";
+  assertSchema020NativeSafe,
+  SCHEMA_020_APPLICATION_GUARD,
+} from "@opensales/core/schema-019-020-native-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -107,7 +107,7 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
-const schemaCompatibilityGuardName = SCHEMA_019_APPLICATION_GUARD;
+const schemaCompatibilityGuardName = SCHEMA_020_APPLICATION_GUARD;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 
 async function releaseWorkerGuard(
@@ -7318,7 +7318,7 @@ let cleanupFailure: unknown;
 try {
   if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
     throw new Error(
-      "Schema 019 Worker refuses the legacy 016-to-017 rollback bridge; use the matching historical worker binary or migrate forward",
+      "Schema 020 Worker refuses the legacy 016-to-017 rollback bridge; use the matching historical worker binary or migrate forward",
     );
   }
   await assertRuntimeDatabaseRoleSafe(
@@ -7341,7 +7341,7 @@ try {
       query: async (text: string, values?: unknown[]) =>
         schemaCompatibilityGuard!.query(text, values),
     };
-    await assertSchema019NativeSafe(queryable);
+    await assertSchema020NativeSafe(queryable);
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {
     await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
