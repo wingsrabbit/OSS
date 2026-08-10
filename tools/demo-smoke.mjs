@@ -48,11 +48,13 @@ export class DemoSession {
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
     this.cookie = "";
+    this.sessionEpoch = 0;
     this.accountContextVersion = null;
     this.clientAccountId = null;
   }
 
   async request(path, init = {}, expectedStatus = 200) {
+    const requestSessionEpoch = this.sessionEpoch;
     const method = (init.method ?? "GET").toUpperCase();
     const headers = new Headers(init.headers);
     if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -73,18 +75,38 @@ export class DemoSession {
       signal: AbortSignal.timeout(10_000),
     });
     const setCookie = response.headers.get("set-cookie");
-    if (setCookie) this.cookie = setCookie.split(";", 1)[0] ?? "";
+    let responseEstablishedCurrentSession = false;
+    if (setCookie && requestSessionEpoch === this.sessionEpoch) {
+      const nextCookie = setCookie.split(";", 1)[0] ?? "";
+      if (nextCookie !== this.cookie) {
+        this.cookie = nextCookie;
+        this.sessionEpoch += 1;
+        this.accountContextVersion = null;
+        this.clientAccountId = null;
+        responseEstablishedCurrentSession = true;
+      }
+    }
     const accountContextVersion = response.headers.get("x-oss-account-context-version");
-    if (accountContextVersion !== null) {
+    const responseBelongsToCurrentSession =
+      requestSessionEpoch === this.sessionEpoch || responseEstablishedCurrentSession;
+    if (accountContextVersion !== null && responseBelongsToCurrentSession) {
       assert.match(
         accountContextVersion,
         /^(?:0|[1-9]\d*)$/,
         "API returned an invalid account-context version",
       );
-      this.accountContextVersion = accountContextVersion;
+      const responseVersion = BigInt(accountContextVersion);
+      const currentVersion =
+        this.accountContextVersion === null ? null : BigInt(this.accountContextVersion);
+      if (
+        currentVersion === null ||
+        responseVersion >= currentVersion
+      ) {
+        this.accountContextVersion = accountContextVersion;
+        const clientAccountId = response.headers.get("x-oss-client-account-id");
+        this.clientAccountId = clientAccountId?.trim() || null;
+      }
     }
-    const clientAccountId = response.headers.get("x-oss-client-account-id");
-    this.clientAccountId = clientAccountId?.trim() || null;
     const bodyText = await response.text();
     if (response.status !== expectedStatus) {
       throw new Error(

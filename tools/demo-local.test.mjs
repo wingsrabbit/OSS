@@ -799,6 +799,106 @@ test("Demo session records a newer context version before reporting an API error
   assert.equal(session.accountContextVersion, "23");
 });
 
+test("Demo session ignores an older context response that arrives after a newer response", async () => {
+  let releaseOlder;
+  let releaseNewer;
+  const olderResponse = new Promise((resolve) => {
+    releaseOlder = resolve;
+  });
+  const newerResponse = new Promise((resolve) => {
+    releaseNewer = resolve;
+  });
+  const session = new DemoSession("http://127.0.0.1:3000", async (url) => {
+    if (url.pathname === "/api/v1/auth/me") {
+      return new Response("{}", {
+        headers: {
+          "Set-Cookie": "oss_session=session-id; Path=/; HttpOnly",
+          "X-OSS-Account-Context-Version": "16",
+          "X-OSS-Client-Account-Id": "account-a",
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/older") return olderResponse;
+    if (url.pathname === "/api/v1/newer") return newerResponse;
+    throw new Error(`Unexpected Demo request ${url.pathname}`);
+  });
+
+  await session.request("/api/v1/auth/me");
+  const older = session.request("/api/v1/older");
+  const newer = session.request("/api/v1/newer");
+  releaseNewer(
+    new Response("{}", {
+      headers: {
+        "X-OSS-Account-Context-Version": "18",
+        "X-OSS-Client-Account-Id": "account-b",
+      },
+    }),
+  );
+  await newer;
+  releaseOlder(
+    new Response("{}", {
+      headers: {
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+  );
+  await older;
+
+  assert.equal(session.accountContextVersion, "18");
+  assert.equal(session.clientAccountId, "account-b");
+});
+
+test("Demo session preserves context on public responses and rejects old-session responses", async () => {
+  let releaseOldSessionResponse;
+  const oldSessionResponse = new Promise((resolve) => {
+    releaseOldSessionResponse = resolve;
+  });
+  const session = new DemoSession("http://127.0.0.1:3000", async (url) => {
+    if (url.pathname === "/api/v1/auth/me") {
+      return new Response("{}", {
+        headers: {
+          "Set-Cookie": "oss_session=old-session; Path=/; HttpOnly",
+          "X-OSS-Account-Context-Version": "17",
+          "X-OSS-Client-Account-Id": "account-a",
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/catalog") return new Response("{}");
+    if (url.pathname === "/api/v1/old-session") return oldSessionResponse;
+    if (url.pathname === "/api/v1/auth/login") {
+      return new Response("{}", {
+        headers: {
+          "Set-Cookie": "oss_session=new-session; Path=/; HttpOnly",
+          "X-OSS-Account-Context-Version": "0",
+        },
+      });
+    }
+    throw new Error(`Unexpected Demo request ${url.pathname}`);
+  });
+
+  await session.request("/api/v1/auth/me");
+  await session.request("/api/v1/catalog");
+  assert.equal(session.accountContextVersion, "17");
+  assert.equal(session.clientAccountId, "account-a");
+
+  const oldRequest = session.request("/api/v1/old-session");
+  await session.request("/api/v1/auth/login", { method: "POST", body: "{}" });
+  releaseOldSessionResponse(
+    new Response("{}", {
+      headers: {
+        "X-OSS-Account-Context-Version": "18",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+  );
+  await oldRequest;
+
+  assert.equal(session.cookie, "oss_session=new-session");
+  assert.equal(session.accountContextVersion, "0");
+  assert.equal(session.clientAccountId, null);
+});
+
 function ticketSessions({ leakInternalNote = false } = {}) {
   const clientAccountId = "customer-account";
   const serviceId = "active-service";
