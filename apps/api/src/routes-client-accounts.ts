@@ -155,7 +155,7 @@ async function listMembershipsPage(
   page: PageQuery,
   scope: string,
 ): Promise<CollectionPage<MembershipSummary>> {
-  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId, true);
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
   const result = await queryable.query<{
     user_id: string;
     email: string;
@@ -163,9 +163,8 @@ async function listMembershipsPage(
     permissions: unknown;
     email_verified_at: Date | null;
     user_restricted_at: Date | null;
-    created_at: Date;
+    created_at_cursor: string;
     removed_at: Date | null;
-    active_rank: number;
   }>(
     `SELECT membership.user_id,
             user_account.email::text,
@@ -173,30 +172,22 @@ async function listMembershipsPage(
             membership.permissions,
             user_account.email_verified_at,
             user_account.restricted_at AS user_restricted_at,
-            membership.created_at,
-            membership.removed_at,
-            CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END AS active_rank
+            to_char(
+              membership.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
+            membership.removed_at
      FROM client_memberships membership
      JOIN users user_account ON user_account.id = membership.user_id
      WHERE membership.client_account_id = $1
        AND (
-         $2::integer IS NULL
-         OR CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END > $2::integer
-         OR (
-           CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END = $2::integer
-           AND membership.created_at > $3::timestamptz
-         )
-         OR (
-           CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END = $2::integer
-           AND membership.created_at = $3::timestamptz
-           AND membership.user_id > $4::uuid
-         )
+         $2::timestamptz IS NULL
+         OR (membership.created_at, membership.user_id) > ($2::timestamptz, $3::uuid)
        )
-     ORDER BY active_rank, membership.created_at, membership.user_id
-     LIMIT $5`,
+     ORDER BY membership.created_at, membership.user_id
+     LIMIT $4`,
     [
       clientAccountId,
-      cursor?.rank ?? null,
       cursor?.at ?? null,
       cursor?.id ?? null,
       page.limit + 1,
@@ -209,11 +200,10 @@ async function listMembershipsPage(
     permissions: stringPermissions(membership.permissions),
     emailVerifiedAt: membership.email_verified_at?.toISOString() ?? null,
     userRestrictedAt: membership.user_restricted_at?.toISOString() ?? null,
-    createdAt: membership.created_at.toISOString(),
+    createdAt: membership.created_at_cursor,
     removedAt: membership.removed_at?.toISOString() ?? null,
   }));
   return collectionPage(items, page.limit, scope, clientAccountId, (membership) => ({
-    rank: membership.removedAt === null ? 0 : 1,
     at: membership.createdAt,
     id: membership.userId,
   }));
@@ -232,7 +222,7 @@ async function listRestrictionsPage(
     source_type: string;
     source_id: string;
     reason: string;
-    created_at: Date;
+    created_at_cursor: string;
     released_at: Date | null;
     release_reason: string | null;
   }>(
@@ -241,7 +231,10 @@ async function listRestrictionsPage(
             restriction.source_type,
             restriction.source_id,
             restriction.reason,
-            restriction.created_at,
+            to_char(
+              restriction.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             release.created_at AS released_at,
             release.reason AS release_reason
      FROM client_account_restrictions restriction
@@ -262,7 +255,7 @@ async function listRestrictionsPage(
     sourceType: restriction.source_type,
     sourceId: restriction.source_id,
     reason: restriction.reason,
-    createdAt: restriction.created_at.toISOString(),
+    createdAt: restriction.created_at_cursor,
     releasedAt: restriction.released_at?.toISOString() ?? null,
     releaseReason: restriction.release_reason,
     active: !restriction.released_at,
@@ -288,7 +281,7 @@ async function listFundReceiptsPage(
     currency: string;
     disposition: string;
     reason: string | null;
-    occurred_at: Date;
+    occurred_at_cursor: string;
     capacity_frozen: boolean;
   }>(
     `SELECT receipt.id,
@@ -298,7 +291,10 @@ async function listFundReceiptsPage(
             receipt.currency,
             receipt.disposition,
             receipt.reason,
-            receipt.occurred_at,
+            to_char(
+              receipt.occurred_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS occurred_at_cursor,
             COALESCE(capacity.capacity_frozen, false) AS capacity_frozen
      FROM fund_receipts receipt
      LEFT JOIN unclaimed_fund_refund_capacity capacity
@@ -320,7 +316,7 @@ async function listFundReceiptsPage(
     currency: receipt.currency,
     disposition: receipt.disposition,
     reason: receipt.reason,
-    occurredAt: receipt.occurred_at.toISOString(),
+    occurredAt: receipt.occurred_at_cursor,
     capacityFrozen: receipt.capacity_frozen,
   }));
   return collectionPage(items, page.limit, scope, clientAccountId, (receipt) => ({
@@ -344,7 +340,7 @@ async function listChargebacksPage(
     credit_recovered_minor: string;
     debt_minor: string;
     currency: string;
-    occurred_at: Date;
+    occurred_at_cursor: string;
   }>(
     `SELECT id,
             principal_minor::text,
@@ -353,7 +349,10 @@ async function listChargebacksPage(
             credit_recovered_minor::text,
             debt_minor::text,
             currency,
-            occurred_at
+            to_char(
+              occurred_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS occurred_at_cursor
      FROM add_funds_chargeback_effects
      WHERE client_account_id = $1
        AND (
@@ -372,7 +371,7 @@ async function listChargebacksPage(
     creditRecoveredMinor: chargeback.credit_recovered_minor,
     debtMinor: chargeback.debt_minor,
     currency: chargeback.currency,
-    occurredAt: chargeback.occurred_at.toISOString(),
+    occurredAt: chargeback.occurred_at_cursor,
   }));
   return collectionPage(items, page.limit, scope, clientAccountId, (chargeback) => ({
     at: chargeback.occurredAt,

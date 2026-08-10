@@ -22,6 +22,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Verify patched dependencies are available to container installs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dockerfile in Dockerfile apps/web/Dockerfile; do
+            awk '
+              /COPY patches patches/ { patch_copy = NR }
+              /RUN pnpm install --frozen-lockfile/ { install = NR }
+              END { exit !(patch_copy > 0 && install > patch_copy) }
+            ' "${dockerfile}"
+          done
+
       - name: Set up pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -194,7 +206,7 @@ jobs:
           ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
         run: pnpm --filter @opensales/api test:integration:account-history
 
-      - name: Verify Unicode multi-page invoice PDF
+      - name: Mechanically inspect Unicode multi-page invoice PDF
         shell: bash
         env:
           ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
@@ -209,17 +221,23 @@ jobs:
           pdffonts "${ACCOUNT_HISTORY_PDF_OUTPUT}" > "${PDF_QA_DIRECTORY}/pdffonts.txt"
           pdftotext -layout "${ACCOUNT_HISTORY_PDF_OUTPUT}" \
             "${PDF_QA_DIRECTORY}/invoice.txt"
+          tr -d '[:space:]' < "${PDF_QA_DIRECTORY}/invoice.txt" \
+            > "${PDF_QA_DIRECTORY}/invoice-compact.txt"
           pdftoppm -png -r 120 "${ACCOUNT_HISTORY_PDF_OUTPUT}" \
             "${PDF_QA_DIRECTORY}/rendered/page"
           pages="$(awk '/^Pages:/ { print $2 }' "${PDF_QA_DIRECTORY}/pdfinfo.txt")"
-          test "${pages}" -gt 1
+          test "${pages}" -gt 3
           test "$(wc -c < "${ACCOUNT_HISTORY_PDF_OUTPUT}" | tr -d ' ')" -lt 250000
-          grep -E '^OSSINV[+]NotoSansSC-VF[[:space:]]+CID TrueType[[:space:]]+Identity-H[[:space:]]+yes[[:space:]]+yes[[:space:]]+yes' \
+          grep -E '^OSSINV[+]NotoSansSC-Regular[[:space:]]+CID TrueType[[:space:]]+Identity-H[[:space:]]+yes[[:space:]]+yes[[:space:]]+yes' \
             "${PDF_QA_DIRECTORY}/pdffonts.txt"
           grep -F '简体中文账单明细 - 云服务月费' "${PDF_QA_DIRECTORY}/invoice.txt"
           grep -F '香港节点带宽续费与技术支持' "${PDF_QA_DIRECTORY}/invoice.txt"
+          grep -F 'OSS-LONG-DESCRIPTION-BEGIN' "${PDF_QA_DIRECTORY}/invoice-compact.txt"
+          grep -F 'OSS-LONG-DESCRIPTION-END' "${PDF_QA_DIRECTORY}/invoice-compact.txt"
           test "$(find "${PDF_QA_DIRECTORY}/rendered" -name 'page-*.png' -size +0c | wc -l | tr -d ' ')" \
             -eq "${pages}"
+          # These checks are deterministic and mechanical; release acceptance still
+          # requires a human to inspect every rendered page for visual completeness.
 
       - name: Prepare and run schema 016 Worker job boundary PostgreSQL journey
         shell: bash

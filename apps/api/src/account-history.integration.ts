@@ -34,6 +34,18 @@ function responseJson<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
 }
 
+function assertCursorPreservesPostgresMicroseconds(cursor: string, label: string): void {
+  const decoded = JSON.parse(
+    Buffer.from(cursor, "base64url").toString("utf8"),
+  ) as { at?: unknown };
+  assert.ok(typeof decoded.at === "string", `${label} cursor must carry a timestamp`);
+  assert.match(
+    decoded.at,
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/,
+    `${label} cursor must preserve PostgreSQL microseconds`,
+  );
+}
+
 const config: Config = {
   DATABASE_URL: testDatabaseUrl.toString(),
   OSS_ENV: "test",
@@ -130,16 +142,16 @@ try {
   const mismatchedPaymentId = randomUUID();
   const mismatchedServiceId = randomUUID();
   const mismatchedTicketId = randomUUID();
-  const paginationOrderIds = [randomUUID(), randomUUID()];
-  const paginationItemIds = [randomUUID(), randomUUID()];
-  const paginationServiceIds = [randomUUID(), randomUUID()];
-  const paginationRenewalInvoiceIds = [randomUUID(), randomUUID()];
-  const paginationRenewalIds = [randomUUID(), randomUUID()];
-  const paginationPaymentIds = [randomUUID(), randomUUID()];
-  const paginationTicketIds = [randomUUID(), randomUUID()];
+  const paginationOrderIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationItemIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationServiceIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationRenewalInvoiceIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationRenewalIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationPaymentIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationTicketIds = [randomUUID(), randomUUID(), randomUUID()];
   const paginationRefundIds = [randomUUID(), randomUUID(), randomUUID()];
-  const paginationCreditIds = [randomUUID(), randomUUID()];
-  const paginationMembershipUserIds = [randomUUID(), randomUUID()];
+  const paginationCreditIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationMembershipUserIds = [randomUUID(), randomUUID(), randomUUID()];
   const priceSnapshot = {
     currency: "USD",
     billingCycle: "monthly",
@@ -190,6 +202,10 @@ try {
               CASE
                 WHEN line_number = 1 THEN '简体中文账单明细 - 云服务月费'
                 WHEN line_number = 2 THEN '香港节点带宽续费与技术支持'
+                WHEN line_number = 50 THEN
+                  'OSS-LONG-DESCRIPTION-BEGIN ' ||
+                  pg_catalog.repeat('跨页账单内容 ', 700) ||
+                  ' OSS-LONG-DESCRIPTION-END'
                 ELSE 'Synthetic History Service - monthly line ' || line_number::text
               END,
               10
@@ -527,7 +543,7 @@ try {
     ) {
       throw new Error("Incomplete account-history pagination fixture IDs");
     }
-    const fixtureAt = new Date(Date.now() - (index + 1) * 60_000).toISOString();
+    const fixtureAt = `2024-01-02T03:04:05.12345${6 - index}Z`;
     await pool.query(
       `INSERT INTO orders(
          id, client_account_id, submitted_by_user_id, status, currency, price_snapshot,
@@ -676,7 +692,7 @@ try {
     throw new Error("Unable to resolve refund pagination fixture sources");
   }
   for (const [index, paginationRefundId] of paginationRefundIds.entries()) {
-    const fixtureAt = new Date(Date.now() - (index + 3) * 60_000).toISOString();
+    const fixtureAt = `2024-01-02T03:04:04.12345${6 - index}Z`;
     await pool.query(
       `INSERT INTO refunds(
          id, invoice_id, client_account_id, source_fund_receipt_id,
@@ -708,7 +724,7 @@ try {
   const creditAccountId = creditAccount.rows[0]?.id;
   if (!creditAccountId) throw new Error("Unable to resolve Credit pagination fixture");
   for (const [index, paginationCreditId] of paginationCreditIds.entries()) {
-    const isCredit = index === 0;
+    const isCredit = index !== 1;
     await pool.query(
       `INSERT INTO credit_transactions(
          id, credit_account_id, kind, credit_minor, debit_minor,
@@ -723,13 +739,13 @@ try {
         paginationCreditId,
         creditAccountId,
         isCredit ? 1 : 0,
-        isCredit ? 0 : 1,
+        isCredit ? 0 : 2,
         randomUUID(),
         staff.userId,
         `Synthetic pagination Credit fixture ${index + 1}`,
         `history-page-credit:${paginationCreditId}`,
         `history-page-credit-fingerprint:${paginationCreditId}`,
-        new Date(Date.now() - (index + 1) * 60_000).toISOString(),
+        `2024-01-02T03:04:03.12345${6 - index}Z`,
       ],
     );
   }
@@ -747,7 +763,9 @@ try {
       [
         customer.accountId,
         membershipUserId,
-        new Date(Date.now() - (index + 1) * 60_000).toISOString(),
+        index === 0
+          ? "2024-01-02T03:04:02.123454Z"
+          : "2024-01-02T03:04:02.123455Z",
       ],
     );
   }
@@ -904,6 +922,10 @@ try {
         if (pages === 0 && facetPage.nextCursor) {
           firstCustomerCursors.set(facet, facetPage.nextCursor);
         }
+        assertCursorPreservesPostgresMicroseconds(
+          facetPage.nextCursor ?? "",
+          `customer ${facet}`,
+        );
       } else {
         assert.equal(facetPage.nextCursor, null);
       }
@@ -918,6 +940,81 @@ try {
       `${facet} pagination omitted or added an item`,
     );
   }
+
+  const ticketMutationFirstResponse = await app.inject({
+    method: "GET",
+    url: "/api/v1/customer/business-history/tickets?limit=2",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(
+    ticketMutationFirstResponse.statusCode,
+    200,
+    ticketMutationFirstResponse.body,
+  );
+  const ticketMutationFirstPage = responseJson<{
+    items: Array<{ id: string }>;
+    hasMore: boolean;
+    nextCursor: string | null;
+  }>(ticketMutationFirstResponse);
+  assert.equal(ticketMutationFirstPage.hasMore, true);
+  assert.ok(ticketMutationFirstPage.nextCursor);
+  assertCursorPreservesPostgresMicroseconds(
+    ticketMutationFirstPage.nextCursor,
+    "customer tickets before reply mutation",
+  );
+  const replyTargetId = paginationTicketIds.find(
+    (id) => !ticketMutationFirstPage.items.some((item) => item.id === id),
+  );
+  assert.ok(replyTargetId, "ticket reply target must be beyond the first page");
+  const replyBetweenPages = await app.inject({
+    method: "POST",
+    url: `/api/v1/tickets/${replyTargetId}/replies`,
+    headers: { cookie: customerCookie },
+    payload: { message: "Synthetic reply between immutable history pages" },
+  });
+  assert.equal(replyBetweenPages.statusCode, 201, replyBetweenPages.body);
+  const ticketMutationIds = ticketMutationFirstPage.items.map((item) => item.id);
+  let ticketMutationCursor: string | null = ticketMutationFirstPage.nextCursor;
+  let ticketMutationPages = 1;
+  while (ticketMutationCursor) {
+    const nextPageResponse: LightMyRequestResponse = await app.inject({
+      method: "GET",
+      url:
+        "/api/v1/customer/business-history/tickets?limit=2&cursor=" +
+        encodeURIComponent(ticketMutationCursor),
+      headers: { cookie: customerCookie },
+    });
+    assert.equal(nextPageResponse.statusCode, 200, nextPageResponse.body);
+    const nextPage = responseJson<{
+      items: Array<{ id: string }>;
+      hasMore: boolean;
+      nextCursor: string | null;
+    }>(nextPageResponse);
+    ticketMutationIds.push(...nextPage.items.map((item) => item.id));
+    if (nextPage.hasMore) {
+      assert.ok(nextPage.nextCursor);
+      assertCursorPreservesPostgresMicroseconds(
+        nextPage.nextCursor,
+        "customer tickets after reply mutation",
+      );
+    } else {
+      assert.equal(nextPage.nextCursor, null);
+    }
+    ticketMutationCursor = nextPage.nextCursor;
+    ticketMutationPages += 1;
+    assert.ok(ticketMutationPages < 10, "ticket mutation pagination did not terminate");
+  }
+  assert.equal(
+    new Set(ticketMutationIds).size,
+    ticketMutationIds.length,
+    "ticket reply between pages repeated an item",
+  );
+  assert.deepEqual(
+    [...ticketMutationIds].sort(),
+    [...expectedCustomerFacetIds.tickets].sort(),
+    "ticket reply between pages omitted or added an item",
+  );
+
   const orderCursor = firstCustomerCursors.get("orders");
   assert.ok(orderCursor);
   const facetBoundCursor = await app.inject({
@@ -991,6 +1088,12 @@ try {
       (line) => line.description === "香港节点带宽续费与技术支持",
     ),
   );
+  const longDescription = invoiceDetail.invoice.lines.find((line) =>
+    line.description.startsWith("OSS-LONG-DESCRIPTION-BEGIN ")
+  )?.description;
+  assert.ok(longDescription);
+  assert.ok(longDescription.length > 4_000);
+  assert.ok(longDescription.endsWith(" OSS-LONG-DESCRIPTION-END"));
   assert.equal(invoiceDetail.related.orderId, orderId);
   assert.deepEqual(invoiceDetail.related.serviceIds, [serviceId]);
   assert.equal(invoiceDetail.pdfUrl, `/api/v1/customer/invoices/${invoiceId}/pdf`);
@@ -1007,8 +1110,10 @@ try {
     `attachment; filename="invoice-${invoiceId}.pdf"`,
   );
   assert.equal(invoicePdfResponse.rawPayload.subarray(0, 5).toString(), "%PDF-");
-  const parsedPdf = await PDFDocument.load(invoicePdfResponse.rawPayload);
-  assert.ok(parsedPdf.getPageCount() > 1);
+  const parsedPdf = await PDFDocument.load(invoicePdfResponse.rawPayload, {
+    updateMetadata: false,
+  });
+  assert.ok(parsedPdf.getPageCount() > 3);
   const pdfCreationDate = parsedPdf.getCreationDate();
   const pdfModificationDate = parsedPdf.getModificationDate();
   assert.ok(pdfCreationDate);
@@ -1232,7 +1337,7 @@ try {
   assert.equal(summary.statusCode, 200, summary.body);
   const summaryBody = responseJson<Record<string, unknown> & { memberships: unknown[] }>(summary);
   assert.equal("contacts" in summaryBody, false);
-  assert.equal(summaryBody.memberships.length, 3);
+  assert.equal(summaryBody.memberships.length, 4);
   const ambiguousSummaryCursor = await app.inject({
     method: "GET",
     url: `/api/v1/admin/client-accounts/${customer.accountId}/summary?cursor=ambiguous`,
@@ -1558,6 +1663,10 @@ try {
         if (pages === 0 && pageBody.nextCursor) {
           firstAdminCursors.set(collection.path, pageBody.nextCursor);
         }
+        assertCursorPreservesPostgresMicroseconds(
+          pageBody.nextCursor ?? "",
+          `admin ${collection.name}`,
+        );
       } else {
         assert.equal(pageBody.nextCursor, null);
       }
@@ -1576,6 +1685,85 @@ try {
       `${collection.name} pagination omitted or added an item`,
     );
   }
+
+  const membershipMutationFirstResponse = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/client-accounts/${customer.accountId}/summary/memberships?limit=2`,
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(
+    membershipMutationFirstResponse.statusCode,
+    200,
+    membershipMutationFirstResponse.body,
+  );
+  const membershipMutationFirstPage = responseJson<{
+    items: Array<{ userId: string }>;
+    hasMore: boolean;
+    nextCursor: string | null;
+  }>(membershipMutationFirstResponse);
+  assert.equal(membershipMutationFirstPage.hasMore, true);
+  assert.ok(membershipMutationFirstPage.nextCursor);
+  assertCursorPreservesPostgresMicroseconds(
+    membershipMutationFirstPage.nextCursor,
+    "admin memberships before removal mutation",
+  );
+  const membershipToRemove = membershipMutationFirstPage.items[0]?.userId;
+  assert.ok(membershipToRemove);
+  assert.ok(paginationMembershipUserIds.some((id) => id === membershipToRemove));
+  const removedBetweenPages = await pool.query(
+    `UPDATE client_memberships
+     SET removed_at = now()
+     WHERE client_account_id = $1 AND user_id = $2 AND removed_at IS NULL`,
+    [customer.accountId, membershipToRemove],
+  );
+  assert.equal(removedBetweenPages.rowCount, 1);
+  const membershipMutationIds = membershipMutationFirstPage.items.map(
+    (membership) => membership.userId,
+  );
+  let membershipMutationCursor: string | null = membershipMutationFirstPage.nextCursor;
+  let membershipMutationPages = 1;
+  while (membershipMutationCursor) {
+    const nextPageResponse: LightMyRequestResponse = await app.inject({
+      method: "GET",
+      url:
+        `/api/v1/admin/client-accounts/${customer.accountId}/summary/memberships` +
+        `?limit=2&cursor=${encodeURIComponent(membershipMutationCursor)}`,
+      headers: { cookie: staffCookie },
+    });
+    assert.equal(nextPageResponse.statusCode, 200, nextPageResponse.body);
+    const nextPage = responseJson<{
+      items: Array<{ userId: string }>;
+      hasMore: boolean;
+      nextCursor: string | null;
+    }>(nextPageResponse);
+    membershipMutationIds.push(...nextPage.items.map((membership) => membership.userId));
+    if (nextPage.hasMore) {
+      assert.ok(nextPage.nextCursor);
+      assertCursorPreservesPostgresMicroseconds(
+        nextPage.nextCursor,
+        "admin memberships after removal mutation",
+      );
+    } else {
+      assert.equal(nextPage.nextCursor, null);
+    }
+    membershipMutationCursor = nextPage.nextCursor;
+    membershipMutationPages += 1;
+    assert.ok(
+      membershipMutationPages < 10,
+      "membership mutation pagination did not terminate",
+    );
+  }
+  assert.equal(
+    new Set(membershipMutationIds).size,
+    membershipMutationIds.length,
+    "membership removal between pages repeated an item",
+  );
+  assert.deepEqual(
+    [...membershipMutationIds].sort(),
+    membershipIds.rows.map((row) => row.user_id).sort(),
+    "membership removal between pages omitted or added an item",
+  );
+
   const adminOrderCursor = firstAdminCursors.get("orders");
   assert.ok(adminOrderCursor);
   const adminFacetCursorMismatch = await app.inject({
@@ -1590,7 +1778,8 @@ try {
   process.stdout.write(
     `accountHistoryIntegration=passed schema=${compatibility.installedSchemaVersion}` +
       ` pdfPages=${parsedPdf.getPageCount()} crossAccount404=passed` +
-      ` pagination=passed panelPermissions=passed permissionRevocation=passed\n`,
+      ` pagination=passed mutationStable=passed microseconds=preserved` +
+      ` panelPermissions=passed permissionRevocation=passed\n`,
   );
 } finally {
   if (app) await app.close().catch(() => undefined);

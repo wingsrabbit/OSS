@@ -6,6 +6,7 @@ WORKDIR /app
 ENV CI=true
 RUN corepack enable && corepack prepare pnpm@11.14.0 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY patches patches
 COPY apps/api/package.json apps/api/package.json
 COPY apps/worker/package.json apps/worker/package.json
 COPY apps/web/package.json apps/web/package.json

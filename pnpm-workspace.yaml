@@ -18,6 +18,8 @@ sharedWorkspaceLockfile: true
 minimumReleaseAge: 1440
 trustLockfile: false
 blockExoticSubdeps: true
+patchedDependencies:
+  fontkit@2.0.4: patches/fontkit@2.0.4.patch
 allowBuilds:
   "@node-rs/argon2": true
   esbuild: true

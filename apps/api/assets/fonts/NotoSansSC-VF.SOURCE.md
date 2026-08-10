@@ -13,4 +13,6 @@
 
 The region-specific SC variable TrueType font is vendored so invoice rendering
 is deterministic and does not depend on runtime network access or host fonts.
-The API embeds only the glyph subset used by each invoice.
+At runtime, Fontkit instantiates the `wght=400` Regular variation before the API
+embeds only the glyph subset used by each invoice. The vendored upstream binary
+is not modified.

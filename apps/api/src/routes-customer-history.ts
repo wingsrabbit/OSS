@@ -30,10 +30,15 @@ const INVOICE_FONT_URL = new URL(
 type PdfLibFontkit = Parameters<PDFDocument["registerFontkit"]>[0];
 const pdfLibFontkit: PdfLibFontkit = {
   create(bytes) {
-    const font = fontkit.create(Buffer.from(bytes));
-    if (!("createSubset" in font)) {
-      throw new Error("Invoice font must be a single TrueType font");
+    const sourceFont = fontkit.create(Buffer.from(bytes));
+    if (!("createSubset" in sourceFont) || !("getVariation" in sourceFont)) {
+      throw new Error("Invoice font must be a single variable TrueType font");
     }
+    const weightAxis = sourceFont.variationAxes.wght;
+    if (!weightAxis || weightAxis.min > 400 || weightAxis.max < 400) {
+      throw new Error("Invoice font must support the Regular wght=400 instance");
+    }
+    const font = sourceFont.getVariation({ wght: 400 });
     const createSubset = font.createSubset.bind(font);
     font.createSubset = () => {
       const subset = createSubset();
@@ -209,7 +214,7 @@ export async function listOrdersPage(
     order_status: string;
     currency: string;
     total_minor: string;
-    submitted_at: Date;
+    submitted_at_cursor: string;
     item_id: string | null;
     product_name: string | null;
     billing_cycle: string | null;
@@ -233,7 +238,10 @@ export async function listOrdersPage(
             customer_order.status AS order_status,
             customer_order.currency,
             customer_order.total_minor::text,
-            customer_order.submitted_at,
+            to_char(
+              customer_order.submitted_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS submitted_at_cursor,
             item.id AS item_id,
             item.product_name,
             item.billing_cycle
@@ -251,7 +259,7 @@ export async function listOrdersPage(
         status: row.order_status,
         currency: row.currency,
         totalMinor: row.total_minor,
-        submittedAt: row.submitted_at.toISOString(),
+        submittedAt: row.submitted_at_cursor,
         items: [],
       };
       orders.set(row.order_id, order);
@@ -296,7 +304,7 @@ async function queryInvoices(
     payment_minor: string;
     credit_minor: string;
     due_at: Date;
-    created_at: Date;
+    created_at_cursor: string;
     renewal_cancelled: boolean;
   }>(
     `SELECT invoice.id,
@@ -314,7 +322,10 @@ async function queryInvoices(
             )::text AS payment_minor,
             COALESCE(credit.amount_minor, 0)::text AS credit_minor,
             invoice.due_at,
-            invoice.created_at,
+            to_char(
+              invoice.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             COALESCE(
               renewal.status = 'cancelled' AND renewal_service.id IS NOT NULL,
               false
@@ -398,7 +409,7 @@ async function queryInvoices(
       dueMinor: status.dueMinor,
       status: status.status,
       dueAt: row.due_at.toISOString(),
-      createdAt: row.created_at.toISOString(),
+      createdAt: row.created_at_cursor,
     };
   });
 }
@@ -455,7 +466,7 @@ async function queryPayments(
     fee_minor: string;
     currency: string;
     payment_method_code: string | null;
-    created_at: Date;
+    created_at_cursor: string;
     updated_at: Date;
   }>(
     `SELECT attempt.id,
@@ -467,7 +478,10 @@ async function queryPayments(
             attempt.fee_minor::text,
             attempt.currency,
             attempt.payment_method_code,
-            attempt.created_at,
+            to_char(
+              attempt.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             attempt.updated_at
      FROM payment_attempts attempt
      JOIN invoices invoice
@@ -505,7 +519,7 @@ async function queryPayments(
     feeMinor: row.fee_minor,
     currency: row.currency,
     paymentMethodCode: row.payment_method_code,
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_at_cursor,
     updatedAt: row.updated_at.toISOString(),
   }));
 }
@@ -593,7 +607,7 @@ export async function loadCreditHistoryPage(
     source_type: string;
     source_id: string;
     reason: string;
-    created_at: Date;
+    created_at_cursor: string;
   }>(
     `SELECT id,
             kind,
@@ -603,7 +617,10 @@ export async function loadCreditHistoryPage(
             source_type,
             source_id,
             reason,
-            created_at
+            to_char(
+              created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor
      FROM credit_transactions
      WHERE credit_account_id = $1
        AND (
@@ -623,7 +640,7 @@ export async function loadCreditHistoryPage(
     sourceType: row.source_type,
     sourceId: row.source_id,
     reason: row.reason,
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_at_cursor,
   }));
   const pagination = collectionPage(
     items,
@@ -659,7 +676,7 @@ async function queryRefunds(
     amount_mode: string;
     amount_minor: string;
     currency: string;
-    created_at: Date;
+    created_at_cursor: string;
     updated_at: Date;
   }>(
     `SELECT refund.id,
@@ -669,7 +686,10 @@ async function queryRefunds(
             refund.amount_mode,
             refund.amount_minor::text,
             refund.currency,
-            refund.created_at,
+            to_char(
+              refund.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             refund.updated_at
      FROM refunds refund
      LEFT JOIN invoices invoice
@@ -703,7 +723,7 @@ async function queryRefunds(
     amountMode: row.amount_mode,
     amountMinor: row.amount_minor,
     currency: row.currency,
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_at_cursor,
     updatedAt: row.updated_at.toISOString(),
   }));
 }
@@ -751,7 +771,7 @@ async function queryServices(
     activated_at: Date | null;
     term_start: Date | null;
     term_end: Date | null;
-    created_at: Date;
+    created_at_cursor: string;
     version: number;
     cancellation_request_id: string | null;
     cancellation_effective_at: Date | null;
@@ -779,7 +799,10 @@ async function queryServices(
             service.activated_at,
             service.term_start,
             service.term_end,
-            service.created_at,
+            to_char(
+              service.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             service.version,
             service.cancellation_request_id,
             service.cancellation_effective_at,
@@ -822,7 +845,7 @@ async function queryServices(
     activatedAt: row.activated_at?.toISOString() ?? null,
     termStart: row.term_start?.toISOString() ?? null,
     termEnd: row.term_end?.toISOString() ?? null,
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_at_cursor,
     version: row.version,
     cancellation:
       row.cancellation_request_id && row.cancellation_effective_at
@@ -880,7 +903,7 @@ async function queryRenewals(
     period_end: Date;
     funded_at: Date | null;
     settled_at: Date | null;
-    created_at: Date;
+    created_at_cursor: string;
   }>(
     `SELECT renewal.id,
             service.id AS service_id,
@@ -897,7 +920,10 @@ async function queryRenewals(
             renewal.period_end,
             renewal.funded_at,
             renewal.settled_at,
-            renewal.created_at
+            to_char(
+              renewal.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor
      FROM service_renewals renewal
      JOIN services service ON service.id = renewal.service_id
      JOIN invoices invoice
@@ -974,7 +1000,7 @@ async function queryRenewals(
       periodEnd: row.period_end.toISOString(),
       fundedAt: row.funded_at?.toISOString() ?? null,
       settledAt: row.settled_at?.toISOString() ?? null,
-      createdAt: row.created_at.toISOString(),
+      createdAt: row.created_at_cursor,
     };
   });
 }
@@ -1017,7 +1043,7 @@ async function queryCancellations(
     service_id: string;
     effective_at: Date;
     reason: string | null;
-    created_at: Date;
+    created_at_cursor: string;
     execution_id: string | null;
     execution_mode: string | null;
     execution_status: string | null;
@@ -1027,7 +1053,10 @@ async function queryCancellations(
             service.id AS service_id,
             cancellation.effective_at,
             cancellation.reason,
-            cancellation.created_at,
+            to_char(
+              cancellation.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             execution.id AS execution_id,
             execution.execution_mode,
             execution.status AS execution_status,
@@ -1064,7 +1093,7 @@ async function queryCancellations(
     serviceId: row.service_id,
     effectiveAt: row.effective_at.toISOString(),
     reason: row.reason,
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_at_cursor,
     execution: row.execution_id
       ? {
           id: row.execution_id,
@@ -1116,7 +1145,7 @@ async function queryTickets(
     service_id: string | null;
     product_name: string | null;
     public_message_count: string;
-    created_at: Date;
+    created_at_cursor: string;
     updated_at: Date;
   }>(
      `SELECT ticket.id,
@@ -1127,7 +1156,10 @@ async function queryTickets(
               AS product_name,
             count(message.id) FILTER (WHERE message.visibility = 'public')::text
               AS public_message_count,
-            ticket.created_at,
+            to_char(
+              ticket.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor,
             ticket.updated_at
      FROM support_tickets ticket
      LEFT JOIN services service
@@ -1143,11 +1175,11 @@ async function queryTickets(
        ${pagination
          ? `AND (
               $3::timestamptz IS NULL
-              OR (ticket.updated_at, ticket.id) < ($3::timestamptz, $4::uuid)
+              OR (ticket.created_at, ticket.id) < ($3::timestamptz, $4::uuid)
             )`
          : ""}
      GROUP BY ticket.id, service.id, item.product_name, ticket_order.id
-     ORDER BY ticket.updated_at DESC, ticket.id DESC
+     ORDER BY ticket.created_at DESC, ticket.id DESC
      ${pagination ? "LIMIT $5" : ""}`,
     pagination
       ? [
@@ -1166,7 +1198,7 @@ async function queryTickets(
     serviceId: row.service_id,
     productName: row.product_name,
     publicMessageCount: Number(row.public_message_count),
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_at_cursor,
     updatedAt: row.updated_at.toISOString(),
   }));
 }
@@ -1190,7 +1222,7 @@ export async function listTicketsPage(
     scope,
   });
   return collectionPage(items, page.limit, scope, clientAccountId, (ticket) => ({
-    at: ticket.updatedAt,
+    at: ticket.createdAt,
     id: ticket.id,
   }));
 }
@@ -1340,21 +1372,65 @@ async function loadInvoiceRelations(
   return result.rows[0] ?? { order_id: null, service_ids: [], renewal_ids: [] };
 }
 
-function wrapPdfText(font: PDFFont, value: string, size: number, width: number): string[] {
-  const text = value.replace(/[\r\n\t]+/g, " ").trim();
-  if (!text) return [""];
-  const lines: string[] = [];
-  let current = "";
-  for (const character of text) {
-    const candidate = current + character;
-    if (current && font.widthOfTextAtSize(candidate, size) > width) {
-      lines.push(current.trimEnd());
-      current = character.trimStart();
+type PdfTextRun = {
+  font: PDFFont;
+  text: string;
+};
+
+function pdfFontForCharacter(regular: PDFFont, unicode: PDFFont, character: string): PDFFont {
+  try {
+    regular.encodeText(character);
+    return regular;
+  } catch {
+    return unicode;
+  }
+}
+
+function pdfTextRuns(
+  regular: PDFFont,
+  unicode: PDFFont,
+  characters: readonly string[],
+): PdfTextRun[] {
+  const runs: PdfTextRun[] = [];
+  for (const character of characters) {
+    const font = pdfFontForCharacter(regular, unicode, character);
+    const previous = runs.at(-1);
+    if (previous?.font === font) {
+      previous.text += character;
     } else {
-      current = candidate;
+      runs.push({ font, text: character });
     }
   }
-  if (current) lines.push(current.trimEnd());
+  return runs;
+}
+
+function wrapPdfText(
+  regular: PDFFont,
+  unicode: PDFFont,
+  value: string,
+  size: number,
+  width: number,
+): PdfTextRun[][] {
+  const text = value.replace(/[\r\n\t]+/g, " ").trim();
+  if (!text) return [[{ font: regular, text: "" }]];
+  const lines: PdfTextRun[][] = [];
+  let current: string[] = [];
+  let currentWidth = 0;
+  for (const character of text) {
+    const font = pdfFontForCharacter(regular, unicode, character);
+    const characterWidth = font.widthOfTextAtSize(character, size);
+    if (current.length > 0 && currentWidth + characterWidth > width) {
+      while (current.at(-1) === " ") current.pop();
+      lines.push(pdfTextRuns(regular, unicode, current));
+      current = character === " " ? [] : [character];
+      currentWidth = character === " " ? 0 : characterWidth;
+    } else {
+      current.push(character);
+      currentWidth += characterWidth;
+    }
+  }
+  while (current.at(-1) === " ") current.pop();
+  if (current.length > 0) lines.push(pdfTextRuns(regular, unicode, current));
   return lines;
 }
 
@@ -1428,7 +1504,7 @@ export async function renderInvoicePdf(input: {
   const bold = await document.embedFont(StandardFonts.HelveticaBold);
   const unicode = await document.embedFont(await loadInvoiceFontBytes(), {
     subset: true,
-    customName: "OSSINV+NotoSansSC-VF",
+    customName: "OSSINV+NotoSansSC-Regular",
   });
   const pageWidth = 595.28;
   const pageHeight = 841.89;
@@ -1536,42 +1612,64 @@ export async function renderInvoicePdf(input: {
   y -= 25;
   drawInvoiceLineHeader();
   for (const line of input.invoice.lines) {
-    const descriptionFont = pdfFontForText(regular, unicode, line.description);
-    const descriptionLines = wrapPdfText(descriptionFont, line.description, 9, 300);
-    const rowHeight = Math.max(22, descriptionLines.length * 12 + 8);
-    if (y - rowHeight - 4 < 60) {
-      drawPdfFooter(page, regular, pageNumber);
-      addPage();
-      drawInvoiceLineHeader(true);
-    }
-    descriptionLines.forEach((description, index) => {
-      page.drawText(description, {
-        x: margin + 8,
-        y: y - index * 12,
-        size: 9,
-        font: descriptionFont,
+    const descriptionLines = wrapPdfText(regular, unicode, line.description, 9, 300);
+    let descriptionOffset = 0;
+    let firstChunk = true;
+    while (descriptionOffset < descriptionLines.length) {
+      let availableLineCount = Math.floor((y - 72) / 12);
+      if (availableLineCount < 1) {
+        drawPdfFooter(page, regular, pageNumber);
+        addPage();
+        drawInvoiceLineHeader(true);
+        availableLineCount = Math.floor((y - 72) / 12);
+      }
+      const descriptionChunk = descriptionLines.slice(
+        descriptionOffset,
+        descriptionOffset + availableLineCount,
+      );
+      const rowHeight = Math.max(22, descriptionChunk.length * 12 + 8);
+      descriptionChunk.forEach((description, index) => {
+        let descriptionX = margin + 8;
+        for (const run of description) {
+          page.drawText(run.text, {
+            x: descriptionX,
+            y: y - index * 12,
+            size: 9,
+            font: run.font,
+          });
+          descriptionX += run.font.widthOfTextAtSize(run.text, 9);
+        }
       });
-    });
-    page.drawText(line.kind.replace(/[\r\n\t]+/g, " "), {
-      x: 380,
-      y,
-      size: 9,
-      font: regular,
-    });
-    const amount = formatPdfMoney(input.invoice.currency, line.amountMinor);
-    page.drawText(amount, {
-      x: 480 - Math.max(0, regular.widthOfTextAtSize(amount, 8) - 55),
-      y,
-      size: 8,
-      font: regular,
-    });
-    y -= rowHeight;
-    page.drawLine({
-      start: { x: margin, y: y + 6 },
-      end: { x: pageWidth - margin, y: y + 6 },
-      thickness: 0.5,
-      color: rgb(0.86, 0.88, 0.91),
-    });
+      if (firstChunk) {
+        page.drawText(line.kind.replace(/[\r\n\t]+/g, " "), {
+          x: 380,
+          y,
+          size: 9,
+          font: regular,
+        });
+        const amount = formatPdfMoney(input.invoice.currency, line.amountMinor);
+        page.drawText(amount, {
+          x: 480 - Math.max(0, regular.widthOfTextAtSize(amount, 8) - 55),
+          y,
+          size: 8,
+          font: regular,
+        });
+      }
+      y -= rowHeight;
+      page.drawLine({
+        start: { x: margin, y: y + 6 },
+        end: { x: pageWidth - margin, y: y + 6 },
+        thickness: 0.5,
+        color: rgb(0.86, 0.88, 0.91),
+      });
+      descriptionOffset += descriptionChunk.length;
+      firstChunk = false;
+      if (descriptionOffset < descriptionLines.length) {
+        drawPdfFooter(page, regular, pageNumber);
+        addPage();
+        drawInvoiceLineHeader(true);
+      }
+    }
   }
 
   ensureSpace(125);

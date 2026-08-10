@@ -1,0 +1,12 @@
+diff --git a/dist/module.mjs b/dist/module.mjs
+--- a/dist/module.mjs
++++ b/dist/module.mjs
+@@ -12136,7 +12136,7 @@ class $807e58506be70005$export$2e2bcd8739ae039 {
+         };
+         let size = $807e58506be70005$var$Glyf.size(glyf);
+         let tail = 4 - size % 4;
+-        let stream = new $52ZIf$EncodeStream(size + tail);
++        let stream = new $52ZIf$EncodeStream(new Uint8Array(size + tail));
+         $807e58506be70005$var$Glyf.encode(stream, glyf);
+         // Align to 4-byte length
+         if (tail !== 0) stream.fill(0, tail);
