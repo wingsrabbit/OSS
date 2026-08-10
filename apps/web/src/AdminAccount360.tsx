@@ -152,17 +152,21 @@ export type AdminAccountAction =
 
 export function AdminAccount360({
   active,
+  accessFingerprint,
   permissions,
   availableActions,
   onAction,
+  onSelectedAccountChange,
   onRefreshAccess,
   onNotice,
   onError,
 }: {
   active: boolean;
+  accessFingerprint: string;
   permissions: ReadonlySet<string>;
   availableActions: ReadonlySet<AdminAccountAction>;
   onAction: (action: AdminAccountAction, account: AccountReference) => void;
+  onSelectedAccountChange: (account: AccountReference | null) => void;
   onRefreshAccess: () => Promise<void>;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
@@ -194,6 +198,7 @@ export function AdminAccount360({
   function clearAccountWorkspace() {
     accountGeneration.current += 1;
     setSelected(null);
+    onSelectedAccountChange(null);
     setSummary(emptyLoadable());
     setOrders(emptyLoadable());
     setBilling(emptyLoadable());
@@ -220,7 +225,7 @@ export function AdminAccount360({
       searchGeneration.current += 1;
       accountGeneration.current += 1;
     };
-  }, [active, permissions]);
+  }, [accessFingerprint, active]);
 
   if (!active || !canSearch) return null;
 
@@ -294,6 +299,7 @@ export function AdminAccount360({
   function openAccount(account: SearchItem) {
     const generation = ++accountGeneration.current;
     setSelected(account);
+    onSelectedAccountChange(account);
     setSummary({ loading: true, data: null, error: null });
     setOrders(canReadOrders ? { loading: true, data: null, error: null } : emptyLoadable());
     setBilling(canReadBilling ? { loading: true, data: null, error: null } : emptyLoadable());

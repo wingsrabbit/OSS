@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { api } from "./api.js";
 
 type Locale = "en" | "zh-CN";
@@ -42,6 +49,24 @@ type StaffTicketDetail = {
   messages: StaffMessage[];
 };
 
+type ScopedStaffTicketsResponse = {
+  account: { id: string; name: string };
+  items: Array<{
+    id: string;
+    subject: string;
+    status: TicketSummary["status"];
+    serviceId: string | null;
+    productName: string | null;
+    publicMessageCount: number;
+    internalMessageCount: number;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  limit?: number;
+  hasMore?: boolean;
+  nextCursor?: string | null;
+};
+
 type ServiceOption = { id: string; productName: string; status: string };
 
 type Viewer = {
@@ -58,6 +83,8 @@ function surfaceIsActive(surface: "customer" | "staff"): boolean {
 export function TicketsPanel({
   mode,
   canManageTickets = false,
+  staffAccountContext = null,
+  requireStaffAccountContext = false,
   me,
   locale,
   onNotice,
@@ -65,6 +92,8 @@ export function TicketsPanel({
 }: {
   mode: "customer" | "staff";
   canManageTickets?: boolean;
+  staffAccountContext?: { id: string; name: string } | null;
+  requireStaffAccountContext?: boolean;
   me: Viewer | null;
   locale: Locale;
   onNotice: (message: string) => void;
@@ -81,6 +110,19 @@ export function TicketsPanel({
   const [customerReply, setCustomerReply] = useState("");
   const [staffReply, setStaffReply] = useState("");
   const [pending, setPending] = useState(false);
+  const staffRequestGeneration = useRef(0);
+  const activeStaffAccountId = useRef<string | null>(staffAccountContext?.id ?? null);
+
+  useLayoutEffect(() => {
+    const accountId = staffAccountContext?.id ?? null;
+    if (activeStaffAccountId.current === accountId) return;
+    activeStaffAccountId.current = accountId;
+    staffRequestGeneration.current += 1;
+    setStaffTickets([]);
+    setStaffSelected(null);
+    setStaffReply("");
+    setPending(false);
+  }, [staffAccountContext?.id]);
 
   const refreshCustomer = useCallback(async () => {
     if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible) {
@@ -99,28 +141,74 @@ export function TicketsPanel({
   }, [me?.eligible, me?.id, mode]);
 
   const refreshStaff = useCallback(async () => {
+    const accountId = staffAccountContext?.id ?? null;
     if (
       mode !== "staff" ||
       !surfaceIsActive("staff") ||
       !me?.staff ||
-      !canManageTickets
+      !canManageTickets ||
+      (requireStaffAccountContext && !accountId)
     ) {
+      staffRequestGeneration.current += 1;
       setStaffTickets([]);
       setStaffSelected(null);
       return;
     }
-    const result = await api<{ items: StaffTicketSummary[] }>(
-      "/api/v1/admin/tickets",
-    );
-    if (!surfaceIsActive("staff")) return;
-    setStaffTickets(result.items);
-  }, [canManageTickets, me?.id, me?.staff, mode]);
+    const generation = ++staffRequestGeneration.current;
+    try {
+      const items = accountId
+        ? await api<ScopedStaffTicketsResponse>(
+            `/api/v1/admin/client-accounts/${accountId}/tickets`,
+          ).then((result) =>
+            result.items.map((ticket) => ({
+              id: ticket.id,
+              subject: ticket.subject,
+              status: ticket.status,
+              service: ticket.serviceId
+                ? { id: ticket.serviceId, productName: ticket.productName ?? "Related service" }
+                : null,
+              publicMessageCount: ticket.publicMessageCount,
+              internalMessageCount: ticket.internalMessageCount,
+              createdAt: ticket.createdAt,
+              updatedAt: ticket.updatedAt,
+              clientAccount: result.account,
+            })),
+          )
+        : await api<{ items: StaffTicketSummary[] }>(
+            "/api/v1/admin/tickets",
+          ).then((result) => result.items);
+      if (
+        generation !== staffRequestGeneration.current ||
+        !surfaceIsActive("staff") ||
+        activeStaffAccountId.current !== accountId
+      ) return;
+      setStaffTickets(items);
+    } catch (caught) {
+      if (
+        generation !== staffRequestGeneration.current ||
+        !surfaceIsActive("staff") ||
+        activeStaffAccountId.current !== accountId
+      ) return;
+      throw caught;
+    }
+  }, [
+    canManageTickets,
+    me?.id,
+    me?.staff,
+    mode,
+    requireStaffAccountContext,
+    staffAccountContext?.id,
+  ]);
 
   useEffect(() => {
     void (mode === "customer" ? refreshCustomer() : refreshStaff()).catch((caught: unknown) =>
       onError(caught instanceof Error ? caught.message : "Tickets could not be loaded"),
     );
   }, [mode, onError, refreshCustomer, refreshStaff]);
+
+  useEffect(() => () => {
+    staffRequestGeneration.current += 1;
+  }, []);
 
   if (mode === "customer" && !me?.eligible) return null;
   if (mode === "staff" && (!me?.staff || !canManageTickets)) return null;
@@ -191,31 +279,48 @@ export function TicketsPanel({
   }
 
   async function openStaffTicket(ticketId: string) {
+    const accountId = staffAccountContext?.id ?? null;
     if (
       mode !== "staff" ||
       !surfaceIsActive("staff") ||
       !me?.staff ||
-      !canManageTickets
+      !canManageTickets ||
+      (requireStaffAccountContext && !accountId)
     ) return;
+    const generation = staffRequestGeneration.current;
     try {
       const detail = await api<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`);
-      if (!surfaceIsActive("staff")) return;
+      if (
+        generation !== staffRequestGeneration.current ||
+        !surfaceIsActive("staff") ||
+        activeStaffAccountId.current !== accountId ||
+        (accountId !== null && detail.ticket.clientAccount.id !== accountId)
+      ) return;
       setStaffSelected(detail);
     } catch (caught) {
-      onError(caught instanceof Error ? caught.message : "Staff ticket could not be loaded");
+      if (
+        generation === staffRequestGeneration.current &&
+        activeStaffAccountId.current === accountId
+      ) {
+        onError(caught instanceof Error ? caught.message : "Staff ticket could not be loaded");
+      }
     }
   }
 
   async function sendStaffMessage(kind: "public_reply" | "internal_note") {
+    const accountId = staffAccountContext?.id ?? null;
     if (
       mode !== "staff" ||
       !surfaceIsActive("staff") ||
       !me?.staff ||
       !canManageTickets ||
       !staffSelected ||
+      (requireStaffAccountContext && !accountId) ||
+      (accountId !== null && staffSelected.ticket.clientAccount.id !== accountId) ||
       staffReply.trim().length === 0 ||
       pending
     ) return;
+    const generation = staffRequestGeneration.current;
     setPending(true);
     try {
       const updated = await api<StaffTicketDetail>(
@@ -225,10 +330,19 @@ export function TicketsPanel({
           body: JSON.stringify({ kind, message: staffReply.trim() }),
         },
       );
-      if (!surfaceIsActive("staff")) return;
+      if (
+        generation !== staffRequestGeneration.current ||
+        !surfaceIsActive("staff") ||
+        activeStaffAccountId.current !== accountId ||
+        (accountId !== null && updated.ticket.clientAccount.id !== accountId)
+      ) return;
       setStaffReply("");
       setStaffSelected(updated);
       await refreshStaff();
+      if (
+        !surfaceIsActive("staff") ||
+        activeStaffAccountId.current !== accountId
+      ) return;
       onNotice(
         kind === "internal_note"
           ? locale === "zh-CN"
@@ -239,9 +353,19 @@ export function TicketsPanel({
             : "Public reply sent.",
       );
     } catch (caught) {
-      onError(caught instanceof Error ? caught.message : "Staff message could not be saved");
+      if (
+        generation === staffRequestGeneration.current &&
+        activeStaffAccountId.current === accountId
+      ) {
+        onError(caught instanceof Error ? caught.message : "Staff message could not be saved");
+      }
     } finally {
-      setPending(false);
+      if (
+        surfaceIsActive("staff") &&
+        activeStaffAccountId.current === accountId
+      ) {
+        setPending(false);
+      }
     }
   }
 
@@ -353,8 +477,19 @@ export function TicketsPanel({
             <h2>Ticket queue</h2>
             <p>Public replies are customer-visible. Internal notes stay in the staff view only.</p>
           </div>
-          <button onClick={() => void refreshStaff()}>Refresh ticket queue</button>
-          <div className="ticket-layout">
+          {staffAccountContext && (
+            <p className="notice" data-testid="staff-ticket-account-context">
+              Fixed Client Account: {staffAccountContext.name} · {staffAccountContext.id}
+            </p>
+          )}
+          {requireStaffAccountContext && !staffAccountContext ? (
+            <p className="muted" data-testid="staff-ticket-account-required">
+              Select a Client Account in Account 360, then choose Open ticket operations.
+            </p>
+          ) : (
+            <>
+              <button onClick={() => void refreshStaff()}>Refresh ticket queue</button>
+              <div className="ticket-layout">
             <div className="ticket-list" data-testid="staff-ticket-list">
               {staffTickets.map((ticket) => (
                 <button key={ticket.id} onClick={() => void openStaffTicket(ticket.id)}>
@@ -412,6 +547,8 @@ export function TicketsPanel({
               </article>
             )}
           </div>
+            </>
+          )}
         </section>
       )}
     </>

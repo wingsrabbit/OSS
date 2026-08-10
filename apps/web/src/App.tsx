@@ -6,6 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -145,12 +146,17 @@ type LabMessage = {
 type ManualItem = {
   serviceId: string;
   orderId: string;
+  clientAccountId: string;
   productName: string;
   billingCycle: string;
   clientAccountName: string;
   paidMinor: string;
   totalMinor: string;
   submittedAt: string;
+};
+type AdminOperationContext = {
+  action: AdminAccountAction;
+  account: { id: string; name: string };
 };
 type AdminCancellationItem = {
   requestId: string;
@@ -286,6 +292,7 @@ type RefundCandidate = {
 type RefundRecord = {
   refundId: string;
   invoiceId: string | null;
+  clientAccountId: string;
   sourceContext: "allocated_invoice" | "unclaimed_funds";
   receiptId: string;
   destination: "original_payment" | "credit" | "none";
@@ -815,6 +822,12 @@ export function App() {
   const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
+  const [adminOperationContext, setAdminOperationContext] =
+    useState<AdminOperationContext | null>(null);
+  const adminOperationContextRef = useRef<AdminOperationContext | null>(null);
+  const adminOperationGeneration = useRef(0);
+  const adminAccessGeneration = useRef(0);
+  const manualReceiptRequestGeneration = useRef(0);
   const [adminCancellations, setAdminCancellations] = useState<AdminCancellationItem[]>([]);
   const [cancellationCompletionReason, setCancellationCompletionReason] = useState("");
   const [cancellationCompletionPendingId, setCancellationCompletionPendingId] = useState<
@@ -924,29 +937,69 @@ export function App() {
     () => parseStaffPermissions(me?.staff?.permissions),
     [me?.staff?.permissions],
   );
+  const staffPermissionFingerprint = [...staffPermissions].sort().join("\u0000");
+  const staffMembershipActive = me?.staff !== null && me?.staff !== undefined;
+  const staffPrincipalFingerprint = [
+    me?.id ?? "",
+    me?.eligible === true ? "eligible" : "ineligible",
+    staffMembershipActive ? "active" : "inactive",
+  ].join("\u0001");
+  const staffAccessFingerprint = [
+    staffPrincipalFingerprint,
+    staffPermissionFingerprint,
+  ].join("\u0002");
+  const previousStaffPrincipalFingerprint = useRef(staffPrincipalFingerprint);
   const canReadCustomerHistory =
     me?.verification.email === "passed" && me.restrictions.user === false;
-  const eligibleStaff = me?.eligible === true && me.staff !== null;
+  const eligibleStaff = me?.eligible === true && staffMembershipActive;
   const canManageStaffTickets =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
+  const canManageManualReceipts =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("billing.manual_receipt_manage"));
+  const canManageUnclaimedFunds =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("billing.unclaimed_manage"));
+  const canManageRefunds =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("billing.refund_manage"));
+  const canManageManualFulfillment =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("services.manual_fulfillment"));
   const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
   const canViewAccount360 =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("accounts.view"));
   const canOpenAdminWorkspace =
-    canManageStaffTickets || canViewAccount360 || canUseFullAdminWorkspace;
+    canManageStaffTickets ||
+    canManageManualReceipts ||
+    canManageRefunds ||
+    canManageManualFulfillment ||
+    canViewAccount360 ||
+    canUseFullAdminWorkspace;
   const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
+  const canManageManualReceiptsRoute = route === "/admin" && canManageManualReceipts;
+  const canManageRefundsRoute = route === "/admin" && canManageRefunds;
+  const canManageManualFulfillmentRoute = route === "/admin" && canManageManualFulfillment;
+  const canMountAdminOperationWorkspace =
+    canUseFullAdminWorkspace ||
+    canManageManualReceipts ||
+    canManageRefunds ||
+    canManageManualFulfillment;
   const account360Actions = useMemo<ReadonlySet<AdminAccountAction>>(() => {
     const actions = new Set<AdminAccountAction>();
-    if (canUseFullAdminWorkspace) {
-      actions.add("manual_receipt");
-      actions.add("refund");
-      actions.add("manual_fulfillment");
-    }
+    if (canManageManualReceipts) actions.add("manual_receipt");
+    if (canManageRefunds) actions.add("refund");
+    if (canManageManualFulfillment) actions.add("manual_fulfillment");
     if (canManageStaffTickets) actions.add("ticket");
     return actions;
-  }, [canManageStaffTickets, canUseFullAdminWorkspace]);
+  }, [
+    canManageManualFulfillment,
+    canManageManualReceipts,
+    canManageRefunds,
+    canManageStaffTickets,
+  ]);
 
   const clearWorkspaceTransientState = useCallback(() => {
     setNoticeRaw("");
@@ -982,6 +1035,10 @@ export function App() {
     setQuantity(1);
     setMail([]);
     setManualItems([]);
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
     setAdminCancellations([]);
     setCancellationCompletionReason("");
     setCancellationCompletionPendingId(null);
@@ -1097,6 +1154,56 @@ export function App() {
     paymentSettingsReauthExpiresAt !== null && paymentSettingsReauthExpiresAt > Date.now();
   const paymentSettingsReauthReady =
     paymentSettingsReauthActive || paymentSettingsPassword.length > 0;
+  const operationAccount = adminOperationContext?.account ?? null;
+  const showUnscopedAdminOperations =
+    operationAccount === null && (canUseFullAdminWorkspace || !canViewAccount360);
+  const visibleManualItems = operationAccount
+    ? manualItems.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? manualItems
+      : [];
+  const visibleRefundCandidates = operationAccount
+    ? refundCandidates.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? refundCandidates
+      : [];
+  const visibleRefundSecurityHolds = operationAccount
+    ? refundSecurityHolds.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? refundSecurityHolds
+      : [];
+  const visibleRefundDismissalCorrections = operationAccount
+    ? refundDismissalCorrections.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? refundDismissalCorrections
+      : [];
+  const visibleRefundReceiptCapacityIncidents = operationAccount
+    ? refundReceiptCapacityIncidents.filter(
+        (item) => item.clientAccountId === operationAccount.id,
+      )
+    : showUnscopedAdminOperations
+      ? refundReceiptCapacityIncidents
+      : [];
+  const visibleRefundRecords = Object.values(refundRecords).filter(
+    (refund) =>
+      showUnscopedAdminOperations ||
+      (operationAccount !== null &&
+        refund.clientAccountId === operationAccount.id),
+  );
+  const adminOperationRequestIsCurrent = useCallback(
+    (operationGeneration: number, accessGeneration: number, clientAccountId: string) => {
+      if (
+        operationGeneration !== adminOperationGeneration.current ||
+        accessGeneration !== adminAccessGeneration.current ||
+        activeRouteRef.current !== "/admin"
+      ) {
+        return false;
+      }
+      const context = adminOperationContextRef.current;
+      return context === null || context.account.id === clientAccountId;
+    },
+    [],
+  );
 
   useEffect(() => {
     const onPopState = () => {
@@ -1218,10 +1325,12 @@ export function App() {
   }, [refreshMe, route]);
 
   useEffect(() => {
+    manualReceiptRequestGeneration.current += 1;
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageManualReceipts ||
+      !me
     ) {
       manualReceiptDefaultedForUser.current = null;
       setManualReceiptClientAccountId("");
@@ -1243,7 +1352,125 @@ export function App() {
     setManualReceiptReversalTargetId(null);
     setManualReceiptReversalReason("");
     setManualReceiptReversalOutcome(null);
-  }, [canUseFullAdminWorkspace, me, route]);
+  }, [canManageManualReceipts, me, route]);
+
+  useLayoutEffect(() => {
+    adminAccessGeneration.current += 1;
+    const principalChanged =
+      previousStaffPrincipalFingerprint.current !== staffPrincipalFingerprint;
+    previousStaffPrincipalFingerprint.current = staffPrincipalFingerprint;
+    if (!principalChanged) return;
+
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    setManualItems([]);
+    setRefundCandidates([]);
+    setRefundRecords({});
+    setRefundSecurityHolds([]);
+    setRefundDismissalCorrections([]);
+    setRefundReceiptCapacityIncidents([]);
+    setAdminPassword("");
+    setManualReason("");
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundPendingReceiptIds(new Set());
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+  }, [route, staffAccessFingerprint, staffPrincipalFingerprint]);
+
+  useLayoutEffect(() => {
+    const context = adminOperationContext;
+    if (!context) return;
+    const stillAuthorized =
+      route === "/admin" &&
+      activeRouteRef.current === "/admin" &&
+      ((context.action === "manual_receipt" && canManageManualReceipts) ||
+        (context.action === "refund" && canManageRefunds) ||
+        (context.action === "ticket" && canManageStaffTickets) ||
+        (context.action === "manual_fulfillment" && canManageManualFulfillment));
+    if (stillAuthorized) return;
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    setAdminPassword("");
+    setManualReason("");
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundPendingReceiptIds(new Set());
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+  }, [
+    adminOperationContext,
+    canManageManualFulfillment,
+    canManageManualReceipts,
+    canManageRefunds,
+    canManageStaffTickets,
+    route,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!canManageManualReceipts) {
+      manualReceiptRequestGeneration.current += 1;
+      setManualReceiptClientAccountId("");
+      setManualReceiptReference("");
+      setManualReceiptReason("");
+      setManualReceiptPending(false);
+      setManualReceiptHistory([]);
+      setManualReceiptTarget(null);
+      setManualReceiptOutcome(null);
+      setManualReceiptReversalTargetId(null);
+      setManualReceiptReversalReason("");
+      setManualReceiptReversalPendingId(null);
+      setManualReceiptReversalOutcome(null);
+    }
+    if (!canManageRefunds) {
+      setRefundAmountMode("full");
+      setRefundAmountMinor("");
+      setRefundReason("");
+      setRefundPendingReceiptIds(new Set());
+      setRefundAdjudicationPendingIds(new Set());
+      setRefundManualActionPendingIds(new Set());
+      setRefundCorrectionPendingIds(new Set());
+      setRefundCapacityAcknowledgementPendingIds(new Set());
+    }
+    if (!canManageManualFulfillment) setManualReason("");
+    if (!canMountAdminOperationWorkspace) setAdminPassword("");
+  }, [
+    canManageManualFulfillment,
+    canManageManualReceipts,
+    canManageRefunds,
+    canMountAdminOperationWorkspace,
+  ]);
 
   useEffect(() => {
     void refreshLatestOrder().catch(() => undefined);
@@ -1430,14 +1657,19 @@ export function App() {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageManualFulfillment
     ) {
       setManualItems([]);
       return;
     }
+    const accessGeneration = adminAccessGeneration.current;
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
+    if (
+      accessGeneration !== adminAccessGeneration.current ||
+      activeRouteRef.current !== "/admin"
+    ) return;
     setManualItems(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+  }, [canManageManualFulfillment, route, staffAccessFingerprint]);
 
   const refreshAdminCancellations = useCallback(async () => {
     if (
@@ -1471,74 +1703,99 @@ export function App() {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
       setRefundCandidates([]);
       return;
     }
+    const accessGeneration = adminAccessGeneration.current;
     const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
+    if (
+      accessGeneration !== adminAccessGeneration.current ||
+      activeRouteRef.current !== "/admin"
+    ) return;
     setRefundCandidates(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+  }, [canManageRefunds, route, staffAccessFingerprint]);
 
   const refreshRefundRecords = useCallback(async () => {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
       setRefundRecords({});
       return;
     }
+    const accessGeneration = adminAccessGeneration.current;
     const result = await api<{ items: RefundRecord[] }>("/api/v1/admin/refunds");
+    if (
+      accessGeneration !== adminAccessGeneration.current ||
+      activeRouteRef.current !== "/admin"
+    ) return;
     setRefundRecords(
       Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
     );
-  }, [canUseFullAdminWorkspace, route]);
+  }, [canManageRefunds, route, staffAccessFingerprint]);
 
   const refreshRefundSecurityHolds = useCallback(async () => {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
       setRefundSecurityHolds([]);
       return;
     }
+    const accessGeneration = adminAccessGeneration.current;
     const result = await api<{ items: RefundSecurityHold[] }>(
       "/api/v1/admin/refund-security-holds",
     );
+    if (
+      accessGeneration !== adminAccessGeneration.current ||
+      activeRouteRef.current !== "/admin"
+    ) return;
     setRefundSecurityHolds(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+  }, [canManageRefunds, route, staffAccessFingerprint]);
 
   const refreshRefundDismissalCorrections = useCallback(async () => {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
       setRefundDismissalCorrections([]);
       return;
     }
+    const accessGeneration = adminAccessGeneration.current;
     const result = await api<{ items: RefundDismissalCorrection[] }>(
       "/api/v1/admin/refund-dismissal-corrections",
     );
+    if (
+      accessGeneration !== adminAccessGeneration.current ||
+      activeRouteRef.current !== "/admin"
+    ) return;
     setRefundDismissalCorrections(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+  }, [canManageRefunds, route, staffAccessFingerprint]);
 
   const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
       setRefundReceiptCapacityIncidents([]);
       return;
     }
+    const accessGeneration = adminAccessGeneration.current;
     const result = await api<{ items: RefundReceiptCapacityIncident[] }>(
       "/api/v1/admin/refund-receipt-capacity-incidents",
     );
+    if (
+      accessGeneration !== adminAccessGeneration.current ||
+      activeRouteRef.current !== "/admin"
+    ) return;
     setRefundReceiptCapacityIncidents(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+  }, [canManageRefunds, route, staffAccessFingerprint]);
 
   const refreshAdminChargebacks = useCallback(async () => {
     if (
@@ -1589,27 +1846,46 @@ export function App() {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) return;
-    const active = Object.values(refundRecords).filter((refund) =>
-      ["queued", "processing", "unknown"].includes(refund.status),
+    const active = Object.values(refundRecords).filter(
+      (refund) =>
+        (showUnscopedAdminOperations ||
+          (operationAccount !== null && refund.clientAccountId === operationAccount.id)) &&
+        ["queued", "processing", "unknown"].includes(refund.status),
     );
     if (active.length === 0) return;
     const timer = window.setInterval(() => {
+      const operationGeneration = adminOperationGeneration.current;
+      const accessGeneration = adminAccessGeneration.current;
       void Promise.all(
         active.map((refund) =>
           api<RefundRecord>(`/api/v1/admin/refunds/${refund.refundId}`).then((updated) => {
+            if (
+              !adminOperationRequestIsCurrent(
+                operationGeneration,
+                accessGeneration,
+                refund.clientAccountId,
+              )
+            ) return false;
             setRefundRecords((current) => ({ ...current, [updated.refundId]: updated }));
+            return true;
           }),
         ),
       )
-        .then(() =>
-          Promise.all([
+        .then((accepted) => {
+          if (
+            !accepted.some(Boolean) ||
+            operationGeneration !== adminOperationGeneration.current ||
+            accessGeneration !== adminAccessGeneration.current ||
+            activeRouteRef.current !== "/admin"
+          ) return undefined;
+          return Promise.all([
             refreshRefundCandidates(),
             refreshRefundSecurityHolds(),
             refreshUnclaimedFunds(),
-          ]),
-        )
+          ]);
+        })
         .catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(timer);
@@ -1618,8 +1894,11 @@ export function App() {
     refreshRefundCandidates,
     refreshRefundSecurityHolds,
     refreshUnclaimedFunds,
-    canUseFullAdminWorkspace,
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    operationAccount,
     route,
+    showUnscopedAdminOperations,
   ]);
 
   const groups = useMemo(() => {
@@ -1668,7 +1947,12 @@ export function App() {
       const viewerCanOpenAdmin =
         viewer?.eligible === true &&
         viewer.staff !== null &&
-        (viewerPermissions.has("*") || viewerPermissions.has("support.tickets.manage"));
+        (viewerPermissions.has("*") ||
+          viewerPermissions.has("accounts.view") ||
+          viewerPermissions.has("billing.manual_receipt_manage") ||
+          viewerPermissions.has("billing.refund_manage") ||
+          viewerPermissions.has("services.manual_fulfillment") ||
+          viewerPermissions.has("support.tickets.manage"));
       const target = route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer";
       const staysOnResolvedRoute = route === target;
       openRoute(target);
@@ -2256,11 +2540,11 @@ export function App() {
     items: ManualReceiptItem[];
   }> {
     if (
-      !canUseFullAdminRoute ||
+      !canManageManualReceiptsRoute ||
       activeRouteRef.current !== "/admin" ||
       routeGenerationRef.current !== renderRouteGeneration
     ) {
-      throw new Error("Full administrator permission is required");
+      throw new Error("Manual receipt permission is required");
     }
     return api<{
       clientAccount: { id: string; name: string };
@@ -2273,29 +2557,44 @@ export function App() {
   async function loadManualReceiptHistory() {
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     if (
-      !canUseFullAdminRoute || manualReceiptPending || !looksLikeUuid(clientAccountId)
+      !canManageManualReceiptsRoute ||
+      manualReceiptPending ||
+      !looksLikeUuid(clientAccountId) ||
+      (operationAccount !== null && operationAccount.id !== clientAccountId)
     ) {
       return;
     }
+    const generation = ++manualReceiptRequestGeneration.current;
     setError("");
     setManualReceiptPending(true);
     try {
       const result = await fetchManualReceiptHistory(clientAccountId);
+      if (
+        generation !== manualReceiptRequestGeneration.current ||
+        activeRouteRef.current !== "/admin" ||
+        (adminOperationContext !== null && adminOperationContext.account.id !== clientAccountId)
+      ) return;
       setManualReceiptTarget(result.clientAccount);
       setManualReceiptHistory(result.items);
       setNotice(
         `Verified ${result.clientAccount.name} (${result.clientAccount.id}) and refreshed its manual receipt history.`,
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual receipt history is unavailable");
+      if (generation === manualReceiptRequestGeneration.current) {
+        setError(caught instanceof Error ? caught.message : "Manual receipt history is unavailable");
+      }
     } finally {
-      setManualReceiptPending(false);
+      if (generation === manualReceiptRequestGeneration.current) {
+        setManualReceiptPending(false);
+      }
     }
   }
 
   async function recordManualReceipt() {
-    if (!canUseFullAdminRoute || manualReceiptPending || !manualReceiptFormReady) return;
+    if (!canManageManualReceiptsRoute || manualReceiptPending || !manualReceiptFormReady) return;
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
+    if (operationAccount !== null && operationAccount.id !== clientAccountId) return;
+    const generation = ++manualReceiptRequestGeneration.current;
     const payload = {
       reference: manualReceiptReference.trim(),
       receivedAt: new Date(manualReceiptReceivedAt).toISOString(),
@@ -2344,6 +2643,11 @@ export function App() {
       } catch {
         // A successful Core response is authoritative even if browser storage is unavailable.
       }
+      if (
+        generation !== manualReceiptRequestGeneration.current ||
+        activeRouteRef.current !== "/admin" ||
+        (adminOperationContext !== null && adminOperationContext.account.id !== clientAccountId)
+      ) return;
       setManualReceiptOutcome(outcome);
       setManualReceiptReference("");
       setManualReceiptGrossMinor("10000");
@@ -2354,6 +2658,10 @@ export function App() {
         fetchManualReceiptHistory(clientAccountId),
         refreshUnclaimedFunds(),
       ]);
+      if (
+        generation !== manualReceiptRequestGeneration.current ||
+        activeRouteRef.current !== "/admin"
+      ) return;
       if (historyRefresh.status === "fulfilled") {
         setManualReceiptTarget(historyRefresh.value.clientAccount);
         setManualReceiptHistory(historyRefresh.value.items);
@@ -2367,16 +2675,21 @@ export function App() {
         setError("The receipt was saved, but one of the administrator lists could not be refreshed.");
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
+      if (generation === manualReceiptRequestGeneration.current) {
+        setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
+      }
     } finally {
-      setManualReceiptPending(false);
+      if (generation === manualReceiptRequestGeneration.current) {
+        setManualReceiptPending(false);
+      }
     }
   }
 
   async function reverseManualReceipt(receipt: ManualReceiptItem) {
     const clientAccountId = manualReceiptTarget?.id;
     if (
-      !canUseFullAdminRoute ||
+      !canManageManualReceiptsRoute ||
+      !canManageUnclaimedFunds ||
       !clientAccountId ||
       manualReceiptReversalPendingId !== null ||
       manualReceiptReversalTargetId !== receipt.manualReceiptId ||
@@ -2387,6 +2700,8 @@ export function App() {
     ) {
       return;
     }
+    if (operationAccount !== null && operationAccount.id !== clientAccountId) return;
+    const generation = ++manualReceiptRequestGeneration.current;
     const payload = {
       expectedFundReceiptId: receipt.fundReceiptId,
       expectedGrossAmountMinor: receipt.grossAmountMinor,
@@ -2436,6 +2751,11 @@ export function App() {
       } catch {
         // Core's successful response is authoritative.
       }
+      if (
+        generation !== manualReceiptRequestGeneration.current ||
+        activeRouteRef.current !== "/admin" ||
+        (adminOperationContext !== null && adminOperationContext.account.id !== clientAccountId)
+      ) return;
       setManualReceiptReversalOutcome(outcome);
       setManualReceiptReversalTargetId(null);
       setManualReceiptReversalReason("");
@@ -2443,6 +2763,10 @@ export function App() {
         fetchManualReceiptHistory(clientAccountId),
         refreshUnclaimedFunds(),
       ]);
+      if (
+        generation !== manualReceiptRequestGeneration.current ||
+        activeRouteRef.current !== "/admin"
+      ) return;
       if (historyRefresh.status === "fulfilled") {
         setManualReceiptTarget(historyRefresh.value.clientAccount);
         setManualReceiptHistory(historyRefresh.value.items);
@@ -2456,31 +2780,69 @@ export function App() {
         setError("The reversal was saved, but one of the administrator lists could not be refreshed.");
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual receipt could not be reversed");
+      if (generation === manualReceiptRequestGeneration.current) {
+        setError(caught instanceof Error ? caught.message : "Manual receipt could not be reversed");
+      }
     } finally {
-      setManualReceiptReversalPendingId(null);
+      if (generation === manualReceiptRequestGeneration.current) {
+        setManualReceiptReversalPendingId(null);
+      }
     }
   }
 
-  async function completeManual(serviceId: string) {
-    if (!canUseFullAdminRoute) return;
+  async function completeManual(item: ManualItem) {
+    if (
+      !canManageManualFulfillmentRoute ||
+      (operationAccount !== null && item.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationGeneration = adminOperationGeneration.current;
+    const accessGeneration = adminAccessGeneration.current;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
-      await api(`/api/v1/admin/services/${serviceId}/complete-manual`, {
+      await api(`/api/v1/admin/services/${item.serviceId}/complete-manual`, {
         method: "POST",
         body: JSON.stringify({ reason: manualReason }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
       setManualReason("");
       await refreshManualItems();
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setNotice("Manual service marked Ready for Service with an audited activation time.");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual fulfillment failed");
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) {
+        setError(caught instanceof Error ? caught.message : "Manual fulfillment failed");
+      }
     }
   }
 
@@ -2677,7 +3039,13 @@ export function App() {
     item: RefundCandidate,
     destination: "original_payment" | "credit" | "none",
   ) {
-    if (!canUseFullAdminRoute || refundInFlight.current.has(item.receiptId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundInFlight.current.has(item.receiptId) ||
+      (operationAccount !== null && item.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationGeneration = adminOperationGeneration.current;
+    const accessGeneration = adminAccessGeneration.current;
     const amountMode = destination === "none" ? "none" : refundAmountMode;
     const amountMinor =
       destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
@@ -2715,6 +3083,13 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
       const refund = await api<RefundRecord>(
         `/api/v1/admin/invoices/${item.invoiceId}/refunds`,
@@ -2738,6 +3113,13 @@ export function App() {
       } catch {
         // A retained key is safe: a later retry will replay instead of moving money twice.
       }
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
       setNotice(
         refund.replayed
@@ -2754,15 +3136,38 @@ export function App() {
         refreshRefundCandidates(),
         ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Refund decision failed");
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) {
+        setError(caught instanceof Error ? caught.message : "Refund decision failed");
+      }
     } finally {
       refundInFlight.current.delete(item.receiptId);
-      setRefundPendingReceiptIds((current) => {
-        const next = new Set(current);
-        next.delete(item.receiptId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) {
+        setRefundPendingReceiptIds((current) => {
+          const next = new Set(current);
+          next.delete(item.receiptId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2773,7 +3178,13 @@ export function App() {
       | "record_unexpected_outflow"
       | "dismiss_provider_claim",
   ) {
-    if (!canUseFullAdminRoute || refundAdjudicationInFlight.current.has(hold.holdId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundAdjudicationInFlight.current.has(hold.holdId) ||
+      (operationAccount !== null && hold.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationGeneration = adminOperationGeneration.current;
+    const accessGeneration = adminAccessGeneration.current;
     const reason = refundReason.trim();
     const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
     refundAdjudicationInFlight.current.add(hold.holdId);
@@ -2797,6 +3208,13 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          hold.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-security-holds/${hold.holdId}/adjudications`,
@@ -2815,6 +3233,13 @@ export function App() {
       } catch {
         // A retained key can only replay the same immutable adjudication.
       }
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          hold.clientAccountId,
+        )
+      ) return;
       setNotice(
         result.replayed
           ? "The same hold adjudication was replayed; no second settlement or journal was created."
@@ -2832,15 +3257,38 @@ export function App() {
         refreshRefundCandidates(),
         refreshRefundRecords(),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          hold.clientAccountId,
+        )
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Refund hold adjudication failed");
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          hold.clientAccountId,
+        )
+      ) {
+        setError(caught instanceof Error ? caught.message : "Refund hold adjudication failed");
+      }
     } finally {
       refundAdjudicationInFlight.current.delete(hold.holdId);
-      setRefundAdjudicationPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(hold.holdId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          hold.clientAccountId,
+        )
+      ) {
+        setRefundAdjudicationPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(hold.holdId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2848,7 +3296,14 @@ export function App() {
     refund: RefundRecord,
     action: "retry_query" | "confirm_no_outflow",
   ) {
-    if (!canUseFullAdminRoute || refundManualActionInFlight.current.has(refund.refundId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundManualActionInFlight.current.has(refund.refundId) ||
+      (operationAccount !== null &&
+        refund.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationGeneration = adminOperationGeneration.current;
+    const accessGeneration = adminAccessGeneration.current;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       refundId: refund.refundId,
@@ -2877,6 +3332,13 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          refund.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refunds/${refund.refundId}/manual-actions`,
@@ -2895,6 +3357,13 @@ export function App() {
       } catch {
         // A retained key can only replay this same manual action.
       }
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          refund.clientAccountId,
+        )
+      ) return;
       setNotice(
         result.replayed
           ? "The same manual refund action was replayed; no duplicate query or decision occurred."
@@ -2908,20 +3377,49 @@ export function App() {
         refreshRefundCandidates(),
         refreshRefundSecurityHolds(),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          refund.clientAccountId,
+        )
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual refund action failed");
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          refund.clientAccountId,
+        )
+      ) {
+        setError(caught instanceof Error ? caught.message : "Manual refund action failed");
+      }
     } finally {
       refundManualActionInFlight.current.delete(refund.refundId);
-      setRefundManualActionPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(refund.refundId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          refund.clientAccountId,
+        )
+      ) {
+        setRefundManualActionPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(refund.refundId);
+          return next;
+        });
+      }
     }
   }
 
   async function correctDismissedRefundOutflow(item: RefundDismissalCorrection) {
-    if (!canUseFullAdminRoute || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundCorrectionInFlight.current.has(item.adjudicationId) ||
+      (operationAccount !== null && item.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationGeneration = adminOperationGeneration.current;
+    const accessGeneration = adminAccessGeneration.current;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       adjudicationId: item.adjudicationId,
@@ -2949,6 +3447,13 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-adjudications/${item.adjudicationId}/corrections`,
@@ -2966,6 +3471,13 @@ export function App() {
       } catch {
         // A retained key can only replay the same immutable correction.
       }
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
       setNotice(
         result.replayed
           ? "The same dismissal correction was replayed; cash and capacity were not reduced twice."
@@ -2979,15 +3491,38 @@ export function App() {
         refreshRefundCandidates(),
         refreshRefundRecords(),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Refund dismissal correction failed");
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) {
+        setError(caught instanceof Error ? caught.message : "Refund dismissal correction failed");
+      }
     } finally {
       refundCorrectionInFlight.current.delete(item.adjudicationId);
-      setRefundCorrectionPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(item.adjudicationId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          item.clientAccountId,
+        )
+      ) {
+        setRefundCorrectionPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(item.adjudicationId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2995,11 +3530,14 @@ export function App() {
     incident: RefundReceiptCapacityIncident,
   ) {
     if (
-      !canUseFullAdminRoute ||
-      refundCapacityAcknowledgementInFlight.current.has(incident.incidentId)
+      !canManageRefundsRoute ||
+      refundCapacityAcknowledgementInFlight.current.has(incident.incidentId) ||
+      (operationAccount !== null && incident.clientAccountId !== operationAccount.id)
     ) {
       return;
     }
+    const operationGeneration = adminOperationGeneration.current;
+    const accessGeneration = adminAccessGeneration.current;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       incidentId: incident.incidentId,
@@ -3030,6 +3568,13 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          incident.clientAccountId,
+        )
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-receipt-capacity-incidents/${incident.incidentId}/acknowledgements`,
@@ -3048,6 +3593,13 @@ export function App() {
       } catch {
         // A retained key can only replay the same acknowledgement.
       }
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          incident.clientAccountId,
+        )
+      ) return;
       setNotice(
         result.replayed
           ? "The same receipt overage acknowledgement was replayed; no financial fact changed."
@@ -3059,20 +3611,81 @@ export function App() {
         refreshRefundCandidates(),
         refreshRefundRecords(),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          incident.clientAccountId,
+        )
+      ) return;
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Refund receipt capacity acknowledgement failed",
-      );
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          incident.clientAccountId,
+        )
+      ) {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : "Refund receipt capacity acknowledgement failed",
+        );
+      }
     } finally {
       refundCapacityAcknowledgementInFlight.current.delete(incident.incidentId);
-      setRefundCapacityAcknowledgementPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(incident.incidentId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(
+          operationGeneration,
+          accessGeneration,
+          incident.clientAccountId,
+        )
+      ) {
+        setRefundCapacityAcknowledgementPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(incident.incidentId);
+          return next;
+        });
+      }
     }
+  }
+
+  function clearAdminOperationSelection() {
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    setAdminPassword("");
+    setManualReason("");
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundPendingReceiptIds(new Set());
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+  }
+
+  function selectedAdminAccountChanged(account: { id: string; name: string } | null) {
+    const context = adminOperationContextRef.current;
+    if (!context || context.account.id === account?.id) return;
+    clearAdminOperationSelection();
+    setNotice("");
   }
 
   function openAdminAccountAction(
@@ -3080,26 +3693,30 @@ export function App() {
     account: { id: string; name: string },
   ) {
     if (route !== "/admin" || activeRouteRef.current !== "/admin") return;
+    const authorized =
+      (action === "manual_receipt" && canManageManualReceipts) ||
+      (action === "refund" && canManageRefunds) ||
+      (action === "ticket" && canManageStaffTickets) ||
+      (action === "manual_fulfillment" && canManageManualFulfillment);
+    if (!authorized) return;
+    clearAdminOperationSelection();
+    const context = { action, account };
+    adminOperationContextRef.current = context;
+    setAdminOperationContext(context);
+    setManualReceiptClientAccountId(account.id);
     let selector = "";
     if (action === "manual_receipt") {
-      setManualReceiptClientAccountId(account.id);
-      setManualReceiptHistory([]);
-      setManualReceiptTarget(null);
-      setManualReceiptOutcome(null);
-      setManualReceiptReversalTargetId(null);
-      setManualReceiptReversalReason("");
-      setManualReceiptReversalOutcome(null);
       selector = '[aria-label="Record manual receipt"]';
-      setNotice(`Manual receipt target prefilled for ${account.name}. Verify the account and load its history before recording money.`);
+      setNotice(`Manual receipt target fixed to ${account.name}. Verify the account and load its history before recording money.`);
     } else if (action === "refund") {
       selector = '[aria-label="Manual refunds"]';
-      setNotice(`Refund operations opened for review. Select only a receipt belonging to ${account.name}.`);
+      setNotice(`Refund operations are fixed to ${account.name}; unrelated receipts and refund facts are hidden.`);
     } else if (action === "ticket") {
       selector = '[aria-label="Staff support tickets"]';
-      setNotice(`Ticket operations opened. Use the Client Account name ${account.name} to select its conversation.`);
+      setNotice(`Ticket operations are fixed to ${account.name}; unrelated conversations are hidden.`);
     } else {
       selector = '[aria-label="Manual fulfillment queue"]';
-      setNotice(`Manual fulfillment opened. Select only a service belonging to ${account.name}.`);
+      setNotice(`Manual fulfillment is fixed to ${account.name}; unrelated services are hidden.`);
     }
     requestAnimationFrame(() => {
       document.querySelector(selector)?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -3402,9 +4019,11 @@ export function App() {
         {route === "/admin" && sessionResolved && canViewAccount360 && me && (
           <AdminAccount360
             active={route === "/admin"}
+            accessFingerprint={staffAccessFingerprint}
             permissions={staffPermissions}
             availableActions={account360Actions}
             onAction={openAdminAccountAction}
+            onSelectedAccountChange={selectedAdminAccountChanged}
             onRefreshAccess={async () => { await refreshMe(); }}
             onNotice={showTicketNotice}
             onError={showTicketError}
@@ -3425,6 +4044,8 @@ export function App() {
           <TicketsPanel
             mode="staff"
             canManageTickets={canManageStaffTickets}
+            staffAccountContext={operationAccount}
+            requireStaffAccountContext={!canUseFullAdminWorkspace && canViewAccount360}
             me={me}
             locale={locale}
             onNotice={showTicketNotice}
@@ -3437,9 +4058,9 @@ export function App() {
             <p className="eyebrow">Permission-scoped Staff workspace</p>
             <h2>Permission-scoped operations</h2>
             <p>
-              This Staff session loads only its explicitly permitted Account 360 and support
-              panels. Billing mutations, refunds, money and service administration remain
-              unmounted unless their operational workspace is available.
+              This Staff session loads only its explicitly permitted Account 360, support and
+              operation panels. Other billing, money and service administration stays unmounted
+              and is not requested.
             </p>
           </section>
         )}
@@ -3949,8 +4570,44 @@ export function App() {
           </section>
         )}
 
-        {route === "/admin" && sessionResolved && canUseFullAdminWorkspace && me && (
-          <section className="admin-panel" data-testid="full-admin-workspace">
+        {route === "/admin" && sessionResolved && canMountAdminOperationWorkspace && me && (
+          <section
+            className="admin-panel"
+            data-testid={
+              canUseFullAdminWorkspace
+                ? "full-admin-workspace"
+                : "permission-admin-operations"
+            }
+          >
+            {!canUseFullAdminWorkspace && (
+              <div data-testid="permission-operation-reauth">
+                <p className="eyebrow">Permission-scoped audited operation</p>
+                <h2>Authorized account operation</h2>
+                {operationAccount ? (
+                  <p className="notice" data-testid="admin-operation-account-context">
+                    Fixed Client Account: {operationAccount.name} · {operationAccount.id}
+                  </p>
+                ) : canViewAccount360 ? (
+                  <p className="muted" data-testid="admin-operation-account-required">
+                    Select a Client Account in Account 360 and choose the required operation.
+                  </p>
+                ) : (
+                  <p className="muted">
+                    This permission can operate its complete queue. Account 360 filtering is not
+                    available without accounts.view.
+                  </p>
+                )}
+                <input
+                  aria-label="Operation password confirmation"
+                  type="password"
+                  value={adminPassword}
+                  onChange={(event) => setAdminPassword(event.target.value)}
+                  placeholder="Re-enter password (15-minute fixed window)"
+                />
+              </div>
+            )}
+            {canUseFullAdminWorkspace && (
+              <>
             <div>
               <p className="eyebrow">Administrator · audited billing and fulfillment</p>
               <h2>Credit adjustment and human Ready decisions</h2>
@@ -4396,10 +5053,22 @@ export function App() {
                 </div>
               )}
             </div>
+              </>
+            )}
+            {canManageManualFulfillment && (
             <div className="admin-subsection" aria-label="Manual fulfillment queue">
               <h3>Manual fulfillment queue</h3>
-              {manualItems.length === 0 ? (
-                <p className="muted">No paid manual services are waiting.</p>
+              {operationAccount && (
+                <p className="notice" data-testid="manual-fulfillment-account-context">
+                  Showing only {operationAccount.name} · {operationAccount.id}
+                </p>
+              )}
+              {visibleManualItems.length === 0 ? (
+                <p className="muted">
+                  {operationAccount === null && canViewAccount360 && !canUseFullAdminWorkspace
+                    ? "Select a Client Account in Account 360 to open its fulfillment queue."
+                    : "No paid manual services are waiting."}
+                </p>
               ) : (
                 <>
                 <div className="inline-form admin-confirm">
@@ -4409,8 +5078,8 @@ export function App() {
                     placeholder="Reason and delivery evidence (10+ characters)"
                   />
                 </div>
-                {manualItems.map((item) => (
-                  <article className="manual-item" key={item.serviceId}>
+                {visibleManualItems.map((item) => (
+                  <article className="manual-item" data-testid="manual-fulfillment-item" key={item.serviceId}>
                     <div>
                       <strong>{item.productName}</strong>
                       <span>
@@ -4421,7 +5090,7 @@ export function App() {
                     <button
                       className="primary"
                       disabled={adminPassword.length === 0 || manualReason.trim().length < 10}
-                      onClick={() => completeManual(item.serviceId)}
+                      onClick={() => completeManual(item)}
                     >
                       Confirm Ready for Service
                     </button>
@@ -4430,6 +5099,8 @@ export function App() {
                 </>
               )}
             </div>
+            )}
+            {canManageManualReceipts && (
             <div className="admin-subsection" aria-label="Record manual receipt">
               <div>
                 <p className="eyebrow">Audited offline or manual money fact</p>
@@ -4439,6 +5110,11 @@ export function App() {
                   immutable gross, fee, net cash, and unclaimed liability facts. It does not call a
                   Provider, pay an invoice, add Credit, or activate a service.
                 </p>
+                {operationAccount && (
+                  <p className="notice" data-testid="manual-receipt-account-context">
+                    Target fixed to {operationAccount.name} · {operationAccount.id}
+                  </p>
+                )}
               </div>
               <div className="manual-receipt-form">
                 <label>
@@ -4448,8 +5124,13 @@ export function App() {
                     disabled={
                       manualReceiptPending || manualReceiptReversalPendingId !== null
                     }
+                    readOnly={
+                      operationAccount !== null ||
+                      (!canUseFullAdminWorkspace && canViewAccount360)
+                    }
                     value={manualReceiptClientAccountId}
                     onChange={(event) => {
+                      manualReceiptRequestGeneration.current += 1;
                       setManualReceiptClientAccountId(event.target.value);
                       setManualReceiptHistory([]);
                       setManualReceiptTarget(null);
@@ -4649,7 +5330,7 @@ export function App() {
                             {receipt.disposition}
                           </span>
                           <span>{receipt.reason}</span>
-                          {manualReceiptTarget && (
+                          {manualReceiptTarget && canManageRefunds && (
                             <ManualReceiptOutflowPanel
                               clientAccountId={manualReceiptTarget.id}
                               receipt={receipt}
@@ -4683,7 +5364,9 @@ export function App() {
                             </span>
                           )}
                         </div>
-                        {manualReceiptIsUntouched(receipt) && !reviewingReversal && (
+                        {canManageUnclaimedFunds &&
+                          manualReceiptIsUntouched(receipt) &&
+                          !reviewingReversal && (
                           <button
                             disabled={manualReceiptReversalPendingId !== null}
                             onClick={() => {
@@ -4695,7 +5378,9 @@ export function App() {
                             Review reversal
                           </button>
                         )}
-                        {manualReceiptIsUntouched(receipt) && reviewingReversal && (
+                        {canManageUnclaimedFunds &&
+                          manualReceiptIsUntouched(receipt) &&
+                          reviewingReversal && (
                           <div
                             className="manual-receipt-reversal-review"
                             aria-label="Manual receipt reversal review"
@@ -4751,6 +5436,8 @@ export function App() {
                 </div>
               )}
             </div>
+            )}
+            {canUseFullAdminWorkspace && operationAccount === null && (
             <div className="admin-subsection">
               <div>
                 <p className="eyebrow">Money received but not yet assigned</p>
@@ -4929,6 +5616,8 @@ export function App() {
                 </div>
               )}
             </div>
+            )}
+            {canManageRefunds && (
             <div className="admin-subsection" aria-label="Manual refunds">
               <div>
                 <p className="eyebrow">Independent money decision</p>
@@ -4939,6 +5628,11 @@ export function App() {
                   allocated invoice receipts; unclaimed original-payment returns are handled in
                   the funds queue above.
                 </p>
+                {operationAccount && (
+                  <p className="notice" data-testid="refund-account-context">
+                    Showing only {operationAccount.name} · {operationAccount.id}
+                  </p>
+                )}
               </div>
               <button
                 onClick={() =>
@@ -4947,6 +5641,7 @@ export function App() {
                     refreshRefundRecords(),
                     refreshRefundSecurityHolds(),
                     refreshRefundDismissalCorrections(),
+                    refreshRefundReceiptCapacityIncidents(),
                   ])
                 }
               >
@@ -5004,11 +5699,15 @@ export function App() {
                 Third-party destinations are disabled until a logged-in customer ticket and
                 two-person approval are both implemented.
               </p>
-              {refundCandidates.length === 0 ? (
-                <p className="muted">No fully allocated invoice receipt is currently refundable.</p>
+              {visibleRefundCandidates.length === 0 ? (
+                <p className="muted">
+                  {operationAccount === null && canViewAccount360 && !canUseFullAdminWorkspace
+                    ? "Select a Client Account in Account 360 to open its refund facts."
+                    : "No fully allocated invoice receipt is currently refundable."}
+                </p>
               ) : (
                 <div data-testid="refund-candidate-list">
-                  {refundCandidates.map((item) => {
+                  {visibleRefundCandidates.map((item) => {
                     const disabled =
                       refundPendingReceiptIds.has(item.receiptId) ||
                       adminPassword.length === 0 ||
@@ -5069,7 +5768,7 @@ export function App() {
                   })}
                 </div>
               )}
-              {refundReceiptCapacityIncidents.length > 0 && (
+              {visibleRefundReceiptCapacityIncidents.length > 0 && (
                 <div data-testid="refund-receipt-capacity-incident-list">
                   <h4>Receipt compensation overages requiring manual recovery</h4>
                   <p className="muted">
@@ -5077,7 +5776,7 @@ export function App() {
                     receipt, only the latest cumulative snapshot is the current recovery amount;
                     older snapshots remain visible as history and must not be added together.
                   </p>
-                  {refundReceiptCapacityIncidents.map((incident) => {
+                  {visibleRefundReceiptCapacityIncidents.map((incident) => {
                     const pending = refundCapacityAcknowledgementPendingIds.has(
                       incident.incidentId,
                     );
@@ -5140,14 +5839,14 @@ export function App() {
                   })}
                 </div>
               )}
-              {refundSecurityHolds.length > 0 && (
+              {visibleRefundSecurityHolds.length > 0 && (
                 <div data-testid="refund-security-hold-list">
                   <h4>Provider facts requiring human adjudication</h4>
                   <p className="muted">
                     Review the immutable fact and impact. Provider callbacks cannot close these
                     holds. Your password confirmation and the reason above are required.
                   </p>
-                  {refundSecurityHolds.map((hold) => {
+                  {visibleRefundSecurityHolds.map((hold) => {
                     const pending = refundAdjudicationPendingIds.has(hold.holdId);
                     const allocatedContributionMinor =
                       hold.sourceContext === "unclaimed_funds"
@@ -5251,7 +5950,7 @@ export function App() {
                   })}
                 </div>
               )}
-              {refundDismissalCorrections.length > 0 && (
+              {visibleRefundDismissalCorrections.length > 0 && (
                 <div data-testid="refund-dismissal-correction-list">
                   <h4>Dismissed Provider facts that can be corrected</h4>
                   <p className="muted">
@@ -5259,7 +5958,7 @@ export function App() {
                     outflow. The prior decision stays immutable; this adds a compensating journal
                     and reserves same-currency receipt capacity.
                   </p>
-                  {refundDismissalCorrections.map((item) => {
+                  {visibleRefundDismissalCorrections.map((item) => {
                     const pending = refundCorrectionPendingIds.has(item.adjudicationId);
                     return (
                       <article
@@ -5296,9 +5995,9 @@ export function App() {
                   })}
                 </div>
               )}
-              {Object.values(refundRecords).length > 0 && (
+              {visibleRefundRecords.length > 0 && (
                 <div data-testid="refund-status-list">
-                  {Object.values(refundRecords).map((refund) => (
+                  {visibleRefundRecords.map((refund) => (
                     <article
                       className="manual-item"
                       data-testid="refund-status"
@@ -5362,6 +6061,7 @@ export function App() {
                 </div>
               )}
             </div>
+            )}
           </section>
         )}
 
