@@ -18,6 +18,7 @@
     "test:integration:payment-method-token-rotation": "node dist/payment-method-token-rotation.integration.js",
     "test:integration:manual-receipts": "node dist/manual-receipts.integration.js",
     "test:integration:tickets": "node dist/tickets.integration.js",
+    "test:integration:account-history": "node dist/account-history.integration.js",
     "test:integration:database-role-boundary": "node dist/database-role-boundary.integration.js",
     "test:integration:schema-rollback-preflight": "node dist/schema-rollback-preflight.integration.js",
     "test:integration:schema-015-016-rollback-preflight": "node dist/schema-015-016-rollback-preflight.integration.js",
@@ -32,6 +33,7 @@
     "@node-rs/argon2": "2.0.2",
     "@opensales/core": "workspace:*",
     "fastify": "5.10.0",
+    "pdf-lib": "1.17.1",
     "pg": "8.22.0",
     "zod": "4.4.3"
   },

@@ -21,6 +21,8 @@ import { registerAdminRoutes } from "./routes-admin.js";
 import { registerCatalogRoutes } from "./routes-catalog.js";
 import { registerBillingRoutes } from "./routes-billing.js";
 import { registerChargebackRoutes } from "./routes-chargebacks.js";
+import { registerClientAccountRoutes } from "./routes-client-accounts.js";
+import { registerCustomerHistoryRoutes } from "./routes-customer-history.js";
 import { registerOrderRoutes } from "./routes-orders.js";
 import { registerManualReceiptOutflowRoutes } from "./routes-manual-receipt-outflows.js";
 import { registerPaymentMethodRoutes } from "./routes-payment-methods.js";
@@ -170,6 +172,8 @@ export async function buildApp(
 
   await registerAuthRoutes(app, pool, config);
   await registerAdminRoutes(app, pool, config);
+  await registerClientAccountRoutes(app, pool, config);
+  await registerCustomerHistoryRoutes(app, pool, config);
   await registerManualReceiptOutflowRoutes(app, pool, config);
   await registerBillingRoutes(app, pool, config);
   await registerChargebackRoutes(app, pool, config);
