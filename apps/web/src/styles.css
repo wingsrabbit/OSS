@@ -805,6 +805,85 @@ select:focus {
   }
 }
 
+.account-context-switcher,
+.account-access-panel {
+  display: grid;
+  gap: 1rem;
+  margin: 0 0 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: rgba(7, 20, 34, 0.82);
+  padding: 1.25rem;
+}
+
+.account-context-switcher .inline-form {
+  align-items: end;
+}
+
+.account-context-switcher label,
+.account-reauth,
+.account-access-editor label {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.account-access-panel {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr));
+}
+
+.account-access-panel > .history-heading,
+.account-access-panel > .account-reauth {
+  grid-column: 1 / -1;
+}
+
+.account-access-collection {
+  display: grid;
+  align-content: start;
+  gap: 0.75rem;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: rgba(3, 10, 20, 0.35);
+  padding: 1rem;
+}
+
+.account-access-create,
+.account-access-editor {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.account-access-create {
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  align-items: end;
+  margin-bottom: 1rem;
+}
+
+.account-access-editor {
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.subscription-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.subscription-options label,
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+@media (max-width: 760px) {
+  .account-context-switcher .inline-form,
+  .account-access-create {
+    grid-template-columns: 1fr;
+  }
+}
+
 .history-heading {
   display: flex;
   align-items: flex-start;

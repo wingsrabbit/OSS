@@ -71,12 +71,18 @@ type StaffRequestScope = {
   token: string;
   accountId: string | null;
 };
+type CustomerRequestScope = {
+  generation: number;
+  token: string;
+};
 
 type ServiceOption = { id: string; productName: string; status: string };
 
 type Viewer = {
   id: string;
   eligible: boolean;
+  clientAccountId?: string | null;
+  accountContextVersion?: string;
   staff: { roles: string[]; permissions: unknown } | null;
 };
 
@@ -87,6 +93,8 @@ function surfaceIsActive(surface: "customer" | "staff"): boolean {
 
 export function TicketsPanel({
   mode,
+  canUseCustomerSupport = false,
+  canWriteCustomerSupport = false,
   canManageTickets = false,
   staffAccessFingerprint = "",
   staffAccountContext = null,
@@ -97,6 +105,8 @@ export function TicketsPanel({
   onError,
 }: {
   mode: "customer" | "staff";
+  canUseCustomerSupport?: boolean;
+  canWriteCustomerSupport?: boolean;
   canManageTickets?: boolean;
   staffAccessFingerprint?: string;
   staffAccountContext?: { id: string; name: string } | null;
@@ -117,6 +127,16 @@ export function TicketsPanel({
   const [customerReply, setCustomerReply] = useState("");
   const [staffReply, setStaffReply] = useState("");
   const [pending, setPending] = useState(false);
+  const customerScopeToken = [
+    mode,
+    me?.id ?? "guest",
+    me?.clientAccountId ?? "no-account",
+    me?.accountContextVersion ?? "no-version",
+    canUseCustomerSupport ? "allowed" : "denied",
+    canWriteCustomerSupport ? "write" : "read-only",
+  ].join("\u0000");
+  const customerRequestGeneration = useRef(0);
+  const activeCustomerScopeToken = useRef(customerScopeToken);
   const staffScopeToken = [
     mode,
     staffAccessFingerprint,
@@ -128,6 +148,29 @@ export function TicketsPanel({
   const staffRefreshSequence = useRef(0);
   const activeStaffScopeToken = useRef(staffScopeToken);
   const activeStaffAccountId = useRef<string | null>(staffAccountContext?.id ?? null);
+
+  useLayoutEffect(() => {
+    if (activeCustomerScopeToken.current === customerScopeToken) return;
+    activeCustomerScopeToken.current = customerScopeToken;
+    customerRequestGeneration.current += 1;
+    setTickets([]);
+    setServices([]);
+    setSelected(null);
+    setSubject("");
+    setOpeningMessage("");
+    setServiceId("");
+    setCustomerReply("");
+    setPending(false);
+  }, [customerScopeToken]);
+
+  const captureCustomerScope = useCallback((): CustomerRequestScope => ({
+    generation: customerRequestGeneration.current,
+    token: activeCustomerScopeToken.current,
+  }), []);
+  const customerScopeIsCurrent = useCallback((scope: CustomerRequestScope) =>
+    scope.generation === customerRequestGeneration.current &&
+    scope.token === activeCustomerScopeToken.current &&
+    surfaceIsActive("customer"), []);
 
   useLayoutEffect(() => {
     const accountId = staffAccountContext?.id ?? null;
@@ -153,21 +196,25 @@ export function TicketsPanel({
     scope.accountId === activeStaffAccountId.current &&
     surfaceIsActive("staff"), []);
 
-  const refreshCustomer = useCallback(async () => {
-    if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible) {
-      setTickets([]);
-      setServices([]);
-      setSelected(null);
+  const refreshCustomer = useCallback(async (expectedScope?: CustomerRequestScope) => {
+    const scope = expectedScope ?? captureCustomerScope();
+    if (mode !== "customer" || !surfaceIsActive("customer") || !canUseCustomerSupport) {
+      if (customerScopeIsCurrent(scope)) {
+        setTickets([]);
+        setServices([]);
+        setSelected(null);
+      }
       return;
     }
+    if (!customerScopeIsCurrent(scope)) return;
     const [ticketResult, serviceResult] = await Promise.all([
       api<{ items: TicketSummary[] }>("/api/v1/tickets"),
       api<{ items: ServiceOption[] }>("/api/v1/tickets/service-options"),
     ]);
-    if (!surfaceIsActive("customer")) return;
+    if (!customerScopeIsCurrent(scope)) return;
     setTickets(ticketResult.items);
     setServices(serviceResult.items);
-  }, [me?.eligible, me?.id, mode]);
+  }, [canUseCustomerSupport, captureCustomerScope, customerScopeIsCurrent, me?.id, mode]);
 
   const refreshStaff = useCallback(async (expectedScope?: StaffRequestScope) => {
     const accountId = staffAccountContext?.id ?? null;
@@ -236,36 +283,46 @@ export function TicketsPanel({
 
   useEffect(() => {
     if (mode === "customer") {
-      void refreshCustomer().catch((caught: unknown) =>
-        onError(caught instanceof Error ? caught.message : "Tickets could not be loaded"),
-      );
+      const scope = captureCustomerScope();
+      void refreshCustomer(scope).catch((caught: unknown) => {
+        if (customerScopeIsCurrent(scope)) {
+          onError(caught instanceof Error ? caught.message : "Tickets could not be loaded");
+        }
+      });
     } else {
       void refreshStaff();
     }
-  }, [mode, onError, refreshCustomer, refreshStaff]);
+  }, [captureCustomerScope, customerScopeIsCurrent, mode, onError, refreshCustomer, refreshStaff]);
 
   useEffect(() => () => {
+    customerRequestGeneration.current += 1;
     staffRequestGeneration.current += 1;
     staffRefreshSequence.current += 1;
   }, []);
 
-  if (mode === "customer" && !me?.eligible) return null;
+  if (mode === "customer" && !canUseCustomerSupport) return null;
   if (mode === "staff" && (!me?.staff || !canManageTickets)) return null;
 
   async function openCustomerTicket(ticketId: string) {
-    if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible) return;
+    if (mode !== "customer" || !surfaceIsActive("customer") || !canUseCustomerSupport) return;
+    const scope = captureCustomerScope();
+    if (!customerScopeIsCurrent(scope)) return;
     try {
       const detail = await api<CustomerTicketDetail>(`/api/v1/tickets/${ticketId}`);
-      if (!surfaceIsActive("customer")) return;
+      if (!customerScopeIsCurrent(scope)) return;
       setSelected(detail);
     } catch (caught) {
-      onError(caught instanceof Error ? caught.message : "Ticket could not be loaded");
+      if (customerScopeIsCurrent(scope)) {
+        onError(caught instanceof Error ? caught.message : "Ticket could not be loaded");
+      }
     }
   }
 
   async function createTicket(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible || pending) return;
+    if (mode !== "customer" || !surfaceIsActive("customer") || !canWriteCustomerSupport || pending) return;
+    const scope = captureCustomerScope();
+    if (!customerScopeIsCurrent(scope)) return;
     setPending(true);
     try {
       const created = await api<CustomerTicketDetail>("/api/v1/tickets", {
@@ -276,17 +333,20 @@ export function TicketsPanel({
           serviceId: serviceId || null,
         }),
       });
-      if (!surfaceIsActive("customer")) return;
+      if (!customerScopeIsCurrent(scope)) return;
       setSubject("");
       setOpeningMessage("");
       setServiceId("");
       setSelected(created);
-      await refreshCustomer();
+      await refreshCustomer(scope);
+      if (!customerScopeIsCurrent(scope)) return;
       onNotice(locale === "zh-CN" ? "工单已创建。" : "Support ticket created.");
     } catch (caught) {
-      onError(caught instanceof Error ? caught.message : "Ticket could not be created");
+      if (customerScopeIsCurrent(scope)) {
+        onError(caught instanceof Error ? caught.message : "Ticket could not be created");
+      }
     } finally {
-      setPending(false);
+      if (customerScopeIsCurrent(scope)) setPending(false);
     }
   }
 
@@ -294,26 +354,31 @@ export function TicketsPanel({
     if (
       mode !== "customer" ||
       !surfaceIsActive("customer") ||
-      !me?.eligible ||
+      !canWriteCustomerSupport ||
       !selected ||
       customerReply.trim().length === 0 ||
       pending
     ) return;
+    const scope = captureCustomerScope();
+    if (!customerScopeIsCurrent(scope)) return;
     setPending(true);
     try {
       const updated = await api<CustomerTicketDetail>(
         `/api/v1/tickets/${selected.ticket.id}/replies`,
         { method: "POST", body: JSON.stringify({ message: customerReply.trim() }) },
       );
-      if (!surfaceIsActive("customer")) return;
+      if (!customerScopeIsCurrent(scope)) return;
       setCustomerReply("");
       setSelected(updated);
-      await refreshCustomer();
+      await refreshCustomer(scope);
+      if (!customerScopeIsCurrent(scope)) return;
       onNotice(locale === "zh-CN" ? "回复已发送给客服。" : "Reply sent to staff.");
     } catch (caught) {
-      onError(caught instanceof Error ? caught.message : "Reply could not be sent");
+      if (customerScopeIsCurrent(scope)) {
+        onError(caught instanceof Error ? caught.message : "Reply could not be sent");
+      }
     } finally {
-      setPending(false);
+      if (customerScopeIsCurrent(scope)) setPending(false);
     }
   }
 
@@ -398,11 +463,15 @@ export function TicketsPanel({
           <h2>{locale === "zh-CN" ? "我的工单" : "My support tickets"}</h2>
           <p>
             {locale === "zh-CN"
-              ? "创建工单、可选关联自己的服务，并在同一会话中继续回复。"
-              : "Create a ticket, optionally link one of your services, and continue the conversation."}
+              ? canWriteCustomerSupport
+                ? "创建工单、可选关联自己的服务，并在同一会话中继续回复。"
+                : "工单仍可查看；当前成员权限不允许创建或回复。"
+              : canWriteCustomerSupport
+                ? "Create a ticket, optionally link one of your services, and continue the conversation."
+                : "Tickets remain readable; this membership cannot create or reply."}
           </p>
         </div>
-        <form className="ticket-compose" onSubmit={createTicket}>
+        {canWriteCustomerSupport && <form className="ticket-compose" onSubmit={createTicket}>
           <label>
             {locale === "zh-CN" ? "主题" : "Ticket subject"}
             <input
@@ -442,7 +511,7 @@ export function TicketsPanel({
           <button className="primary" type="submit" disabled={pending}>
             {locale === "zh-CN" ? "创建工单" : "Create ticket"}
           </button>
-        </form>
+        </form>}
 
         <div className="ticket-layout">
           <div className="ticket-list" data-testid="customer-ticket-list">
@@ -468,7 +537,7 @@ export function TicketsPanel({
                   </div>
                 ))}
               </div>
-              <label>
+              {canWriteCustomerSupport && <label>
                 {locale === "zh-CN" ? "回复" : "Reply to ticket"}
                 <textarea
                   aria-label="Customer ticket reply"
@@ -476,14 +545,14 @@ export function TicketsPanel({
                   onChange={(event) => setCustomerReply(event.target.value)}
                   maxLength={10_000}
                 />
-              </label>
-              <button
+              </label>}
+              {canWriteCustomerSupport && <button
                 className="primary"
                 disabled={pending || customerReply.trim().length === 0}
                 onClick={() => void replyAsCustomer()}
               >
                 {locale === "zh-CN" ? "发送回复" : "Send reply"}
-              </button>
+              </button>}
             </article>
           )}
         </div>

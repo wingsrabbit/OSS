@@ -8,11 +8,32 @@ type MockViewer = {
   locale: "en";
   clientAccountId: string;
   membershipRole: string;
+  accountContextVersion: string;
+  context: {
+    clientAccountId: string;
+    name: string;
+    role: "owner";
+    permissions: string[];
+    capabilities: string[];
+    version: string;
+  };
   verification: { email: "passed" };
   restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
+
+const ownerCapabilities = [
+  "account.contacts.manage",
+  "account.contacts.read",
+  "account.members.manage",
+  "account.members.read",
+  "billing.read",
+  "billing.write",
+  "orders.create",
+  "services.manage",
+  "support.tickets.write",
+];
 
 function mockViewer({
   email,
@@ -25,12 +46,22 @@ function mockViewer({
   permissions?: unknown;
   restrictions?: { user: boolean; clientAccount: boolean };
 }): MockViewer {
+  const clientAccountId = "00000000-0000-4000-8000-000000000002";
   return {
     id: "00000000-0000-4000-8000-000000000001",
     email,
     locale: "en",
-    clientAccountId: "00000000-0000-4000-8000-000000000002",
+    clientAccountId,
     membershipRole: "owner",
+    accountContextVersion: "1",
+    context: {
+      clientAccountId,
+      name: "Synthetic route account",
+      role: "owner",
+      permissions: ["*"],
+      capabilities: ownerCapabilities,
+      version: "1",
+    },
     verification: { email: "passed" },
     restrictions,
     eligible,
@@ -57,10 +88,43 @@ async function installMockApi(
 
     if (path === "/api/v1/auth/me") {
       if (viewer) {
-        await route.fulfill({ json: viewer });
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": viewer.accountContextVersion,
+            "X-OSS-Client-Account-Id": viewer.clientAccountId,
+          },
+          json: viewer,
+        });
       } else {
         await route.fulfill({ status: 401, json: { error: "Authentication required" } });
       }
+      return;
+    }
+    if (path === "/api/v1/auth/account-contexts" && viewer) {
+      await route.fulfill({
+        headers: {
+          "X-OSS-Account-Context-Version": viewer.accountContextVersion,
+          "X-OSS-Client-Account-Id": viewer.clientAccountId,
+        },
+        json: {
+          activeClientAccountId: viewer.clientAccountId,
+          accountContextVersion: viewer.accountContextVersion,
+          items: [{
+            clientAccountId: viewer.clientAccountId,
+            name: viewer.context.name,
+            role: viewer.context.role,
+            permissions: viewer.context.permissions,
+            capabilities: viewer.context.capabilities,
+            restrictions: {
+              membership: false,
+              clientAccount: viewer.restrictions.clientAccount,
+            },
+          }],
+          limit: 25,
+          hasMore: false,
+          nextCursor: null,
+        },
+      });
       return;
     }
     if (path === options.unauthorizedPath) {
@@ -216,6 +280,14 @@ async function installMockApi(
       return;
     }
     if (
+      path === "/api/v1/account/members" ||
+      path === "/api/v1/account/membership-invitations" ||
+      path === "/api/v1/account/contacts"
+    ) {
+      await route.fulfill({ json: { items: [], limit: 25, hasMore: false, nextCursor: null } });
+      return;
+    }
+    if (
       path.startsWith("/api/v1/billing/payment-methods/") &&
       path.endsWith("/default")
     ) {
@@ -317,7 +389,7 @@ test("customer and Staff sessions stay separated and can switch accounts through
 
   await page.getByRole("link", { name: "Admin", exact: true }).click();
   await expect(page.getByTestId("admin-access-restricted")).toContainText(
-    "Access denied — eligible Staff account required",
+    "Access denied — verified, unrestricted Staff User required",
   );
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
   await page.getByRole("button", { name: "Sign out" }).click();
@@ -449,12 +521,13 @@ test("restricted wildcard Staff mounts no Admin capability or Admin fetch", asyn
       email: "restricted-wildcard@example.invalid",
       eligible: false,
       permissions: ["*"],
+      restrictions: { user: true, clientAccount: false },
     }),
   );
 
   await page.goto("/admin");
   await expect(page.getByTestId("admin-access-restricted")).toContainText(
-    "Access denied — eligible Staff account required",
+    "Access denied — verified, unrestricted Staff User required",
   );
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
@@ -513,7 +586,7 @@ test("Client Account restriction keeps verified customer history readable while 
   await expect(page.getByRole("heading", { name: "Purchases and account changes are unavailable" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Open my Mock Provider mailbox" })).toHaveCount(0);
   expect(requests).toContain("/api/v1/customer/business-history");
-  expect(requests.filter((path) => path === "/api/v1/orders")).toEqual([]);
+  expect(requests).toContain("/api/v1/orders");
 });
 
 test("user restriction unmounts customer history without issuing its request", async ({ page }) => {
@@ -553,20 +626,36 @@ test("changing Client Account clears old history before the new request and igno
   const viewerA = {
     ...mockViewer({ email: "account-a@example.invalid" }),
     clientAccountId: accountAId,
+    accountContextVersion: "1",
+    context: {
+      clientAccountId: accountAId,
+      name: "Account A saved facts",
+      role: "owner" as const,
+      permissions: ["*"],
+      capabilities: ownerCapabilities,
+      version: "1",
+    },
   };
   const viewerB = {
     ...mockViewer({ email: "account-b@example.invalid" }),
     clientAccountId: accountBId,
+    accountContextVersion: "2",
+    context: {
+      clientAccountId: accountBId,
+      name: "Account B saved facts",
+      role: "owner" as const,
+      permissions: ["*"],
+      capabilities: ownerCapabilities,
+      version: "2",
+    },
   };
   let serveViewerB = false;
   let delayNextAccountAHistory = false;
-  let releaseVerification!: () => void;
   let releaseLateAccountA!: () => void;
   let releaseAccountB!: () => void;
   let markLateAccountAStarted!: () => void;
   let markLateAccountAFulfilled!: () => void;
   let markAccountBStarted!: () => void;
-  const verificationGate = new Promise<void>((resolve) => { releaseVerification = resolve; });
   const lateAccountAGate = new Promise<void>((resolve) => { releaseLateAccountA = resolve; });
   const accountBGate = new Promise<void>((resolve) => { releaseAccountB = resolve; });
   const lateAccountAStarted = new Promise<void>((resolve) => { markLateAccountAStarted = resolve; });
@@ -589,13 +678,45 @@ test("changing Client Account clears old history before the new request and igno
   await installMockApi(page, viewerA, {
     intercept: async (path, route) => {
       if (path === "/api/v1/auth/me") {
-        await route.fulfill({ json: serveViewerB ? viewerB : viewerA });
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": serveViewerB ? "2" : "1",
+            "X-OSS-Client-Account-Id": serveViewerB ? accountBId : accountAId,
+          },
+          json: serveViewerB ? viewerB : viewerA,
+        });
         return true;
       }
-      if (path === "/api/v1/auth/verify-email") {
-        await verificationGate;
+      if (path === "/api/v1/auth/account-contexts") {
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": serveViewerB ? "2" : "1",
+            "X-OSS-Client-Account-Id": serveViewerB ? accountBId : accountAId,
+          },
+          json: {
+            activeClientAccountId: serveViewerB ? accountBId : accountAId,
+            accountContextVersion: serveViewerB ? "2" : "1",
+            items: [
+              { clientAccountId: accountAId, name: "Account A saved facts", role: "owner", permissions: ["*"], restrictions: { membership: false, clientAccount: false } },
+              { clientAccountId: accountBId, name: "Account B saved facts", role: "owner", permissions: ["*"], restrictions: { membership: false, clientAccount: false } },
+            ],
+            limit: 25,
+            hasMore: false,
+            nextCursor: null,
+          },
+        });
+        return true;
+      }
+      if (path === "/api/v1/auth/account-context" && route.request().method() === "PUT") {
+        expect(route.request().headers()["x-oss-account-context-version"]).toBe("1");
         serveViewerB = true;
-        await route.fulfill({ json: { status: "verified" } });
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": "2",
+            "X-OSS-Client-Account-Id": accountBId,
+          },
+          json: { context: { ...viewerB.context, restrictions: { clientAccount: false } } },
+        });
         return true;
       }
       if (path === `/api/v1/customer/invoices/${invoiceAId}`) {
@@ -617,22 +738,31 @@ test("changing Client Account clears old history before the new request and igno
         delayNextAccountAHistory = false;
         markLateAccountAStarted();
         await lateAccountAGate;
-        await route.fulfill({ json: historyPayload(accountAId, "Late Account A facts") });
+        await route.fulfill({
+          headers: { "X-OSS-Account-Context-Version": "1", "X-OSS-Client-Account-Id": accountAId },
+          json: historyPayload(accountAId, "Late Account A facts"),
+        });
         markLateAccountAFulfilled();
         return true;
       }
       if (serveViewerB) {
         markAccountBStarted();
         await accountBGate;
-        await route.fulfill({ json: historyPayload(accountBId, "Account B saved facts") });
+        await route.fulfill({
+          headers: { "X-OSS-Account-Context-Version": "2", "X-OSS-Client-Account-Id": accountBId },
+          json: historyPayload(accountBId, "Account B saved facts"),
+        });
         return true;
       }
-      await route.fulfill({ json: historyPayload(accountAId, "Account A saved facts") });
+      await route.fulfill({
+        headers: { "X-OSS-Account-Context-Version": "1", "X-OSS-Client-Account-Id": accountAId },
+        json: historyPayload(accountAId, "Account A saved facts"),
+      });
       return true;
     },
   });
 
-  await page.goto("/customer?token=switch-account-context");
+  await page.goto("/customer");
   await expect(page.getByTestId("history-account")).toContainText("Account A saved facts");
   await page.getByTestId("history-invoice").click();
   await expect(page.getByTestId("customer-history-detail")).toContainText("Invoice detail");
@@ -641,9 +771,10 @@ test("changing Client Account clears old history before the new request and igno
   await page.getByTestId("customer-business-history").getByRole("button", { name: "Refresh history" }).click();
   await lateAccountAStarted;
 
-  releaseVerification();
+  const switcher = page.getByTestId("account-context-switcher");
+  await switcher.getByLabel("Active Client Account").selectOption(accountBId);
+  await switcher.getByRole("button", { name: "Switch account" }).click();
   await accountBStarted;
-  await expect(page.getByText("Account A saved facts")).toHaveCount(0);
   await expect(page.getByTestId("history-account")).toHaveCount(0);
   await expect(page.getByTestId("customer-history-detail")).toHaveCount(0);
   await expect(page).not.toHaveURL(/invoice=|service=/);
@@ -989,7 +1120,7 @@ test("Account 360 requests only the panels granted to Staff", async ({ page }) =
   await workspace.getByTestId("account360-search-results").getByRole("button", { name: /Synthetic 360 account/ }).click();
   await expect(workspace.getByRole("heading", { name: "Account identity, verification and restrictions" })).toBeVisible();
   await expect(workspace.getByText("Founder owner@example.invalid", { exact: true })).toBeVisible();
-  await expect(workspace.getByTestId("account360-contacts-gap")).toContainText("Contacts are not represented by Schema 018");
+  await expect(workspace.locator('section[aria-label="Account Contacts"]')).toHaveCount(0);
   await expect(workspace.getByTestId("account360-billing")).toContainText("$1.25");
   await expect(workspace.locator('section[aria-label="Account renewals"]')).toBeVisible();
   await expect(workspace.locator('section[aria-label="Account orders"]')).toHaveCount(0);
@@ -1394,7 +1525,7 @@ test("delayed customer completion cannot leak notice or DOM after navigating Hom
   releaseResponse();
   await responseFulfilled;
   await page.waitForTimeout(50);
-  await expect(page.locator(".notice")).toHaveCount(0);
+  await expect(page.getByText("Support ticket created.", { exact: true })).toHaveCount(0);
   await expect(page.locator('section[aria-label="Customer support tickets"]')).toHaveCount(0);
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
@@ -1485,7 +1616,7 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
   releaseResponse();
   await responseFulfilled;
   await page.waitForTimeout(50);
-  await expect(page.locator(".notice")).toHaveCount(0);
+  await expect(page.getByText("Public reply sent.", { exact: true })).toHaveCount(0);
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
   expect(requests.filter((path) => path === "/api/v1/admin/tickets").length).toBe(

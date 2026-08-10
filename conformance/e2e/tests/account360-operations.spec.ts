@@ -56,11 +56,13 @@ function viewer(permissions: string[]) {
     id: "00000000-0000-4000-8000-000000000499",
     email: "operation-staff@example.invalid",
     locale: "en",
-    clientAccountId: "00000000-0000-4000-8000-000000000498",
-    membershipRole: "support",
+    clientAccountId: null,
+    membershipRole: null,
+    accountContextVersion: "0",
+    context: null,
     verification: { email: "passed" },
     restrictions: { user: false, clientAccount: false },
-    eligible: true,
+    eligible: false,
     staff: { roles: ["support"], permissions },
   };
 }
@@ -670,11 +672,23 @@ async function installApi(
     }
     if (interceptor && await interceptor(path, route)) return;
     if (path === "/api/v1/auth/me") {
-      await route.fulfill({ json: viewer(permissions) });
+      await route.fulfill({
+        headers: { "X-OSS-Account-Context-Version": "0" },
+        json: viewer(permissions),
+      });
       return;
     }
     if (path === "/api/v1/auth/login") {
-      await route.fulfill({ json: {} });
+      await route.fulfill({
+        status: 409,
+        headers: { "X-OSS-Account-Context-Version": "0" },
+        json: {
+          error: "Select a Client Account for customer work",
+          code: "ACCOUNT_CONTEXT_REQUIRED",
+          context: null,
+          requiresAccountContext: true,
+        },
+      });
       return;
     }
     if (path === "/api/v1/auth/logout") {
@@ -2407,7 +2421,7 @@ test("changing Staff principal clears context and rejects the prior principal qu
   await expect(page.getByText("Manual service 01", { exact: true })).toHaveCount(0);
 });
 
-for (const statusChange of ["ineligible", "inactive"] as const) {
+for (const statusChange of ["user-restricted", "inactive"] as const) {
   test(`changing Staff to ${statusChange} invalidates the pending operation queue`, async ({ page }) => {
     let accessChanged = false;
     let releaseQueue!: () => void;
@@ -2425,7 +2439,10 @@ for (const statusChange of ["ineligible", "inactive"] as const) {
             json: accessChanged
               ? {
                   ...currentViewer,
-                  eligible: statusChange === "ineligible" ? false : currentViewer.eligible,
+                  eligible: statusChange === "user-restricted" ? false : currentViewer.eligible,
+                  restrictions: statusChange === "user-restricted"
+                    ? { ...currentViewer.restrictions, user: true }
+                    : currentViewer.restrictions,
                   staff: statusChange === "inactive" ? null : currentViewer.staff,
                 }
               : currentViewer,

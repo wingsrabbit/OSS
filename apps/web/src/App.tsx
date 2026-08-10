@@ -19,7 +19,16 @@ import {
   AdminAccount360,
   type AdminAccountAction,
 } from "./AdminAccount360.js";
-import { ApiError, api, hardResetSession } from "./api.js";
+import { AccountAccessPanel } from "./AccountAccessPanel.js";
+import { AccountContextSwitcher, type MembershipRole } from "./AccountContextSwitcher.js";
+import {
+  ApiError,
+  ObsoleteSessionResponseError,
+  api,
+  getAccountContextSnapshot,
+  hardResetSession,
+  subscribeAccountContextInvalidation,
+} from "./api.js";
 import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
 import { TicketsPanel } from "./TicketsPanel.js";
 
@@ -29,6 +38,7 @@ type AppRoute = "/" | "/customer" | "/admin";
 function routeFromPath(pathname: string): AppRoute {
   const normalized = pathname.replace(/\/+$/, "") || "/";
   if (normalized === "/customer" || normalized === "/admin") return normalized;
+  if (normalized === "/membership-invitations/accept") return "/customer";
   return "/";
 }
 
@@ -50,8 +60,17 @@ type Me = {
   id: string;
   email: string;
   locale: Locale;
-  clientAccountId: string;
-  membershipRole: string;
+  clientAccountId: string | null;
+  membershipRole: MembershipRole | null;
+  accountContextVersion: string;
+  context: {
+    clientAccountId: string;
+    name: string;
+    role: MembershipRole;
+    permissions: string[];
+    capabilities: string[];
+    version: string;
+  } | null;
   verification: { email: "pending" | "passed" };
   restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
@@ -72,6 +91,7 @@ function parseStaffPermissions(value: unknown): ReadonlySet<string> {
   }
   return new Set(value);
 }
+
 type Price = {
   id: string;
   currency: string;
@@ -778,7 +798,21 @@ export function App() {
   const [products, setProducts] = useState<Product[]>([]);
   const [legal, setLegal] = useState<Legal | null>(null);
   const [me, setMe] = useState<Me | null>(null);
+  const meRef = useRef<Me | null>(null);
+  meRef.current = me;
+  const meRequestGeneration = useRef(0);
   const [sessionResolved, setSessionResolved] = useState(false);
+  const [membershipInvitationToken, setMembershipInvitationToken] = useState<string | null>(() => {
+    const path = window.location.pathname.replace(/\/+$/, "") || "/";
+    if (path !== "/membership-invitations/accept") return null;
+    return new URLSearchParams(window.location.search).get("token");
+  });
+  const invitationAcceptGeneration = useRef(0);
+  const invitationAccepting = useRef(false);
+  const [invitationAcceptPending, setInvitationAcceptPending] = useState(false);
+  const [invitationAcceptError, setInvitationAcceptError] = useState("");
+  const [invitationRetryNonce, setInvitationRetryNonce] = useState(0);
+  const [acceptedInvitationAccountId, setAcceptedInvitationAccountId] = useState<string | null>(null);
   const [selected, setSelected] = useState<{ product: Product; price: Price } | null>(null);
   const [order, setOrder] = useState<OrderDetail | null>(null);
   const [notice, setNoticeRaw] = useState<string>("");
@@ -948,9 +982,11 @@ export function App() {
   );
   const staffPermissionFingerprint = [...staffPermissions].sort().join("\u0000");
   const staffMembershipActive = me?.staff !== null && me?.staff !== undefined;
+  const staffIdentityEligible =
+    me?.verification.email === "passed" && me.restrictions.user === false;
   const staffPrincipalFingerprint = [
     me?.id ?? "",
-    me?.eligible === true ? "eligible" : "ineligible",
+    staffIdentityEligible ? "eligible" : "ineligible",
     staffMembershipActive ? "active" : "inactive",
   ].join("\u0001");
   const staffAccessFingerprint = [
@@ -961,9 +997,26 @@ export function App() {
   staffAccessFingerprintRef.current = staffAccessFingerprint;
   const previousStaffAccessFingerprint = useRef(staffAccessFingerprint);
   const previousStaffPrincipalFingerprint = useRef(staffPrincipalFingerprint);
-  const canReadCustomerHistory =
-    me?.verification.email === "passed" && me.restrictions.user === false;
-  const eligibleStaff = me?.eligible === true && staffMembershipActive;
+  const canReadCustomerAccount =
+    me?.verification.email === "passed" &&
+    me.restrictions.user === false &&
+    me.clientAccountId !== null &&
+    me.clientAccountId !== undefined;
+  // A Client Account restriction blocks commerce and money mutations, but it
+  // must never cut off the verified User's support lifeline.
+  const accountCapabilities = new Set(me?.context?.capabilities ?? []);
+  const accountPermissionGranted = (permission: string) => accountCapabilities.has(permission);
+  const canReadCustomerHistory = canReadCustomerAccount;
+  const canUseCustomerSupport = canReadCustomerAccount;
+  const canWriteCustomerSupport =
+    canUseCustomerSupport && accountPermissionGranted("support.tickets.write");
+  const canCreateOrders =
+    me?.eligible === true && accountPermissionGranted("orders.create");
+  const canWriteBilling =
+    me?.eligible === true && accountPermissionGranted("billing.write");
+  const canManageServices =
+    me?.eligible === true && accountPermissionGranted("services.manage");
+  const eligibleStaff = staffIdentityEligible && staffMembershipActive;
   const canManageStaffTickets =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
@@ -1025,6 +1078,13 @@ export function App() {
   );
 
   const clearWorkspaceTransientState = useCallback(() => {
+    const location = new URL(window.location.href);
+    const hadCustomerDetail = location.searchParams.has("invoice") || location.searchParams.has("service");
+    location.searchParams.delete("invoice");
+    location.searchParams.delete("service");
+    if (hadCustomerDetail) {
+      window.history.replaceState({}, "", `${location.pathname}${location.search}${location.hash}`);
+    }
     setNoticeRaw("");
     setErrorRaw("");
     setSelected(null);
@@ -1285,12 +1345,24 @@ export function App() {
   }, [clearWorkspaceTransientState]);
 
   const refreshMe = useCallback(async (): Promise<Me | null> => {
+    const generation = ++meRequestGeneration.current;
     try {
       const viewer = await api<Me>("/api/v1/auth/me");
+      const capturedContext = getAccountContextSnapshot();
+      if (
+        generation !== meRequestGeneration.current ||
+        (capturedContext.version !== null &&
+          (viewer.accountContextVersion !== capturedContext.version ||
+            viewer.clientAccountId !== capturedContext.clientAccountId))
+      ) {
+        return meRef.current;
+      }
       setMe(viewer);
       setSessionResolved(true);
       return viewer;
-    } catch {
+    } catch (caught) {
+      if (generation !== meRequestGeneration.current) return meRef.current;
+      if (caught instanceof ObsoleteSessionResponseError) return meRef.current;
       setMe(null);
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
@@ -1299,8 +1371,37 @@ export function App() {
     }
   }, []);
 
+  useEffect(() => subscribeAccountContextInvalidation(() => {
+    meRequestGeneration.current += 1;
+    invitationAcceptGeneration.current += 1;
+    invitationAccepting.current = false;
+    setInvitationAcceptPending(false);
+    routeGenerationRef.current += 1;
+    clearWorkspaceTransientState();
+    setMe(null);
+    setSessionResolved(false);
+    void refreshMe();
+  }), [clearWorkspaceTransientState, refreshMe]);
+
+  const accountContextSwitched = useCallback(async () => {
+    meRequestGeneration.current += 1;
+    invitationAcceptGeneration.current += 1;
+    routeGenerationRef.current += 1;
+    clearWorkspaceTransientState();
+    setMe(null);
+    setSessionResolved(false);
+    const viewer = await refreshMe();
+    if (viewer) {
+      setNoticeRaw(
+        locale === "zh-CN"
+          ? `当前客户账户：${viewer.context?.name ?? "未选择"}。`
+          : `Active Client Account: ${viewer.context?.name ?? "not selected"}.`,
+      );
+    }
+  }, [clearWorkspaceTransientState, locale, refreshMe]);
+
   const refreshLatestOrder = useCallback(async () => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setOrder(null);
       return;
     }
@@ -1311,21 +1412,21 @@ export function App() {
       return;
     }
     setOrder(await api<OrderDetail>(`/api/v1/orders/${latest.orderId}`));
-  }, [me?.clientAccountId, me?.eligible, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshBilling = useCallback(async () => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setBilling(null);
       return;
     }
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
-  }, [me, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshPaymentSettings = useCallback(async () => {
     if (
       route !== "/customer" ||
       activeRouteRef.current !== "/customer" ||
-      me?.verification.email !== "passed"
+      !canReadCustomerHistory
     ) {
       setPaymentSettings(null);
       return;
@@ -1333,17 +1434,17 @@ export function App() {
     setPaymentSettings(
       await api<PaymentSettings>("/api/v1/billing/payment-settings"),
     );
-  }, [me?.clientAccountId, me?.verification.email, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setRenewals([]);
       return [];
     }
     const result = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
     setRenewals(result.items);
     return result.items;
-  }, [me?.eligible, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshAdminRenewals = useCallback(async (
     expectedScope?: AdminOperationScope,
@@ -1373,14 +1474,14 @@ export function App() {
   ]);
 
   const refreshChargebackStatus = useCallback(async () => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setChargebackStatus(null);
       return;
     }
     setChargebackStatus(
       await api<ChargebackStatus>("/api/v1/billing/chargeback-status"),
     );
-  }, [me, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   useEffect(() => {
     void Promise.all([
@@ -1644,7 +1745,7 @@ export function App() {
   useEffect(() => {
     if (
       route !== "/customer" ||
-      !me?.eligible ||
+      !canWriteBilling ||
       !billing?.addFunds.enabled ||
       !billing.addFunds.allowed ||
       !/^[1-9]\d*$/.test(addFundsPrincipalMinor)
@@ -1683,7 +1784,7 @@ export function App() {
     billing?.addFunds.maximumMinor,
     billing?.addFunds.minimumMinor,
     billing?.creditBalanceMinor,
-    me?.eligible,
+    canWriteBilling,
     route,
   ]);
 
@@ -1717,7 +1818,7 @@ export function App() {
   }, [addFundsCommand, refreshBilling, route]);
 
   useEffect(() => {
-    if (route !== "/customer" || !order || order.invoice.status === "paid" || !me?.eligible) {
+    if (route !== "/customer" || !order || order.invoice.status === "paid" || !canWriteBilling) {
       setPaymentQuote(null);
       return;
     }
@@ -1730,9 +1831,11 @@ export function App() {
         setPaymentQuote(null);
         setError(caught instanceof Error ? caught.message : "Payment quote is unavailable");
       });
-  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod, route]);
+  }, [applyCredit, billing?.creditBalanceMinor, canWriteBilling, order?.invoice.id, order?.invoice.status, paymentMethod, route]);
 
   useEffect(() => {
+    const path = window.location.pathname.replace(/\/+$/, "") || "/";
+    if (path !== "/verify") return;
     const token = new URLSearchParams(window.location.search).get("token");
     if (!token) return;
     void api<{ status: string }>("/api/v1/auth/verify-email", {
@@ -1749,6 +1852,83 @@ export function App() {
         setError(caught instanceof Error ? caught.message : "Verification failed"),
       );
   }, [openRoute, refreshMe, setError]);
+
+  useEffect(() => {
+    if (
+      !membershipInvitationToken ||
+      !sessionResolved ||
+      !me ||
+      me.verification.email !== "passed" ||
+      me.restrictions.user ||
+      invitationAccepting.current ||
+      (window.location.pathname.replace(/\/+$/, "") || "/") !==
+        "/membership-invitations/accept"
+    ) return;
+    const token = membershipInvitationToken;
+    const generation = ++invitationAcceptGeneration.current;
+    invitationAccepting.current = true;
+    setInvitationAcceptPending(true);
+    setInvitationAcceptError("");
+    const acceptOrResume = acceptedInvitationAccountId === null
+      ? api<{ membership: { clientAccountId: string } }>(
+          "/api/v1/membership-invitations/accept",
+          { method: "POST", body: JSON.stringify({ token }) },
+        ).then((result) => {
+          if (generation !== invitationAcceptGeneration.current) return null;
+          setAcceptedInvitationAccountId(result.membership.clientAccountId);
+          return result.membership.clientAccountId;
+        })
+      : Promise.resolve(acceptedInvitationAccountId);
+    void acceptOrResume
+      .then(async (clientAccountId) => {
+        if (!clientAccountId || generation !== invitationAcceptGeneration.current) return;
+        await api("/api/v1/auth/account-context", {
+          method: "PUT",
+          body: JSON.stringify({ clientAccountId }),
+        });
+        if (generation !== invitationAcceptGeneration.current) return;
+        setMembershipInvitationToken(null);
+        setAcceptedInvitationAccountId(null);
+        setInvitationAcceptPending(false);
+        setInvitationAcceptError("");
+        window.history.replaceState({}, "", "/customer");
+        activeRouteRef.current = "/customer";
+        routeGenerationRef.current += 1;
+        meRequestGeneration.current += 1;
+        clearWorkspaceTransientState();
+        setMe(null);
+        setSessionResolved(false);
+        await refreshMe();
+        if (generation !== invitationAcceptGeneration.current) return;
+        setNoticeRaw(
+          locale === "zh-CN"
+            ? "成员邀请已接受，并已切换到受邀客户账户。"
+            : "Membership invitation accepted and the invited Client Account is now active.",
+        );
+      })
+      .catch((caught: unknown) => {
+        if (generation !== invitationAcceptGeneration.current) return;
+        setInvitationAcceptPending(false);
+        setInvitationAcceptError(
+          caught instanceof Error ? caught.message : "Membership invitation could not be accepted",
+        );
+      })
+      .finally(() => {
+        if (generation === invitationAcceptGeneration.current) {
+          invitationAccepting.current = false;
+          setInvitationAcceptPending(false);
+        }
+      });
+  }, [
+    clearWorkspaceTransientState,
+    acceptedInvitationAccountId,
+    me,
+    membershipInvitationToken,
+    refreshMe,
+    invitationRetryNonce,
+    locale,
+    sessionResolved,
+  ]);
 
   useEffect(() => {
     if (
@@ -2138,33 +2318,123 @@ export function App() {
     }
   }
 
+  async function registerInvitationIdentity(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!membershipInvitationToken) return;
+    setError("");
+    const data = new FormData(event.currentTarget);
+    try {
+      await api("/api/v1/auth/invitation-registrations", {
+        method: "POST",
+        body: JSON.stringify({
+          token: membershipInvitationToken,
+          email: data.get("email"),
+          password: data.get("password"),
+          locale,
+        }),
+      });
+      setNotice(
+        locale === "zh-CN"
+          ? "受邀用户身份已创建，未创建客户账户。请登录并在 Mock Provider 邮箱完成验证。"
+          : "Invited User identity created without a Client Account. Sign in and verify it in the Mock Provider mailbox.",
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : locale === "zh-CN" ? "无法创建受邀用户身份" : "Invited User registration failed");
+    }
+  }
+
+  async function verifyInvitationIdentity(
+    event: ReactMouseEvent<HTMLAnchorElement>,
+    verificationUrl: string,
+  ) {
+    if (!membershipInvitationToken) return;
+    event.preventDefault();
+    setError("");
+    let verificationToken: string | null = null;
+    try {
+      const target = new URL(verificationUrl, window.location.origin);
+      if (target.pathname.replace(/\/+$/, "") !== "/verify") {
+        throw new Error(locale === "zh-CN" ? "验证链接无效" : "The verification link is invalid");
+      }
+      verificationToken = target.searchParams.get("token");
+      if (!verificationToken) {
+        throw new Error(locale === "zh-CN" ? "验证链接缺少令牌" : "The verification link has no token");
+      }
+      const result = await api<{ status: string }>("/api/v1/auth/verify-email", {
+        method: "POST",
+        body: JSON.stringify({ token: verificationToken }),
+      });
+      await refreshMe();
+      setNoticeRaw(
+        locale === "zh-CN"
+          ? `邮箱验证：${result.status === "already_verified" ? "已验证" : result.status}。正在继续接受成员邀请…`
+          : `Email verification: ${result.status === "already_verified" ? "verified" : result.status}. Continuing the membership invitation…`,
+      );
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : locale === "zh-CN"
+            ? "邮箱验证失败"
+            : "Email verification failed",
+      );
+    } finally {
+      verificationToken = null;
+    }
+  }
+
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
     const data = new FormData(event.currentTarget);
     try {
-      await api("/api/v1/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
-      });
+      let requiresAccountContext = false;
+      try {
+        await api("/api/v1/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
+        });
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.code === "ACCOUNT_CONTEXT_REQUIRED") {
+          // Login deliberately returns 409 after setting the session cookie
+          // when zero, multiple or restricted memberships need an explicit
+          // context choice. Resolve that authenticated identity normally.
+          requiresAccountContext = true;
+        } else {
+          throw caught;
+        }
+      }
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
       const viewer = await refreshMe();
       const viewerPermissions = parseStaffPermissions(viewer?.staff?.permissions);
       const viewerCanOpenAdmin =
-        viewer?.eligible === true &&
+        viewer?.verification.email === "passed" &&
+        viewer.restrictions.user === false &&
         viewer.staff !== null &&
+        viewer.staff !== undefined &&
         (viewerPermissions.has("*") ||
           viewerPermissions.has("accounts.view") ||
           viewerPermissions.has("billing.manual_receipt_manage") ||
           viewerPermissions.has("billing.refund_manage") ||
           viewerPermissions.has("services.manual_fulfillment") ||
           viewerPermissions.has("support.tickets.manage"));
-      const target = route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer";
+      const target = route === "/"
+        ? viewerCanOpenAdmin ? "/admin" : "/customer"
+        : route;
+      if (membershipInvitationToken) {
+        setSessionResolved(true);
+        setNoticeRaw(locale === "zh-CN" ? "已登录，正在检查成员邀请…" : "Signed in. Checking the membership invitation…");
+        return;
+      }
       const staysOnResolvedRoute = route === target;
       openRoute(target);
       if (staysOnResolvedRoute) setSessionResolved(true);
-      setNoticeRaw("Signed in.");
+      setNoticeRaw(
+        requiresAccountContext
+          ? locale === "zh-CN" ? "已登录。请选择当前客户账户后继续。" : "Signed in. Select an active Client Account to continue."
+          : locale === "zh-CN" ? "已登录。" : "Signed in.",
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
     }
@@ -2181,7 +2451,7 @@ export function App() {
   }
 
   async function createOrder() {
-    if (!selected || !legal) return;
+    if (!selected || !legal || !canCreateOrders) return;
     setError("");
     try {
       const configuration =
@@ -2204,7 +2474,7 @@ export function App() {
   }
 
   async function startPayment() {
-    if (!order) return;
+    if (!order || !canWriteBilling) return;
     setError("");
     try {
       if (savePaymentMethod || enableAutomaticRenewal) {
@@ -2408,7 +2678,7 @@ export function App() {
   }
 
   async function scheduleServiceCancellation() {
-    if (!order || cancellationPending) return;
+    if (!order || !canManageServices || cancellationPending) return;
     const reason = cancellationReason.trim();
     const requestIdentity = JSON.stringify({
       serviceId: order.service.id,
@@ -2457,7 +2727,26 @@ export function App() {
   }
 
   async function startRenewalPayment(renewal: RenewalItem) {
-    if (renewal.status === "paid" || renewalPaymentPendingId) return;
+    if (renewal.status === "paid" || renewalPaymentPendingId || !canWriteBilling || !me) return;
+    const operationScope = {
+      routeGeneration: routeGenerationRef.current,
+      viewerId: me.id,
+      accountId: me.clientAccountId,
+      contextVersion: me.accountContextVersion,
+    };
+    const paymentRequestIsCurrent = () => {
+      const current = meRef.current;
+      return (
+        activeRouteRef.current === "/customer" &&
+        routeGenerationRef.current === operationScope.routeGeneration &&
+        current?.id === operationScope.viewerId &&
+        current.clientAccountId === operationScope.accountId &&
+        current.accountContextVersion === operationScope.contextVersion &&
+        current.eligible === true &&
+        (current.context?.capabilities ?? []).includes("billing.write")
+      );
+    };
+    if (!paymentRequestIsCurrent()) return;
     setError("");
     setRenewalPaymentPendingId(renewal.renewalId);
     let paymentStarted = false;
@@ -2469,6 +2758,7 @@ export function App() {
           body: JSON.stringify({ paymentMethod, applyCredit }),
         },
       );
+      if (!paymentRequestIsCurrent()) return;
       await api(`/api/v1/invoices/${renewal.invoiceId}/payments`, {
         method: "POST",
         body: JSON.stringify({
@@ -2477,19 +2767,26 @@ export function App() {
           idempotencyKey: newIdempotencyKey(),
         }),
       });
+      if (!paymentRequestIsCurrent()) return;
       paymentStarted = true;
       setNotice(
         "Mock renewal payment started. The service term changes only after real allocations fully settle the invoice.",
       );
       for (let poll = 0; poll < 12; poll += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 500));
-        const current = await refreshRenewals();
-        if (current.find((item) => item.renewalId === renewal.renewalId)?.status === "paid") {
+        if (!paymentRequestIsCurrent()) return;
+        const current = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
+        if (!paymentRequestIsCurrent()) return;
+        setRenewals(current.items);
+        if (current.items.find((item) => item.renewalId === renewal.renewalId)?.status === "paid") {
           break;
         }
       }
-      await Promise.all([refreshBilling(), refreshAdminRenewals()]);
+      const refreshedBilling = await api<BillingSummary>("/api/v1/billing/summary");
+      if (!paymentRequestIsCurrent()) return;
+      setBilling(refreshedBilling);
     } catch (caught) {
+      if (!paymentRequestIsCurrent()) return;
       setError(
         paymentStarted
           ? "The payment was accepted, but its current status could not be refreshed. Check the renewal again before retrying."
@@ -2498,7 +2795,7 @@ export function App() {
             : "Renewal payment could not start",
       );
     } finally {
-      setRenewalPaymentPendingId(null);
+      if (paymentRequestIsCurrent()) setRenewalPaymentPendingId(null);
     }
   }
 
@@ -2740,7 +3037,7 @@ export function App() {
   }
 
   async function startAddFunds() {
-    if (!addFundsQuote) return;
+    if (!addFundsQuote || !canWriteBilling) return;
     setError("");
     try {
       const created = await api<{
@@ -3985,6 +4282,39 @@ export function App() {
           </div>
         )}
 
+        {route === "/customer" && membershipInvitationToken && (
+          <section className="route-access" aria-label="Membership invitation acceptance" data-testid="membership-invitation-acceptance">
+            <p className="eyebrow">{locale === "zh-CN" ? "客户账户成员邀请" : "Client Account membership invitation"}</p>
+            <h2>
+              {!me
+                ? locale === "zh-CN" ? "使用受邀邮箱登录" : "Sign in with the invited email"
+                : invitationAcceptPending
+                  ? locale === "zh-CN" ? "正在接受邀请…" : "Accepting the invitation…"
+                  : invitationAcceptError
+                    ? locale === "zh-CN" ? "邀请尚未接受" : "The invitation was not accepted"
+                    : locale === "zh-CN" ? "正在检查邀请…" : "Checking this invitation…"}
+            </h2>
+            <p>
+              {!me
+                ? locale === "zh-CN"
+                  ? "邀请令牌只保留在当前页面；请在下方登录，它不会复制到本地存储或日志。"
+                  : "The invitation stays in this page only. Sign in below; it is never copied to local storage or logs."
+                : invitationAcceptError || (locale === "zh-CN"
+                  ? "未经明确选择，新成员关系不会替换当前客户账户。"
+                  : "The new membership will not replace your active Client Account without an explicit selection.")}
+            </p>
+            {me && invitationAcceptError && (
+              <button
+                className="primary"
+                disabled={invitationAcceptPending}
+                onClick={() => setInvitationRetryNonce((value) => value + 1)}
+              >
+                {locale === "zh-CN" ? "重试接受邀请" : "Retry invitation acceptance"}
+              </button>
+            )}
+          </section>
+        )}
+
         {route === "/" && (
           <section className="account-grid" data-testid="public-access">
             <div className="panel">
@@ -4057,9 +4387,13 @@ export function App() {
                         ? locale === "zh-CN"
                           ? "当前用户已受限。"
                           : "This user is restricted."
-                        : locale === "zh-CN"
-                          ? "客户账户已受限；已保存的业务历史仍可读取。"
-                          : "The Client Account is restricted; saved business history remains readable."}
+                        : !me.clientAccountId
+                          ? locale === "zh-CN"
+                            ? "请选择当前客户账户后继续。"
+                            : "Select the active Client Account to continue."
+                          : locale === "zh-CN"
+                            ? "客户账户已受限；已保存的业务历史仍可读取。"
+                            : "The Client Account is restricted; saved business history remains readable."}
                 </p>
                 <div className="status-row">
                   <span>Email verification</span>
@@ -4071,14 +4405,38 @@ export function App() {
                       Open my Mock Provider mailbox
                     </button>
                     {mail.map((message) => {
-                      const verificationUrl = message.body.match(/https?:\/\/\S+/)?.[0];
+                      const messageUrl = message.body.match(/https?:\/\/\S+/)?.[0];
+                      let verificationUrl: string | null = null;
+                      let isMembershipInvitation = false;
+                      if (messageUrl) {
+                        try {
+                          const parsed = new URL(messageUrl, window.location.origin);
+                          const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+                          if (pathname === "/verify") verificationUrl = messageUrl;
+                          isMembershipInvitation = pathname === "/membership-invitations/accept";
+                        } catch {
+                          // Malformed Mock Provider links remain inert message facts.
+                        }
+                      }
                       return (
                         <div className="mock-message" key={message.id}>
                           <strong>{message.subject}</strong>
                           <span>
                             {message.status} · {new Date(message.deliveredAt).toLocaleString()}
                           </span>
-                          {verificationUrl && <a href={verificationUrl}>Use one-time verification link</a>}
+                          {verificationUrl && (
+                            <a
+                              href={verificationUrl}
+                              onClick={(event) => void verifyInvitationIdentity(event, verificationUrl)}
+                            >
+                              {locale === "zh-CN" ? "使用一次性验证链接" : "Use one-time verification link"}
+                            </a>
+                          )}
+                          {isMembershipInvitation && (
+                            <span className="muted">
+                              {locale === "zh-CN" ? "当前成员邀请链接（无需重复打开）" : "Current membership invitation link (already open)"}
+                            </span>
+                          )}
                         </div>
                       );
                     })}
@@ -4087,21 +4445,48 @@ export function App() {
               </>
             ) : (
               <div className="form-columns">
-                <form onSubmit={register}>
-                  <h3>{text.register}</h3>
-                  <input name="clientName" placeholder="Client account name" required />
-                  <input name="email" type="email" placeholder="Email" required />
-                  <input
-                    name="password"
-                    type="password"
-                    minLength={12}
-                    placeholder="Password (12+ characters)"
-                    required
-                  />
-                  <button className="primary" type="submit">
-                    {text.register}
-                  </button>
-                </form>
+                {membershipInvitationToken ? (
+                  <form onSubmit={registerInvitationIdentity} data-testid="invitation-registration-form">
+                    <h3>{locale === "zh-CN" ? "创建受邀用户身份" : "Create invited User identity"}</h3>
+                    <p className="muted">
+                      {locale === "zh-CN"
+                        ? "此流程只创建用户身份，不会创建无关的客户账户。"
+                        : "This creates only your User identity and no unrelated Client Account."}
+                    </p>
+                    <input
+                      name="email"
+                      type="email"
+                      placeholder={locale === "zh-CN" ? "受邀邮箱" : "Invited email"}
+                      required
+                    />
+                    <input
+                      name="password"
+                      type="password"
+                      minLength={12}
+                      placeholder={locale === "zh-CN" ? "密码（至少12个字符）" : "Password (12+ characters)"}
+                      required
+                    />
+                    <button className="primary" type="submit">
+                      {locale === "zh-CN" ? "创建受邀用户身份" : "Create invited identity"}
+                    </button>
+                  </form>
+                ) : (
+                  <form onSubmit={register}>
+                    <h3>{text.register}</h3>
+                    <input name="clientName" placeholder="Client account name" required />
+                    <input name="email" type="email" placeholder="Email" required />
+                    <input
+                      name="password"
+                      type="password"
+                      minLength={12}
+                      placeholder="Password (12+ characters)"
+                      required
+                    />
+                    <button className="primary" type="submit">
+                      {text.register}
+                    </button>
+                  </form>
+                )}
                 <form onSubmit={login}>
                   <h3>{text.login}</h3>
                   <input name="email" type="email" placeholder="Email" required />
@@ -4116,6 +4501,34 @@ export function App() {
         </section>
         )}
 
+        {route === "/customer" &&
+          sessionResolved &&
+          me &&
+          me.verification.email === "passed" &&
+          !me.restrictions.user &&
+          typeof me.accountContextVersion === "string" && (
+          <AccountContextSwitcher
+            active={route === "/customer"}
+            viewerId={me.id}
+            activeClientAccountId={me.clientAccountId}
+            activeContext={me.context ? {
+              clientAccountId: me.context.clientAccountId,
+              name: me.context.name,
+              role: me.context.role,
+              permissions: me.context.permissions,
+              capabilities: me.context.capabilities ?? [],
+              restrictions: {
+                membership: false,
+                clientAccount: me.restrictions.clientAccount,
+              },
+            } : null}
+            accountContextVersion={me.accountContextVersion}
+            locale={locale}
+            onSwitched={accountContextSwitched}
+            onError={showTicketError}
+          />
+        )}
+
         {route === "/customer" && !me?.eligible && (
           <section className="route-access" aria-label="Customer access status">
             <p className="eyebrow">Customer access</p>
@@ -4124,9 +4537,11 @@ export function App() {
                 ? "Sign in to open the customer workspace"
                 : me.verification.email !== "passed"
                   ? "Verify your email to continue"
-                  : me.restrictions.user
+                : me.restrictions.user
                     ? "This user is restricted"
-                    : "Purchases and account changes are unavailable"}
+                    : !me.clientAccountId
+                      ? "Select an active Client Account"
+                      : locale === "zh-CN" ? "购买与账户变更不可用" : "Purchases and account changes are unavailable"}
             </h2>
             <p>
               {!me
@@ -4135,7 +4550,11 @@ export function App() {
                   ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
                   : me.restrictions.user
                     ? "This user cannot open account history or perform customer actions while the user restriction remains active."
-                    : "The Client Account restriction prevents new purchases and customer actions, but its saved business history remains readable below."}
+                    : !me.clientAccountId
+                      ? "Choose an unrestricted membership above. No customer account data is loaded until that choice is explicit."
+                      : locale === "zh-CN"
+                        ? "客户账户限制会阻止商业、账单与账户变更；已保存历史和支持工单通道仍可继续使用。"
+                        : "The Client Account restriction prevents commerce, billing and account changes. Saved history and the support-ticket lifeline remain available below."}
             </p>
           </section>
         )}
@@ -4158,14 +4577,14 @@ export function App() {
             <h2>
               {!me
                 ? "Sign in required"
-                : !me.eligible
-                  ? "Access denied — eligible Staff account required"
+                : !staffIdentityEligible
+                  ? "Access denied — verified, unrestricted Staff User required"
                   : "Access denied — Staff permission required"}
             </h2>
             <p>
               {!me
                 ? "Sign in with an authorized Staff account. No administrative capability is shown to guests."
-                : !me.eligible
+                : !staffIdentityEligible
                   ? `${me.email} is not currently eligible. No administrative capability has been loaded on this page.`
                   : `${me.email} has no recognized Staff permission for this workspace. No administrative capability has been loaded.`}
             </p>
@@ -4190,6 +4609,7 @@ export function App() {
 
         {route === "/customer" && sessionResolved && canReadCustomerHistory && me && (
           <CustomerBusinessHistory
+            key={`${me.id}:${me.clientAccountId}:${me.accountContextVersion}`}
             active={route === "/customer"}
             canReadHistory={canReadCustomerHistory}
             clientAccountId={me.clientAccountId}
@@ -4199,11 +4619,29 @@ export function App() {
           />
         )}
 
+        {route === "/customer" && sessionResolved && canReadCustomerHistory && me?.context && (
+          <AccountAccessPanel
+            active={route === "/customer"}
+            viewerId={me.id}
+            accountId={me.context.clientAccountId}
+            accountName={me.context.name}
+            role={me.context.role}
+            capabilities={me.context.capabilities ?? []}
+            contextVersion={me.context.version}
+            writeEligible={me.eligible}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+            onSelfMembershipChanged={accountContextSwitched}
+          />
+        )}
+
         {route === "/admin" && sessionResolved && canViewAccount360 && me && (
           <AdminAccount360
             active={route === "/admin"}
             accessFingerprint={staffAccessFingerprint}
             permissions={staffPermissions}
+            locale={locale}
             availableActions={account360Actions}
             onAction={openAdminAccountAction}
             onSelectedAccountChange={selectedAdminAccountChanged}
@@ -4216,6 +4654,8 @@ export function App() {
         {route === "/customer" && (
           <TicketsPanel
             mode="customer"
+            canUseCustomerSupport={canUseCustomerSupport}
+            canWriteCustomerSupport={canWriteCustomerSupport}
             me={me}
             locale={locale}
             onNotice={showTicketNotice}
@@ -4328,7 +4768,7 @@ export function App() {
             </section>
           )}
 
-        {route === "/customer" && me?.eligible && paymentSettings && (
+        {route === "/customer" && canReadCustomerHistory && paymentSettings && (
           <section className="order-panel" aria-label="Payment methods and automatic renewal">
             <div>
               <p className="eyebrow">Customer billing · payment permissions</p>
@@ -4341,7 +4781,17 @@ export function App() {
                 background attempt; customer action or failure stops background charging.
               </p>
             </div>
-            {paymentSettingsReauthActive ? (
+            {!canWriteBilling ? (
+              <p className="notice" data-testid="payment-settings-read-only">
+                {locale === "zh-CN"
+                  ? me?.restrictions.clientAccount
+                    ? "客户账户当前受限；已保存的付款方式与自动续费状态仅供查看，不能更改。"
+                    : "当前成员权限仅允许查看付款方式与自动续费状态，不能更改。"
+                  : me?.restrictions.clientAccount
+                    ? "The Client Account is restricted. Saved payment methods and automatic-renewal status are read-only."
+                    : "This membership can view payment methods and automatic-renewal status but cannot change them."}
+              </p>
+            ) : paymentSettingsReauthActive ? (
               <p className="muted" data-testid="payment-settings-reauth-active">
                 Password confirmed until {new Date(paymentSettingsReauthExpiresAt!).toLocaleTimeString()}.
                 This fixed window does not extend when you make another change.
@@ -4390,7 +4840,7 @@ export function App() {
                       <span>
                         Saved with consent {method.consentVersion} at {new Date(method.savedAt).toLocaleString()}
                       </span>
-                      <div className="fund-actions">
+                      {canWriteBilling && <div className="fund-actions">
                         {!method.default && (
                           <button
                             disabled={paymentSettingsPending || !paymentSettingsReauthReady}
@@ -4417,7 +4867,7 @@ export function App() {
                                 : "Enable automatic renewal for current service"}
                             </button>
                           )}
-                      </div>
+                      </div>}
                     </article>
                   );
                 })}
@@ -4436,12 +4886,14 @@ export function App() {
                       Withdrawing this consent does not cancel the invoice payment; it only prevents a
                       late payment result from enabling future off-session charges.
                     </span>
-                    <button
-                      disabled={paymentSettingsPending || !paymentSettingsReauthReady}
-                      onClick={() => void revokePendingAutomaticRenewal(pending)}
-                    >
-                      Withdraw pending automatic-renewal consent
-                    </button>
+                    {canWriteBilling && (
+                      <button
+                        disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                        onClick={() => void revokePendingAutomaticRenewal(pending)}
+                      >
+                        Withdraw pending automatic-renewal consent
+                      </button>
+                    )}
                   </article>
                 ))}
               </div>
@@ -4472,7 +4924,7 @@ export function App() {
                           : ""}
                       </span>
                     )}
-                    {authorization.status === "active" && (
+                    {canWriteBilling && authorization.status === "active" && (
                       <button
                         disabled={paymentSettingsPending || !paymentSettingsReauthReady}
                         onClick={() => void revokeServiceAutomaticRenewal(authorization)}
@@ -4486,7 +4938,7 @@ export function App() {
           </section>
         )}
 
-        {route === "/customer" && me?.eligible && renewals.length > 0 && (
+        {route === "/customer" && canReadCustomerHistory && renewals.length > 0 && (
           <section className="order-panel" aria-label="Service renewals">
             <div>
               <p className="eyebrow">Customer billing · renewals</p>
@@ -4578,7 +5030,7 @@ export function App() {
                             .join(", ")}
                     </span>
                   </div>
-                  {renewal.status !== "paid" && renewal.status !== "cancelled" && (
+                  {canWriteBilling && renewal.status !== "paid" && renewal.status !== "cancelled" && (
                     <div className="fund-actions">
                       <select
                         aria-label={`Renewal payment method ${renewal.invoiceId}`}
@@ -4638,7 +5090,7 @@ export function App() {
           </section>
         )}
 
-        {route === "/customer" && me?.eligible && billing?.addFunds.enabled && (
+        {route === "/customer" && canWriteBilling && billing?.addFunds.enabled && (
           <section className="order-panel" aria-label="Add Funds">
             <div>
               <p className="eyebrow">Customer billing · Mock Add Funds</p>
@@ -6344,7 +6796,7 @@ export function App() {
               <span>Payment fee charged {usd(order.invoice.paymentFeeMinor)}</span>
               <strong>Due {usd(order.invoice.dueMinor)}</strong>
             </div>
-            {order.invoice.status !== "paid" && (
+            {order.invoice.status !== "paid" && canWriteBilling && (
               <div className="payment-controls">
                 <select
                   aria-label="Payment method"
@@ -6430,7 +6882,7 @@ export function App() {
                 <button
                   className="primary"
                   disabled={
-                    !me?.eligible ||
+                    !canWriteBilling ||
                     !paymentQuote ||
                     ((savePaymentMethod || enableAutomaticRenewal) &&
                       !paymentSettingsReauthReady)
@@ -6513,9 +6965,9 @@ export function App() {
                   <span>{order.service.cancellation.lastError}</span>
                 )}
               </div>
-            ) : order.service.termEnd &&
+            ) : canManageServices && order.service.termEnd &&
               (order.service.status === "active" || order.service.status === "suspended") &&
-              (me?.membershipRole === "owner" || me?.membershipRole === "billing") ? (
+              !order.service.cancellation ? (
               <div
                 className="payment-controls"
                 aria-label={locale === "zh-CN" ? "安排服务取消" : "Schedule service cancellation"}
@@ -6648,8 +7100,8 @@ export function App() {
                 Continue in customer workspace
               </button>
             ) : (
-              <button className="primary wide" disabled={!me?.eligible} onClick={createOrder}>
-                {me?.eligible ? text.buy : text.pending}
+              <button className="primary wide" disabled={!canCreateOrders} onClick={createOrder}>
+                {canCreateOrders ? text.buy : text.pending}
               </button>
             )}
           </section>

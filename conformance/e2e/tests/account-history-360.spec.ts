@@ -115,5 +115,5 @@ test("customer returns to complete business history and Staff opens the same Acc
   await expect(account360.getByTestId("account360-billing")).toContainText("Invoices");
   await expect(account360.getByTestId("account360-services")).toContainText("HKBGP VPS");
   await expect(account360.getByTestId("account360-tickets")).toContainText(ticketSubject);
-  await expect(account360.getByTestId("account360-contacts-gap")).toBeVisible();
+  await expect(account360.locator('section[aria-label="Account Contacts"]')).toBeVisible();
 });

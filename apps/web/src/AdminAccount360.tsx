@@ -46,6 +46,7 @@ type AccountSummaryResponse = {
     permissions: unknown;
     emailVerifiedAt: string | null;
     userRestrictedAt: string | null;
+    membershipRestrictedAt: string | null;
     createdAt: string;
     removedAt: string | null;
   }>;
@@ -101,6 +102,22 @@ type TicketsResponse = {
   account: AccountReference;
   items: Array<TicketHistory & { internalMessageCount: number }>;
 };
+type ContactsResponse = {
+  warning: string;
+  account: AccountReference;
+  items: Array<{
+    id: string;
+    displayName: string;
+    email: string;
+    locale: "en" | "zh-CN";
+    notificationSubscriptions: string[];
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  limit: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+};
 
 type Loadable<T> = { loading: boolean; data: T | null; error: string | null };
 
@@ -154,6 +171,7 @@ export function AdminAccount360({
   active,
   accessFingerprint,
   permissions,
+  locale,
   availableActions,
   onAction,
   onSelectedAccountChange,
@@ -164,6 +182,7 @@ export function AdminAccount360({
   active: boolean;
   accessFingerprint: string;
   permissions: ReadonlySet<string>;
+  locale: "en" | "zh-CN";
   availableActions: ReadonlySet<AdminAccountAction>;
   onAction: (action: AdminAccountAction, account: AccountReference) => void;
   onSelectedAccountChange: (account: AccountReference | null) => void;
@@ -186,6 +205,7 @@ export function AdminAccount360({
   const [renewals, setRenewals] = useState<Loadable<RenewalsResponse>>(emptyLoadable);
   const [cancellations, setCancellations] = useState<Loadable<CancellationsResponse>>(emptyLoadable);
   const [tickets, setTickets] = useState<Loadable<TicketsResponse>>(emptyLoadable);
+  const [contacts, setContacts] = useState<Loadable<ContactsResponse>>(emptyLoadable);
   const searchGeneration = useRef(0);
   const accountGeneration = useRef(0);
 
@@ -194,6 +214,7 @@ export function AdminAccount360({
   const canReadBilling = permissionSetHas(permissions, "billing.read");
   const canReadServices = permissionSetHas(permissions, "services.read");
   const canReadTickets = permissionSetHas(permissions, "support.tickets.manage");
+  const canReadContacts = permissionSetHas(permissions, "accounts.contacts.read");
 
   function clearAccountWorkspace() {
     accountGeneration.current += 1;
@@ -206,6 +227,7 @@ export function AdminAccount360({
     setRenewals(emptyLoadable());
     setCancellations(emptyLoadable());
     setTickets(emptyLoadable());
+    setContacts(emptyLoadable());
   }
 
   function clearSearchResults() {
@@ -307,6 +329,7 @@ export function AdminAccount360({
     setRenewals(canReadBilling ? { loading: true, data: null, error: null } : emptyLoadable());
     setCancellations(canReadServices ? { loading: true, data: null, error: null } : emptyLoadable());
     setTickets(canReadTickets ? { loading: true, data: null, error: null } : emptyLoadable());
+    setContacts(canReadContacts ? { loading: true, data: null, error: null } : emptyLoadable());
 
     const load = <T,>(path: string, setter: (value: Loadable<T>) => void) => {
       void api<T>(path)
@@ -338,6 +361,31 @@ export function AdminAccount360({
       load(`${base}/cancellations`, setCancellations);
     }
     if (canReadTickets) load(`${base}/tickets`, setTickets);
+    if (canReadContacts) load(`${base}/contacts`, setContacts);
+  }
+
+  async function loadMoreContacts() {
+    const current = contacts.data;
+    if (!selected || !current?.hasMore || !current.nextCursor || contacts.loading || !surfaceIsActive()) return;
+    const account = selected;
+    const generation = accountGeneration.current;
+    setContacts({ ...contacts, loading: true, error: null });
+    try {
+      const page = await api<ContactsResponse>(
+        `/api/v1/admin/client-accounts/${account.id}/contacts?cursor=${encodeURIComponent(current.nextCursor)}&limit=${current.limit}`,
+      );
+      if (generation !== accountGeneration.current || selected.id !== account.id || !surfaceIsActive()) return;
+      const unique = new Map(current.items.map((contact) => [contact.id, contact]));
+      for (const contact of page.items) unique.set(contact.id, contact);
+      setContacts({ loading: false, error: null, data: { ...page, items: [...unique.values()] } });
+    } catch (caught) {
+      if (generation !== accountGeneration.current || !surfaceIsActive()) return;
+      setContacts({
+        loading: false,
+        data: current,
+        error: caught instanceof Error ? caught.message : locale === "zh-CN" ? "无法加载联系人" : "Contacts could not be loaded",
+      });
+    }
   }
 
   return (
@@ -413,8 +461,16 @@ export function AdminAccount360({
                   {data.memberships.map((membership) => (
                     <div className="manual-item" key={membership.userId}>
                       <strong>{membership.email} · {membership.role}</strong>
-                      <span>{membership.removedAt ? `removed ${when(membership.removedAt)}` : "active membership"}</span>
-                      <span>Email {membership.emailVerifiedAt ? "verified" : "pending"}{membership.userRestrictedAt ? " · user restricted" : ""}</span>
+                      <span>
+                        {membership.removedAt
+                          ? `removed ${when(membership.removedAt)}`
+                          : membership.membershipRestrictedAt
+                            ? locale === "zh-CN"
+                              ? `成员关系受限 ${when(membership.membershipRestrictedAt)}`
+                              : `membership restricted ${when(membership.membershipRestrictedAt)}`
+                            : locale === "zh-CN" ? "有效成员关系" : "active membership"}
+                      </span>
+                      <span>{locale === "zh-CN" ? "邮箱" : "Email"} {membership.emailVerifiedAt ? (locale === "zh-CN" ? "已验证" : "verified") : (locale === "zh-CN" ? "待验证" : "pending")}{membership.userRestrictedAt ? locale === "zh-CN" ? " · 用户受限" : " · User restricted" : ""}</span>
                     </div>
                   ))}
                 </div>
@@ -431,10 +487,6 @@ export function AdminAccount360({
                     ))}
                   </div>
                 )}
-                <p className="notice" data-testid="account360-contacts-gap">
-                  Contacts are not represented by Schema 018. A forward-only member/contact data
-                  slice is required before this laboratory can display or claim Contact coverage.
-                </p>
                 {availableActions.size > 0 && (
                   <div className="account360-actions" aria-label="Client Account actions">
                     {availableActions.has("manual_receipt") && <button onClick={() => onAction("manual_receipt", data.account)}>Record manual receipt</button>}
@@ -446,6 +498,31 @@ export function AdminAccount360({
               </>
             )}
           </Panel>
+
+          {canReadContacts && (
+            <Panel label={locale === "zh-CN" ? "账户联系人" : "Account Contacts"} state={contacts}>
+              {(data) => (
+                <>
+                  {data.items.length === 0 ? <p className="muted">{locale === "zh-CN" ? "没有有效联系人。" : "No active Contacts."}</p> : (
+                    <div className="manual-list" data-testid="account360-contacts">
+                      {data.items.map((contact) => (
+                        <article className="manual-item" key={contact.id}>
+                          <strong>{contact.displayName} · {contact.email}</strong>
+                          <span>{locale === "zh-CN" ? "仅为联系人——没有用户身份或客户账户成员权限" : "Contact only — no User identity or Client Account membership"}</span>
+                          <span>{contact.notificationSubscriptions.join(", ") || (locale === "zh-CN" ? "未订阅通知" : "No notification subscriptions")} · {contact.locale}</span>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                  {data.hasMore && (
+                    <button disabled={contacts.loading || !data.nextCursor} onClick={() => void loadMoreContacts()}>
+                      {contacts.loading ? (locale === "zh-CN" ? "正在加载更多联系人…" : "Loading more Contacts…") : (locale === "zh-CN" ? "加载更多联系人" : "Load more Contacts")}
+                    </button>
+                  )}
+                </>
+              )}
+            </Panel>
+          )}
 
           {canReadOrders && (
             <Panel label="Account orders" state={orders}>
