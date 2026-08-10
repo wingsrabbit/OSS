@@ -6,6 +6,7 @@ import { assertBillingWriteEligible, type AuthenticatedUser } from "./auth.js";
 
 function eligibleUser(
   membershipRole: AuthenticatedUser["membershipRole"],
+  membershipPermissions: readonly string[] = [],
 ): AuthenticatedUser {
   return {
     sessionId: "00000000-0000-4000-8000-000000000001",
@@ -17,10 +18,13 @@ function eligibleUser(
     clientAccountId: "00000000-0000-4000-8000-000000000003",
     clientAccountRestrictedAt: null,
     membershipRole,
+    membershipPermissions,
+    membershipRestrictedAt: null,
+    accountContextVersion: "1",
   };
 }
 
-test("only Owner and Billing roles may initiate invoice money movement", () => {
+test("billing.write capability governs invoice money movement", () => {
   assert.doesNotThrow(() => assertBillingWriteEligible(eligibleUser("owner")));
   assert.doesNotThrow(() => assertBillingWriteEligible(eligibleUser("billing")));
   for (const role of ["technical", "viewer"] as const) {
@@ -30,7 +34,26 @@ test("only Owner and Billing roles may initiate invoice money movement", () => {
         error instanceof Error &&
         (error as Error & { statusCode?: number; code?: string }).statusCode === 403 &&
         (error as Error & { statusCode?: number; code?: string }).code ===
-          "BILLING_PERMISSION_REQUIRED",
+          "CUSTOMER_CAPABILITY_REQUIRED",
+    );
+    assert.doesNotThrow(() =>
+      assertBillingWriteEligible(eligibleUser(role, ["billing.write"])),
+    );
+  }
+});
+
+test("billing.write never bypasses User or Client Account restrictions", () => {
+  for (const user of [
+    { ...eligibleUser("billing"), userRestrictedAt: new Date() },
+    { ...eligibleUser("billing"), clientAccountRestrictedAt: new Date() },
+  ]) {
+    assert.throws(
+      () => assertBillingWriteEligible(user),
+      (error: unknown) =>
+        error instanceof Error &&
+        (error as Error & { statusCode?: number; code?: string }).statusCode === 403 &&
+        (error as Error & { statusCode?: number; code?: string }).code ===
+          "ACCOUNT_RESTRICTED",
     );
   }
 });

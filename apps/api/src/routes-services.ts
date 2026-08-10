@@ -3,10 +3,23 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertBillingWriteEligible, requireUser } from "./auth.js";
+import {
+  assertCustomerCapability,
+  assertEligible,
+  expectedAccountContextVersion,
+  lockMembershipAccountForMutation,
+  lockSessionContextForMutation,
+  requireSessionIdentity,
+  requireUser,
+  type LockedAccountContext,
+} from "./auth.js";
 import type { Config } from "./config.js";
-import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import {
+  enqueueNotification,
+  enqueueSubscribedContactNotifications,
+} from "./notification-outbox.js";
 import {
   requireRecentReauth,
   requireStaffActionLocked,
@@ -55,63 +68,10 @@ function requestError(message: string, statusCode: number, code: string): Error 
   return Object.assign(new Error(message), { statusCode, code });
 }
 
-async function assertCancellationActorLocked(
-  client: DatabaseClient,
-  input: {
-    userId: string;
-    sessionId: string;
-    clientAccountId: string;
-  },
-): Promise<void> {
-  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [input.userId]);
-  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-    input.clientAccountId,
-  ]);
-  await client.query(
-    `SELECT client_account_id
-     FROM client_memberships
-     WHERE user_id = $1 AND client_account_id = $2
-     FOR UPDATE`,
-    [input.userId, input.clientAccountId],
-  );
-  const eligibility = await client.query<{
-    email_verified_at: Date | null;
-    user_restricted_at: Date | null;
-    account_restricted_at: Date | null;
-    removed_at: Date | null;
-    role: "owner" | "billing" | "technical" | "viewer" | null;
-    session_revoked_at: Date | null;
-    session_expires_at: Date | null;
-  }>(
-    `SELECT user_account.email_verified_at,
-            user_account.restricted_at AS user_restricted_at,
-            client_account.restricted_at AS account_restricted_at,
-            membership.removed_at,
-            membership.role,
-            session.revoked_at AS session_revoked_at,
-            session.expires_at AS session_expires_at
-     FROM users user_account
-     JOIN client_accounts client_account ON client_account.id = $2
-     LEFT JOIN client_memberships membership
-       ON membership.user_id = user_account.id
-      AND membership.client_account_id = client_account.id
-     LEFT JOIN sessions session
-       ON session.id = $3
-      AND session.user_id = user_account.id
-     WHERE user_account.id = $1`,
-    [input.userId, input.clientAccountId, input.sessionId],
-  );
-  const state = eligibility.rows[0];
-  if (
-    !state?.email_verified_at ||
-    state.user_restricted_at ||
-    state.account_restricted_at ||
-    state.removed_at ||
-    (state.role !== "owner" && state.role !== "billing") ||
-    state.session_revoked_at ||
-    !state.session_expires_at ||
-    state.session_expires_at.getTime() <= Date.now()
-  ) {
+function assertCancellationContextLocked(context: LockedAccountContext): void {
+  try {
+    assertCustomerCapability(context, "services.manage");
+  } catch {
     throw requestError("Account is not eligible to schedule cancellation", 403, "ACCOUNT_NOT_ELIGIBLE");
   }
 }
@@ -123,7 +83,9 @@ export async function registerServiceRoutes(
 ): Promise<void> {
   app.post("/api/v1/services/:serviceId/cancellation", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertBillingWriteEligible(user);
+    const expectedContextVersion = expectedAccountContextVersion(request);
+    assertEligible(user);
+    assertCustomerCapability(user, "services.manage");
     const params = z.object({ serviceId: z.uuid() }).parse(request.params);
     const body = scheduleCancellationSchema.parse(request.body);
     const fingerprint = requestFingerprint("services.schedule-cancellation:v1", {
@@ -136,6 +98,11 @@ export async function registerServiceRoutes(
     for (let transactionAttempt = 0; transactionAttempt < 3; transactionAttempt += 1) {
       try {
         outcome = await transaction(pool, async (client) => {
+      const sessionContext = await lockSessionContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `service-cancellation:${user.userId}:${body.idempotencyKey}`,
       ]);
@@ -161,11 +128,12 @@ export async function registerServiceRoutes(
             "IDEMPOTENCY_CONFLICT",
           );
         }
-        await assertCancellationActorLocked(client, {
-          userId: user.userId,
-          sessionId: user.sessionId,
-          clientAccountId: user.clientAccountId,
-        });
+        const accountContext = await lockMembershipAccountForMutation(
+          client,
+          user,
+          sessionContext,
+        );
+        assertCancellationContextLocked(accountContext);
         return { ...previous.result, replayed: true };
       }
 
@@ -278,11 +246,12 @@ export async function registerServiceRoutes(
       if (!service) {
         throw requestError("Service not found", 404, "SERVICE_NOT_FOUND");
       }
-      await assertCancellationActorLocked(client, {
-        userId: user.userId,
-        sessionId: user.sessionId,
-        clientAccountId: user.clientAccountId,
-      });
+      const accountContext = await lockMembershipAccountForMutation(
+        client,
+        user,
+        sessionContext,
+      );
+      assertCancellationContextLocked(accountContext);
       if (service.version !== body.expectedVersion) {
         throw requestError(
           "Service changed; refresh the page and confirm cancellation again",
@@ -652,7 +621,17 @@ export async function registerServiceRoutes(
              AND NOT EXISTS (
                SELECT 1 FROM renewal_reminder_delivery_facts delivery
                WHERE delivery.intent_id = reminder.id
+                 AND delivery.status IN ('delivered', 'bounced')
              )
+           ON CONFLICT (intent_id) DO NOTHING`,
+          [pristineRenewal.invoiceId],
+        );
+        await client.query(
+          `INSERT INTO renewal_notification_dispatch_suppressions(intent_id, reason)
+           SELECT reminder.id,
+                  'renewal invoice was withdrawn for cycle-end cancellation'
+           FROM renewal_reminder_intents reminder
+           WHERE reminder.invoice_id = $1
            ON CONFLICT (intent_id) DO NOTHING`,
           [pristineRenewal.invoiceId],
         );
@@ -733,30 +712,36 @@ export async function registerServiceRoutes(
           },
         ],
       );
-      const notification = await client.query<{ id: string }>(
-        `INSERT INTO outbox(event_type, unique_key, payload)
-         VALUES ('notification.service_cancellation_scheduled', $1, $2)
-         RETURNING id`,
-        [
-          `service-cancellation:${requestId}`,
-          {
-            email: user.email,
-            locale: user.locale,
-            cancellationRequestId: requestId,
-            serviceId: service.id,
-            productName: service.product_name,
-            effectiveAt: service.term_end.toISOString(),
-            executionMode,
-          },
-        ],
-      );
-      const outboxId = notification.rows[0]?.id;
-      if (!outboxId) throw new Error("Unable to queue cancellation confirmation");
-      await client.query(
-        `INSERT INTO durable_jobs(job_type, unique_key, payload)
-         VALUES ('notification.send', $1, $2)`,
-        [`outbox:${outboxId}`, { outboxId }],
-      );
+      const notificationPayload = {
+        cancellationRequestId: requestId,
+        serviceId: service.id,
+        productName: service.product_name,
+        effectiveAt: service.term_end.toISOString(),
+        executionMode,
+      } as const;
+      await enqueueNotification(client, {
+        eventType: "notification.service_cancellation_scheduled",
+        templateRevision: "service-cancellation-scheduled-v1",
+        uniqueKey: `service-cancellation:${requestId}`,
+        payload: notificationPayload,
+        recipient: {
+          kind: "account_user",
+          category: "service",
+          userId: user.userId,
+          clientAccountId: user.clientAccountId,
+          email: user.email,
+          locale: user.locale === "zh-CN" ? "zh-CN" : "en",
+        },
+      });
+      await enqueueSubscribedContactNotifications(client, {
+        eventType: "notification.service_cancellation_scheduled",
+        templateRevision: "service-cancellation-scheduled-v1",
+        uniqueKeyPrefix: `service-cancellation:${requestId}`,
+        payload: notificationPayload,
+        clientAccountId: user.clientAccountId,
+        category: "service",
+        excludeEmails: [user.email],
+      });
       return { ...result, replayed: false };
         });
         break;
@@ -797,7 +782,7 @@ export async function registerServiceRoutes(
   });
 
   app.get("/api/v1/admin/services/cancellations", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "services.manual_fulfillment");
     const result = await pool.query<{
       request_id: string;
@@ -881,7 +866,7 @@ export async function registerServiceRoutes(
   app.post(
     "/api/v1/admin/services/cancellations/:executionId/complete-manual",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "services.manual_fulfillment");
       await requireRecentReauth(pool, user);
       const params = z.object({ executionId: z.uuid() }).parse(request.params);
@@ -894,6 +879,7 @@ export async function registerServiceRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "services.manual_fulfillment");
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `service-cancellation-manual:${user.userId}:${body.idempotencyKey}`,
         ]);
@@ -923,12 +909,14 @@ export async function registerServiceRoutes(
           execution_id: string;
           request_id: string;
           service_id: string;
+          client_account_id: string;
           order_item_id: string;
           provider_operation_id: string | null;
         }>(
           `SELECT execution.id AS execution_id,
                   request.id AS request_id,
                   service.id AS service_id,
+                  service.client_account_id,
                   service.order_item_id,
                   operation.id AS provider_operation_id
            FROM service_cancellation_executions execution
@@ -1063,7 +1051,7 @@ export async function registerServiceRoutes(
             pointer.service_id,
             user.userId,
             user.sessionId,
-            user.clientAccountId,
+            pointer.client_account_id,
             takeoverKind,
             body.expectedExecutionVersion,
             body.expectedServiceVersion,

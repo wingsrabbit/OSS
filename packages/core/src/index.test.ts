@@ -6,9 +6,72 @@ import {
   addBillingCycle,
   buildPriceSnapshot,
   canTransitionPayment,
+  CUSTOMER_CAPABILITIES,
+  customerMembershipCapabilities,
   isPaymentBusinessStatePayable,
   percentageFeeMinor,
 } from "./index.js";
+
+test("customer membership capability defaults and explicit grants are exact", () => {
+  const all = [...CUSTOMER_CAPABILITIES].sort();
+  assert.deepEqual(all, [
+    "account.contacts.manage",
+    "account.contacts.read",
+    "account.history.read",
+    "account.members.manage",
+    "account.members.read",
+    "billing.read",
+    "billing.write",
+    "orders.create",
+    "services.manage",
+    "support.tickets.write",
+  ]);
+  assert.deepEqual(
+    customerMembershipCapabilities({ role: "owner", permissions: [] }),
+    all,
+  );
+  assert.deepEqual(
+    customerMembershipCapabilities({ role: "viewer", permissions: ["*"] }),
+    all,
+  );
+  assert.deepEqual(
+    customerMembershipCapabilities({ role: "billing", permissions: [] }),
+    [
+      "account.history.read",
+      "billing.read",
+      "billing.write",
+      "orders.create",
+      "support.tickets.write",
+    ],
+  );
+  assert.deepEqual(
+    customerMembershipCapabilities({ role: "technical", permissions: [] }),
+    [
+      "account.history.read",
+      "billing.read",
+      "services.manage",
+      "support.tickets.write",
+    ],
+  );
+  assert.deepEqual(
+    customerMembershipCapabilities({ role: "viewer", permissions: [] }),
+    ["account.history.read", "billing.read"],
+  );
+  assert.deepEqual(
+    customerMembershipCapabilities({
+      role: "viewer",
+      permissions: ["unknown.future.capability", "orders.create"],
+    }),
+    ["account.history.read", "billing.read", "orders.create"],
+  );
+});
+
+test("customer capability resolution never mutates its input", () => {
+  const permissions = ["services.manage", "unknown.future.capability"];
+  const before = [...permissions];
+  customerMembershipCapabilities({ role: "viewer", permissions });
+  assert.deepEqual(permissions, before);
+});
 
 test("price snapshots use exact minor units and include option quantity", () => {
   const price = buildPriceSnapshot({

@@ -3,7 +3,16 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertBillingWriteEligible, assertFinancialReadEligible, requireUser } from "./auth.js";
+import {
+  assertBillingWriteEligible,
+  assertCustomerCapability,
+  assertFinancialReadEligible,
+  expectedAccountContextVersion,
+  lockMembershipAccountForMutation,
+  lockSessionContextForMutation,
+  requireUser,
+  type LockedAccountContext,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -84,51 +93,10 @@ async function lockPaymentMethodTokenReaders(client: DatabaseClient): Promise<vo
   );
 }
 
-async function assertBillingActorLocked(
-  client: DatabaseClient,
-  input: { userId: string; clientAccountId: string; sessionId: string },
-): Promise<void> {
-  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [input.userId]);
-  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-    input.clientAccountId,
-  ]);
-  const state = await client.query<{
-    email_verified_at: Date | null;
-    user_restricted_at: Date | null;
-    account_restricted_at: Date | null;
-    removed_at: Date | null;
-    role: string | null;
-    session_revoked_at: Date | null;
-    session_expires_at: Date | null;
-  }>(
-    `SELECT user_account.email_verified_at,
-            user_account.restricted_at AS user_restricted_at,
-            account.restricted_at AS account_restricted_at,
-            membership.removed_at, membership.role,
-            session.revoked_at AS session_revoked_at,
-            session.expires_at AS session_expires_at
-     FROM users user_account
-     JOIN client_accounts account ON account.id = $2
-     JOIN client_memberships membership
-       ON membership.user_id = user_account.id
-      AND membership.client_account_id = account.id
-     JOIN sessions session
-       ON session.id = $3 AND session.user_id = user_account.id
-     WHERE user_account.id = $1
-     FOR UPDATE OF membership, session`,
-    [input.userId, input.clientAccountId, input.sessionId],
-  );
-  const row = state.rows[0];
-  if (
-    !row?.email_verified_at ||
-    row.user_restricted_at ||
-    row.account_restricted_at ||
-    row.removed_at ||
-    (row.role !== "owner" && row.role !== "billing") ||
-    row.session_revoked_at ||
-    !row.session_expires_at ||
-    row.session_expires_at.getTime() <= Date.now()
-  ) {
+function assertBillingContextLocked(context: LockedAccountContext): void {
+  try {
+    assertCustomerCapability(context, "billing.write");
+  } catch {
     throw Object.assign(new Error("Account is not eligible to manage payment settings"), {
       statusCode: 403,
       code: "ACCOUNT_NOT_ELIGIBLE",
@@ -394,6 +362,7 @@ export async function registerPaymentMethodRoutes(
 
   app.post("/api/v1/billing/payment-methods/:paymentMethodId/default", async (request) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ paymentMethodId: z.uuid() }).parse(request.params);
     const body = actionSchema.parse(request.body);
@@ -402,17 +371,27 @@ export async function registerPaymentMethodRoutes(
       expectedVersion: body.expectedVersion,
     });
     return transaction(pool, async (client) => {
+      const sessionContext = await lockSessionContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
       await lockPaymentMethodTokenReaders(client);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment-settings:${user.clientAccountId}`,
       ]);
+      const accountContext = await lockMembershipAccountForMutation(
+        client,
+        user,
+        sessionContext,
+      );
+      assertBillingContextLocked(accountContext);
       const replayed = await replayedConsentResult(client, {
         clientAccountId: user.clientAccountId,
         idempotencyKey: body.idempotencyKey,
         fingerprint,
       });
       if (replayed) return replayed;
-      await assertBillingActorLocked(client, user);
       await requireRecentReauthLocked(client, user);
       const method = await client.query<{ version: number; status: string }>(
         `SELECT version, status FROM saved_payment_methods
@@ -449,6 +428,7 @@ export async function registerPaymentMethodRoutes(
 
   app.post("/api/v1/billing/payment-methods/:paymentMethodId/remove", async (request) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ paymentMethodId: z.uuid() }).parse(request.params);
     const body = actionSchema.parse(request.body);
@@ -457,16 +437,15 @@ export async function registerPaymentMethodRoutes(
       expectedVersion: body.expectedVersion,
     });
     return transaction(pool, async (client) => {
+      const sessionContext = await lockSessionContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
       await lockPaymentMethodTokenReaders(client);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment-settings:${user.clientAccountId}`,
       ]);
-      const replayed = await replayedConsentResult(client, {
-        clientAccountId: user.clientAccountId,
-        idempotencyKey: body.idempotencyKey,
-        fingerprint,
-      });
-      if (replayed) return replayed;
       // Billing automation locks Service before Authorization/Saved Method.
       // Discover the account-serialized Service set without a row lock, then
       // take Service before User/Account and Saved Method so removal cannot
@@ -494,7 +473,18 @@ export async function registerPaymentMethodRoutes(
           ],
         );
       }
-      await assertBillingActorLocked(client, user);
+      const accountContext = await lockMembershipAccountForMutation(
+        client,
+        user,
+        sessionContext,
+      );
+      assertBillingContextLocked(accountContext);
+      const replayed = await replayedConsentResult(client, {
+        clientAccountId: user.clientAccountId,
+        idempotencyKey: body.idempotencyKey,
+        fingerprint,
+      });
+      if (replayed) return replayed;
       await requireRecentReauthLocked(client, user);
       const method = await client.query<{ version: number; status: string }>(
         `SELECT version, status FROM saved_payment_methods
@@ -603,6 +593,7 @@ export async function registerPaymentMethodRoutes(
 
   app.post("/api/v1/services/:serviceId/automatic-renewal", async (request) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ serviceId: z.uuid() }).parse(request.params);
     const body = automaticRenewalSchema.parse(request.body);
@@ -615,16 +606,15 @@ export async function registerPaymentMethodRoutes(
       expectedDecisionGeneration: body.expectedDecisionGeneration,
     });
     return transaction(pool, async (client) => {
+      const sessionContext = await lockSessionContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
       await lockPaymentMethodTokenReaders(client);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment-settings:${user.clientAccountId}`,
       ]);
-      const replayed = await replayedConsentResult(client, {
-        clientAccountId: user.clientAccountId,
-        idempotencyKey: body.idempotencyKey,
-        fingerprint,
-      });
-      if (replayed) return replayed;
       const service = await client.query<{
         status: string;
         billing_cycle: string;
@@ -640,13 +630,24 @@ export async function registerPaymentMethodRoutes(
       );
       const serviceRow = service.rows[0];
       if (!serviceRow) throw Object.assign(new Error("Service not found"), { statusCode: 404 });
+      const accountContext = await lockMembershipAccountForMutation(
+        client,
+        user,
+        sessionContext,
+      );
+      assertBillingContextLocked(accountContext);
+      const replayed = await replayedConsentResult(client, {
+        clientAccountId: user.clientAccountId,
+        idempotencyKey: body.idempotencyKey,
+        fingerprint,
+      });
+      if (replayed) return replayed;
       if (
         serviceRow.automatic_renewal_decision_generation !==
         body.expectedDecisionGeneration
       ) {
         throw conflict("Automatic-renewal decision changed; refresh and confirm again");
       }
-      await assertBillingActorLocked(client, user);
       await requireRecentReauthLocked(client, user);
       if (
         !["active", "suspended"].includes(serviceRow.status) ||
@@ -765,6 +766,7 @@ export async function registerPaymentMethodRoutes(
     "/api/v1/services/:serviceId/automatic-renewal/pending-consent/withdraw",
     async (request) => {
       const user = await requireUser(request, pool, config);
+      const expectedContextVersion = expectedAccountContextVersion(request);
       assertBillingWriteEligible(user);
       const params = z.object({ serviceId: z.uuid() }).parse(request.params);
       const body = withdrawPendingAutomaticRenewalSchema.parse(request.body);
@@ -775,16 +777,15 @@ export async function registerPaymentMethodRoutes(
         reason: body.reason,
       });
       return transaction(pool, async (client) => {
+        const sessionContext = await lockSessionContextForMutation(
+          client,
+          user,
+          expectedContextVersion,
+        );
         await lockPaymentMethodTokenReaders(client);
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `payment-settings:${user.clientAccountId}`,
         ]);
-        const replayed = await replayedConsentResult(client, {
-          clientAccountId: user.clientAccountId,
-          idempotencyKey: body.idempotencyKey,
-          fingerprint,
-        });
-        if (replayed) return replayed;
         const service = await client.query<{ automatic_renewal_decision_generation: string }>(
           `SELECT automatic_renewal_decision_generation::text
            FROM services
@@ -796,6 +797,18 @@ export async function registerPaymentMethodRoutes(
         if (!serviceRow) {
           throw Object.assign(new Error("Service not found"), { statusCode: 404 });
         }
+        const accountContext = await lockMembershipAccountForMutation(
+          client,
+          user,
+          sessionContext,
+        );
+        assertBillingContextLocked(accountContext);
+        const replayed = await replayedConsentResult(client, {
+          clientAccountId: user.clientAccountId,
+          idempotencyKey: body.idempotencyKey,
+          fingerprint,
+        });
+        if (replayed) return replayed;
         if (
           serviceRow.automatic_renewal_decision_generation !==
           body.expectedDecisionGeneration
@@ -804,7 +817,6 @@ export async function registerPaymentMethodRoutes(
             "Pending automatic-renewal consent changed; refresh and confirm again",
           );
         }
-        await assertBillingActorLocked(client, user);
         await requireRecentReauthLocked(client, user);
         const pendingConsent = await client.query<{ consent_version: string }>(
           `SELECT automatic_renewal_consent_version AS consent_version
@@ -879,6 +891,7 @@ export async function registerPaymentMethodRoutes(
 
   app.post("/api/v1/services/:serviceId/automatic-renewal/revoke", async (request) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ serviceId: z.uuid() }).parse(request.params);
     const body = revokeAutomaticRenewalSchema.parse(request.body);
@@ -890,16 +903,15 @@ export async function registerPaymentMethodRoutes(
       reason: body.reason,
     });
     return transaction(pool, async (client) => {
+      const sessionContext = await lockSessionContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
       await lockPaymentMethodTokenReaders(client);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment-settings:${user.clientAccountId}`,
       ]);
-      const replayed = await replayedConsentResult(client, {
-        clientAccountId: user.clientAccountId,
-        idempotencyKey: body.idempotencyKey,
-        fingerprint,
-      });
-      if (replayed) return replayed;
       const service = await client.query<{
         automatic_renewal_consent_generation: string;
         automatic_renewal_decision_generation: string;
@@ -915,13 +927,24 @@ export async function registerPaymentMethodRoutes(
       if (!serviceRow) {
         throw Object.assign(new Error("Service not found"), { statusCode: 404 });
       }
+      const accountContext = await lockMembershipAccountForMutation(
+        client,
+        user,
+        sessionContext,
+      );
+      assertBillingContextLocked(accountContext);
+      const replayed = await replayedConsentResult(client, {
+        clientAccountId: user.clientAccountId,
+        idempotencyKey: body.idempotencyKey,
+        fingerprint,
+      });
+      if (replayed) return replayed;
       if (
         serviceRow.automatic_renewal_decision_generation !==
         body.expectedDecisionGeneration
       ) {
         throw conflict("Automatic-renewal decision changed; refresh and confirm again");
       }
-      await assertBillingActorLocked(client, user);
       await requireRecentReauthLocked(client, user);
       const authorization = await client.query<{
         id: string;

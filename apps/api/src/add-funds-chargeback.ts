@@ -742,6 +742,46 @@ export async function handleAddFundsChargebackEvent(
   config: Config,
   body: AddFundsChargebackEvent,
 ): Promise<Record<string, unknown>> {
+  const operationPointer = await client.query<{
+    id: string;
+    subject_id: string;
+  }>(
+    `SELECT id, subject_id
+     FROM provider_operations
+     WHERE id = $1
+       AND provider_installation_id = $2
+       AND subject_type = 'add_funds'
+       AND kind = 'payment_create'`,
+    [body.providerOperationId, PROVIDER_INSTALLATION_ID],
+  );
+  const pointedOperation = operationPointer.rows[0];
+  const attemptPointer = pointedOperation
+    ? await client.query<{
+        submitted_by_user_id: string;
+        client_account_id: string;
+      }>(
+        `SELECT submitted_by_user_id, client_account_id
+         FROM add_funds_attempts
+         WHERE id = $1`,
+        [pointedOperation.subject_id],
+      )
+    : null;
+  const pointer = attemptPointer?.rows[0];
+  if (pointer) {
+    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+      pointer.submitted_by_user_id,
+    ]);
+    await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+      pointer.client_account_id,
+    ]);
+    await client.query(
+      `SELECT client_account_id
+       FROM client_memberships
+       WHERE user_id = $1 AND client_account_id = $2
+       FOR UPDATE`,
+      [pointer.submitted_by_user_id, pointer.client_account_id],
+    );
+  }
   for (const lock of [
     `provider-operation:${body.providerOperationId}`,
     `chargeback-external:${PROVIDER_INSTALLATION_ID}:${body.externalChargebackId}`,
@@ -804,34 +844,14 @@ export async function handleAddFundsChargebackEvent(
     return { rejected: true, reason: "provider_operation_not_started" };
   }
 
-  const attemptPointer = await client.query<{
-    submitted_by_user_id: string;
-    client_account_id: string;
-  }>(
-    `SELECT submitted_by_user_id, client_account_id
-     FROM add_funds_attempts
-     WHERE id = $1
-     FOR UPDATE`,
+  if (!pointer) throw new Error("Chargeback operation lost its Add Funds attempt");
+  await client.query(
+    `SELECT id FROM add_funds_attempts WHERE id = $1 FOR UPDATE`,
     [operation.subject_id],
   );
-  const pointer = attemptPointer.rows[0];
-  if (!pointer) throw new Error("Chargeback operation lost its Add Funds attempt");
   await client.query(
     `SELECT id FROM add_funds_commands WHERE add_funds_attempt_id = $1 FOR UPDATE`,
     [operation.subject_id],
-  );
-  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-    pointer.submitted_by_user_id,
-  ]);
-  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-    pointer.client_account_id,
-  ]);
-  await client.query(
-    `SELECT client_account_id
-     FROM client_memberships
-     WHERE user_id = $1 AND client_account_id = $2
-     FOR UPDATE`,
-    [pointer.submitted_by_user_id, pointer.client_account_id],
   );
 
   const storedPayload = { ...body, callbackCapability: "[REDACTED]" };

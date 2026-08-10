@@ -123,6 +123,11 @@ try {
     accountId = account.rows[0]?.id ?? "";
     if (!accountId) throw new Error("Unable to seed rotation integration account");
     await seed.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+      [accountId, userId],
+    );
+    await seed.query(
       `INSERT INTO provider_installation_capabilities(
          provider_installation_id, provider_type, enabled, capabilities
        ) VALUES (

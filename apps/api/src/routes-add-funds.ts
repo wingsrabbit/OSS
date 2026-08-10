@@ -4,7 +4,14 @@ import { randomUUID } from "node:crypto";
 import { percentageFeeMinor } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertEligible, requireUser } from "./auth.js";
+import {
+  assertCustomerCapability,
+  assertEligible,
+  assertFinancialReadEligible,
+  expectedAccountContextVersion,
+  lockAccountContextForMutation,
+  requireUser,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -47,14 +54,18 @@ async function assertEligibilityLocked(
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
     removed_at: Date | null;
-    membership_role: string;
+    membership_restricted_at: Date | null;
+    membership_role: "owner" | "billing" | "technical" | "viewer";
+    membership_permissions: unknown;
   }>(
     `SELECT
        customer.email_verified_at,
        customer.restricted_at AS user_restricted_at,
        account.restricted_at AS account_restricted_at,
        membership.removed_at,
-       membership.role AS membership_role
+       membership.restricted_at AS membership_restricted_at,
+       membership.role AS membership_role,
+       membership.permissions AS membership_permissions
      FROM users customer
      JOIN client_memberships membership
        ON membership.user_id = customer.id
@@ -70,13 +81,26 @@ async function assertEligibilityLocked(
     state.user_restricted_at ||
     state.account_restricted_at ||
     state.removed_at ||
-    (state.membership_role !== "owner" && state.membership_role !== "billing")
+    state.membership_restricted_at
   ) {
     throw Object.assign(new Error("Account is not eligible to Add Funds"), {
       statusCode: 403,
       code: "ACCOUNT_NOT_ELIGIBLE",
     });
   }
+  assertCustomerCapability(
+    {
+      membershipRole: state.membership_role,
+      membershipPermissions:
+        Array.isArray(state.membership_permissions) &&
+        state.membership_permissions.every(
+          (permission) => typeof permission === "string",
+        )
+          ? state.membership_permissions
+          : [],
+    },
+    "billing.write",
+  );
 }
 
 async function lockCreditAccount(
@@ -134,14 +158,19 @@ export async function registerAddFundsRoutes(
 ): Promise<void> {
   app.post("/api/v1/billing/add-funds/quotes", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertEligible(user);
-    if (user.membershipRole !== "owner" && user.membershipRole !== "billing") {
-      return reply.code(403).send({ error: "Billing permission is required" });
-    }
+    assertCustomerCapability(user, "billing.write");
     const body = quoteSchema.parse(request.body);
     const fingerprint = requestFingerprint("add-funds.quote:v1", body);
 
     const quote = await transaction(pool, async (client) => {
+      const context = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "billing.write");
       await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       const policyResult = await client.query<{
         currency: string;
@@ -248,10 +277,9 @@ export async function registerAddFundsRoutes(
 
   app.post("/api/v1/billing/add-funds", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertEligible(user);
-    if (user.membershipRole !== "owner" && user.membershipRole !== "billing") {
-      return reply.code(403).send({ error: "Billing permission is required" });
-    }
+    assertCustomerCapability(user, "billing.write");
     const body = commandSchema.parse(request.body);
     const fingerprint = requestFingerprint("add-funds.create:v1", {
       quoteId: body.quoteId,
@@ -259,6 +287,12 @@ export async function registerAddFundsRoutes(
     });
 
     const outcome = await transaction(pool, async (client) => {
+      const context = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "billing.write");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `add-funds:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
@@ -484,10 +518,7 @@ export async function registerAddFundsRoutes(
 
   app.get("/api/v1/billing/add-funds/:commandId", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
-    if (user.membershipRole !== "owner" && user.membershipRole !== "billing") {
-      return reply.code(403).send({ error: "Billing permission is required" });
-    }
+    assertFinancialReadEligible(user);
     const params = z.object({ commandId: z.uuid() }).parse(request.params);
     const result = await pool.query<{
       id: string;

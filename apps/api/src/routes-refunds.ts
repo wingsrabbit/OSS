@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { requireUser } from "./auth.js";
+import { requireSessionIdentity } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -850,7 +850,7 @@ export async function registerRefundRoutes(
   config: Config,
 ): Promise<void> {
   app.get("/api/v1/admin/refund-receipt-capacity-incidents", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_adjudicate");
     const result = await pool.query<RefundReceiptCapacityIncidentRow>(
       `SELECT
@@ -903,7 +903,7 @@ export async function registerRefundRoutes(
   app.post(
     "/api/v1/admin/refund-receipt-capacity-incidents/:incidentId/acknowledgements",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.refund_adjudicate");
       await requireRecentReauth(pool, user);
       const params = z.object({ incidentId: canonicalUuid }).parse(request.params);
@@ -916,6 +916,7 @@ export async function registerRefundRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `refund-capacity-ack:idempotency:${body.idempotencyKey}`,
         ]);
@@ -1149,7 +1150,7 @@ export async function registerRefundRoutes(
   );
 
   app.get("/api/v1/admin/refund-security-holds", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_adjudicate");
     const result = await pool.query<RefundSecurityHoldRow>(
       `SELECT
@@ -1257,7 +1258,7 @@ export async function registerRefundRoutes(
   });
 
   app.get("/api/v1/admin/refund-dismissal-corrections", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_adjudicate");
     const result = await pool.query<RefundDismissalCorrectionRow>(
       `SELECT
@@ -1332,7 +1333,7 @@ export async function registerRefundRoutes(
   app.post(
     "/api/v1/admin/refund-security-holds/:holdId/adjudications",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.refund_adjudicate");
       await requireRecentReauth(pool, user);
       const params = z.object({ holdId: canonicalUuid }).parse(request.params);
@@ -1344,6 +1345,7 @@ export async function registerRefundRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `refund-adjudication:idempotency:${body.idempotencyKey}`,
         ]);
@@ -1870,7 +1872,7 @@ export async function registerRefundRoutes(
   app.post(
     "/api/v1/admin/refund-adjudications/:adjudicationId/corrections",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.refund_adjudicate");
       await requireRecentReauth(pool, user);
       const params = z.object({ adjudicationId: canonicalUuid }).parse(request.params);
@@ -1881,6 +1883,7 @@ export async function registerRefundRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `refund-correction:idempotency:${body.idempotencyKey}`,
         ]);
@@ -2282,7 +2285,7 @@ export async function registerRefundRoutes(
   );
 
   app.post("/api/v1/admin/funds/:receiptId/refunds", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.unclaimed_manage");
     await requireStaffPermission(pool, user, "billing.refund_manage");
     await requireRecentReauth(pool, user);
@@ -2298,6 +2301,8 @@ export async function registerRefundRoutes(
     });
 
     const outcome = await transaction(pool, async (client) => {
+      await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
+      await requireStaffActionLocked(client, user, "billing.refund_manage");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `refund:idempotency:${body.idempotencyKey}`,
       ]);
@@ -2460,7 +2465,7 @@ export async function registerRefundRoutes(
           body.scenario,
           user.userId,
           user.sessionId,
-          user.clientAccountId,
+          receipt.client_account_id,
           body.reason,
           body.idempotencyKey,
           fingerprint,
@@ -2533,7 +2538,7 @@ export async function registerRefundRoutes(
   });
 
   app.get("/api/v1/admin/refund-candidates", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_manage");
     const result = await pool.query<{
       receipt_id: string;
@@ -2689,7 +2694,7 @@ export async function registerRefundRoutes(
   });
 
   app.get("/api/v1/admin/refunds", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_manage");
     const result = await pool.query<RefundRow>(
       `SELECT
@@ -2748,7 +2753,7 @@ export async function registerRefundRoutes(
   });
 
   app.get("/api/v1/admin/refunds/:refundId", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_manage");
     const params = z.object({ refundId: canonicalUuid }).parse(request.params);
     const result = await pool.query<RefundRow>(
@@ -2804,7 +2809,7 @@ export async function registerRefundRoutes(
   });
 
   app.post("/api/v1/admin/refunds/:refundId/manual-actions", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_adjudicate");
     await requireRecentReauth(pool, user);
     const params = z.object({ refundId: canonicalUuid }).parse(request.params);
@@ -2816,6 +2821,7 @@ export async function registerRefundRoutes(
     });
 
     const outcome = await transaction(pool, async (client) => {
+      await requireStaffActionLocked(client, user, "billing.refund_adjudicate");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `refund-manual-action:${body.idempotencyKey}`,
       ]);
@@ -3027,7 +3033,7 @@ export async function registerRefundRoutes(
   });
 
   app.post("/api/v1/admin/invoices/:invoiceId/refunds", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.refund_manage");
     await requireRecentReauth(pool, user);
     const params = z.object({ invoiceId: canonicalUuid }).parse(request.params);
@@ -3050,6 +3056,7 @@ export async function registerRefundRoutes(
     });
 
     const outcome = await transaction(pool, async (client) => {
+      await requireStaffActionLocked(client, user, "billing.refund_manage");
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
         [`refund:idempotency:${body.idempotencyKey}`],
@@ -3281,7 +3288,7 @@ export async function registerRefundRoutes(
           body.destination === "original_payment" ? body.scenario : null,
           user.userId,
           user.sessionId,
-          user.clientAccountId,
+          receipt.client_account_id,
           body.reason,
           body.idempotencyKey,
           fingerprint,

@@ -9,7 +9,7 @@ import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
 import type { Config } from "./config.js";
-import { assertSchemaCompatible, runMigrations } from "./database.js";
+import { assertSchemaCompatible, runMigrations, transaction } from "./database.js";
 
 const adminDatabaseUrl = process.env.ADMIN_DATABASE_URL;
 if (!adminDatabaseUrl) {
@@ -76,26 +76,30 @@ async function createFixture(label: string): Promise<Fixture> {
   const accountId = randomUUID();
   const sessionToken = randomBytes(32).toString("base64url");
   const email = `account-history-${label}-${databaseName}@example.invalid`;
-  await pool.query(
-    `INSERT INTO users(id, email, password_hash, email_verified_at)
-     VALUES ($1, $2, 'synthetic-not-a-password', now())`,
-    [userId, email],
-  );
-  await pool.query(
-    `INSERT INTO client_accounts(id, name, owner_user_id)
-     VALUES ($1, $2, $3)`,
-    [accountId, `Synthetic ${label} Account`, userId],
-  );
-  await pool.query(
-    `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
-     VALUES ($1, $2, 'owner', '["*"]'::jsonb)`,
-    [accountId, userId],
-  );
-  await pool.query(
-    `INSERT INTO sessions(user_id, token_digest, expires_at)
-     VALUES ($1, $2, now() + interval '1 hour')`,
-    [userId, digestToken(sessionToken)],
-  );
+  await transaction(pool, async (client) => {
+    await client.query(
+      `INSERT INTO users(id, email, password_hash, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', now())`,
+      [userId, email],
+    );
+    await client.query(
+      `INSERT INTO client_accounts(id, name, owner_user_id)
+       VALUES ($1, $2, $3)`,
+      [accountId, `Synthetic ${label} Account`, userId],
+    );
+    await client.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES ($1, $2, 'owner', '["*"]'::jsonb)`,
+      [accountId, userId],
+    );
+    await client.query(
+      `INSERT INTO sessions(
+         user_id, token_digest, expires_at,
+         active_client_account_id, account_context_version
+       ) VALUES ($1, $2, now() + interval '1 hour', $3, 1)`,
+      [userId, digestToken(sessionToken), accountId],
+    );
+  });
   return { userId, accountId, email, sessionToken };
 }
 
@@ -111,7 +115,10 @@ try {
   });
   await runMigrations(pool);
   const compatibility = await assertSchemaCompatible(pool);
-  assert.equal(compatibility.installedSchemaVersion, "018_stage_c_support_tickets");
+  assert.equal(
+    compatibility.installedSchemaVersion,
+    "019_stage_c_account_context_memberships_contacts",
+  );
 
   const customer = await createFixture("Customer Alpha");
   const otherCustomer = await createFixture("Customer Beta");
@@ -138,10 +145,8 @@ try {
   const otherPaymentId = randomUUID();
   const otherServiceId = randomUUID();
   const otherTicketId = randomUUID();
-  const mismatchedInvoiceId = randomUUID();
-  const mismatchedPaymentId = randomUUID();
-  const mismatchedServiceId = randomUUID();
-  const mismatchedTicketId = randomUUID();
+  const standaloneInvoiceId = randomUUID();
+  const unscopedTicketId = randomUUID();
   const paginationOrderIds = [randomUUID(), randomUUID(), randomUUID()];
   const paginationItemIds = [randomUUID(), randomUUID(), randomUUID()];
   const paginationServiceIds = [randomUUID(), randomUUID(), randomUUID()];
@@ -477,53 +482,15 @@ try {
   );
 
   await pool.query(
-    `INSERT INTO invoices(id, client_account_id, order_id, currency, total_minor, due_at)
-     VALUES ($1, $2, $3, 'USD', 0, now() + interval '7 days')`,
-    [mismatchedInvoiceId, customer.accountId, otherTraceOrderId],
-  );
-  await pool.query(
-    `INSERT INTO payment_attempts(
-       id, client_account_id, invoice_id, provider_installation_id,
-       external_payment_id, status, amount_minor, principal_minor,
-       fee_minor, currency, scenario, idempotency_key, request_fingerprint,
-       provider_occurred_at
-     ) VALUES (
-       $1, $2, $3, 'mock-payment', $4, 'failed', 500, 500,
-       0, 'USD', 'decline', $5, $6, now()
-     )`,
-    [
-      mismatchedPaymentId,
-      customer.accountId,
-      otherInvoiceId,
-      `history-external:${mismatchedPaymentId}`,
-      `history-payment:${mismatchedPaymentId}`,
-      `history-payment-fingerprint:${mismatchedPaymentId}`,
-    ],
-  );
-  await pool.query(
-    `INSERT INTO payment_allocations(payment_attempt_id, invoice_id, amount_minor)
-     VALUES ($1, $2, 100), ($1, $3, 100)`,
-    [mismatchedPaymentId, invoiceId, renewalInvoiceId],
-  );
-  await pool.query(
-    `INSERT INTO services(
-       id, client_account_id, order_item_id, status, billing_cycle,
-       external_resource_id, activated_at, term_start, term_end
-     ) VALUES ($1, $2, $3, 'active', 'monthly', $4, $5, $5, $6)`,
-    [
-      mismatchedServiceId,
-      customer.accountId,
-      otherTraceItemId,
-      `mock-resource:${mismatchedServiceId}`,
-      term.start_at,
-      term.end_at,
-    ],
+    `INSERT INTO invoices(id, client_account_id, currency, total_minor, due_at)
+     VALUES ($1, $2, 'USD', 0, now() + interval '7 days')`,
+    [standaloneInvoiceId, customer.accountId],
   );
   await pool.query(
     `INSERT INTO support_tickets(
-       id, client_account_id, service_id, created_by_user_id, subject
-     ) VALUES ($1, $2, $3, $4, 'Mismatched service relation ticket')`,
-    [mismatchedTicketId, customer.accountId, mismatchedServiceId, customer.userId],
+       id, client_account_id, created_by_user_id, subject
+     ) VALUES ($1, $2, $3, 'Account-level history ticket without a Service')`,
+    [unscopedTicketId, customer.accountId, customer.userId],
   );
 
   for (const [index, paginationOrderId] of paginationOrderIds.entries()) {
@@ -827,18 +794,16 @@ try {
     1,
   );
   assert.equal(
-    history.tickets.find((ticket) => ticket.id === mismatchedTicketId)?.productName,
+    history.tickets.find((ticket) => ticket.id === unscopedTicketId)?.productName,
     null,
   );
   assert.ok(!history.orders.some((order) => order.id === otherOrderId));
   assert.ok(!history.invoices.some((invoice) => invoice.id === otherInvoiceId));
   assert.ok(!history.payments.some((payment) => payment.id === otherPaymentId));
-  assert.ok(!history.payments.some((payment) => payment.id === mismatchedPaymentId));
   assert.ok(!history.services.some((service) => service.id === otherServiceId));
-  assert.ok(!history.services.some((service) => service.id === mismatchedServiceId));
   assert.ok(!history.tickets.some((ticket) => ticket.id === otherTicketId));
   assert.equal(
-    history.invoices.find((invoice) => invoice.id === mismatchedInvoiceId)?.orderId,
+    history.invoices.find((invoice) => invoice.id === standaloneInvoiceId)?.orderId,
     null,
   );
   const customerFacets = [
@@ -876,7 +841,7 @@ try {
     invoices: [
       invoiceId,
       renewalInvoiceId,
-      mismatchedInvoiceId,
+      standaloneInvoiceId,
       ...paginationRenewalInvoiceIds,
     ],
     payments: [paymentId, ...paginationPaymentIds],
@@ -885,7 +850,7 @@ try {
     services: [serviceId, ...paginationServiceIds],
     renewals: [renewalId, ...paginationRenewalIds],
     cancellations: [],
-    tickets: [ticketId, mismatchedTicketId, ...paginationTicketIds],
+    tickets: [ticketId, unscopedTicketId, ...paginationTicketIds],
   };
   const firstCustomerCursors = new Map<string, string>();
   for (const facet of customerFacets) {
@@ -969,7 +934,10 @@ try {
   const replyBetweenPages = await app.inject({
     method: "POST",
     url: `/api/v1/tickets/${replyTargetId}/replies`,
-    headers: { cookie: customerCookie },
+    headers: {
+      cookie: customerCookie,
+      "x-oss-account-context-version": "1",
+    },
     payload: { message: "Synthetic reply between immutable history pages" },
   });
   assert.equal(replyBetweenPages.statusCode, 201, replyBetweenPages.body);
@@ -1152,32 +1120,25 @@ try {
   assert.deepEqual(serviceDetail.trace.renewalIds, [renewalId]);
   assert.deepEqual(serviceDetail.trace.ticketIds, [ticketId]);
 
-  const mismatchedInvoiceResponse = await app.inject({
+  const standaloneInvoiceResponse = await app.inject({
     method: "GET",
-    url: `/api/v1/customer/invoices/${mismatchedInvoiceId}`,
+    url: `/api/v1/customer/invoices/${standaloneInvoiceId}`,
     headers: { cookie: customerCookie },
   });
   assert.equal(
-    mismatchedInvoiceResponse.statusCode,
+    standaloneInvoiceResponse.statusCode,
     200,
-    mismatchedInvoiceResponse.body,
+    standaloneInvoiceResponse.body,
   );
-  const mismatchedInvoice = responseJson<{
+  const standaloneInvoice = responseJson<{
     invoice: { id: string; orderId: string | null };
     related: { orderId: string | null; serviceIds: string[]; renewalIds: string[] };
-  }>(mismatchedInvoiceResponse);
-  assert.equal(mismatchedInvoice.invoice.id, mismatchedInvoiceId);
-  assert.equal(mismatchedInvoice.invoice.orderId, null);
-  assert.equal(mismatchedInvoice.related.orderId, null);
-  assert.deepEqual(mismatchedInvoice.related.serviceIds, []);
-  assert.deepEqual(mismatchedInvoice.related.renewalIds, []);
-
-  const mismatchedServiceResponse = await app.inject({
-    method: "GET",
-    url: `/api/v1/customer/services/${mismatchedServiceId}`,
-    headers: { cookie: customerCookie },
-  });
-  assert.equal(mismatchedServiceResponse.statusCode, 404, mismatchedServiceResponse.body);
+  }>(standaloneInvoiceResponse);
+  assert.equal(standaloneInvoice.invoice.id, standaloneInvoiceId);
+  assert.equal(standaloneInvoice.invoice.orderId, null);
+  assert.equal(standaloneInvoice.related.orderId, null);
+  assert.deepEqual(standaloneInvoice.related.serviceIds, []);
+  assert.deepEqual(standaloneInvoice.related.renewalIds, []);
 
   for (const url of [
     `/api/v1/customer/invoices/${invoiceId}`,

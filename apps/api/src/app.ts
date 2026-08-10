@@ -10,12 +10,18 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema016RollbackBridgeGuard,
-  holdSchema017ApplicationGuard,
+  holdSchema019ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
+import {
+  ACCOUNT_CONTEXT_VERSION_HEADER,
+  accountContextForRequest,
+  CLIENT_ACCOUNT_CONTEXT_HEADER,
+  setAccountContextForRequest,
+} from "./auth.js";
 import { registerAddFundsRoutes } from "./routes-add-funds.js";
+import { registerAccountContextRoutes } from "./routes-account-context.js";
 import { registerAuthRoutes } from "./routes-auth.js";
 import { registerAdminRoutes } from "./routes-admin.js";
 import { registerCatalogRoutes } from "./routes-catalog.js";
@@ -84,9 +90,12 @@ export async function buildApp(
   };
 
   try {
-    releaseSchemaRollbackGuard = config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017"
-      ? await holdSchema016RollbackBridgeGuard(pool)
-      : await holdSchema017ApplicationGuard(pool);
+    if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
+      throw new Error(
+        "Schema 019 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
+      );
+    }
+    releaseSchemaRollbackGuard = await holdSchema019ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
@@ -96,14 +105,31 @@ export async function buildApp(
   await app.register(cors, {
     origin: config.WEB_ORIGIN,
     credentials: true,
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    exposedHeaders: [
+      CLIENT_ACCOUNT_CONTEXT_HEADER,
+      ACCOUNT_CONTEXT_VERSION_HEADER,
+    ],
   });
   await app.register(rateLimit, {
     max: config.GLOBAL_RATE_LIMIT_MAX,
     timeWindow: "1 minute",
   });
 
-  app.addHook("onSend", async (_request, reply) => {
+  app.addHook("onSend", async (request, reply) => {
+    const context = accountContextForRequest(request);
+    if (context && !reply.hasHeader(ACCOUNT_CONTEXT_VERSION_HEADER)) {
+      reply.header(
+        ACCOUNT_CONTEXT_VERSION_HEADER,
+        context.accountContextVersion,
+      );
+    }
+    if (
+      context?.clientAccountId &&
+      !reply.hasHeader(CLIENT_ACCOUNT_CONTEXT_HEADER)
+    ) {
+      reply.header(CLIENT_ACCOUNT_CONTEXT_HEADER, context.clientAccountId);
+    }
     reply.header("X-Robots-Tag", "noindex, nofollow, noarchive");
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Referrer-Policy", "no-referrer");
@@ -112,7 +138,7 @@ export async function buildApp(
     reply.header("Cache-Control", "no-store");
   });
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (error instanceof ZodError) {
       return reply.code(400).send({
         error: "Invalid request",
@@ -136,6 +162,20 @@ export async function buildApp(
       typeof error.code === "string"
         ? error.code
         : undefined;
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "currentClientAccountId" in error &&
+      (typeof error.currentClientAccountId === "string" ||
+        error.currentClientAccountId === null) &&
+      "currentAccountContextVersion" in error &&
+      typeof error.currentAccountContextVersion === "string"
+    ) {
+      setAccountContextForRequest(request, {
+        clientAccountId: error.currentClientAccountId,
+        accountContextVersion: error.currentAccountContextVersion,
+      });
+    }
     if (statusCode >= 500) {
       app.log.error({ err: error }, "request failed");
     }
@@ -171,6 +211,7 @@ export async function buildApp(
   });
 
   await registerAuthRoutes(app, pool, config);
+  await registerAccountContextRoutes(app, pool, config);
   await registerAdminRoutes(app, pool, config);
   await registerClientAccountRoutes(app, pool, config);
   await registerCustomerHistoryRoutes(app, pool, config);

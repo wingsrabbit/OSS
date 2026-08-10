@@ -6,7 +6,11 @@ import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
 import type { Config } from "./config.js";
-import { assertSchemaCompatible, runMigrations } from "./database.js";
+import {
+  assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
+  runMigrations,
+} from "./database.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required for manual receipt integration");
@@ -56,10 +60,7 @@ let app: Awaited<ReturnType<typeof buildApp>>["app"] | null = null;
 try {
   await runMigrations(pool);
   const schema = await assertSchemaCompatible(pool);
-  assert.equal(
-    schema.installedSchemaVersion,
-    "018_stage_c_support_tickets",
-  );
+  assert.equal(schema.installedSchemaVersion, REQUIRED_SCHEMA_VERSION);
   assert.equal(schema.mode, "native");
 
   await pool.query(
@@ -67,18 +68,30 @@ try {
      VALUES ($1, $2, 'synthetic-not-a-password', now())`,
     [userId, `manual-receipt-${namespace}@example.invalid`],
   );
-  await pool.query(
-    `INSERT INTO client_accounts(id, name, owner_user_id)
-     VALUES
-       ($1, 'Synthetic staff account', $3),
-       ($2, 'Synthetic manual receipt target', $3)`,
-    [staffAccountId, targetAccountId, userId],
-  );
-  await pool.query(
-    `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
-     VALUES ($1, $2, 'owner', '[]'::jsonb)`,
-    [staffAccountId, userId],
-  );
+  const accountSetup = await pool.connect();
+  try {
+    await accountSetup.query("BEGIN");
+    await accountSetup.query(
+      `INSERT INTO client_accounts(id, name, owner_user_id)
+       VALUES
+         ($1, 'Synthetic staff account', $3),
+         ($2, 'Synthetic manual receipt target', $3)`,
+      [staffAccountId, targetAccountId, userId],
+    );
+    await accountSetup.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES
+         ($1, $3, 'owner', '[]'::jsonb),
+         ($2, $3, 'owner', '[]'::jsonb)`,
+      [staffAccountId, targetAccountId, userId],
+    );
+    await accountSetup.query("COMMIT");
+  } catch (error) {
+    await accountSetup.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    accountSetup.release();
+  }
   await pool.query(
     `INSERT INTO sessions(id, user_id, token_digest, expires_at)
      VALUES ($1, $2, $3, now() + interval '1 hour')`,
@@ -1212,7 +1225,7 @@ try {
 
   await assert.rejects(
     runMigrations(pool),
-    /running schema-017 API or Worker/,
+    /running schema-019 API or Worker/,
   );
   await app.close();
   app = null;
@@ -1221,7 +1234,7 @@ try {
 
   process.stdout.write(
     `${JSON.stringify({
-      schema018Native: true,
+      schema019Native: true,
       manualReceiptRecorded: true,
       mistakenManualReceiptReversed: true,
       reversalRequiresBothPermissions: true,

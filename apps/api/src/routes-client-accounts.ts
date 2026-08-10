@@ -2,7 +2,7 @@
 
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { requireUser } from "./auth.js";
+import { requireSessionIdentity } from "./auth.js";
 import type { Config } from "./config.js";
 import type { DatabasePool } from "./database.js";
 import {
@@ -17,6 +17,7 @@ import {
   LAB_WARNING,
   listCancellationsPage,
   listInvoicesPage,
+  listNotificationDeliveriesPage,
   listOrdersPage,
   listPaymentsPage,
   listRefundsPage,
@@ -24,6 +25,7 @@ import {
   listServicesPage,
   listTicketsPage,
   loadCreditHistoryPage,
+  maskNotificationRecipient,
   withReadSnapshot,
 } from "./routes-customer-history.js";
 import { requireStaffPermission } from "./routes-admin.js";
@@ -102,6 +104,7 @@ type MembershipSummary = {
   permissions: string[];
   emailVerifiedAt: string | null;
   userRestrictedAt: string | null;
+  membershipRestrictedAt: string | null;
   createdAt: string;
   removedAt: string | null;
 };
@@ -163,6 +166,7 @@ async function listMembershipsPage(
     permissions: unknown;
     email_verified_at: Date | null;
     user_restricted_at: Date | null;
+    membership_restricted_at: Date | null;
     created_at_cursor: string;
     removed_at: Date | null;
   }>(
@@ -172,6 +176,7 @@ async function listMembershipsPage(
             membership.permissions,
             user_account.email_verified_at,
             user_account.restricted_at AS user_restricted_at,
+            membership.restricted_at AS membership_restricted_at,
             to_char(
               membership.created_at AT TIME ZONE 'UTC',
               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
@@ -200,6 +205,8 @@ async function listMembershipsPage(
     permissions: stringPermissions(membership.permissions),
     emailVerifiedAt: membership.email_verified_at?.toISOString() ?? null,
     userRestrictedAt: membership.user_restricted_at?.toISOString() ?? null,
+    membershipRestrictedAt:
+      membership.membership_restricted_at?.toISOString() ?? null,
     createdAt: membership.created_at_cursor,
     removedAt: membership.removed_at?.toISOString() ?? null,
   }));
@@ -385,7 +392,7 @@ export async function registerClientAccountRoutes(
   config: Config,
 ): Promise<void> {
   app.get("/api/v1/admin/client-accounts", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "accounts.view");
     const query = z
       .object({
@@ -505,7 +512,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/summary",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "accounts.view");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parseInitialPageQuery(request.query);
@@ -575,7 +582,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/billing/:facet",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.read");
       const params = z
         .object({
@@ -659,7 +666,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/summary/:facet",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "accounts.view");
       const params = z
         .object({
@@ -694,9 +701,96 @@ export async function registerClientAccountRoutes(
   );
 
   app.get(
+    "/api/v1/admin/client-accounts/:clientAccountId/notification-deliveries",
+    async (request) => {
+      const user = await requireSessionIdentity(request, pool, config);
+      await requireStaffPermission(pool, user, "accounts.notification.read");
+      const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
+      return withReadSnapshot(pool, async (client) => {
+        const account = await loadAccountIdentity(client, params.clientAccountId);
+        const collection = await listNotificationDeliveriesPage(
+          client,
+          account.id,
+          page,
+          "admin.account-notification-deliveries",
+        );
+        return {
+          warning: LAB_WARNING,
+          account,
+          ...collection,
+          items: collection.items.map((item) => ({
+            ...item,
+            recipient: maskNotificationRecipient(item.recipient),
+          })),
+        };
+      });
+    },
+  );
+
+  app.get(
+    "/api/v1/admin/client-accounts/:clientAccountId/contacts",
+    async (request) => {
+      const user = await requireSessionIdentity(request, pool, config);
+      await requireStaffPermission(pool, user, "accounts.contacts.read");
+      const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
+      return withReadSnapshot(pool, async (client) => {
+        const account = await loadAccountIdentity(client, params.clientAccountId);
+        const scope = "admin.account-contacts";
+        const cursor = decodeKeysetCursor(page.cursor, scope, account.id);
+        const contacts = await client.query<{
+          id: string;
+          display_name: string;
+          email: string;
+          locale: "en" | "zh-CN";
+          notification_subscriptions: unknown;
+          created_at_cursor: string;
+          updated_at: Date;
+        }>(
+          `SELECT id, display_name, email, locale, notification_subscriptions,
+                  to_char(
+                    created_at AT TIME ZONE 'UTC',
+                    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                  ) AS created_at_cursor,
+                  updated_at
+           FROM client_contacts
+           WHERE client_account_id = $1 AND removed_at IS NULL
+             AND (
+               $2::timestamptz IS NULL OR
+               (created_at, id) > ($2::timestamptz, $3::uuid)
+             )
+           ORDER BY created_at, id
+           LIMIT $4`,
+          [account.id, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
+        );
+        const items = contacts.rows.map((contact) => ({
+          id: contact.id,
+          displayName: contact.display_name,
+          email: contact.email,
+          locale: contact.locale,
+          notificationSubscriptions: stringPermissions(
+            contact.notification_subscriptions,
+          ),
+          createdAt: contact.created_at_cursor,
+          updatedAt: contact.updated_at.toISOString(),
+        }));
+        return {
+          warning: LAB_WARNING,
+          account,
+          ...collectionPage(items, page.limit, scope, account.id, (contact) => ({
+            at: contact.createdAt,
+            id: contact.id,
+          })),
+        };
+      });
+    },
+  );
+
+  app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/orders",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "orders.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parsePageQuery(request.query);
@@ -720,7 +814,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/billing",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parseInitialPageQuery(request.query);
@@ -802,7 +896,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/services",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "services.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parsePageQuery(request.query);
@@ -826,7 +920,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/renewals",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parsePageQuery(request.query);
@@ -850,7 +944,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/cancellations",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "services.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parsePageQuery(request.query);
@@ -874,7 +968,7 @@ export async function registerClientAccountRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/tickets",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "support.tickets.manage");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const page = parsePageQuery(request.query);

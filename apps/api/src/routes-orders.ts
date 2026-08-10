@@ -10,7 +10,16 @@ import {
 } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertBillingWriteEligible, assertEligible, requireUser } from "./auth.js";
+import {
+  assertBillingWriteEligible,
+  assertCustomerCapability,
+  assertEligible,
+  assertFinancialReadEligible,
+  expectedAccountContextVersion,
+  lockAccountContextForMutation,
+  requireUser,
+  setAccountContextHeaders,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -189,7 +198,6 @@ async function assertEligibilityLocked(
   client: DatabaseClient,
   userId: string,
   clientAccountId: string,
-  requireBillingRole = false,
 ): Promise<void> {
   // Keep the shared identity lock order explicit. PostgreSQL does not promise
   // the row-lock order of a multi-relation FOR UPDATE join, and payment
@@ -210,14 +218,12 @@ async function assertEligibilityLocked(
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
     removed_at: Date | null;
-    membership_role: "owner" | "billing" | "technical" | "viewer";
   }>(
     `SELECT
        u.email_verified_at,
        u.restricted_at AS user_restricted_at,
        ca.restricted_at AS account_restricted_at,
-       cm.removed_at,
-       cm.role AS membership_role
+       cm.removed_at
      FROM users u
      JOIN client_memberships cm ON cm.user_id = u.id AND cm.client_account_id = $2
      JOIN client_accounts ca ON ca.id = cm.client_account_id
@@ -229,10 +235,7 @@ async function assertEligibilityLocked(
     !state?.email_verified_at ||
     state.user_restricted_at ||
     state.account_restricted_at ||
-    state.removed_at ||
-    (requireBillingRole &&
-      state.membership_role !== "owner" &&
-      state.membership_role !== "billing")
+    state.removed_at
   ) {
     throw Object.assign(new Error("Account is not eligible for this operation"), {
       statusCode: 403,
@@ -248,7 +251,9 @@ export async function registerOrderRoutes(
 ): Promise<void> {
   app.post("/api/v1/orders", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertEligible(user);
+    assertCustomerCapability(user, "orders.create");
     const body = checkoutSchema.parse(request.body);
     const fingerprint = requestFingerprint("orders.create:v1", {
       priceId: body.priceId,
@@ -258,6 +263,12 @@ export async function registerOrderRoutes(
     });
 
     const created = await transaction(pool, async (client) => {
+      const context = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "orders.create");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `order:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
@@ -494,11 +505,13 @@ export async function registerOrderRoutes(
       return { orderId, invoiceId, serviceId, replayed: false };
     });
 
+    setAccountContextHeaders(reply, user);
     return reply.code(created.replayed ? 200 : 201).send(created);
   });
 
   app.get("/api/v1/orders", async (request) => {
     const user = await requireUser(request, pool, config);
+    assertFinancialReadEligible(user);
     const result = await pool.query<{
       order_id: string;
       order_status: string;
@@ -535,6 +548,7 @@ export async function registerOrderRoutes(
 
   app.get("/api/v1/orders/:orderId", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    assertFinancialReadEligible(user);
     const params = z.object({ orderId: z.uuid() }).parse(request.params);
     const result = await pool.query<{
       order_id: string;
@@ -686,6 +700,7 @@ export async function registerOrderRoutes(
 
   app.post("/api/v1/invoices/:invoiceId/payments", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = paymentSchema.parse(request.body);
@@ -703,6 +718,37 @@ export async function registerOrderRoutes(
     });
 
     const result = await transaction(pool, async (client) => {
+      const settlementIdentity = await client.query<{ target_user_id: string | null }>(
+        `SELECT pg_catalog.coalesce(
+                  order_record.submitted_by_user_id,
+                  original_order.submitted_by_user_id
+                ) AS target_user_id
+         FROM invoices invoice
+         LEFT JOIN orders order_record ON order_record.id = invoice.order_id
+         LEFT JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+         LEFT JOIN services service ON service.id = renewal.service_id
+         LEFT JOIN order_items item ON item.id = service.order_item_id
+         LEFT JOIN orders original_order ON original_order.id = item.order_id
+         WHERE invoice.id = $1`,
+        [params.invoiceId],
+      );
+      const targetUserId = settlementIdentity.rows[0]?.target_user_id;
+      const accountContext = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+        targetUserId ? [targetUserId] : [],
+      );
+      assertCustomerCapability(accountContext, "billing.write");
+      if (targetUserId && targetUserId !== user.userId) {
+        await client.query(
+          `SELECT user_id
+           FROM client_memberships
+           WHERE client_account_id = $1 AND user_id = $2
+           FOR UPDATE`,
+          [user.clientAccountId, targetUserId],
+        );
+      }
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
@@ -884,7 +930,7 @@ export async function registerOrderRoutes(
         }
         automaticRenewalServiceId = renewable.id;
       }
-      await assertEligibilityLocked(client, user.userId, user.clientAccountId, true);
+      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       if (body.savePaymentMethod || body.enableAutomaticRenewal) {
         await requireRecentReauthLocked(client, user);
       }
@@ -1135,6 +1181,7 @@ export async function registerOrderRoutes(
         replayed: false,
       };
     });
+    setAccountContextHeaders(reply, user);
     return reply
       .code(result.replayed || result.paymentAttemptId === null ? 200 : 202)
       .send(result);

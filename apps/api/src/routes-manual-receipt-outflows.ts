@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { requireUser, type AuthenticatedUser } from "./auth.js";
+import { requireSessionIdentity, type SessionIdentity } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -86,7 +86,7 @@ type StoredOutcome = Record<string, unknown>;
 
 async function requireOutflowStaffActionLocked(
   client: DatabaseClient,
-  user: AuthenticatedUser,
+  user: SessionIdentity,
 ): Promise<string> {
   await requireStaffActionLocked(client, user, "billing.manual_receipt_manage");
   await requireStaffActionLocked(client, user, "billing.refund_manage");
@@ -211,7 +211,7 @@ export async function registerManualReceiptOutflowRoutes(
   app.post(
     "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts/:manualReceiptId/outflow-reports",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
       await requireStaffPermission(pool, user, "billing.refund_manage");
       await requireRecentReauth(pool, user);
@@ -249,6 +249,7 @@ export async function registerManualReceiptOutflowRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        const reauthGrantId = await requireOutflowStaffActionLocked(client, user);
         const locks = [
           `manual-receipt-outflow:idempotency:${body.idempotencyKey}`,
           `manual-receipt-outflow:source:${params.manualReceiptId}`,
@@ -300,7 +301,6 @@ export async function registerManualReceiptOutflowRoutes(
           return { ...semanticReplay.rows[0].result, replayed: true };
         }
 
-        const reauthGrantId = await requireOutflowStaffActionLocked(client, user);
         const source = await lockOriginalSource(
           client,
           params.clientAccountId,
@@ -437,7 +437,7 @@ export async function registerManualReceiptOutflowRoutes(
   app.post(
     "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts/:manualReceiptId/outflow-reports/:reportId/reconciliation",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
       await requireStaffPermission(pool, user, "billing.refund_manage");
       await requireRecentReauth(pool, user);
@@ -466,6 +466,7 @@ export async function registerManualReceiptOutflowRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        const reauthGrantId = await requireOutflowStaffActionLocked(client, user);
         const locks = [
           `manual-receipt-outflow-reconciliation:idempotency:${body.idempotencyKey}`,
           `manual-receipt-outflow:source:${params.manualReceiptId}`,
@@ -503,7 +504,6 @@ export async function registerManualReceiptOutflowRoutes(
           return { ...keyReplay.result, replayed: true };
         }
 
-        const reauthGrantId = await requireOutflowStaffActionLocked(client, user);
         const reportResult = await client.query<{
           id: string;
           manual_receipt_id: string;

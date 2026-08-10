@@ -32,6 +32,10 @@
     "./schema-017-018-native-compatibility": {
       "types": "./dist/schema-017-018-native-compatibility.d.ts",
       "default": "./dist/schema-017-018-native-compatibility.js"
+    },
+    "./schema-018-019-native-compatibility": {
+      "types": "./dist/schema-018-019-native-compatibility.d.ts",
+      "default": "./dist/schema-018-019-native-compatibility.js"
     }
   },
   "scripts": {

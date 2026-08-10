@@ -134,6 +134,9 @@ jobs:
       - name: Build applications and conformance code
         run: pnpm -r --if-present build
 
+      - name: Run Mock Mail result reconciliation integration
+        run: pnpm --filter @opensales/mock-lab test:integration:mail
+
       - name: Install invoice PDF inspection tools
         shell: bash
         run: |
@@ -176,6 +179,7 @@ jobs:
           await client.query('CREATE DATABASE manual_receipts');
           await client.query('CREATE DATABASE support_tickets');
           await client.query('CREATE DATABASE worker_job_claim');
+          await client.query('CREATE DATABASE notification_delivery');
           await client.query('CREATE DATABASE schema_rollback');
           await client.query('CREATE DATABASE schema_015_016_rollback');
           await client.query('CREATE DATABASE schema_016_017_rollback');
@@ -205,6 +209,9 @@ jobs:
         env:
           ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
         run: pnpm --filter @opensales/api test:integration:account-history
+
+      - name: Run account context PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:account-context
 
       - name: Mechanically inspect Unicode multi-page invoice PDF
         shell: bash
@@ -273,6 +280,23 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/worker_job_claim
         run: |
           pnpm --filter @opensales/worker test:integration:job-claim
+
+      - name: Prepare schema 019 notification delivery PostgreSQL journey
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/notification_delivery
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import pg from 'pg';
+          import { runMigrations } from './dist/database.js';
+          const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+          await runMigrations(pool);
+          await pool.end();"
+
+      - name: Run schema 019 notification delivery PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/notification_delivery
+        run: pnpm --filter @opensales/worker test:integration:notification-delivery
 
       - name: Prepare schema 014 rollback database
         shell: bash

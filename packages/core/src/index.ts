@@ -2,6 +2,61 @@
 
 export const LAB_BANNER = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY" as const;
 
+export const CUSTOMER_CAPABILITIES = [
+  "account.contacts.manage",
+  "account.contacts.read",
+  "account.history.read",
+  "account.members.manage",
+  "account.members.read",
+  "billing.read",
+  "billing.write",
+  "orders.create",
+  "services.manage",
+  "support.tickets.write",
+] as const;
+
+export type CustomerCapability = (typeof CUSTOMER_CAPABILITIES)[number];
+export type CustomerMembershipRole = "owner" | "billing" | "technical" | "viewer";
+
+const customerCapabilitySet = new Set<string>(CUSTOMER_CAPABILITIES);
+
+export function customerMembershipCapabilities(input: Readonly<{
+  role: CustomerMembershipRole;
+  permissions: readonly string[];
+}>): readonly CustomerCapability[] {
+  if (input.role === "owner" || input.permissions.includes("*")) {
+    return [...CUSTOMER_CAPABILITIES];
+  }
+  const capabilities = new Set<CustomerCapability>([
+    "account.history.read",
+    "billing.read",
+  ]);
+  if (input.role === "billing") {
+    capabilities.add("orders.create");
+    capabilities.add("billing.write");
+    capabilities.add("support.tickets.write");
+  } else if (input.role === "technical") {
+    capabilities.add("services.manage");
+    capabilities.add("support.tickets.write");
+  }
+  for (const permission of input.permissions) {
+    if (customerCapabilitySet.has(permission)) {
+      capabilities.add(permission as CustomerCapability);
+    }
+  }
+  return [...capabilities].sort();
+}
+
+export function hasCustomerMembershipCapability(
+  input: Readonly<{
+    role: CustomerMembershipRole;
+    permissions: readonly string[];
+  }>,
+  capability: CustomerCapability,
+): boolean {
+  return customerMembershipCapabilities(input).includes(capability);
+}
+
 export {
   assertMigrationDatabaseRoleSafe,
   assertRuntimeDatabaseRoleSafe,

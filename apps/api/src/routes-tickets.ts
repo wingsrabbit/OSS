@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertEligible, requireUser } from "./auth.js";
+import {
+  assertCustomerCapability,
+  assertIdentityReadEligible,
+  expectedAccountContextVersion,
+  lockSupportAccountContextForMutation,
+  requireSessionIdentity,
+  requireUser,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
-import { requireStaffPermission } from "./routes-admin.js";
+import {
+  enqueueNotification,
+  enqueueSubscribedContactNotifications,
+} from "./notification-outbox.js";
+import {
+  requireStaffActionLocked,
+  requireStaffPermission,
+} from "./routes-admin.js";
 
 const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
 
@@ -52,6 +67,17 @@ type TicketMessageRow = {
 
 function requestError(message: string, statusCode: number, code?: string): Error {
   return Object.assign(new Error(message), { statusCode, ...(code ? { code } : {}) });
+}
+
+function rethrowNotificationRecipientLock(error: unknown): never {
+  if (error && typeof error === "object" && "code" in error && error.code === "55P03") {
+    throw requestError(
+      "Ticket notification recipient changed; retry",
+      409,
+      "NOTIFICATION_RECIPIENT_CHANGED",
+    );
+  }
+  throw error;
 }
 
 function customerTicket(row: CustomerTicketRow) {
@@ -192,7 +218,7 @@ export async function registerTicketRoutes(
 ): Promise<void> {
   app.get("/api/v1/tickets/service-options", async (request) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    assertIdentityReadEligible(user);
     const result = await pool.query<{
       id: string;
       product_name: string;
@@ -216,7 +242,7 @@ export async function registerTicketRoutes(
 
   app.get("/api/v1/tickets", async (request) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    assertIdentityReadEligible(user);
     const result = await pool.query<CustomerTicketRow>(
       `SELECT ticket.id,
               ticket.subject,
@@ -242,9 +268,17 @@ export async function registerTicketRoutes(
 
   app.post("/api/v1/tickets", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    const expectedContextVersion = expectedAccountContextVersion(request);
+    assertIdentityReadEligible(user);
+    assertCustomerCapability(user, "support.tickets.write");
     const body = createTicketSchema.parse(request.body);
     const ticketId = await transaction(pool, async (client) => {
+      const context = await lockSupportAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "support.tickets.write");
       if (body.serviceId) {
         const service = await client.query(
           `SELECT id FROM services
@@ -283,17 +317,25 @@ export async function registerTicketRoutes(
 
   app.get("/api/v1/tickets/:ticketId", async (request) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    assertIdentityReadEligible(user);
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     return loadCustomerTicket(pool, params.ticketId, user.clientAccountId);
   });
 
   app.post("/api/v1/tickets/:ticketId/replies", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    const expectedContextVersion = expectedAccountContextVersion(request);
+    assertIdentityReadEligible(user);
+    assertCustomerCapability(user, "support.tickets.write");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = customerReplySchema.parse(request.body);
     await transaction(pool, async (client) => {
+      const context = await lockSupportAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "support.tickets.write");
       const ticket = await client.query<{ status: TicketStatus }>(
         `SELECT status FROM support_tickets
          WHERE id = $1 AND client_account_id = $2
@@ -323,7 +365,7 @@ export async function registerTicketRoutes(
   });
 
   app.get("/api/v1/admin/tickets", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const result = await pool.query<
       CustomerTicketRow & {
@@ -363,32 +405,219 @@ export async function registerTicketRoutes(
   });
 
   app.get("/api/v1/admin/tickets/:ticketId", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     return loadStaffTicket(pool, params.ticketId);
   });
 
   app.post("/api/v1/admin/tickets/:ticketId/messages", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = staffMessageSchema.parse(request.body);
+    const messageId = randomUUID();
     await transaction(pool, async (client) => {
-      const ticket = await client.query<{ status: TicketStatus }>(
-        "SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE",
+      await requireStaffActionLocked(client, user, "support.tickets.manage");
+      const visibility = body.kind === "internal_note" ? "internal" : "public";
+      let notificationPrimary: "creator" | "recorded_owner" | null = null;
+      let notificationTicketSnapshot:
+        | Readonly<{
+            clientAccountId: string;
+            createdByUserId: string;
+            subject: string;
+          }>
+        | null = null;
+      if (visibility === "public") {
+        const pointerResult = await client.query<{
+          client_account_id: string;
+          created_by_user_id: string;
+          subject: string;
+          owner_user_id: string;
+        }>(
+          `SELECT ticket.client_account_id,
+                  ticket.created_by_user_id,
+                  ticket.subject,
+                  account.owner_user_id
+           FROM support_tickets ticket
+           JOIN client_accounts account ON account.id = ticket.client_account_id
+           WHERE ticket.id = $1`,
+          [params.ticketId],
+        );
+        const pointer = pointerResult.rows[0];
+        if (!pointer) throw requestError("Ticket not found", 404);
+        let principals: Array<{
+          id: string;
+          email: string;
+          locale: string;
+          email_verified_at: Date | null;
+          restricted_at: Date | null;
+        }>;
+        let memberships: Array<{
+          user_id: string;
+          role: string;
+          removed_at: Date | null;
+          restricted_at: Date | null;
+        }>;
+        try {
+          const principalResult = await client.query<{
+            id: string;
+            email: string;
+            locale: string;
+            email_verified_at: Date | null;
+            restricted_at: Date | null;
+          }>(
+            `SELECT id, email::text, locale, email_verified_at, restricted_at
+             FROM users
+             WHERE id = ANY($1::uuid[])
+             ORDER BY id
+             FOR SHARE NOWAIT`,
+            [[...new Set([pointer.created_by_user_id, pointer.owner_user_id])].sort()],
+          );
+          principals = principalResult.rows;
+          const account = await client.query<{ owner_user_id: string }>(
+            `SELECT owner_user_id
+             FROM client_accounts
+             WHERE id = $1
+             FOR SHARE NOWAIT`,
+            [pointer.client_account_id],
+          );
+          if (account.rows[0]?.owner_user_id !== pointer.owner_user_id) {
+            throw requestError(
+              "Ticket notification recipient changed; retry",
+              409,
+              "NOTIFICATION_RECIPIENT_CHANGED",
+            );
+          }
+          const membershipResult = await client.query<{
+            user_id: string;
+            role: string;
+            removed_at: Date | null;
+            restricted_at: Date | null;
+          }>(
+            `SELECT user_id, role, removed_at, restricted_at
+             FROM client_memberships
+             WHERE client_account_id = $1
+               AND user_id = ANY($2::uuid[])
+             ORDER BY user_id
+             FOR SHARE NOWAIT`,
+            [
+              pointer.client_account_id,
+              [...new Set([pointer.created_by_user_id, pointer.owner_user_id])].sort(),
+            ],
+          );
+          memberships = membershipResult.rows;
+        } catch (error) {
+          rethrowNotificationRecipientLock(error);
+        }
+        const creator = principals.find(
+          (principal) => principal.id === pointer.created_by_user_id,
+        );
+        const creatorMembership = memberships.find(
+          (membership) => membership.user_id === pointer.created_by_user_id,
+        );
+        const owner = principals.find((principal) => principal.id === pointer.owner_user_id);
+        const ownerMembership = memberships.find(
+          (membership) => membership.user_id === pointer.owner_user_id,
+        );
+        const creatorEligible = Boolean(
+          creator?.email_verified_at &&
+            !creator.restricted_at &&
+            creatorMembership &&
+            !creatorMembership.removed_at &&
+            !creatorMembership.restricted_at,
+        );
+        notificationTicketSnapshot = {
+          clientAccountId: pointer.client_account_id,
+          createdByUserId: pointer.created_by_user_id,
+          subject: pointer.subject,
+        };
+        const notificationPayload = {
+          ticketId: params.ticketId,
+          ticketMessageId: messageId,
+          ticketSubject: pointer.subject,
+          ticketMessage: body.message,
+        } as const;
+        let primaryEmail: string | null = null;
+        if (creatorEligible && creator) {
+          await enqueueNotification(client, {
+            eventType: "notification.support_ticket_reply_requested",
+            templateRevision: "support-ticket-reply-v1",
+            uniqueKey: `support-ticket-reply:${messageId}`,
+            payload: notificationPayload,
+            recipient: {
+              kind: "account_user",
+              category: "support",
+              userId: pointer.created_by_user_id,
+              clientAccountId: pointer.client_account_id,
+              email: creator.email,
+              locale: creator.locale === "zh-CN" ? "zh-CN" : "en",
+            },
+          });
+          primaryEmail = creator.email;
+          notificationPrimary = "creator";
+        } else if (owner && ownerMembership?.role === "owner") {
+          const ownerNotification = await enqueueNotification(client, {
+            eventType: "notification.support_ticket_reply_requested",
+            templateRevision: "support-ticket-reply-v1",
+            uniqueKey: `support-ticket-reply:${messageId}`,
+            payload: notificationPayload,
+            recipient: {
+              kind: "account_user",
+              category: "support",
+              userId: pointer.owner_user_id,
+              clientAccountId: pointer.client_account_id,
+              email: owner.email,
+              locale: owner.locale === "zh-CN" ? "zh-CN" : "en",
+            },
+          });
+          if (ownerNotification.status === "queued") primaryEmail = owner.email;
+          notificationPrimary = "recorded_owner";
+        }
+        await enqueueSubscribedContactNotifications(client, {
+          eventType: "notification.support_ticket_reply_requested",
+          templateRevision: "support-ticket-reply-v1",
+          uniqueKeyPrefix: `support-ticket-reply:${messageId}`,
+          payload: notificationPayload,
+          clientAccountId: pointer.client_account_id,
+          category: "support",
+          ...(primaryEmail ? { excludeEmails: [primaryEmail] } : {}),
+        });
+      }
+
+      const ticket = await client.query<{
+        status: TicketStatus;
+        client_account_id: string;
+        created_by_user_id: string;
+        subject: string;
+      }>(
+        `SELECT status, client_account_id, created_by_user_id, subject
+         FROM support_tickets
+         WHERE id = $1
+         FOR UPDATE`,
         [params.ticketId],
       );
       if (!ticket.rows[0]) throw requestError("Ticket not found", 404);
+      if (
+        notificationTicketSnapshot &&
+        (ticket.rows[0].client_account_id !== notificationTicketSnapshot.clientAccountId ||
+          ticket.rows[0].created_by_user_id !== notificationTicketSnapshot.createdByUserId ||
+          ticket.rows[0].subject !== notificationTicketSnapshot.subject)
+      ) {
+        throw requestError(
+          "Ticket notification scope changed; retry",
+          409,
+          "NOTIFICATION_RECIPIENT_CHANGED",
+        );
+      }
       if (ticket.rows[0].status === "closed") {
         throw requestError("Closed tickets cannot be replied to", 409, "TICKET_CLOSED");
       }
-      const visibility = body.kind === "internal_note" ? "internal" : "public";
       await client.query(
         `INSERT INTO support_ticket_messages(
-           ticket_id, author_user_id, author_type, visibility, body
-         ) VALUES ($1, $2, 'staff', $3, $4)`,
-        [params.ticketId, user.userId, visibility, body.message],
+           id, ticket_id, author_user_id, author_type, visibility, body
+         ) VALUES ($1, $2, $3, 'staff', $4, $5)`,
+        [messageId, params.ticketId, user.userId, visibility, body.message],
       );
       await client.query(
         `UPDATE support_tickets
@@ -410,7 +639,7 @@ export async function registerTicketRoutes(
             ? "support.internal_note_added"
             : "support.public_reply_added",
           params.ticketId,
-          { visibility },
+          { visibility, messageId, notificationPrimary },
         ],
       );
     });

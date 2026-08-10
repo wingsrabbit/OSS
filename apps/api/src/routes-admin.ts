@@ -4,7 +4,11 @@ import { randomUUID } from "node:crypto";
 import { addBillingCycle, type BillingCycle } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { requireUser, type AuthenticatedUser } from "./auth.js";
+import {
+  lockSessionIdentityForMutation,
+  requireSessionIdentity,
+  type SessionIdentity,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -70,10 +74,10 @@ const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 
 export async function requireStaffPermission(
   pool: DatabasePool,
-  user: AuthenticatedUser,
+  user: SessionIdentity,
   permission: string,
 ): Promise<void> {
-  if (user.userRestrictedAt || user.clientAccountRestrictedAt || !user.emailVerifiedAt) {
+  if (user.userRestrictedAt || !user.emailVerifiedAt) {
     throw Object.assign(new Error("Staff account is not eligible"), { statusCode: 403 });
   }
   const result = await pool.query<{ permissions: unknown }>(
@@ -85,6 +89,12 @@ export async function requireStaffPermission(
   const permissions = result.rows[0]?.permissions;
   if (
     !Array.isArray(permissions) ||
+    !permissions.every(
+      (candidate) =>
+        typeof candidate === "string" &&
+        candidate.length > 0 &&
+        candidate.trim() === candidate,
+    ) ||
     (!permissions.includes("*") && !permissions.includes(permission))
   ) {
     throw Object.assign(new Error("Staff permission is required"), { statusCode: 403 });
@@ -93,39 +103,50 @@ export async function requireStaffPermission(
 
 export async function requireStaffActionLocked(
   client: DatabaseClient,
-  user: AuthenticatedUser,
+  user: SessionIdentity,
   permission: string,
+  affectedUserIds: readonly string[] = [],
 ): Promise<void> {
+  const identity = await lockSessionIdentityForMutation(
+    client,
+    user,
+    affectedUserIds,
+  );
+  if (!identity.emailVerifiedAt || identity.userRestrictedAt) {
+    throw Object.assign(new Error("Current permission and password confirmation are required"), {
+      statusCode: 403,
+      code: "STAFF_AUTHORIZATION_REQUIRED",
+    });
+  }
   const result = await client.query<{ permissions: unknown }>(
-    `SELECT sm.permissions
-     FROM staff_members sm
-     JOIN users u ON u.id = sm.user_id
-     JOIN sessions s ON s.user_id = u.id AND s.id = $2
-     JOIN client_memberships cm
-       ON cm.user_id = u.id
-      AND cm.client_account_id = $3
-      AND cm.removed_at IS NULL
-     JOIN client_accounts ca ON ca.id = cm.client_account_id
-     JOIN reauth_grants rg
-       ON rg.user_id = u.id
-      AND rg.session_id = s.id
-      AND rg.invalidated_at IS NULL
-      AND rg.expires_at > now()
-     WHERE sm.user_id = $1
-       AND sm.active
-       AND u.email_verified_at IS NOT NULL
-       AND u.restricted_at IS NULL
-       AND ca.restricted_at IS NULL
-       AND s.revoked_at IS NULL
-       AND s.expires_at > now()
-     ORDER BY rg.created_at DESC
-     LIMIT 1
-     FOR UPDATE OF sm, u, s, cm, ca, rg`,
-    [user.userId, user.sessionId, user.clientAccountId],
+    `SELECT permissions
+     FROM staff_members
+     WHERE user_id = $1 AND active
+     FOR UPDATE`,
+    [user.userId],
   );
   const permissions = result.rows[0]?.permissions;
+  const grant = await client.query(
+    `SELECT id
+     FROM reauth_grants
+     WHERE user_id = $1
+       AND session_id = $2
+       AND invalidated_at IS NULL
+       AND expires_at > now()
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [user.userId, user.sessionId],
+  );
   if (
+    grant.rowCount !== 1 ||
     !Array.isArray(permissions) ||
+    !permissions.every(
+      (candidate) =>
+        typeof candidate === "string" &&
+        candidate.length > 0 &&
+        candidate.trim() === candidate,
+    ) ||
     (!permissions.includes("*") && !permissions.includes(permission))
   ) {
     throw Object.assign(new Error("Current permission and password confirmation are required"), {
@@ -137,7 +158,7 @@ export async function requireStaffActionLocked(
 
 export async function requireRecentReauth(
   pool: DatabasePool,
-  user: AuthenticatedUser,
+  user: Pick<SessionIdentity, "userId" | "sessionId">,
 ): Promise<void> {
   const result = await pool.query(
     `SELECT rg.id
@@ -162,24 +183,9 @@ export async function requireRecentReauth(
 
 export async function requireRecentReauthLocked(
   client: DatabaseClient,
-  user: Pick<AuthenticatedUser, "userId" | "sessionId">,
+  user: Pick<SessionIdentity, "userId" | "sessionId">,
 ): Promise<string> {
-  const session = await client.query(
-    `SELECT id
-     FROM sessions
-     WHERE id = $2
-       AND user_id = $1
-       AND revoked_at IS NULL
-       AND expires_at > now()
-     FOR UPDATE`,
-    [user.userId, user.sessionId],
-  );
-  if (session.rowCount !== 1) {
-    throw Object.assign(new Error("Password confirmation is required for this action"), {
-      statusCode: 403,
-      code: "REAUTH_REQUIRED",
-    });
-  }
+  await lockSessionIdentityForMutation(client, user);
   const grant = await client.query<{ id: string }>(
     `SELECT id
      FROM reauth_grants
@@ -210,7 +216,7 @@ export async function registerAdminRoutes(
   app.get(
     "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts",
     async (request) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
       const account = await pool.query<{ id: string; name: string }>(
@@ -432,7 +438,7 @@ export async function registerAdminRoutes(
   app.post(
     "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
       await requireRecentReauth(pool, user);
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
@@ -469,6 +475,7 @@ export async function registerAdminRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "billing.manual_receipt_manage");
         const locks = [
           `manual-receipt:idempotency:${body.idempotencyKey}`,
           `manual-receipt:reference:${params.clientAccountId}:${body.reference}`,
@@ -661,7 +668,7 @@ export async function registerAdminRoutes(
   app.post(
     "/api/v1/admin/client-accounts/:clientAccountId/manual-receipts/:manualReceiptId/reversal",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.manual_receipt_manage");
       await requireStaffPermission(pool, user, "billing.unclaimed_manage");
       await requireRecentReauth(pool, user);
@@ -678,6 +685,8 @@ export async function registerAdminRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "billing.manual_receipt_manage");
+        await requireStaffActionLocked(client, user, "billing.unclaimed_manage");
         const locks = [
           `manual-receipt-reversal:idempotency:${body.idempotencyKey}`,
           `manual-receipt-reversal:semantic:${params.manualReceiptId}`,
@@ -912,7 +921,7 @@ export async function registerAdminRoutes(
   );
 
   app.get("/api/v1/admin/funds/unclaimed", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.unclaimed_manage");
     const result = await pool.query<{
       id: string;
@@ -1005,7 +1014,7 @@ export async function registerAdminRoutes(
   });
 
   app.post("/api/v1/admin/funds/:receiptId/resolutions", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.unclaimed_manage");
     await requireRecentReauth(pool, user);
     const params = z.object({ receiptId: canonicalUuid }).parse(request.params);
@@ -1019,6 +1028,50 @@ export async function registerAdminRoutes(
     });
 
     const outcome = await transaction(pool, async (client) => {
+      const settlementIdentity = body.action === "allocate_invoice"
+        ? (
+            await client.query<{
+              client_account_id: string;
+              target_user_id: string | null;
+            }>(
+              `SELECT invoice.client_account_id,
+                      pg_catalog.coalesce(
+                        order_record.submitted_by_user_id,
+                        original_order.submitted_by_user_id
+                      ) AS target_user_id
+               FROM invoices invoice
+               LEFT JOIN orders order_record ON order_record.id = invoice.order_id
+               LEFT JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+               LEFT JOIN services service ON service.id = renewal.service_id
+               LEFT JOIN order_items item ON item.id = service.order_item_id
+               LEFT JOIN orders original_order ON original_order.id = item.order_id
+               WHERE invoice.id = $1`,
+              [body.invoiceId],
+            )
+          ).rows[0]
+        : undefined;
+      await requireStaffActionLocked(
+        client,
+        user,
+        "billing.unclaimed_manage",
+        settlementIdentity?.target_user_id
+          ? [settlementIdentity.target_user_id]
+          : [],
+      );
+      if (settlementIdentity) {
+        await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+          settlementIdentity.client_account_id,
+        ]);
+        if (settlementIdentity.target_user_id) {
+          await client.query(
+            `SELECT client_account_id
+             FROM client_memberships
+             WHERE client_account_id = $1 AND user_id = $2
+             FOR UPDATE`,
+            [settlementIdentity.client_account_id, settlementIdentity.target_user_id],
+          );
+        }
+      }
       const resolutionLocks = [
         `fund-receipt-resolution:idempotency:${body.idempotencyKey}`,
         `fund-receipt-resolution:semantic:${params.receiptId}:${fingerprint}`,
@@ -1389,7 +1442,7 @@ export async function registerAdminRoutes(
   app.post(
     "/api/v1/admin/client-accounts/:clientAccountId/credit-adjustments",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.credit_adjust");
       await requireRecentReauth(pool, user);
       const params = z.object({ clientAccountId: z.uuid() }).parse(request.params);
@@ -1555,7 +1608,7 @@ export async function registerAdminRoutes(
   );
 
   app.get("/api/v1/admin/manual-fulfillment", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "services.manual_fulfillment");
     const result = await pool.query<{
       service_id: string;
@@ -1604,7 +1657,7 @@ export async function registerAdminRoutes(
   });
 
   app.post("/api/v1/admin/services/:serviceId/complete-manual", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "services.manual_fulfillment");
     await requireRecentReauth(pool, user);
     const params = z.object({ serviceId: z.uuid() }).parse(request.params);
@@ -1631,30 +1684,15 @@ export async function registerAdminRoutes(
         [params.serviceId],
       );
       const lockPointer = lockPointers.rows[0];
-      if (lockPointer) {
-        // Payment callbacks for this order also begin with Invoice. Taking the
-        // same root lock before staff/target rows prevents Invoice/Order ABBA
-        // when a duplicate Provider fact races manual completion.
-        await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
-          lockPointer.invoice_id,
-        ]);
-      }
-      await requireStaffActionLocked(client, user, "services.manual_fulfillment");
+      await requireStaffActionLocked(
+        client,
+        user,
+        "services.manual_fulfillment",
+        lockPointer ? [lockPointer.submitted_by_user_id] : [],
+      );
       if (!lockPointer) {
         throw Object.assign(new Error("Service not found"), { statusCode: 404 });
       }
-      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
-        lockPointer.order_id,
-      ]);
-      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
-        lockPointer.order_item_id,
-      ]);
-      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
-        params.serviceId,
-      ]);
-      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-        lockPointer.submitted_by_user_id,
-      ]);
       await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
         lockPointer.client_account_id,
       ]);
@@ -1665,6 +1703,18 @@ export async function registerAdminRoutes(
          FOR UPDATE`,
         [lockPointer.client_account_id, lockPointer.submitted_by_user_id],
       );
+      await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        lockPointer.invoice_id,
+      ]);
+      await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_id,
+      ]);
+      await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
+        lockPointer.order_item_id,
+      ]);
+      await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
+        params.serviceId,
+      ]);
       const serviceResult = await client.query<{
         service_id: string;
         service_status: string;

@@ -7,7 +7,9 @@ import { Readable } from "node:stream";
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import { z } from "zod";
 import {
+  assertCustomerCapability,
   assertFinancialReadEligible,
+  assertIdentityReadEligible,
   requireUser,
 } from "./auth.js";
 import type { Config } from "./config.js";
@@ -186,6 +188,170 @@ export type TicketSummary = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type NotificationDeliverySummary = {
+  id: string;
+  attemptNumber: number;
+  eventType: string;
+  templateRevision: string;
+  category: string;
+  recipientKind: string;
+  recipient: string;
+  locale: string;
+  status: string;
+  operationState: string;
+  outcomeStatus: string | null;
+  reason: string | null;
+  requiresAttention: boolean;
+  attempts: number;
+  provider: "mock-mail-v1";
+  dispatchStartedAt: string | null;
+  lastCheckedAt: string | null;
+  providerOccurredAt: string | null;
+  recordedAt: string | null;
+  createdAt: string;
+};
+
+export async function listNotificationDeliveriesPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<NotificationDeliverySummary>> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
+  const result = await queryable.query<{
+    id: string;
+    attempt_number: number;
+    event_type: string;
+    template_revision: string;
+    category: string;
+    recipient_kind: string;
+    recipient: string;
+    locale: string;
+    status: string;
+    operation_state: string;
+    outcome_status: string | null;
+    attempts: number;
+    dispatch_started_at: string | null;
+    last_checked_at: string | null;
+    provider_occurred_at: string | null;
+    recorded_at: string | null;
+    created_at_cursor: string;
+  }>(
+    `SELECT operation.id,
+            operation.attempt_number,
+            operation.event_type,
+            operation.template_revision,
+            operation.category,
+            operation.recipient_kind,
+            operation.recipient::text,
+            operation.locale,
+            operation.status,
+            CASE
+              WHEN job.status = 'manual'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM notification_delivery_operations newer_operation
+                 WHERE newer_operation.outbox_id = operation.outbox_id
+                   AND newer_operation.attempt_number > operation.attempt_number
+               ) THEN 'manual'
+              ELSE operation.status
+            END AS operation_state,
+            fact.status AS outcome_status,
+            operation.attempts,
+            CASE WHEN operation.dispatch_started_at IS NULL THEN NULL ELSE
+              to_char(
+                operation.dispatch_started_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+              )
+            END AS dispatch_started_at,
+            CASE WHEN operation.last_checked_at IS NULL THEN NULL ELSE
+              to_char(
+                operation.last_checked_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+              )
+            END AS last_checked_at,
+            CASE WHEN fact.provider_occurred_at IS NULL THEN NULL ELSE
+              to_char(
+                fact.provider_occurred_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+              )
+            END AS provider_occurred_at,
+            CASE WHEN fact.recorded_at IS NULL THEN NULL ELSE
+              to_char(
+                fact.recorded_at AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+              )
+            END AS recorded_at,
+            to_char(
+              operation.created_at AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            ) AS created_at_cursor
+     FROM notification_delivery_operations operation
+     LEFT JOIN notification_delivery_facts fact
+       ON fact.outbox_id = operation.outbox_id
+      AND fact.attempt_number = operation.attempt_number
+      AND fact.provider_operation_id = operation.provider_operation_id
+     LEFT JOIN durable_jobs job
+       ON job.job_type = 'notification.send'
+      AND job.unique_key = 'outbox:' || operation.outbox_id::text
+      AND job.payload = pg_catalog.jsonb_build_object(
+        'outboxId', operation.outbox_id::text
+      )
+     WHERE operation.client_account_id = $1
+       AND (
+         $2::timestamptz IS NULL
+         OR (operation.created_at, operation.id) < ($2::timestamptz, $3::uuid)
+       )
+     ORDER BY operation.created_at DESC, operation.id DESC
+     LIMIT $4`,
+    [clientAccountId, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
+  );
+  const items = result.rows.map((row) => ({
+    id: row.id,
+    attemptNumber: row.attempt_number,
+    eventType: row.event_type,
+    templateRevision: row.template_revision,
+    category: row.category,
+    recipientKind: row.recipient_kind,
+    recipient: row.recipient,
+    locale: row.locale,
+    status: row.operation_state,
+    operationState: row.operation_state,
+    outcomeStatus: row.outcome_status,
+    reason:
+      row.operation_state === "unknown"
+        ? "provider_reconciliation_required"
+        : row.operation_state === "manual"
+          ? "operator_attention_required"
+          : row.outcome_status === "bounced"
+            ? "provider_reported_bounced"
+            : row.outcome_status === "failed"
+              ? "provider_reported_failed"
+              : row.outcome_status === "skipped"
+                ? "not_sent"
+                : null,
+    requiresAttention:
+      row.operation_state === "unknown" || row.operation_state === "manual",
+    attempts: row.attempts,
+    provider: "mock-mail-v1" as const,
+    dispatchStartedAt: row.dispatch_started_at,
+    lastCheckedAt: row.last_checked_at,
+    providerOccurredAt: row.provider_occurred_at,
+    recordedAt: row.recorded_at,
+    createdAt: row.created_at_cursor,
+  }));
+  return collectionPage(items, page.limit, scope, clientAccountId, (item) => ({
+    at: item.createdAt,
+    id: item.id,
+  }));
+}
+
+export function maskNotificationRecipient(recipient: string): string {
+  const at = recipient.lastIndexOf("@");
+  if (at <= 0 || at === recipient.length - 1) return "***";
+  return `${recipient.slice(0, 1)}***${recipient.slice(at)}`;
+}
 
 function invoiceStatus(
   totalMinor: string,
@@ -1789,6 +1955,36 @@ export async function registerCustomerHistoryRoutes(
   pool: DatabasePool,
   config: Config,
 ): Promise<void> {
+  app.get("/api/v1/customer/notification-deliveries", async (request) => {
+    const user = await requireUser(request, pool, config);
+    assertIdentityReadEligible(user);
+    assertCustomerCapability(user, "account.history.read");
+    const page = parsePageQuery(request.query);
+    return withReadSnapshot(pool, async (client) => {
+      const account = await client.query<{ id: string; name: string }>(
+        "SELECT id, name FROM client_accounts WHERE id = $1",
+        [user.clientAccountId],
+      );
+      const currentAccount = account.rows[0];
+      if (!currentAccount) throw requestError("Client account not found", 404);
+      const collection = await listNotificationDeliveriesPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.notification-deliveries",
+      );
+      return {
+        warning: LAB_WARNING,
+        account: currentAccount,
+        ...collection,
+        items: collection.items.map((item) => ({
+          ...item,
+          recipient: maskNotificationRecipient(item.recipient),
+        })),
+      };
+    });
+  });
+
   app.get("/api/v1/customer/business-history", async (request) => {
     const user = await requireUser(request, pool, config);
     assertFinancialReadEligible(user);

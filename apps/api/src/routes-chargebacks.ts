@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { FastifyInstance } from "fastify";
-import { assertFinancialReadEligible, requireUser } from "./auth.js";
+import {
+  assertFinancialReadEligible,
+  requireSessionIdentity,
+  requireUser,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import type { DatabasePool } from "./database.js";
 import { requireStaffPermission } from "./routes-admin.js";
@@ -190,7 +194,7 @@ export async function registerChargebackRoutes(
   });
 
   app.get("/api/v1/admin/add-funds-chargebacks", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.chargeback_manage");
     const [effects, holds, unclaimedEffects] = await Promise.all([
       pool.query<ChargebackRow>(

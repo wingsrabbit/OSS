@@ -7,7 +7,12 @@ import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
-import { assertSchemaCompatible, runMigrations } from "./database.js";
+import {
+  assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
+  runMigrations,
+} from "./database.js";
+import { digestToken } from "./auth.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { providerSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
@@ -160,10 +165,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
          ) AS payment_attempt_decision_generation
        FROM schema_migrations`,
     );
-    assert.equal(
-      upgraded.rows[0]?.version,
-      "018_stage_c_support_tickets",
-    );
+    assert.equal(upgraded.rows[0]?.version, REQUIRED_SCHEMA_VERSION);
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
@@ -235,6 +237,30 @@ const deadlockBaseline = await corePool.query<{ deadlocks: string }>(
 );
 const initialDeadlocks = deadlockBaseline.rows[0]?.deadlocks ?? "0";
 let cookie = "";
+const accountContextVersionByCookie = new Map<string, string>();
+
+function sessionContextHeaders(): Record<string, string> {
+  const accountContextVersion = cookie
+    ? accountContextVersionByCookie.get(cookie)
+    : undefined;
+  return {
+    ...(cookie ? { Cookie: cookie } : {}),
+    ...(accountContextVersion
+      ? { "X-OSS-Account-Context-Version": accountContextVersion }
+      : {}),
+  };
+}
+
+function rememberSessionContext(response: Response): void {
+  const setCookie = response.headers.get("set-cookie");
+  if (setCookie) cookie = setCookie.split(";", 1)[0] ?? "";
+  const accountContextVersion = response.headers.get(
+    "x-oss-account-context-version",
+  );
+  if (cookie && accountContextVersion) {
+    accountContextVersionByCookie.set(cookie, accountContextVersion);
+  }
+}
 
 type Catalog = {
   products: Array<{
@@ -453,11 +479,12 @@ async function request<T>(
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...(cookie ? { Cookie: cookie } : {}),
+      ...sessionContextHeaders(),
       ...init.headers,
     },
     redirect: "error",
   });
+  rememberSessionContext(response);
   if (response.status !== expectedStatus) {
     const responseBody = await response.text();
     assert.equal(
@@ -466,8 +493,6 @@ async function request<T>(
       `${init.method ?? "GET"} ${path} expected ${expectedStatus}, received ${response.status}: ${responseBody}`,
     );
   }
-  const setCookie = response.headers.get("set-cookie");
-  if (setCookie) cookie = setCookie.split(";", 1)[0] ?? "";
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
@@ -480,15 +505,36 @@ async function rawCoreRequest(
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...(cookie ? { Cookie: cookie } : {}),
+      ...sessionContextHeaders(),
       ...init.headers,
     },
     redirect: "error",
   });
+  rememberSessionContext(response);
   return {
     status: response.status,
     body: (await response.json()) as Record<string, unknown>,
   };
+}
+
+async function refreshAccountContext(expectedClientAccountId: string): Promise<void> {
+  const current = await request<{
+    eligible: boolean;
+    clientAccountId: string | null;
+  }>("/api/v1/auth/me");
+  if (current.clientAccountId === expectedClientAccountId) {
+    assert.equal(current.eligible, true);
+    return;
+  }
+  assert.equal(current.clientAccountId, null);
+  const selected = await request<{ clientAccountId: string }>(
+    "/api/v1/auth/account-context",
+    {
+      method: "PUT",
+      body: JSON.stringify({ clientAccountId: expectedClientAccountId }),
+    },
+  );
+  assert.equal(selected.clientAccountId, expectedClientAccountId);
 }
 
 async function submitPaymentFact(
@@ -1888,16 +1934,35 @@ await corePool.query(
 );
 const heldForRestriction = await waitFor(
   "restriction before provisioning to prevent the provider create",
-  () => request<OrderDetail>(`/api/v1/orders/${paidBeforeRestriction.order.id}`),
-  (value) => value.order.status === "on_hold",
+  async () => {
+    const state = await corePool.query<{
+      order_status: string;
+      service_status: string;
+    }>(
+      `SELECT customer_order.status AS order_status,
+              service.status AS service_status
+       FROM orders customer_order
+       JOIN services service ON service.id = $2
+       WHERE customer_order.id = $1`,
+      [paidBeforeRestriction.order.id, paidBeforeRestriction.service.id],
+    );
+    return state.rows[0] ?? null;
+  },
+  (value) => value?.order_status === "on_hold",
 );
-assert.equal(heldForRestriction.service.status, "pending");
+assert.equal(heldForRestriction?.service_status, "pending");
 const restrictedCreateCount = await providerPool.query<{ count: string }>(
   "SELECT count(*)::text AS count FROM mock_resource_operations WHERE operation_id = $1",
   [heldProvisionOperation.rows[0].id],
 );
 assert.equal(restrictedCreateCount.rows[0]?.count, "0");
 await corePool.query("UPDATE users SET restricted_at = NULL WHERE email = $1", [email]);
+const restoredAfterProvisionRestriction = await request<{
+  eligible: boolean;
+  clientAccountId: string | null;
+}>("/api/v1/auth/me");
+assert.equal(restoredAfterProvisionRestriction.eligible, true);
+assert.ok(restoredAfterProvisionRestriction.clientAccountId);
 
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_payment_start()
@@ -4107,6 +4172,23 @@ const eligibilityRevocations: Array<{
         [staffMe.clientAccountId, staffMe.id],
       ),
   },
+  {
+    label: "membership restriction",
+    revoke: () =>
+      corePool.query(
+        `UPDATE client_memberships
+         SET restricted_at = now()
+         WHERE client_account_id = $1 AND user_id = $2`,
+        [staffMe.clientAccountId, staffMe.id],
+      ),
+    restore: () =>
+      corePool.query(
+        `UPDATE client_memberships
+         SET restricted_at = NULL
+         WHERE client_account_id = $1 AND user_id = $2`,
+        [staffMe.clientAccountId, staffMe.id],
+      ),
+  },
 ];
 
 for (const revocation of eligibilityRevocations) {
@@ -4186,6 +4268,7 @@ for (const revocation of eligibilityRevocations) {
   }
 
   await revocation.restore();
+  await refreshAccountContext(staffMe.clientAccountId);
   const retryQuote = await createPaymentQuote(order.invoice.id, "card", false);
   const retry = await request<PaymentCommand>(
     `/api/v1/invoices/${order.invoice.id}/payments`,
@@ -4207,6 +4290,121 @@ for (const revocation of eligibilityRevocations) {
     (value) => value.service.status === "active",
   );
   assert.equal(retriedOrder.invoice.status, "paid");
+}
+
+const capabilityOwnerCookie = cookie;
+const explicitCapabilityUserId = randomUUID();
+const explicitCapabilitySessionId = randomUUID();
+const explicitCapabilitySessionToken = randomBytes(32).toString("base64url");
+const sessionCookieName = capabilityOwnerCookie.split("=", 1)[0];
+assert.ok(sessionCookieName, "integration requires a named Session cookie");
+const explicitCapabilityCookie = `${sessionCookieName}=${explicitCapabilitySessionToken}`;
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [explicitCapabilityUserId, `explicit-payment-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(
+     client_account_id, user_id, role, permissions
+   ) VALUES ($1, $2, 'viewer', '["orders.create","billing.write"]'::jsonb)`,
+  [staffMe.clientAccountId, explicitCapabilityUserId],
+);
+await corePool.query(
+  `INSERT INTO sessions(
+     id, user_id, token_digest, expires_at,
+     active_client_account_id, account_context_version
+   ) VALUES ($1, $2, $3, now() + interval '1 hour', $4, 1)`,
+  [
+    explicitCapabilitySessionId,
+    explicitCapabilityUserId,
+    digestToken(explicitCapabilitySessionToken),
+    staffMe.clientAccountId,
+  ],
+);
+cookie = explicitCapabilityCookie;
+accountContextVersionByCookie.set(cookie, "1");
+try {
+  const explicitOrder = await createOrder(automaticPrice.id, legal);
+  const explicitQuote = await createPaymentQuote(explicitOrder.invoice.id, "card", false);
+  const explicitCommand = await request<PaymentCommand>(
+    `/api/v1/invoices/${explicitOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: explicitQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(explicitCommand.paymentAttemptId);
+  await corePool.query(
+    `UPDATE client_memberships
+     SET permissions = '["orders.create"]'::jsonb
+     WHERE client_account_id = $1 AND user_id = $2`,
+    [staffMe.clientAccountId, explicitCapabilityUserId],
+  );
+  await releasePaymentStart(explicitCommand.paymentAttemptId);
+  const explicitRevoked = await waitFor(
+    "known-unsent payment to close after explicit billing.write revocation",
+    () => readPaymentRecords(explicitCommand.commandId),
+    (records) =>
+      records.command_status === "failed" &&
+      records.attempt_status === "cancelled" &&
+      records.operation_status === "failed" &&
+      records.job_status === "completed",
+    8_000,
+  );
+  const explicitRevokedProviderCalls = await providerPool.query<{ count: string }>(
+    "SELECT count(*)::text AS count FROM mock_payment_operations WHERE operation_id = $1",
+    [explicitRevoked.operation_id],
+  );
+  assert.equal(explicitRevokedProviderCalls.rows[0]?.count, "0");
+
+  await corePool.query(
+    `UPDATE client_memberships
+     SET permissions = '["orders.create","billing.write"]'::jsonb
+     WHERE client_account_id = $1 AND user_id = $2`,
+    [staffMe.clientAccountId, explicitCapabilityUserId],
+  );
+  const explicitContext = await corePool.query<{ account_context_version: string }>(
+    `SELECT account_context_version::text
+     FROM sessions WHERE id = $1`,
+    [explicitCapabilitySessionId],
+  );
+  accountContextVersionByCookie.set(
+    cookie,
+    explicitContext.rows[0]?.account_context_version ?? "3",
+  );
+  const explicitRetryQuote = await createPaymentQuote(
+    explicitOrder.invoice.id,
+    "card",
+    false,
+  );
+  const explicitRetry = await request<PaymentCommand>(
+    `/api/v1/invoices/${explicitOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: explicitRetryQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(explicitRetry.paymentAttemptId);
+  await releasePaymentStart(explicitRetry.paymentAttemptId);
+  const explicitRetriedOrder = await waitFor(
+    "payment retry after restoring explicit billing.write",
+    () => request<OrderDetail>(`/api/v1/orders/${explicitOrder.order.id}`),
+    (value) => value.service.status === "active",
+  );
+  assert.equal(explicitRetriedOrder.invoice.status, "paid");
+} finally {
+  cookie = capabilityOwnerCookie;
 }
 
 const definitiveOrder = await createOrder(automaticPrice.id, legal);
@@ -4512,6 +4710,7 @@ const invalidatedGrant = await corePool.query<{ count: string }>(
 );
 assert.equal(invalidatedGrant.rows[0]?.count, "0");
 await corePool.query("UPDATE users SET restricted_at = NULL WHERE email = $1", [email]);
+await refreshAccountContext(staffMe.clientAccountId);
 
 const staffCookie = cookie;
 const recoveryEmail = `expired-${randomUUID()}@example.invalid`;
@@ -5036,6 +5235,7 @@ await corePool.query(
    WHERE user_id = $1 AND client_account_id = $2`,
   [recoveryMe.id, recoveryMe.clientAccountId],
 );
+await refreshAccountContext(recoveryMe.clientAccountId);
 const revokedMembershipManual = await waitForAddFunds(
   revokedMembership.command.commandId,
   "manual",
@@ -10614,6 +10814,7 @@ await corePool.query(
    WHERE user_id = $1 AND client_account_id = $2`,
   [chargebackMe.id, chargebackMe.clientAccountId],
 );
+await refreshAccountContext(chargebackMe.clientAccountId);
 const customerChargebackStatus = await waitFor(
   "settled Add Funds Chargeback customer status",
   () => request<ChargebackStatus>("/api/v1/billing/chargeback-status"),
@@ -11833,6 +12034,7 @@ await corePool.query(
   "UPDATE users SET email_verified_at = now() WHERE id = $1",
   [terminatedCreditIdentityRow.user_id],
 );
+await refreshAccountContext(terminatedCreditIdentityRow.client_account_id);
 const terminatedCreditOrder = await createOrder(automaticPrice.id, legal);
 await pay(terminatedCreditOrder, "success");
 const terminatedCreditActive = await waitFor(
@@ -12015,6 +12217,7 @@ assert.ok(cancellationIdentityRow);
 await corePool.query("UPDATE users SET email_verified_at = now() WHERE id = $1", [
   cancellationIdentityRow.user_id,
 ]);
+await refreshAccountContext(cancellationIdentityRow.client_account_id);
 const cancellationOrder = await createOrder(automaticPrice.id, legal);
 await pay(cancellationOrder, "success");
 const cancellationInitiallyActive = await waitFor(
