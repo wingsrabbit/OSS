@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, type ClientRequest } from "node:http";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import pg from "pg";
@@ -103,6 +103,41 @@ function providerHeaders(operationId?: string): Record<string, string> {
   };
 }
 
+function createRawMailPost(
+  providerBaseUrl: string,
+  operationId: string,
+  body: string,
+): Readonly<{
+  request: ClientRequest;
+  response: Promise<{ status: number; body: string }>;
+}> {
+  let request!: ClientRequest;
+  const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
+    request = httpRequest(
+      new URL("/v1/mail", providerBaseUrl),
+      {
+        method: "POST",
+        headers: {
+          ...providerHeaders(operationId),
+          "Content-Length": String(Buffer.byteLength(body)),
+        },
+      },
+      (incoming) => {
+        const chunks: Buffer[] = [];
+        incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+        incoming.on("end", () => {
+          resolve({
+            status: incoming.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    request.once("error", reject);
+  });
+  return { request, response };
+}
+
 async function responseJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
@@ -189,31 +224,13 @@ try {
     body: `parsing body ${parsingOperationId}`,
     sensitive: true,
   });
-  const parsingPost = new Promise<{ status: number; body: string }>((resolve, reject) => {
-    const request = httpRequest(
-      new URL("/v1/mail", providerBaseUrl),
-      {
-        method: "POST",
-        headers: {
-          ...providerHeaders(parsingOperationId),
-          "Content-Length": String(Buffer.byteLength(parsingMessage)),
-        },
-      },
-      (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer) => chunks.push(chunk));
-        response.on("end", () => {
-          resolve({
-            status: response.statusCode ?? 0,
-            body: Buffer.concat(chunks).toString("utf8"),
-          });
-        });
-      },
-    );
-    request.once("error", reject);
-    request.flushHeaders();
-    setTimeout(() => request.end(parsingMessage), 200);
-  });
+  const parsingPost = createRawMailPost(
+    providerBaseUrl,
+    parsingOperationId,
+    parsingMessage,
+  );
+  parsingPost.request.flushHeaders();
+  setTimeout(() => parsingPost.request.end(parsingMessage), 200);
   await delay(50);
   let parsingGetSettled = false;
   const parsingGet = fetch(
@@ -234,11 +251,49 @@ try {
     false,
     "GET must await a POST whose authenticated headers arrived before body parsing completed",
   );
-  const parsedPost = await parsingPost;
+  const parsedPost = await parsingPost.response;
   const parsedGet = await parsingGet;
   assert.equal(parsedPost.status, 202);
   assert.equal(parsedGet.status, 200);
   assert.deepEqual(await responseJson<MailDeliveryFact>(parsedGet), JSON.parse(parsedPost.body));
+
+  const partialOperationId = randomUUID();
+  const partialMessage = JSON.stringify({
+    operationId: partialOperationId,
+    recipient: `partial-${partialOperationId}@example.invalid`,
+    template: "integration.partial",
+    locale: "en",
+    subject: `partial subject ${partialOperationId}`,
+    body: `partial body ${partialOperationId}`,
+    sensitive: true,
+  });
+  const partialPost = createRawMailPost(
+    providerBaseUrl,
+    partialOperationId,
+    partialMessage,
+  );
+  partialPost.request.write(partialMessage.slice(0, 1));
+  await delay(50);
+  let partialGetSettled = false;
+  const partialGet = fetch(
+    new URL(`/v1/mail/${partialOperationId}`, providerBaseUrl),
+    { headers: providerHeaders() },
+  );
+  void partialGet.then(
+    () => {
+      partialGetSettled = true;
+    },
+    () => {
+      partialGetSettled = true;
+    },
+  );
+  await delay(50);
+  assert.equal(partialGetSettled, false, "GET must wait while a POST body is incomplete");
+  partialPost.request.destroy(new Error("synthetic partial-body disconnect"));
+  await assert.rejects(partialPost.response, /synthetic partial-body disconnect|socket hang up/);
+  const partialGetResult = await partialGet;
+  assert.equal(partialGetResult.status, 404);
+  assert.deepEqual(await responseJson(partialGetResult), { error: "operation not found" });
 
   const linearization = new pg.Client({ connectionString: testDatabaseUrl.toString() });
   await linearization.connect();
@@ -294,6 +349,46 @@ try {
       await responseJson<MailDeliveryFact>(committedGet),
       await responseJson<MailDeliveryFact>(committedPost),
     );
+
+    const abandonedOperationId = randomUUID();
+    const abandonedMessage = JSON.stringify({
+      ...message,
+      operationId: abandonedOperationId,
+      recipient: `abandoned-${abandonedOperationId}@example.invalid`,
+    });
+    await linearization.query("BEGIN");
+    await linearization.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`mock-mail-operation:${abandonedOperationId}`],
+    );
+    const abandonedPost = createRawMailPost(
+      providerBaseUrl,
+      abandonedOperationId,
+      abandonedMessage,
+    );
+    abandonedPost.request.end(abandonedMessage);
+    await waitForMockMailAdvisoryWait(linearization, 1);
+    abandonedPost.request.destroy(new Error("synthetic response-lost disconnect"));
+    await assert.rejects(
+      abandonedPost.response,
+      /synthetic response-lost disconnect|socket hang up/,
+    );
+    await linearization.query("COMMIT");
+    const abandonedGet = await fetch(
+      new URL(`/v1/mail/${abandonedOperationId}`, providerBaseUrl),
+      { headers: providerHeaders() },
+    );
+    assert.equal(abandonedGet.status, 200);
+    const abandonedFact = await responseJson<MailDeliveryFact>(abandonedGet);
+    assert.equal(abandonedFact.operationId, abandonedOperationId);
+    assert.equal(abandonedFact.status, "delivered");
+    const abandonedRows = await linearization.query<{ delivery_calls: number }>(
+      `SELECT delivery_calls
+       FROM mock_mail_messages
+       WHERE operation_id = $1`,
+      [abandonedOperationId],
+    );
+    assert.equal(abandonedRows.rows[0]?.delivery_calls, 1);
 
     const rolledBackOperationId = randomUUID();
     await linearization.query("BEGIN");
