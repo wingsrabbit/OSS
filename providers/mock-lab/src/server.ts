@@ -410,7 +410,9 @@ await pool.query(`
   BEGIN
     IF TG_OP = 'DELETE'
        OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
-       OR NEW.recipient IS DISTINCT FROM OLD.recipient
+       -- citext equality intentionally ignores case, but the stored recipient
+       -- spelling is part of the immutable Provider request fingerprint.
+       OR NEW.recipient::text IS DISTINCT FROM OLD.recipient::text
        OR NEW.template IS DISTINCT FROM OLD.template
        OR NEW.locale IS DISTINCT FROM OLD.locale
        OR NEW.subject IS DISTINCT FROM OLD.subject
@@ -449,16 +451,17 @@ const app = Fastify({
 });
 
 app.addHook("onRequest", async (request, reply) => {
-  if (!request.url.startsWith("/v1/")) return;
+  const requestPath = new URL(request.url, "http://127.0.0.1").pathname;
+  if (!requestPath.startsWith("/v1/")) return;
   const expectedToken =
-    request.url.startsWith("/v1/payments") || request.url.startsWith("/v1/refunds")
+    requestPath.startsWith("/v1/payments") || requestPath.startsWith("/v1/refunds")
       ? config.MOCK_PAYMENT_PROVIDER_TOKEN
-      : request.url.startsWith("/v1/resources") ||
-          request.url.startsWith("/v1/resource-actions")
+      : requestPath.startsWith("/v1/resources") ||
+          requestPath.startsWith("/v1/resource-actions")
         ? config.MOCK_PROVISIONING_PROVIDER_TOKEN
-        : request.url.startsWith("/v1/mailbox")
+        : requestPath.startsWith("/v1/mailbox")
           ? config.LAB_MAILBOX_TOKEN
-          : request.url === "/v1/mail" || request.url.startsWith("/v1/mail/")
+          : requestPath === "/v1/mail" || requestPath.startsWith("/v1/mail/")
             ? config.MOCK_MAIL_PROVIDER_TOKEN
             : undefined;
   if (!expectedToken) return reply.code(404).send({ error: "capability is not enabled" });
@@ -1507,7 +1510,8 @@ app.post("/v1/mail", async (request, reply) => {
   if (request.headers["idempotency-key"] !== body.operationId) {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
-  const fingerprint = requestFingerprint("mail.send:v1", body);
+  const normalizedBody = { ...body, scenario: body.scenario ?? "delivered" } as const;
+  const fingerprint = requestFingerprint("mail.send:v1", normalizedBody);
   const result = await pool.query<{
     status: "delivered" | "bounced" | "failed";
     delivered_at: Date;
@@ -1521,14 +1525,14 @@ app.post("/v1/mail", async (request, reply) => {
        WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
      RETURNING status, delivered_at`,
     [
-      body.operationId,
-      body.recipient,
-      body.template,
-      body.locale,
-      body.subject,
-      body.body,
-      body.sensitive,
-      body.scenario ?? "delivered",
+      normalizedBody.operationId,
+      normalizedBody.recipient,
+      normalizedBody.template,
+      normalizedBody.locale,
+      normalizedBody.subject,
+      normalizedBody.body,
+      normalizedBody.sensitive,
+      normalizedBody.scenario,
       fingerprint,
     ],
   );
@@ -1536,7 +1540,7 @@ app.post("/v1/mail", async (request, reply) => {
     return reply.code(409).send({ error: "idempotency key was reused with a different message" });
   }
   return reply.code(202).send({
-    operationId: body.operationId,
+    operationId: normalizedBody.operationId,
     status: result.rows[0]?.status ?? "delivered",
     deliveredAt: result.rows[0]?.delivered_at.toISOString(),
   });

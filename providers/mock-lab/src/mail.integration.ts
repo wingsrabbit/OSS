@@ -73,6 +73,27 @@ async function stopProvider(): Promise<void> {
   }
 }
 
+function startProvider(connectionString: string, port: number): void {
+  providerLogs = "";
+  provider = spawn(process.execPath, [new URL("./server.js", import.meta.url).pathname], {
+    env: {
+      ...process.env,
+      PROVIDER_DATABASE_URL: connectionString,
+      MOCK_MAIL_PROVIDER_TOKEN: providerToken,
+      CORE_CALLBACK_URL: "http://127.0.0.1:1",
+      PROVIDER_HOST: "127.0.0.1",
+      PROVIDER_PORT: String(port),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  provider.stdout?.on("data", (chunk: Buffer) => {
+    providerLogs += chunk.toString("utf8");
+  });
+  provider.stderr?.on("data", (chunk: Buffer) => {
+    providerLogs += chunk.toString("utf8");
+  });
+}
+
 function providerHeaders(operationId?: string): Record<string, string> {
   return {
     Authorization: `Bearer ${providerToken}`,
@@ -92,23 +113,7 @@ try {
 
   const providerPort = await reservePort();
   const providerBaseUrl = `http://127.0.0.1:${providerPort}`;
-  provider = spawn(process.execPath, [new URL("./server.js", import.meta.url).pathname], {
-    env: {
-      ...process.env,
-      PROVIDER_DATABASE_URL: testDatabaseUrl.toString(),
-      MOCK_MAIL_PROVIDER_TOKEN: providerToken,
-      CORE_CALLBACK_URL: "http://127.0.0.1:1",
-      PROVIDER_HOST: "127.0.0.1",
-      PROVIDER_PORT: String(providerPort),
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  provider.stdout?.on("data", (chunk: Buffer) => {
-    providerLogs += chunk.toString("utf8");
-  });
-  provider.stderr?.on("data", (chunk: Buffer) => {
-    providerLogs += chunk.toString("utf8");
-  });
+  startProvider(testDatabaseUrl.toString(), providerPort);
   await waitForProvider(providerBaseUrl);
 
   const operationId = randomUUID();
@@ -162,7 +167,7 @@ try {
   assert.equal(createdFact.status, "delivered");
   assert.ok(!Number.isNaN(Date.parse(createdFact.deliveredAt)));
 
-  const found = await fetch(new URL(`/v1/mail/${operationId}`, providerBaseUrl), {
+  const found = await fetch(new URL(`/v1/mail/${operationId}?source=reconcile`, providerBaseUrl), {
     headers: providerHeaders(),
   });
   assert.equal(found.status, 200);
@@ -181,6 +186,31 @@ try {
   });
   assert.equal(replay.status, 202);
   assert.deepEqual(await responseJson<MailDeliveryFact>(replay), createdFact);
+
+  const explicitDefaultReplay = await fetch(
+    new URL("/v1/mail?source=idempotent-replay", providerBaseUrl),
+    {
+      method: "POST",
+      headers: providerHeaders(operationId),
+      body: JSON.stringify({ ...message, scenario: "delivered" }),
+    },
+  );
+  assert.equal(explicitDefaultReplay.status, 202);
+  assert.deepEqual(await responseJson<MailDeliveryFact>(explicitDefaultReplay), createdFact);
+
+  const concurrentReplays = await Promise.all(
+    [undefined, "delivered" as const].map((scenario) =>
+      fetch(new URL("/v1/mail", providerBaseUrl), {
+        method: "POST",
+        headers: providerHeaders(operationId),
+        body: JSON.stringify({ ...message, ...(scenario ? { scenario } : {}) }),
+      }),
+    ),
+  );
+  for (const concurrentReplay of concurrentReplays) {
+    assert.equal(concurrentReplay.status, 202);
+    assert.deepEqual(await responseJson<MailDeliveryFact>(concurrentReplay), createdFact);
+  }
 
   const conflicting = await fetch(new URL("/v1/mail", providerBaseUrl), {
     method: "POST",
@@ -218,8 +248,18 @@ try {
       subject: privateSubject,
       body: privateBody,
       status: "delivered",
-      delivery_calls: 2,
+      delivery_calls: 5,
     });
+    await assert.rejects(
+      verification.query(
+        `UPDATE mock_mail_messages
+         SET recipient = upper(recipient::text)::citext,
+             delivery_calls = delivery_calls + 1
+         WHERE operation_id = $1`,
+        [operationId],
+      ),
+      /Mock mail messages are append-only except for idempotent delivery call counting/,
+    );
   } finally {
     await verification.end();
   }
@@ -247,6 +287,21 @@ try {
     assert.equal(scenarioFound.status, 200);
     assert.deepEqual(await responseJson<MailDeliveryFact>(scenarioFound), scenarioFact);
   }
+
+  await stopProvider();
+  provider = null;
+  startProvider(testDatabaseUrl.toString(), providerPort);
+  await waitForProvider(providerBaseUrl);
+  const afterExistingDatabaseRestart = await fetch(
+    new URL(`/v1/mail/${operationId}`, providerBaseUrl),
+    { headers: providerHeaders() },
+  );
+  assert.equal(afterExistingDatabaseRestart.status, 200);
+  assert.deepEqual(
+    await responseJson<MailDeliveryFact>(afterExistingDatabaseRestart),
+    createdFact,
+    "Provider initialization must preserve existing immutable Mock Mail facts",
+  );
 
   console.log("Mock Mail result query integration: PASS");
 } finally {
