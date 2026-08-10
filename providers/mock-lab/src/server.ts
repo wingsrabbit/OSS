@@ -113,7 +113,14 @@ const mailCreateSchema = z.object({
   subject: z.string().min(1).max(240),
   body: z.string().min(1).max(20_000),
   sensitive: z.boolean().default(false),
+  scenario: z.enum(["delivered", "bounced", "failed"]).optional(),
 });
+
+const mailOperationParamsSchema = z.object({
+  operationId: z.uuid(),
+});
+
+const mailDeliveryStatusSchema = z.enum(["delivered", "bounced", "failed"]);
 
 const mailboxQuerySchema = z.object({
   recipient: z.email(),
@@ -255,6 +262,11 @@ await pool.query(`
     delivery_calls integer NOT NULL DEFAULT 1,
     request_fingerprint text NOT NULL
   );
+  ALTER TABLE mock_mail_messages
+    DROP CONSTRAINT IF EXISTS mock_mail_messages_status_check;
+  ALTER TABLE mock_mail_messages
+    ADD CONSTRAINT mock_mail_messages_status_check
+    CHECK (status IN ('delivered', 'bounced', 'failed'));
   ALTER TABLE mock_payment_operations
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
   ALTER TABLE mock_payment_operations
@@ -391,6 +403,33 @@ await pool.query(`
   CREATE TRIGGER mock_resource_action_operations_append_only
   BEFORE UPDATE OR DELETE ON mock_resource_action_operations
   FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_resource_action_mutation();
+  CREATE OR REPLACE FUNCTION opensales_guard_mock_mail_message_mutation()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF TG_OP = 'DELETE'
+       OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+       OR NEW.recipient IS DISTINCT FROM OLD.recipient
+       OR NEW.template IS DISTINCT FROM OLD.template
+       OR NEW.locale IS DISTINCT FROM OLD.locale
+       OR NEW.subject IS DISTINCT FROM OLD.subject
+       OR NEW.body IS DISTINCT FROM OLD.body
+       OR NEW.sensitive IS DISTINCT FROM OLD.sensitive
+       OR NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.delivered_at IS DISTINCT FROM OLD.delivered_at
+       OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
+       OR NEW.delivery_calls <> OLD.delivery_calls + 1 THEN
+      RAISE EXCEPTION
+        'Mock mail messages are append-only except for idempotent delivery call counting';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS mock_mail_messages_append_only ON mock_mail_messages;
+  CREATE TRIGGER mock_mail_messages_append_only
+  BEFORE UPDATE OR DELETE ON mock_mail_messages
+  FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_mail_message_mutation();
 `);
 
 const app = Fastify({
@@ -419,7 +458,7 @@ app.addHook("onRequest", async (request, reply) => {
         ? config.MOCK_PROVISIONING_PROVIDER_TOKEN
         : request.url.startsWith("/v1/mailbox")
           ? config.LAB_MAILBOX_TOKEN
-          : request.url === "/v1/mail"
+          : request.url === "/v1/mail" || request.url.startsWith("/v1/mail/")
             ? config.MOCK_MAIL_PROVIDER_TOKEN
             : undefined;
   if (!expectedToken) return reply.code(404).send({ error: "capability is not enabled" });
@@ -1469,11 +1508,14 @@ app.post("/v1/mail", async (request, reply) => {
     return reply.code(400).send({ error: "stable idempotency key is required" });
   }
   const fingerprint = requestFingerprint("mail.send:v1", body);
-  const result = await pool.query<{ status: string; delivered_at: Date }>(
+  const result = await pool.query<{
+    status: "delivered" | "bounced" | "failed";
+    delivered_at: Date;
+  }>(
     `INSERT INTO mock_mail_messages(
-       operation_id, recipient, template, locale, subject, body, sensitive
-       , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       operation_id, recipient, template, locale, subject, body, sensitive,
+       status, request_fingerprint
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (operation_id) DO UPDATE
        SET delivery_calls = mock_mail_messages.delivery_calls + 1
        WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
@@ -1486,6 +1528,7 @@ app.post("/v1/mail", async (request, reply) => {
       body.subject,
       body.body,
       body.sensitive,
+      body.scenario ?? "delivered",
       fingerprint,
     ],
   );
@@ -1497,6 +1540,30 @@ app.post("/v1/mail", async (request, reply) => {
     status: result.rows[0]?.status ?? "delivered",
     deliveredAt: result.rows[0]?.delivered_at.toISOString(),
   });
+});
+
+app.get("/v1/mail/:operationId", async (request, reply) => {
+  const params = mailOperationParamsSchema.safeParse(request.params);
+  if (!params.success) {
+    return reply.code(400).send({ error: "operationId must be a UUID" });
+  }
+  const result = await pool.query<{
+    operation_id: string;
+    status: "delivered" | "bounced" | "failed";
+    delivered_at: Date;
+  }>(
+    `SELECT operation_id, status, delivered_at
+     FROM mock_mail_messages
+     WHERE operation_id = $1`,
+    [params.data.operationId],
+  );
+  const row = result.rows[0];
+  if (!row) return reply.code(404).send({ error: "operation not found" });
+  return {
+    operationId: row.operation_id,
+    status: mailDeliveryStatusSchema.parse(row.status),
+    deliveredAt: row.delivered_at.toISOString(),
+  };
 });
 
 app.post("/v1/mailbox/query", async (request) => {
