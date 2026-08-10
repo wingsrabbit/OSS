@@ -1383,8 +1383,14 @@ export function App() {
     routeGenerationRef.current += 1;
     clearWorkspaceTransientState();
     setMe(null);
-    setSessionResolved(false);
-    void refreshMe();
+    // Public Home is deliberately session-neutral. It must discard stale
+    // workspace state, but a background identity read there is redundant.
+    if (activeRouteRef.current === "/") {
+      setSessionResolved(true);
+    } else {
+      setSessionResolved(false);
+      void refreshMe();
+    }
   }), [clearWorkspaceTransientState, refreshMe]);
 
   const accountContextSwitched = useCallback(async () => {

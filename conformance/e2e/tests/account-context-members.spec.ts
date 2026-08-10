@@ -825,6 +825,102 @@ test("invalid or missing protected response context is recovered once and mutati
   expect({ reads, mutations, meReads }).toEqual({ reads: 2, mutations: 1, meReads: 2 });
 });
 
+test("a cross-tab A to B ordinary response never enters the old workspace and a mismatched mutation is not replayed", async ({ page: browserPage, context }) => {
+  let activeId = accountA;
+  let version = "1";
+  let reads = 0;
+  let mutations = 0;
+  let meReads = 0;
+  await context.route("**/api/v1/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/catalog") {
+      await route.fulfill({ json: { products: [] } });
+    } else if (url.pathname === "/api/v1/legal/current") {
+      const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
+      await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/test/seed") {
+      await route.fulfill({
+        headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA },
+        json: { account: accountA },
+      });
+    } else if (url.pathname === "/api/v1/auth/me") {
+      meReads += 1;
+      await route.fulfill({
+        headers: { [contextVersionHeader]: version, [contextIdHeader]: activeId },
+        json: { id: viewerId, clientAccountId: activeId, accountContextVersion: version },
+      });
+    } else if (url.pathname === "/api/v1/customer/cross-tab-read") {
+      reads += 1;
+      await route.fulfill({
+        headers: { [contextVersionHeader]: version, [contextIdHeader]: activeId },
+        json: reads === 1
+          ? { account: activeId, leakedIntoOldWorkspace: true }
+          : { account: activeId, replayedUnderAuthoritativeContext: true },
+      });
+    } else if (url.pathname === "/api/v1/account/cross-tab-mutation") {
+      mutations += 1;
+      expect(route.request().headers()[contextVersionHeader.toLowerCase()]).toBe("2");
+      await route.fulfill({
+        headers: { [contextVersionHeader]: "3", [contextIdHeader]: accountA },
+        json: { committedUnderDifferentAccount: true },
+      });
+    } else {
+      await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+    }
+  });
+
+  const peerPage = await context.newPage();
+  await Promise.all([browserPage.goto("/"), peerPage.goto("/")]);
+  for (const pageInstance of [browserPage, peerPage]) {
+    await pageInstance.evaluate(async () => {
+      const modulePath = "/src/api.ts";
+      const client = await import(modulePath);
+      const invalidations: string[] = [];
+      client.subscribeAccountContextInvalidation(
+        (error: { code?: string }) => invalidations.push(error.code ?? "unknown"),
+      );
+      await client.api("/api/v1/test/seed");
+      (globalThis as Record<string, unknown>).ossTestClient = client;
+      (globalThis as Record<string, unknown>).ossInvalidations = invalidations;
+    });
+  }
+
+  // Another tab/server action rotates the shared session from Account A to B.
+  activeId = accountB;
+  version = "2";
+  const readOutcome = await browserPage.evaluate(async () => {
+    const client = (globalThis as Record<string, any>).ossTestClient;
+    return client.api("/api/v1/customer/cross-tab-read");
+  });
+  expect(readOutcome).toEqual({
+    account: accountB,
+    replayedUnderAuthoritativeContext: true,
+  });
+  expect(readOutcome).not.toHaveProperty("leakedIntoOldWorkspace");
+  expect({ reads, meReads }).toEqual({ reads: 2, meReads: 1 });
+  await expect.poll(() => peerPage.evaluate(() =>
+    (globalThis as unknown as Record<string, string[]>).ossInvalidations,
+  )).toContain("SESSION_CHANGED");
+  expect(await browserPage.evaluate(() => {
+    const client = (globalThis as Record<string, any>).ossTestClient;
+    return client.getAccountContextSnapshot();
+  })).toEqual({ clientAccountId: accountB, version: "2", generation: expect.any(Number) });
+  expect(await peerPage.evaluate(() => {
+    const client = (globalThis as Record<string, any>).ossTestClient;
+    return client.getAccountContextSnapshot();
+  })).toEqual({ clientAccountId: null, version: null, generation: expect.any(Number) });
+
+  const mutationCode = await browserPage.evaluate(async () => {
+    const client = (globalThis as Record<string, any>).ossTestClient;
+    return client
+      .api("/api/v1/account/cross-tab-mutation", { method: "POST", body: "{}" })
+      .catch((error: { code?: string }) => error.code);
+  });
+  expect(mutationCode).toBe("SESSION_CONTEXT_INVALID");
+  expect({ mutations, meReads }).toEqual({ mutations: 1, meReads: 2 });
+  await peerPage.close();
+});
+
 test("a rotated login cookie with bad context headers clears old state and uses only authoritative recovery", async ({ page: browserPage }) => {
   let loginCalls = 0;
   let meReads = 0;
@@ -1015,6 +1111,99 @@ test("stale context errors clear protected account state before refreshing the n
   await expect(browserPage.getByTestId("account-access-panel")).toHaveCount(0);
   await expect(browserPage.getByText("Alpha Contact")).toHaveCount(0);
 });
+
+for (const identityLoss of [
+  {
+    label: "User restriction",
+    code: "ACCOUNT_RESTRICTED",
+    error: "This User is restricted",
+    heading: "This user is restricted",
+  },
+  {
+    label: "lost email verification",
+    code: "EMAIL_VERIFICATION_REQUIRED",
+    error: "Email verification is required",
+    heading: "Verify your email to continue",
+  },
+] as const) {
+  test(`${identityLoss.label} unmounts old PII before authoritative identity recovery completes`, async ({ page: browserPage }) => {
+    let identityInvalidated = false;
+    let meReads = 0;
+    let recoveryMeReads = 0;
+    let historyReads = 0;
+    let releaseRecoveryMe!: () => void;
+    let markRecoveryMeStarted!: () => void;
+    const recoveryMeGate = new Promise<void>((resolve) => { releaseRecoveryMe = resolve; });
+    const recoveryMeStarted = new Promise<void>((resolve) => { markRecoveryMeStarted = resolve; });
+    const state = baseState();
+    await installMockApi(browserPage, state, {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/auth/me") {
+          meReads += 1;
+          if (identityInvalidated) {
+            recoveryMeReads += 1;
+            markRecoveryMeStarted();
+            await recoveryMeGate;
+          }
+          const currentViewer = viewer(state);
+          await route.fulfill({
+            headers: headers(state),
+            json: identityInvalidated && identityLoss.code === "EMAIL_VERIFICATION_REQUIRED"
+              ? { ...currentViewer, verification: { email: "pending" } }
+              : currentViewer,
+          });
+          return true;
+        }
+        if (path === "/api/v1/customer/business-history") {
+          historyReads += 1;
+          if (!identityInvalidated) {
+            await route.fulfill({
+              headers: headers(state),
+              json: businessHistory(accountA, "OLD ACCOUNT A PII"),
+            });
+          } else {
+            await route.fulfill({
+              status: 403,
+              headers: headers(state),
+              json: { error: identityLoss.error, code: identityLoss.code },
+            });
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    await browserPage.goto("/customer");
+    await expect(browserPage.getByTestId("history-account")).toContainText("OLD ACCOUNT A PII");
+    const initialMeReads = meReads;
+    const initialHistoryReads = historyReads;
+
+    identityInvalidated = true;
+    state.version = "2";
+    state.activeId = null;
+    state.role = null;
+    state.permissions = [];
+    state.userRestricted = identityLoss.code === "ACCOUNT_RESTRICTED";
+    await browserPage.getByTestId("customer-business-history")
+      .getByRole("button", { name: "Refresh history" })
+      .click();
+    await recoveryMeStarted;
+
+    // The listener clears the route/account workspace synchronously. Neither
+    // the raw protocol rebootstrap nor React's Me refresh has completed yet.
+    await expect(browserPage.getByText("OLD ACCOUNT A PII")).toHaveCount(0);
+    await expect(browserPage.getByTestId("customer-business-history")).toHaveCount(0);
+    await expect.poll(() => recoveryMeReads).toBe(2);
+    expect(meReads).toBe(initialMeReads + 2);
+
+    releaseRecoveryMe();
+    await expect(browserPage.getByRole("heading", { name: identityLoss.heading })).toBeVisible();
+    await expect(browserPage.getByText("OLD ACCOUNT A PII")).toHaveCount(0);
+    expect(historyReads).toBe(initialHistoryReads + 2);
+    expect(recoveryMeReads).toBe(2);
+  });
+}
 
 test("Staff identity with null customer context can open permission-scoped Admin", async ({ page: browserPage }) => {
   const state = baseState({

@@ -24,6 +24,12 @@ const CONTEXT_INVALIDATION_CODES = new Set([
   "ACCOUNT_CONTEXT_STALE",
   "ACCOUNT_CONTEXT_REQUIRED",
   "ACCOUNT_CONTEXT_INVALID",
+  "ACCOUNT_RESTRICTED",
+  "EMAIL_VERIFICATION_REQUIRED",
+]);
+const IDENTITY_INVALIDATION_CODES = new Set([
+  "ACCOUNT_RESTRICTED",
+  "EMAIL_VERIFICATION_REQUIRED",
 ]);
 const SESSION_CHANNEL_NAME = "opensales-session-epoch-v1";
 const SESSION_LOCK_NAME = "opensales-auth-transition-v1";
@@ -148,6 +154,22 @@ function newTransitionId(): string {
 
 function broadcastSessionPhase(transitionId: string, phase: SessionBroadcast["phase"]): void {
   sessionChannel?.postMessage({ type: "session-transition", transitionId, phase } satisfies SessionBroadcast);
+}
+
+function invalidateSessionContextAcrossTabs(error: ApiError, clear = true): void {
+  if (clear) clearAccountContext();
+  sessionEpoch += 1;
+  publishContextInvalidation(error);
+  // `replace` is sufficient here: there is no lock holder for peers to wait
+  // for, but every other workspace must drop its old identity/account facts.
+  broadcastSessionPhase(newTransitionId(), "replace");
+}
+
+function broadcastIntentionalContextReplacement(): void {
+  // The initiating workspace refreshes through its Account Context switch
+  // callback. Peers still need the same fail-closed invalidation immediately.
+  sessionEpoch += 1;
+  broadcastSessionPhase(newTransitionId(), "replace");
 }
 
 function beginSessionEpochTransition(transitionId: string): void {
@@ -337,6 +359,11 @@ function isSafeRead(init?: RequestInit): boolean {
   return method === "GET" || method === "HEAD";
 }
 
+function isIntentionalAccountContextTransition(pathname: string, init?: RequestInit): boolean {
+  return pathname === "/api/v1/auth/account-context" &&
+    (init?.method ?? "GET").toUpperCase() === "PUT";
+}
+
 function contextProtocolError(message: string): ApiError {
   return new ApiError(message, 502, "SESSION_CONTEXT_INVALID");
 }
@@ -380,6 +407,7 @@ async function request<T>(
   path: string,
   init: RequestInit | undefined,
   allowAuthoritativeRecovery: boolean,
+  inheritedInvalidation = false,
 ): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
   const transition: AuthTransition | null = pathname === "/api/v1/auth/login"
@@ -397,6 +425,7 @@ async function request<T>(
   if (transitionId) beginSessionEpochTransition(transitionId);
   const requestEpoch = sessionEpoch;
   const requestContext = accountContext;
+  let invalidationPublished = inheritedInvalidation;
   try {
     const response = await fetch(path, {
       ...init,
@@ -404,6 +433,22 @@ async function request<T>(
       headers: mutationHeaders(path, init, requestContext),
     });
     const body = await errorBody(response);
+    const identityInvalidated =
+      transition === null &&
+      !isPublicApiPath(pathname) &&
+      response.status === 403 &&
+      body.code !== undefined &&
+      IDENTITY_INVALIDATION_CODES.has(body.code);
+    if (identityInvalidated && !invalidationPublished) {
+      invalidateSessionContextAcrossTabs(
+        new ApiError(
+          body.error ?? "The current identity is no longer eligible for this workspace",
+          response.status,
+          body.code,
+        ),
+      );
+      invalidationPublished = true;
+    }
     const establishingLogin = transition === "login" && loginEstablished(response, body);
     if (establishingLogin) {
       replaceSessionContext(transitionId!);
@@ -419,18 +464,39 @@ async function request<T>(
     } else {
       const requirement = responseContextRequirement(pathname, response, body, transition);
       const incoming = responseContext(response);
+      const intentionalContextTransition =
+        response.ok && isIntentionalAccountContextTransition(pathname, init);
       const epochChanged = transition === null && requestEpoch !== sessionEpoch;
       const contextInvalid =
         requirement !== "none" &&
         (incoming.kind !== "valid" ||
           (requirement === "account" && incoming.clientAccountId === null));
+      const responseAccountChanged =
+        transition === null &&
+        !intentionalContextTransition &&
+        requirement !== "none" &&
+        requestContext.version !== null &&
+        incoming.kind === "valid" &&
+        incoming.clientAccountId !== requestContext.clientAccountId;
       const obsolete =
         !contextInvalid &&
+        !responseAccountChanged &&
         requirement !== "none" &&
         incoming.kind === "valid" &&
         !captureResponseContext(incoming, establishingLogin);
 
-      if (epochChanged || contextInvalid || obsolete) {
+      if (responseAccountChanged && !invalidationPublished) {
+        invalidateSessionContextAcrossTabs(
+          new ApiError(
+            "The response belonged to a different Client Account context",
+            409,
+            "SESSION_CHANGED",
+          ),
+        );
+        invalidationPublished = true;
+      }
+
+      if (epochChanged || contextInvalid || responseAccountChanged || obsolete) {
         if (!allowAuthoritativeRecovery) {
           throw publishProtocolFailure(
             contextInvalid
@@ -449,18 +515,21 @@ async function request<T>(
         }
         if (transition === null && isSafeRead(init)) {
           if (
-            contextBeforeRecovery.version !== accountContext.version ||
-            contextBeforeRecovery.clientAccountId !== accountContext.clientAccountId
+            !invalidationPublished &&
+            (contextBeforeRecovery.version !== accountContext.version ||
+              contextBeforeRecovery.clientAccountId !== accountContext.clientAccountId)
           ) {
-            publishContextInvalidation(
+            invalidateSessionContextAcrossTabs(
               new ApiError(
                 "The browser session context changed during authoritative recovery",
                 409,
                 "SESSION_CHANGED",
               ),
+              false,
             );
+            invalidationPublished = true;
           }
-          return request<T>(path, init, false);
+          return request<T>(path, init, false, invalidationPublished);
         }
         if (!establishingLogin) {
           throw publishProtocolFailure(
@@ -468,6 +537,14 @@ async function request<T>(
             false,
           );
         }
+      }
+      if (
+        intentionalContextTransition &&
+        requestContext.version !== null &&
+        incoming.kind === "valid" &&
+        incoming.clientAccountId !== requestContext.clientAccountId
+      ) {
+        broadcastIntentionalContextReplacement();
       }
     }
 
@@ -485,10 +562,16 @@ async function request<T>(
       );
       if (
         pathname !== "/api/v1/auth/login" &&
+        !invalidationPublished &&
         error.code !== undefined &&
-        CONTEXT_INVALIDATION_CODES.has(error.code)
+        CONTEXT_INVALIDATION_CODES.has(error.code) &&
+        (!IDENTITY_INVALIDATION_CODES.has(error.code) || !isPublicApiPath(pathname))
       ) {
-        publishContextInvalidation(error);
+        if (IDENTITY_INVALIDATION_CODES.has(error.code)) {
+          invalidateSessionContextAcrossTabs(error);
+        } else {
+          publishContextInvalidation(error);
+        }
       }
       throw error;
     }

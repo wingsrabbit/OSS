@@ -69,6 +69,29 @@ function mockViewer({
   };
 }
 
+function withViewerSessionContext(route: Route, viewer: MockViewer | null): Route {
+  if (!viewer) return route;
+  return new Proxy(route, {
+    get(target, property, receiver) {
+      if (property === "fulfill") {
+        return (options: Parameters<Route["fulfill"]>[0]) => {
+          const response = options ?? {};
+          return target.fulfill({
+            ...response,
+            headers: {
+              "X-OSS-Account-Context-Version": viewer.accountContextVersion,
+              "X-OSS-Client-Account-Id": viewer.clientAccountId,
+              ...(response.headers ?? {}),
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 async function installMockApi(
   page: Page,
   viewer: MockViewer | null,
@@ -79,7 +102,8 @@ async function installMockApi(
   } = {},
 ): Promise<string[]> {
   const requests: string[] = [];
-  await page.route("**/api/v1/**", async (route) => {
+  await page.route("**/api/v1/**", async (rawRoute) => {
+    const route = withViewerSessionContext(rawRoute, viewer);
     const request = route.request();
     const path = new URL(request.url()).pathname;
     requests.push(path);
@@ -710,6 +734,11 @@ test("changing Client Account clears old history before the new request and igno
       if (path === "/api/v1/auth/account-context" && route.request().method() === "PUT") {
         expect(route.request().headers()["x-oss-account-context-version"]).toBe("1");
         serveViewerB = true;
+        // Keep the helper's default protected-response headers aligned with
+        // the same synthetic session after the explicit context switch.
+        viewerA.clientAccountId = accountBId;
+        viewerA.accountContextVersion = "2";
+        viewerA.context = viewerB.context;
         await route.fulfill({
           headers: {
             "X-OSS-Account-Context-Version": "2",
