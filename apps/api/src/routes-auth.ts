@@ -192,6 +192,10 @@ export async function registerAuthRoutes(
       verification: {
         email: user.emailVerifiedAt ? "passed" : "pending",
       },
+      restrictions: {
+        user: Boolean(user.userRestrictedAt),
+        clientAccount: Boolean(user.clientAccountRestrictedAt),
+      },
       eligible:
         Boolean(user.emailVerifiedAt) &&
         !user.userRestrictedAt &&

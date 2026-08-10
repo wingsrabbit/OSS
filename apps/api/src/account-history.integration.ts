@@ -406,6 +406,62 @@ try {
     assert.equal(crossAccount.statusCode, 404, `${url}: ${crossAccount.body}`);
   }
 
+  await pool.query(
+    "UPDATE client_accounts SET restricted_at = now() WHERE id = $1",
+    [customer.accountId],
+  );
+  const accountRestrictedMe = await app.inject({
+    method: "GET",
+    url: "/api/v1/auth/me",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(accountRestrictedMe.statusCode, 200, accountRestrictedMe.body);
+  const accountRestrictedBody = responseJson<{
+    eligible: boolean;
+    restrictions: { user: boolean; clientAccount: boolean };
+  }>(accountRestrictedMe);
+  assert.equal(accountRestrictedBody.eligible, false);
+  assert.deepEqual(accountRestrictedBody.restrictions, {
+    user: false,
+    clientAccount: true,
+  });
+  const restrictedAccountHistory = await app.inject({
+    method: "GET",
+    url: "/api/v1/customer/business-history",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(restrictedAccountHistory.statusCode, 200, restrictedAccountHistory.body);
+  assert.ok(
+    responseJson<{ invoices: Array<{ id: string }> }>(restrictedAccountHistory).invoices.some(
+      (invoice) => invoice.id === invoiceId,
+    ),
+  );
+  await pool.query(
+    "UPDATE client_accounts SET restricted_at = NULL WHERE id = $1",
+    [customer.accountId],
+  );
+
+  await pool.query("UPDATE users SET restricted_at = now() WHERE id = $1", [customer.userId]);
+  const userRestrictedMe = await app.inject({
+    method: "GET",
+    url: "/api/v1/auth/me",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(userRestrictedMe.statusCode, 200, userRestrictedMe.body);
+  const userRestrictedBody = responseJson<{
+    eligible: boolean;
+    restrictions: { user: boolean; clientAccount: boolean };
+  }>(userRestrictedMe);
+  assert.equal(userRestrictedBody.eligible, false);
+  assert.deepEqual(userRestrictedBody.restrictions, { user: true, clientAccount: false });
+  const restrictedUserHistory = await app.inject({
+    method: "GET",
+    url: "/api/v1/customer/business-history",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(restrictedUserHistory.statusCode, 403, restrictedUserHistory.body);
+  await pool.query("UPDATE users SET restricted_at = NULL WHERE id = $1", [customer.userId]);
+
   for (const query of [
     customer.accountId,
     "Customer Alpha",
