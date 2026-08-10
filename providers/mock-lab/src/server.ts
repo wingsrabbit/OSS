@@ -142,6 +142,38 @@ const pool = new pg.Pool({
 });
 
 const inFlightMailWrites = new Map<string, Promise<void>>();
+const incomingMailRequests = new Map<string, Promise<void>>();
+const incomingMailRequestReleases = new WeakMap<object, () => void>();
+
+function registerIncomingMailRequest(operationId: string): () => void {
+  const predecessor = incomingMailRequests.get(operationId) ?? Promise.resolve();
+  let resolveCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    resolveCurrent = resolve;
+  });
+  const tail = predecessor.then(() => current);
+  incomingMailRequests.set(operationId, tail);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    resolveCurrent();
+    void tail.finally(() => {
+      if (incomingMailRequests.get(operationId) === tail) {
+        incomingMailRequests.delete(operationId);
+      }
+    });
+  };
+}
+
+async function waitForIncomingMailRequest(operationId: string): Promise<void> {
+  while (true) {
+    const pending = incomingMailRequests.get(operationId);
+    if (!pending) return;
+    await pending;
+    if (incomingMailRequests.get(operationId) === pending) return;
+  }
+}
 
 async function serializeMailWrite<T>(operationId: string, work: () => Promise<T>): Promise<T> {
   const predecessor = inFlightMailWrites.get(operationId) ?? Promise.resolve();
@@ -501,12 +533,43 @@ app.addHook("onRequest", async (request, reply) => {
   if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
     return reply.code(401).send({ error: "invalid provider credential" });
   }
+  if (request.method === "POST" && requestPath === "/v1/mail") {
+    const idempotencyKey = request.headers["idempotency-key"];
+    const parsedOperationId = z.uuid().safeParse(
+      Array.isArray(idempotencyKey) ? idempotencyKey[0] : idempotencyKey,
+    );
+    if (parsedOperationId.success) {
+      incomingMailRequestReleases.set(
+        request,
+        registerIncomingMailRequest(parsedOperationId.data),
+      );
+    }
+  }
+});
+
+function releaseIncomingMailRequest(request: object): void {
+  const release = incomingMailRequestReleases.get(request);
+  if (!release) return;
+  incomingMailRequestReleases.delete(request);
+  release();
+}
+
+app.addHook("onError", async (request) => {
+  releaseIncomingMailRequest(request);
+});
+
+app.addHook("onRequestAbort", async (request) => {
+  releaseIncomingMailRequest(request);
 });
 
 app.addHook("onSend", async (_request, reply) => {
   reply.header("X-Robots-Tag", "noindex, nofollow, noarchive");
   reply.header("Cache-Control", "no-store");
   reply.header("X-Content-Type-Options", "nosniff");
+});
+
+app.addHook("onResponse", async (request) => {
+  releaseIncomingMailRequest(request);
 });
 
 function signature(timestamp: string, body: unknown, secret: string): string {
@@ -1599,6 +1662,7 @@ app.get("/v1/mail/:operationId", async (request, reply) => {
   if (!params.success) {
     return reply.code(400).send({ error: "operationId must be a UUID" });
   }
+  await waitForIncomingMailRequest(params.data.operationId);
   await waitForInFlightMailWrite(params.data.operationId);
   const client = await pool.connect();
   let result: pg.QueryResult<{

@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import pg from "pg";
@@ -177,6 +178,67 @@ try {
   );
   assert.equal(missing.status, 404);
   assert.deepEqual(await responseJson(missing), { error: "operation not found" });
+
+  const parsingOperationId = randomUUID();
+  const parsingMessage = JSON.stringify({
+    operationId: parsingOperationId,
+    recipient: `parsing-${parsingOperationId}@example.invalid`,
+    template: "integration.parsing",
+    locale: "en",
+    subject: `parsing subject ${parsingOperationId}`,
+    body: `parsing body ${parsingOperationId}`,
+    sensitive: true,
+  });
+  const parsingPost = new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const request = httpRequest(
+      new URL("/v1/mail", providerBaseUrl),
+      {
+        method: "POST",
+        headers: {
+          ...providerHeaders(parsingOperationId),
+          "Content-Length": String(Buffer.byteLength(parsingMessage)),
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          resolve({
+            status: response.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    request.once("error", reject);
+    request.flushHeaders();
+    setTimeout(() => request.end(parsingMessage), 200);
+  });
+  await delay(50);
+  let parsingGetSettled = false;
+  const parsingGet = fetch(
+    new URL(`/v1/mail/${parsingOperationId}`, providerBaseUrl),
+    { headers: providerHeaders() },
+  );
+  void parsingGet.then(
+    () => {
+      parsingGetSettled = true;
+    },
+    () => {
+      parsingGetSettled = true;
+    },
+  );
+  await delay(75);
+  assert.equal(
+    parsingGetSettled,
+    false,
+    "GET must await a POST whose authenticated headers arrived before body parsing completed",
+  );
+  const parsedPost = await parsingPost;
+  const parsedGet = await parsingGet;
+  assert.equal(parsedPost.status, 202);
+  assert.equal(parsedGet.status, 200);
+  assert.deepEqual(await responseJson<MailDeliveryFact>(parsedGet), JSON.parse(parsedPost.body));
 
   const linearization = new pg.Client({ connectionString: testDatabaseUrl.toString() });
   await linearization.connect();
