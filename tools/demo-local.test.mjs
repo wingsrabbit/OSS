@@ -899,6 +899,45 @@ test("Demo session preserves context on public responses and rejects old-session
   assert.equal(session.clientAccountId, null);
 });
 
+test("Demo session treats a logout clear-cookie as terminal and ignores stale context headers", async () => {
+  const requests = [];
+  const responses = [
+    new Response("{}", {
+      headers: {
+        "Set-Cookie": "oss_session=session-id; Path=/; HttpOnly",
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response(null, {
+      status: 204,
+      headers: {
+        "Set-Cookie": "oss_session=; Path=/; HttpOnly; Max-Age=0",
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response("{}"),
+  ];
+  const session = new DemoSession("http://127.0.0.1:3000", async (url, init) => {
+    requests.push({ url: String(url), init });
+    return responses.shift();
+  });
+
+  await session.request("/api/v1/auth/me");
+  const epochBeforeLogout = session.sessionEpoch;
+  await session.request("/api/v1/auth/logout", { method: "POST", body: "{}" }, 204);
+
+  assert.equal(session.cookie, "");
+  assert.equal(session.sessionEpoch, epochBeforeLogout + 1);
+  assert.equal(session.accountContextVersion, null);
+  assert.equal(session.clientAccountId, null);
+
+  await session.request("/api/v1/catalog");
+  assert.equal(requests[2].init.headers.get("Cookie"), null);
+  assert.equal(requests[2].init.headers.get("X-OSS-Account-Context-Version"), null);
+});
+
 function ticketSessions({ leakInternalNote = false } = {}) {
   const clientAccountId = "customer-account";
   const serviceId = "active-service";

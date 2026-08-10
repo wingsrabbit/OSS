@@ -78,7 +78,22 @@ export class DemoSession {
     let responseEstablishedCurrentSession = false;
     if (setCookie && requestSessionEpoch === this.sessionEpoch) {
       const nextCookie = setCookie.split(";", 1)[0] ?? "";
-      if (nextCookie !== this.cookie) {
+      const cookieValue = nextCookie.includes("=")
+        ? nextCookie.slice(nextCookie.indexOf("=") + 1).trim()
+        : "";
+      const maxAge = /(?:^|;)\s*max-age\s*=\s*(-?\d+)/i.exec(setCookie)?.[1];
+      const expires = /(?:^|;)\s*expires\s*=\s*([^;]+)/i.exec(setCookie)?.[1];
+      const expiresAt = expires === undefined ? Number.NaN : Date.parse(expires);
+      const clearsSession =
+        cookieValue.length === 0 ||
+        (maxAge !== undefined && Number(maxAge) <= 0) ||
+        (Number.isFinite(expiresAt) && expiresAt <= Date.now());
+      if (clearsSession) {
+        this.cookie = "";
+        this.sessionEpoch += 1;
+        this.accountContextVersion = null;
+        this.clientAccountId = null;
+      } else if (nextCookie !== this.cookie) {
         this.cookie = nextCookie;
         this.sessionEpoch += 1;
         this.accountContextVersion = null;
