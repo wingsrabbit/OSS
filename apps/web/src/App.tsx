@@ -891,6 +891,8 @@ export function App() {
   const refundManualActionInFlight = useRef(new Set<string>());
   const refundCorrectionInFlight = useRef(new Set<string>());
   const refundCapacityAcknowledgementInFlight = useRef(new Set<string>());
+  const refundPollInFlight = useRef(new Map<string, number>());
+  const refundPollRequestSequence = useRef(0);
   const [refundAdjudicationPendingIds, setRefundAdjudicationPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
@@ -957,6 +959,7 @@ export function App() {
   ].join("\u0002");
   const staffAccessFingerprintRef = useRef(staffAccessFingerprint);
   staffAccessFingerprintRef.current = staffAccessFingerprint;
+  const previousStaffAccessFingerprint = useRef(staffAccessFingerprint);
   const previousStaffPrincipalFingerprint = useRef(staffPrincipalFingerprint);
   const canReadCustomerHistory =
     me?.verification.email === "passed" && me.restrictions.user === false;
@@ -1111,6 +1114,13 @@ export function App() {
     manualReceiptIntentKeys.current.clear();
     manualReceiptReversalIntentKeys.current.clear();
     refundIntentKeys.current.clear();
+    refundInFlight.current.clear();
+    refundAdjudicationInFlight.current.clear();
+    refundManualActionInFlight.current.clear();
+    refundCorrectionInFlight.current.clear();
+    refundCapacityAcknowledgementInFlight.current.clear();
+    fundResolutionInFlight.current.clear();
+    refundPollInFlight.current.clear();
   }, []);
 
   const openRoute = useCallback((target: AppRoute, replace = false) => {
@@ -1423,38 +1433,83 @@ export function App() {
 
   useLayoutEffect(() => {
     adminAccessGeneration.current += 1;
+    const accessChanged =
+      previousStaffAccessFingerprint.current !== staffAccessFingerprint;
     const principalChanged =
       previousStaffPrincipalFingerprint.current !== staffPrincipalFingerprint;
+    previousStaffAccessFingerprint.current = staffAccessFingerprint;
     previousStaffPrincipalFingerprint.current = staffPrincipalFingerprint;
-    if (!principalChanged) return;
+    if (!accessChanged && !principalChanged) return;
 
     adminOperationGeneration.current += 1;
     manualReceiptRequestGeneration.current += 1;
     adminOperationContextRef.current = null;
     setAdminOperationContext(null);
+    setNoticeRaw("");
+    setErrorRaw("");
     setManualItems([]);
+    setAdminRenewals([]);
+    setAdminCancellations([]);
+    setAdminChargebacks([]);
+    setAdminUnclaimedChargebacks([]);
+    setAdminChargebackHolds([]);
+    setUnclaimedFunds([]);
     setRefundCandidates([]);
     setRefundRecords({});
     setRefundSecurityHolds([]);
     setRefundDismissalCorrections([]);
     setRefundReceiptCapacityIncidents([]);
+    setRenewalHoldPendingId(null);
+    setManualSuspensionPendingId(null);
+    setCancellationCompletionPendingId(null);
     setAdminPassword("");
     setManualReason("");
+    setAutomationEffectiveAt("");
+    setAutomationReason("");
+    setRenewalHoldReason("");
+    setManualSuspensionReason("");
+    setCancellationCompletionReason("");
+    setCreditAdjustmentMinor("5000");
+    setCreditAdjustmentReason("");
+    manualReceiptClientAccountIdRef.current = "";
     setManualReceiptClientAccountId("");
     setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
     setManualReceiptReason("");
     setManualReceiptPending(false);
     setManualReceiptHistory([]);
     setManualReceiptTarget(null);
     setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
     setRefundAmountMode("full");
     setRefundAmountMinor("");
     setRefundReason("");
+    setRefundScenario("success");
     setRefundPendingReceiptIds(new Set());
     setRefundAdjudicationPendingIds(new Set());
     setRefundManualActionPendingIds(new Set());
     setRefundCorrectionPendingIds(new Set());
     setRefundCapacityAcknowledgementPendingIds(new Set());
+    setFundResolutionMinor("");
+    setFundResolutionInvoiceId("");
+    setFundResolutionReason("");
+    setFundReturnAmountMode("full");
+    setFundReturnAmountMinor("");
+    setFundReturnReason("");
+    setFundReturnScenario("success");
+    setFundResolutionPendingReceiptIds(new Set());
+    refundInFlight.current.clear();
+    refundAdjudicationInFlight.current.clear();
+    refundManualActionInFlight.current.clear();
+    refundCorrectionInFlight.current.clear();
+    refundCapacityAcknowledgementInFlight.current.clear();
+    fundResolutionInFlight.current.clear();
+    refundPollInFlight.current.clear();
   }, [route, staffAccessFingerprint, staffPrincipalFingerprint]);
 
   useLayoutEffect(() => {
@@ -2000,15 +2055,31 @@ export function App() {
       const operationScope = captureAdminOperationScope();
       if (!adminOperationRequestIsCurrent(operationScope)) return;
       void Promise.all(
-        active.map((refund) =>
-          api<RefundRecord>(`/api/v1/admin/refunds/${refund.refundId}`).then((updated) => {
+        active.map(async (refund) => {
+          if (refundPollInFlight.current.has(refund.refundId)) return false;
+          const requestSequence = ++refundPollRequestSequence.current;
+          refundPollInFlight.current.set(refund.refundId, requestSequence);
+          try {
+            const updated = await api<RefundRecord>(
+              `/api/v1/admin/refunds/${refund.refundId}`,
+            );
             if (
-              !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
+              refundPollInFlight.current.get(refund.refundId) !== requestSequence ||
+              !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId) ||
+              updated.clientAccountId !== refund.clientAccountId
             ) return false;
-            setRefundRecords((current) => ({ ...current, [updated.refundId]: updated }));
+            setRefundRecords((current) => {
+              const currentRefund = current[updated.refundId];
+              if (currentRefund && currentRefund.version > updated.version) return current;
+              return { ...current, [updated.refundId]: updated };
+            });
             return true;
-          }),
-        ),
+          } finally {
+            if (refundPollInFlight.current.get(refund.refundId) === requestSequence) {
+              refundPollInFlight.current.delete(refund.refundId);
+            }
+          }
+        }),
       )
         .then((accepted) => {
           if (
@@ -2434,13 +2505,21 @@ export function App() {
   async function runBillingAutomation() {
     if (!canUseFullAdminRoute || automationReason.trim().length < 10) return;
     const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = automationReason.trim();
+    const effectiveAt = automationEffectiveAt
+      ? new Date(automationEffectiveAt).toISOString()
+      : null;
     setError("");
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       const result = await api<{
         businessDate: string;
         invoicesCreated: number;
@@ -2450,20 +2529,22 @@ export function App() {
       }>("/api/v1/admin/billing/automation/run", {
         method: "POST",
         body: JSON.stringify({
-          reason: automationReason.trim(),
+          reason,
           idempotencyKey: newIdempotencyKey(),
-          ...(automationEffectiveAt
-            ? { effectiveAt: new Date(automationEffectiveAt).toISOString() }
-            : {}),
+          ...(effectiveAt ? { effectiveAt } : {}),
         }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAutomationReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals(operationScope)]);
+      await refreshAdminRenewals(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(
         `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s), ${result.delinquencyDeferralsCreated} payment reconciliation hold(s).`,
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Billing automation failed");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Billing automation failed");
+      }
     }
   }
 
@@ -2477,30 +2558,39 @@ export function App() {
       return;
     }
     const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = renewalHoldReason.trim();
     setError("");
     setRenewalHoldPendingId(renewal.renewalId);
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api(`/api/v1/admin/billing/renewals/${renewal.renewalId}/resolve-hold`, {
         method: "POST",
         body: JSON.stringify({
           action: "grant_period",
-          reason: renewalHoldReason.trim(),
+          reason,
           expectedVersion: renewal.version,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setRenewalHoldReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals(operationScope)]);
+      await refreshAdminRenewals(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice("The funded renewal Hold was reviewed and the exact service period was granted.");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
+      }
     } finally {
-      setRenewalHoldPendingId(null);
+      if (adminOperationRequestIsCurrent(operationScope)) setRenewalHoldPendingId(null);
     }
   }
 
@@ -2518,11 +2608,13 @@ export function App() {
       return;
     }
     const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = manualSuspensionReason.trim();
     const requestIdentity = JSON.stringify({
       caseId: delinquency.caseId,
       action,
       expectedVersion: delinquency.version,
-      reason: manualSuspensionReason.trim(),
+      reason,
     });
     let idempotencyKey = manualSuspensionIntentKeys.current.get(requestIdentity);
     if (!idempotencyKey) {
@@ -2532,11 +2624,14 @@ export function App() {
     setError("");
     setManualSuspensionPendingId(delinquency.caseId);
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       const outcome = await api<{
         caseStatus: string;
         serviceStatus: string;
@@ -2548,24 +2643,28 @@ export function App() {
           method: "POST",
           body: JSON.stringify({
             action,
-            reason: manualSuspensionReason.trim(),
+            reason,
             expectedVersion: delinquency.version,
             idempotencyKey,
           }),
         },
       );
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       manualSuspensionIntentKeys.current.delete(requestIdentity);
       setManualSuspensionReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals(operationScope)]);
+      await refreshAdminRenewals(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(
         action === "confirm_suspended"
           ? `Manual suspension recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`
           : `Manual restoration recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`,
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual service action failed");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Manual service action failed");
+      }
     } finally {
-      setManualSuspensionPendingId(null);
+      if (adminOperationRequestIsCurrent(operationScope)) setManualSuspensionPendingId(null);
     }
   }
 
@@ -2579,11 +2678,13 @@ export function App() {
       return;
     }
     const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = cancellationCompletionReason.trim();
     const requestIdentity = JSON.stringify({
       executionId: item.executionId,
       expectedExecutionVersion: item.executionVersion,
       expectedServiceVersion: item.serviceVersion,
-      reason: cancellationCompletionReason.trim(),
+      reason,
     });
     let idempotencyKey = cancellationCompletionIntentKeys.current.get(requestIdentity);
     if (!idempotencyKey) {
@@ -2593,11 +2694,14 @@ export function App() {
     setError("");
     setCancellationCompletionPendingId(item.executionId);
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       const outcome = await api<{
         executionStatus: "terminated";
         serviceStatus: "terminated";
@@ -2608,27 +2712,30 @@ export function App() {
         body: JSON.stringify({
           expectedExecutionVersion: item.executionVersion,
           expectedServiceVersion: item.serviceVersion,
-          reason: cancellationCompletionReason.trim(),
+          reason,
           idempotencyKey,
         }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       cancellationCompletionIntentKeys.current.delete(requestIdentity);
       setCancellationCompletionReason("");
-      await Promise.all([
-        refreshAdminCancellations(operationScope),
-        refreshLatestOrder(),
-      ]);
+      await refreshAdminCancellations(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(
         `${outcome.replayed ? "Replayed" : "Recorded"} manual cycle-end termination: Core service ${outcome.serviceStatus}, execution ${outcome.executionStatus}. No Provider request was sent.`,
       );
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Manual cycle-end termination could not be recorded",
-      );
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : "Manual cycle-end termination could not be recorded",
+        );
+      }
     } finally {
-      setCancellationCompletionPendingId(null);
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setCancellationCompletionPendingId(null);
+      }
     }
   }
 
@@ -2979,28 +3086,38 @@ export function App() {
 
   async function adjustCredit(direction: "increase" | "decrease") {
     if (!canUseFullAdminRoute || !me) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const clientAccountId = me.clientAccountId;
+    const amountMinor = creditAdjustmentMinor;
+    const reason = creditAdjustmentReason;
     setError("");
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
-      await api(`/api/v1/admin/client-accounts/${me.clientAccountId}/credit-adjustments`, {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
+      await api(`/api/v1/admin/client-accounts/${clientAccountId}/credit-adjustments`, {
         method: "POST",
         body: JSON.stringify({
           direction,
-          amountMinor: creditAdjustmentMinor,
+          amountMinor,
           currency: "USD",
-          reason: creditAdjustmentReason,
+          reason,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
-      await refreshBilling();
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(`Credit ${direction} recorded with a balanced journal and audit event.`);
       setCreditAdjustmentReason("");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
+      }
     }
   }
 
@@ -3736,6 +3853,14 @@ export function App() {
     setRefundManualActionPendingIds(new Set());
     setRefundCorrectionPendingIds(new Set());
     setRefundCapacityAcknowledgementPendingIds(new Set());
+    setFundResolutionPendingReceiptIds(new Set());
+    refundInFlight.current.clear();
+    refundAdjudicationInFlight.current.clear();
+    refundManualActionInFlight.current.clear();
+    refundCorrectionInFlight.current.clear();
+    refundCapacityAcknowledgementInFlight.current.clear();
+    fundResolutionInFlight.current.clear();
+    refundPollInFlight.current.clear();
   }
 
   function selectedAdminAccountChanged(account: { id: string; name: string } | null) {
@@ -5424,25 +5549,60 @@ export function App() {
                                 ) setAdminPassword("");
                               }}
                               onRefresh={async (scopeToken) => {
+                                const clientAccountId = manualReceiptTarget.id;
                                 if (
                                   !manualReceiptScopeIsCurrent(
                                     scopeToken,
-                                    manualReceiptTarget.id,
+                                    clientAccountId,
                                   )
                                 ) return false;
-                                const refreshed = await fetchManualReceiptHistory(
-                                  manualReceiptTarget.id,
-                                  scopeToken,
-                                );
+                                const operationScope = captureAdminOperationScope();
                                 if (
-                                  !refreshed ||
+                                  !adminOperationRequestIsCurrent(
+                                    operationScope,
+                                    clientAccountId,
+                                  )
+                                ) return false;
+                                const [historyResult, unclaimedResult] =
+                                  await Promise.allSettled([
+                                    fetchManualReceiptHistory(clientAccountId, scopeToken),
+                                    canUseFullAdminWorkspace
+                                      ? refreshUnclaimedFunds(
+                                          operationScope,
+                                          () => manualReceiptScopeIsCurrent(
+                                            scopeToken,
+                                            clientAccountId,
+                                          ),
+                                        )
+                                      : Promise.resolve(true),
+                                  ]);
+                                if (
                                   !manualReceiptScopeIsCurrent(
                                     scopeToken,
-                                    manualReceiptTarget.id,
+                                    clientAccountId,
+                                  ) ||
+                                  !adminOperationRequestIsCurrent(
+                                    operationScope,
+                                    clientAccountId,
                                   )
                                 ) return false;
-                                setManualReceiptTarget(refreshed.clientAccount);
-                                setManualReceiptHistory(refreshed.items);
+                                if (
+                                  historyResult.status === "fulfilled" &&
+                                  historyResult.value
+                                ) {
+                                  setManualReceiptTarget(historyResult.value.clientAccount);
+                                  setManualReceiptHistory(historyResult.value.items);
+                                }
+                                if (
+                                  historyResult.status === "rejected" ||
+                                  !historyResult.value ||
+                                  unclaimedResult.status === "rejected" ||
+                                  !unclaimedResult.value
+                                ) {
+                                  setError(
+                                    "The outflow fact was saved, but one of the administrator balances could not be refreshed.",
+                                  );
+                                }
                                 return true;
                               }}
                               onNotice={setNotice}

@@ -299,6 +299,92 @@ function refundCapacityIncident(
   };
 }
 
+function adminRenewalFixture(
+  kind: "hold" | "suspension",
+) {
+  const renewalId = "00000000-0000-4000-8000-000000001501";
+  const serviceId = "00000000-0000-4000-8000-000000001502";
+  const caseId = "00000000-0000-4000-8000-000000001503";
+  return {
+    renewalId,
+    serviceId,
+    productName: "Synthetic full-admin renewal",
+    serviceStatus: kind === "suspension" ? "suspended" : "active",
+    billingCycle: "monthly",
+    termStart: occurredAt,
+    termEnd: "2026-09-10T00:00:00.000Z",
+    invoiceId: "00000000-0000-4000-8000-000000001504",
+    currency: "USD",
+    totalMinor: "500",
+    allocatedMinor: kind === "hold" ? "500" : "0",
+    dueMinor: kind === "hold" ? "0" : "500",
+    status: kind === "hold" ? "paid" : "open",
+    fundingStatus: kind === "hold" ? "paid" : "open",
+    renewalStatus: kind === "hold" ? "manual_hold" : "invoiced",
+    fundedAt: kind === "hold" ? occurredAt : null,
+    dueAt: "2026-08-20T00:00:00.000Z",
+    periodStart: "2026-09-10T00:00:00.000Z",
+    periodEnd: "2026-10-10T00:00:00.000Z",
+    settledAt: kind === "hold" ? occurredAt : null,
+    version: 3,
+    reminders: [],
+    lateFee: null,
+    delinquency: kind === "suspension"
+      ? {
+          caseId,
+          action: "manual",
+          decisionReason: "Synthetic manual suspension evidence",
+          status: "manual",
+          resumeRequired: true,
+          providerInstallationId: null,
+          lastError: null,
+          version: 2,
+          suspendOperation: null,
+          resumeOperation: null,
+          manualControl: {
+            allowedActions: ["confirm_suspended"],
+            requiresReauthentication: true,
+            actionCount: "0",
+            latestActionAt: null,
+            blockedReason: null,
+            impact: {
+              confirmSuspended: "Record a synthetic confirmed suspension.",
+              confirmRestored: "Record a synthetic confirmed restoration.",
+            },
+          },
+        }
+      : null,
+    paymentReconciliationHold: {
+      active: false,
+      deferralCount: "0",
+      latestDeferredAt: null,
+    },
+    automaticPayment: null,
+    clientAccountId: accountA,
+    clientAccountName: "Account Alpha",
+  };
+}
+
+function adminCancellationFixture() {
+  return {
+    requestId: "00000000-0000-4000-8000-000000001601",
+    executionId: "00000000-0000-4000-8000-000000001602",
+    serviceId: "00000000-0000-4000-8000-000000001603",
+    serviceStatus: "active",
+    clientAccountName: "Account Alpha",
+    productName: "Synthetic manual cancellation",
+    effectiveAt: occurredAt,
+    executionMode: "manual",
+    executionStatus: "manual",
+    executionVersion: 4,
+    serviceVersion: 7,
+    lastError: null,
+    providerOperation: null,
+    job: { status: "manual", lastError: null },
+    interventionRequired: true,
+  };
+}
+
 function barrier() {
   let release!: () => void;
   let arrive!: () => void;
@@ -347,6 +433,215 @@ const refundReadPaths = [
   "/api/v1/admin/refund-receipt-capacity-incidents",
 ];
 
+function expectedMethods(path: string): ReadonlySet<string> | null {
+  if (path === "/api/v1/catalog" || path === "/api/v1/legal/current") {
+    return new Set(["GET"]);
+  }
+  if (path === "/api/v1/auth/me") return new Set(["GET"]);
+  if ([
+    "/api/v1/auth/register",
+    "/api/v1/auth/login",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/reauth",
+  ].includes(path)) return new Set(["POST"]);
+  if (!path.startsWith("/api/v1/admin/")) return null;
+  if (/^\/api\/v1\/admin\/client-accounts\/[^/]+\/manual-receipts$/.test(path)) {
+    return new Set(["GET", "POST"]);
+  }
+  if (
+    path === "/api/v1/admin/billing/automation/run" ||
+    /\/resolve-hold$/.test(path) ||
+    /\/manual-actions$/.test(path) ||
+    /\/complete-manual$/.test(path) ||
+    /\/credit-adjustments$/.test(path) ||
+    /\/resolutions$/.test(path) ||
+    (/\/refunds$/.test(path) && !refundReadPaths.includes(path)) ||
+    /\/adjudications$/.test(path) ||
+    /\/corrections$/.test(path) ||
+    /\/acknowledgements$/.test(path) ||
+    /\/reversal$/.test(path) ||
+    /\/outflow-reports$/.test(path) ||
+    /\/reconciliation$/.test(path) ||
+    /\/messages$/.test(path)
+  ) {
+    return new Set(["POST"]);
+  }
+  return new Set(["GET"]);
+}
+
+function bodyHasExactly(
+  body: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const permitted = new Set([...required, ...optional]);
+  const keys = Object.keys(body);
+  return required.every((key) => Object.hasOwn(body, key)) &&
+    keys.every((key) => permitted.has(key));
+}
+
+function expectedPostBody(path: string, body: Record<string, unknown>): boolean {
+  if (path === "/api/v1/auth/register") {
+    return bodyHasExactly(body, ["email", "password", "clientName", "locale"]);
+  }
+  if (path === "/api/v1/auth/login") {
+    return bodyHasExactly(body, ["email", "password"]);
+  }
+  if (path === "/api/v1/auth/logout") return bodyHasExactly(body, []);
+  if (path === "/api/v1/auth/reauth") return bodyHasExactly(body, ["password"]);
+  if (path === "/api/v1/admin/billing/automation/run") {
+    return bodyHasExactly(body, ["reason", "idempotencyKey"], ["effectiveAt"]);
+  }
+  if (/\/billing\/renewals\/[^/]+\/resolve-hold$/.test(path)) {
+    return bodyHasExactly(body, ["action", "reason", "expectedVersion", "idempotencyKey"]);
+  }
+  if (/\/billing\/delinquency-cases\/[^/]+\/manual-actions$/.test(path)) {
+    return bodyHasExactly(body, ["action", "reason", "expectedVersion", "idempotencyKey"]);
+  }
+  if (/\/services\/cancellations\/[^/]+\/complete-manual$/.test(path)) {
+    return bodyHasExactly(body, [
+      "expectedExecutionVersion",
+      "expectedServiceVersion",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/client-accounts\/[^/]+\/credit-adjustments$/.test(path)) {
+    return bodyHasExactly(body, [
+      "direction",
+      "amountMinor",
+      "currency",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/client-accounts\/[^/]+\/manual-receipts$/.test(path)) {
+    return bodyHasExactly(body, [
+      "reference",
+      "receivedAt",
+      "grossAmountMinor",
+      "feeMinor",
+      "currency",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/manual-receipts\/[^/]+\/reversal$/.test(path)) {
+    return bodyHasExactly(body, [
+      "expectedFundReceiptId",
+      "expectedGrossAmountMinor",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/outflow-reports\/[^/]+\/reconciliation$/.test(path)) {
+    return bodyHasExactly(body, ["outcome", "occurredAt", "reason", "idempotencyKey"]);
+  }
+  if (/\/outflow-reports$/.test(path)) {
+    return bodyHasExactly(body, [
+      "expectedAvailableMinor",
+      "amountMinor",
+      "currency",
+      "destination",
+      "destinationReference",
+      "observedOutcome",
+      "occurredAt",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/admin\/services\/[^/]+\/complete-manual$/.test(path)) {
+    return bodyHasExactly(body, ["reason"]);
+  }
+  if (/\/admin\/funds\/[^/]+\/resolutions$/.test(path)) {
+    return bodyHasExactly(body, ["action", "amountMinor", "invoiceId", "reason", "idempotencyKey"]);
+  }
+  if (/\/admin\/funds\/[^/]+\/refunds$/.test(path)) {
+    return bodyHasExactly(body, [
+      "amountMode",
+      "amountMinor",
+      "expectedAvailableMinor",
+      "scenario",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/admin\/invoices\/[^/]+\/refunds$/.test(path)) {
+    return bodyHasExactly(body, [
+      "receiptId",
+      "destination",
+      "amountMode",
+      "amountMinor",
+      "expectedRefundableMinor",
+      "scenario",
+      "reason",
+      "idempotencyKey",
+    ]);
+  }
+  if (/\/refund-security-holds\/[^/]+\/adjudications$/.test(path)) {
+    return bodyHasExactly(body, ["decision", "reason", "idempotencyKey", "expectedRefundVersion"]);
+  }
+  if (/\/admin\/refunds\/[^/]+\/manual-actions$/.test(path)) {
+    return bodyHasExactly(body, ["action", "reason", "idempotencyKey", "expectedRefundVersion"]);
+  }
+  if (/\/refund-adjudications\/[^/]+\/corrections$/.test(path)) {
+    return bodyHasExactly(body, ["reason", "idempotencyKey", "expectedRefundVersion"]);
+  }
+  if (/\/refund-receipt-capacity-incidents\/[^/]+\/acknowledgements$/.test(path)) {
+    return bodyHasExactly(body, [
+      "reason",
+      "idempotencyKey",
+      "expectedConfirmedCompensationMinor",
+      "expectedOverageMinor",
+    ]);
+  }
+  if (/\/admin\/tickets\/[^/]+\/messages$/.test(path)) {
+    return bodyHasExactly(body, ["kind", "message"]);
+  }
+  return false;
+}
+
+function requestContractError(fact: RequestFact): string | null {
+  const methods = expectedMethods(fact.path);
+  if (!methods) return null;
+  if (!methods.has(fact.method)) {
+    return `unexpected method ${fact.method}; expected ${[...methods].join(" or ")}`;
+  }
+  const params = new URLSearchParams(fact.query);
+  if (fact.path === "/api/v1/catalog" || fact.path === "/api/v1/legal/current") {
+    if (
+      [...params.keys()].length !== 1 ||
+      !["en", "zh-CN"].includes(params.get("locale") ?? "")
+    ) return "expected exactly one supported locale query parameter";
+  } else if (fact.path === "/api/v1/admin/client-accounts") {
+    const keys = [...params.keys()];
+    if (
+      keys.some((key) => !["query", "limit", "cursor"].includes(key)) ||
+      new Set(keys).size !== keys.length ||
+      !params.get("query") ||
+      params.get("limit") !== "20" ||
+      (params.has("cursor") && !params.get("cursor"))
+    ) return "invalid Client Account search query contract";
+  } else if (fact.query !== "") {
+    return `unexpected query string ${fact.query}`;
+  }
+  if (fact.method === "GET") {
+    return fact.body === null ? null : "GET requests must not contain a body";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fact.body ?? "");
+  } catch {
+    return "POST request body must be valid JSON";
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "POST request body must be a JSON object";
+  }
+  return expectedPostBody(fact.path, parsed as Record<string, unknown>)
+    ? null
+    : "POST request body did not match the exact endpoint contract";
+}
+
 async function installApi(
   page: Page,
   permissions: string[],
@@ -364,6 +659,15 @@ async function installApi(
       body: request.postData(),
     };
     requests.push(fact);
+    const contractError = requestContractError(fact);
+    if (contractError) {
+      unexpectedRequests.push(fact);
+      await route.fulfill({
+        status: 501,
+        json: { error: `${contractError}: ${fact.method} ${fact.path}${fact.query}` },
+      });
+      return;
+    }
     if (interceptor && await interceptor(path, route)) return;
     if (path === "/api/v1/auth/me") {
       await route.fulfill({ json: viewer(permissions) });
@@ -397,9 +701,18 @@ async function installApi(
     if (
       path === "/api/v1/admin/manual-fulfillment" ||
       path === "/api/v1/admin/tickets" ||
+      path === "/api/v1/admin/billing/renewals" ||
+      path === "/api/v1/admin/services/cancellations" ||
+      path === "/api/v1/admin/funds/unclaimed" ||
       refundReadPaths.includes(path)
     ) {
       await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (path === "/api/v1/admin/add-funds-chargebacks") {
+      await route.fulfill({
+        json: { items: [], unclaimedChargebacks: [], manualHolds: [] },
+      });
       return;
     }
     unexpectedRequests.push(fact);
@@ -569,6 +882,198 @@ function refundMutationButton(page: Page, kind: RefundMutationKind) {
   }
   return page.getByTestId("refund-receipt-capacity-incident")
     .getByRole("button", { name: "Acknowledge and take manual recovery" });
+}
+
+const fullAdminAccessChangeCases = [
+  {
+    name: "billing automation",
+    mutationPath: "/api/v1/admin/billing/automation/run",
+    reasonInput: (page: Page) => page.getByPlaceholder("Automation run reason (10+ characters)"),
+    actionButton: (page: Page) => page.getByRole("button", { name: "Run billing day" }),
+    fixture: "none" as const,
+  },
+  {
+    name: "renewal Hold resolution",
+    mutationPath:
+      `/api/v1/admin/billing/renewals/${adminRenewalFixture("hold").renewalId}/resolve-hold`,
+    reasonInput: (page: Page) => page.getByLabel("Renewal Hold resolution reason"),
+    actionButton: (page: Page) =>
+      page.getByRole("button", { name: "Review and grant exact period" }),
+    fixture: "hold" as const,
+  },
+  {
+    name: "manual suspension confirmation",
+    mutationPath:
+      `/api/v1/admin/billing/delinquency-cases/${adminRenewalFixture("suspension").delinquency!.caseId}/manual-actions`,
+    reasonInput: (page: Page) => page.getByLabel("Manual suspension or restoration reason"),
+    actionButton: (page: Page) =>
+      page.getByRole("button", { name: "Confirm service suspended" }),
+    fixture: "suspension" as const,
+  },
+  {
+    name: "manual cycle-end cancellation",
+    mutationPath:
+      `/api/v1/admin/services/cancellations/${adminCancellationFixture().executionId}/complete-manual`,
+    reasonInput: (page: Page) => page.getByLabel("Manual cycle-end termination reason"),
+    actionButton: (page: Page) => page.getByRole("button", { name: "Confirm manual termination" }),
+    fixture: "cancellation" as const,
+  },
+  {
+    name: "Credit adjustment",
+    mutationPath:
+      `/api/v1/admin/client-accounts/${viewer(["*"]).clientAccountId}/credit-adjustments`,
+    reasonInput: (page: Page) => page.getByPlaceholder("Credit adjustment reason (10+ characters)"),
+    actionButton: (page: Page) => page.getByRole("button", { name: "Increase Credit" }),
+    fixture: "none" as const,
+  },
+];
+
+test("the operation mock fails closed on method, query, and body drift", () => {
+  expect(requestContractError({
+    method: "POST",
+    path: "/api/v1/admin/refunds",
+    query: "",
+    body: "{}",
+  })).toContain("unexpected method");
+  expect(requestContractError({
+    method: "GET",
+    path: "/api/v1/admin/refunds",
+    query: "?unexpected=1",
+    body: null,
+  })).toContain("unexpected query string");
+  expect(requestContractError({
+    method: "POST",
+    path: "/api/v1/auth/reauth",
+    query: "",
+    body: JSON.stringify({ password: "Synthetic!", accountId: accountA }),
+  })).toContain("exact endpoint contract");
+  expect(requestContractError({
+    method: "POST",
+    path: "/api/v1/auth/reauth",
+    query: "",
+    body: JSON.stringify({ password: "Synthetic!" }),
+  })).toBeNull();
+});
+
+for (const operation of fullAdminAccessChangeCases) {
+  test(`a same-principal access change cancels pending full-admin ${operation.name}`, async ({ page }) => {
+    let accessChanged = false;
+    let meReads = 0;
+    let mutationPosts = 0;
+    const reauth = barrier();
+    const requests = await installApi(
+      page,
+      ["*"],
+      async (path, route) => {
+        if (path === "/api/v1/auth/me") {
+          meReads += 1;
+          await route.fulfill({
+            json: viewer(accessChanged ? ["*", "synthetic.audit.read"] : ["*"]),
+          });
+          return true;
+        }
+        if (path === "/api/v1/auth/reauth" && route.request().method() === "POST") {
+          reauth.arrive();
+          await reauth.gate;
+          await route.fulfill({
+            json: { expiresAt: "2026-08-10T00:15:00.000Z", fixedWindowMinutes: 15 },
+          });
+          return true;
+        }
+        if (path === "/api/v1/admin/billing/renewals") {
+          await route.fulfill({
+            json: {
+              items: operation.fixture === "hold"
+                ? [adminRenewalFixture("hold")]
+                : operation.fixture === "suspension"
+                  ? [adminRenewalFixture("suspension")]
+                  : [],
+            },
+          });
+          return true;
+        }
+        if (path === "/api/v1/admin/services/cancellations") {
+          await route.fulfill({
+            json: { items: operation.fixture === "cancellation" ? [adminCancellationFixture()] : [] },
+          });
+          return true;
+        }
+        if (path === operation.mutationPath && route.request().method() === "POST") {
+          mutationPosts += 1;
+          await route.fulfill({
+            json: operation.fixture === "suspension"
+              ? {
+                  caseStatus: "suspended",
+                  serviceStatus: "suspended",
+                  providerCalled: false,
+                  replayed: false,
+                }
+              : operation.fixture === "cancellation"
+                ? {
+                    executionStatus: "terminated",
+                    serviceStatus: "terminated",
+                    providerCalled: false,
+                    replayed: false,
+                  }
+                : operation.name === "billing automation"
+                  ? {
+                      businessDate: "2026-08-10",
+                      invoicesCreated: 1,
+                      remindersCreated: 1,
+                      delinquencyDeferralsCreated: 0,
+                      replayed: false,
+                    }
+                  : {},
+          });
+          return true;
+        }
+        return false;
+      },
+    );
+
+    await page.goto("/admin");
+    await expect(page.getByTestId("full-admin-workspace")).toBeVisible();
+    const password = page.getByPlaceholder("Re-enter password (15-minute fixed window)");
+    const reason = operation.reasonInput(page);
+    const action = operation.actionButton(page);
+    await expect(action).toBeVisible();
+    await password.fill("Synthetic-Old-Access-Reauth!");
+    await reason.fill(`Synthetic old ${operation.name} evidence`);
+    await expect(action).toBeEnabled();
+    await action.click();
+    await reauth.reached;
+
+    accessChanged = true;
+    const readsBeforeRefresh = meReads;
+    await page.getByTestId("client-account-360")
+      .getByRole("button", { name: "Refresh Staff access" })
+      .click();
+    await expect.poll(() => meReads).toBeGreaterThan(readsBeforeRefresh);
+    await expect(reason).toHaveValue("");
+    await expect(password).toHaveValue("");
+
+    const replacementPassword = "Synthetic-New-Access-Reauth!";
+    const replacementReason = `Synthetic replacement ${operation.name} evidence`;
+    await expect(operation.actionButton(page)).toBeVisible();
+    await password.fill(replacementPassword);
+    await operation.reasonInput(page).fill(replacementReason);
+    await expect(operation.actionButton(page)).toBeEnabled();
+
+    const reauthResponse = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === "/api/v1/auth/reauth" &&
+      response.request().method() === "POST",
+    );
+    reauth.release();
+    await reauthResponse;
+
+    expect(mutationPosts).toBe(0);
+    expect(requests.filter((request) =>
+      request.method === "POST" && request.path === operation.mutationPath
+    )).toEqual([]);
+    await expect(password).toHaveValue(replacementPassword);
+    await expect(operation.reasonInput(page)).toHaveValue(replacementReason);
+    await expect(operation.actionButton(page)).toBeEnabled();
+  });
 }
 
 for (const operation of operationCases) {
@@ -1425,6 +1930,80 @@ for (const outflowKind of ["report", "reconciliation"] as const) {
   });
 }
 
+test("a successful original-source outflow refreshes receipt and unclaimed capacity before notice", async ({ page }) => {
+  const receipt = manualReceiptItem("01");
+  const historyPath = `/api/v1/admin/client-accounts/${accountA}/manual-receipts`;
+  const mutationPath =
+    `${historyPath}/${receipt.manualReceiptId}/outflow-reports`;
+  const historyFollowUp = barrier();
+  const unclaimedFollowUp = barrier();
+  let followUpsArmed = false;
+  let historyReads = 0;
+  let unclaimedReads = 0;
+  await installApi(
+    page,
+    ["*"],
+    async (path, route) => {
+      if (path === historyPath && route.request().method() === "GET") {
+        historyReads += 1;
+        if (followUpsArmed) {
+          historyFollowUp.arrive();
+          await historyFollowUp.gate;
+        }
+        await route.fulfill({
+          json: {
+            clientAccount: { id: accountA, name: "Account Alpha" },
+            items: [receipt],
+          },
+        });
+        return true;
+      }
+      if (path === "/api/v1/admin/funds/unclaimed") {
+        unclaimedReads += 1;
+        if (followUpsArmed) {
+          unclaimedFollowUp.arrive();
+          await unclaimedFollowUp.gate;
+        }
+        await route.fulfill({ json: { items: [] } });
+        return true;
+      }
+      if (path === mutationPath && route.request().method() === "POST") {
+        await route.fulfill({ json: { status: "confirmed", replayed: false } });
+        return true;
+      }
+      return false;
+    },
+  );
+
+  await page.goto("/admin");
+  await expect.poll(() => unclaimedReads).toBeGreaterThan(0);
+  await page.getByLabel("Manual receipt Client Account ID").fill(accountA);
+  await loadManualReceiptHistory(page);
+  const historyReadsBeforeMutation = historyReads;
+  const unclaimedReadsBeforeMutation = unclaimedReads;
+  await page.getByPlaceholder("Re-enter password (15-minute fixed window)")
+    .fill("Synthetic-Outflow-Reauth!");
+  await page.getByRole("button", { name: "Report original-source outflow" }).click();
+  await page.getByLabel("Original-source destination reference").fill("SYNTHETIC-RETURN-REFRESH");
+  await page.getByLabel("Original-source outflow reason")
+    .fill("Synthetic independent evidence confirms refresh ordering");
+  followUpsArmed = true;
+  await page.getByRole("button", { name: "Record outflow report" }).click();
+  await Promise.all([historyFollowUp.reached, unclaimedFollowUp.reached]);
+
+  const successNotice = page.locator("main > .notice").filter({
+    hasText:
+      "Recorded confirmed original-source outflow with one immutable balanced journal. No Provider was called.",
+  });
+  await expect(successNotice).toHaveCount(0);
+  historyFollowUp.release();
+  unclaimedFollowUp.release();
+
+  await expect(successNotice).toBeVisible();
+  expect(historyReads).toBe(historyReadsBeforeMutation + 1);
+  expect(unclaimedReads).toBe(unclaimedReadsBeforeMutation + 1);
+});
+
 test("an Account A fulfillment follow-up cannot replace Account B queue state", async ({ page }) => {
   let queueReads = 0;
   const followUp = barrier();
@@ -1700,6 +2279,62 @@ test("an Account A polling result cannot update or refetch after switching to Ac
   expect(requests.filter((request) =>
     request.method === "GET" && refundReadPaths.includes(request.path)
   )).toHaveLength(refundReadsBeforeRelease);
+});
+
+test("refund polling is single-flight while one same-scope response is pending", async ({ page }) => {
+  const poll = barrier();
+  let detailReads = 0;
+  const processing = { ...refundRecord(accountA, "01"), status: "processing" };
+  const detailPath = `/api/v1/admin/refunds/${processing.refundId}`;
+  await installApi(
+    page,
+    ["accounts.view", "billing.refund_manage"],
+    async (path, route) => {
+      if (path === detailPath && route.request().method() === "GET") {
+        detailReads += 1;
+        if (detailReads === 1) {
+          poll.arrive();
+          await poll.gate;
+        }
+        await route.fulfill({
+          json: {
+            ...processing,
+            status: "completed",
+            version: 2,
+            lastError: null,
+            providerOperationStatus: "succeeded",
+          },
+        });
+        return true;
+      }
+      if (refundReadPaths.includes(path)) {
+        await route.fulfill({
+          json: { items: path === "/api/v1/admin/refunds" ? [processing] : [] },
+        });
+        return true;
+      }
+      if (await account360Interceptor("refund", path, route)) return true;
+      return false;
+    },
+  );
+
+  await page.clock.install({ time: new Date("2026-08-10T00:00:00.000Z") });
+  await page.goto("/admin");
+  await openAccountOperation(page, "Account Alpha", "Open refund operations");
+  await expect(page.getByTestId("refund-status")).toContainText("Refund processing");
+  await page.clock.runFor(2_001);
+  await poll.reached;
+
+  await page.clock.runFor(6_000);
+  expect(detailReads).toBe(1);
+
+  const pollResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === detailPath,
+  );
+  poll.release();
+  await pollResponse;
+  await expect(page.getByTestId("refund-status")).toContainText("Refund completed");
+  expect(detailReads).toBe(1);
 });
 
 test("changing Staff principal clears context and rejects the prior principal queue", async ({ page }) => {
