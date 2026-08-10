@@ -43,29 +43,52 @@ async function waitFor(description, read, predicate, timeoutMs = 60_000) {
   throw new Error(`Timed out waiting for ${description}: ${detail}`);
 }
 
-class DemoSession {
-  constructor(baseUrl) {
+export class DemoSession {
+  constructor(baseUrl, fetchImpl = fetch) {
     this.baseUrl = baseUrl;
+    this.fetchImpl = fetchImpl;
     this.cookie = "";
+    this.accountContextVersion = null;
+    this.clientAccountId = null;
   }
 
   async request(path, init = {}, expectedStatus = 200) {
-    const response = await fetch(new URL(path, this.baseUrl), {
+    const method = (init.method ?? "GET").toUpperCase();
+    const headers = new Headers(init.headers);
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    if (this.cookie && !headers.has("Cookie")) headers.set("Cookie", this.cookie);
+    if (
+      method !== "GET" &&
+      method !== "HEAD" &&
+      this.accountContextVersion !== null &&
+      !headers.has("X-OSS-Account-Context-Version")
+    ) {
+      headers.set("X-OSS-Account-Context-Version", this.accountContextVersion);
+    }
+
+    const response = await this.fetchImpl(new URL(path, this.baseUrl), {
       ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...(this.cookie ? { Cookie: this.cookie } : {}),
-        ...init.headers,
-      },
+      headers,
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
     });
     const setCookie = response.headers.get("set-cookie");
     if (setCookie) this.cookie = setCookie.split(";", 1)[0] ?? "";
+    const accountContextVersion = response.headers.get("x-oss-account-context-version");
+    if (accountContextVersion !== null) {
+      assert.match(
+        accountContextVersion,
+        /^(?:0|[1-9]\d*)$/,
+        "API returned an invalid account-context version",
+      );
+      this.accountContextVersion = accountContextVersion;
+    }
+    const clientAccountId = response.headers.get("x-oss-client-account-id");
+    this.clientAccountId = clientAccountId?.trim() || null;
     const bodyText = await response.text();
     if (response.status !== expectedStatus) {
       throw new Error(
-        `${init.method ?? "GET"} ${path} expected ${expectedStatus}, received ${response.status}: ${bodyText}`,
+        `${method} ${path} expected ${expectedStatus}, received ${response.status}: ${bodyText}`,
       );
     }
     if (response.status === 204 || bodyText.length === 0) return undefined;

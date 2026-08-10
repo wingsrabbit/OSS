@@ -33,6 +33,7 @@ import {
 } from "./demo-local.mjs";
 import {
   assertSeparatedDemoRoles,
+  DemoSession,
   runSupportTicketSmoke,
 } from "./demo-smoke.mjs";
 
@@ -713,6 +714,89 @@ test("administrator credentials recover from both current and legacy smoke state
     }),
     null,
   );
+});
+
+test("Demo session carries the exact account-context version across customer mutations", async () => {
+  const requests = [];
+  const responses = [
+    new Response(JSON.stringify({ id: "customer-user" }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Set-Cookie": "oss_session=session-id; Path=/; HttpOnly",
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response(JSON.stringify({ created: true }), {
+      status: 201,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Account-Context-Version": "18",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response(JSON.stringify({ created: true }), {
+      status: 201,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Account-Context-Version": "18",
+      },
+    }),
+  ];
+  const session = new DemoSession("http://127.0.0.1:3000", async (url, init) => {
+    requests.push({ url: String(url), init });
+    return responses.shift();
+  });
+
+  await session.request("/api/v1/auth/me");
+  await session.request(
+    "/api/v1/orders",
+    { method: "POST", body: JSON.stringify({ synthetic: true }) },
+    201,
+  );
+  await session.request(
+    "/api/v1/tickets",
+    {
+      method: "POST",
+      headers: { "X-OSS-Account-Context-Version": "99" },
+      body: JSON.stringify({ synthetic: true }),
+    },
+    201,
+  );
+
+  assert.equal(requests[0].init.headers.get("X-OSS-Account-Context-Version"), null);
+  assert.equal(requests[1].init.headers.get("X-OSS-Account-Context-Version"), "17");
+  assert.equal(requests[1].init.headers.get("Cookie"), "oss_session=session-id");
+  assert.equal(
+    requests[2].init.headers.get("X-OSS-Account-Context-Version"),
+    "99",
+    "An explicit test version must not be overwritten",
+  );
+  assert.equal(session.accountContextVersion, "18");
+  assert.equal(
+    session.clientAccountId,
+    null,
+    "An authenticated response without an active-account header must clear the cached account ID",
+  );
+});
+
+test("Demo session records a newer context version before reporting an API error", async () => {
+  const session = new DemoSession("http://127.0.0.1:3000", async () =>
+    new Response(JSON.stringify({ code: "ACCOUNT_CONTEXT_STALE" }), {
+      status: 409,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Account-Context-Version": "23",
+      },
+    }),
+  );
+
+  await assert.rejects(
+    session.request("/api/v1/orders", { method: "POST", body: "{}" }, 201),
+    /ACCOUNT_CONTEXT_STALE/,
+  );
+  assert.equal(session.accountContextVersion, "23");
 });
 
 function ticketSessions({ leakInternalNote = false } = {}) {
