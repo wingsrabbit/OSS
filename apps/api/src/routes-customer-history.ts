@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import * as fontkit from "fontkit";
 import type { FastifyInstance } from "fastify";
+import { readFile } from "node:fs/promises";
+import { Readable } from "node:stream";
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import { z } from "zod";
 import {
@@ -9,9 +12,45 @@ import {
 } from "./auth.js";
 import type { Config } from "./config.js";
 import type { DatabaseClient, DatabasePool } from "./database.js";
+import {
+  collectionPage,
+  decodeKeysetCursor,
+  parseInitialPageQuery,
+  parsePageQuery,
+  type CollectionPage,
+  type PageQuery,
+} from "./keyset-pagination.js";
 
 export const LAB_WARNING = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY";
 const PDF_LAB_WARNING = "NOT FOR PRODUCTION - MOCK PROVIDERS ONLY";
+const INVOICE_FONT_URL = new URL(
+  "../assets/fonts/NotoSansSC-VF.ttf",
+  import.meta.url,
+);
+type PdfLibFontkit = Parameters<PDFDocument["registerFontkit"]>[0];
+const pdfLibFontkit: PdfLibFontkit = {
+  create(bytes) {
+    const font = fontkit.create(Buffer.from(bytes));
+    if (!("createSubset" in font)) {
+      throw new Error("Invoice font must be a single TrueType font");
+    }
+    const createSubset = font.createSubset.bind(font);
+    font.createSubset = () => {
+      const subset = createSubset();
+      Object.assign(subset, {
+        encodeStream: () => Readable.from([subset.encode()]),
+      });
+      return subset;
+    };
+    return font as unknown as ReturnType<PdfLibFontkit["create"]>;
+  },
+};
+let invoiceFontBytesPromise: Promise<Uint8Array> | undefined;
+
+function loadInvoiceFontBytes(): Promise<Uint8Array> {
+  invoiceFontBytesPromise ??= readFile(INVOICE_FONT_URL);
+  return invoiceFontBytesPromise;
+}
 
 type Queryable = Pick<DatabasePool, "query">;
 
@@ -93,6 +132,7 @@ export type ServiceSummary = {
   activatedAt: string | null;
   termStart: string | null;
   termEnd: string | null;
+  createdAt: string;
   version: number;
   cancellation: {
     requestId: string;
@@ -157,10 +197,13 @@ function invoiceStatus(
   };
 }
 
-export async function listOrders(
+export async function listOrdersPage(
   queryable: Queryable,
   clientAccountId: string,
-): Promise<OrderSummary[]> {
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<OrderSummary>> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
   const result = await queryable.query<{
     order_id: string;
     order_status: string;
@@ -171,7 +214,22 @@ export async function listOrders(
     product_name: string | null;
     billing_cycle: string | null;
   }>(
-    `SELECT customer_order.id AS order_id,
+    `WITH page_orders AS (
+       SELECT customer_order.id,
+              customer_order.status,
+              customer_order.currency,
+              customer_order.total_minor,
+              customer_order.submitted_at
+       FROM orders customer_order
+       WHERE customer_order.client_account_id = $1
+         AND (
+           $2::timestamptz IS NULL
+           OR (customer_order.submitted_at, customer_order.id) < ($2::timestamptz, $3::uuid)
+         )
+       ORDER BY customer_order.submitted_at DESC, customer_order.id DESC
+       LIMIT $4
+     )
+     SELECT customer_order.id AS order_id,
             customer_order.status AS order_status,
             customer_order.currency,
             customer_order.total_minor::text,
@@ -179,11 +237,10 @@ export async function listOrders(
             item.id AS item_id,
             item.product_name,
             item.billing_cycle
-     FROM orders customer_order
+     FROM page_orders customer_order
      LEFT JOIN order_items item ON item.order_id = customer_order.id
-     WHERE customer_order.client_account_id = $1
      ORDER BY customer_order.submitted_at DESC, customer_order.id DESC, item.id`,
-    [clientAccountId],
+    [clientAccountId, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
   );
   const orders = new Map<string, OrderSummary>();
   for (const row of result.rows) {
@@ -207,14 +264,29 @@ export async function listOrders(
       });
     }
   }
-  return [...orders.values()];
+  return collectionPage(
+    [...orders.values()],
+    page.limit,
+    scope,
+    clientAccountId,
+    (order) => ({ at: order.submittedAt, id: order.id }),
+  );
 }
 
-export async function listInvoices(
+async function queryInvoices(
   queryable: Queryable,
   clientAccountId: string,
   invoiceId?: string,
+  invoiceIds?: string[],
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<InvoiceSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(
+        pagination.page.cursor,
+        pagination.scope,
+        clientAccountId,
+      )
+    : null;
   const result = await queryable.query<{
     id: string;
     order_id: string | null;
@@ -289,8 +361,25 @@ export async function listInvoices(
       AND renewal_service.client_account_id = invoice.client_account_id
      WHERE invoice.client_account_id = $1
        AND ($2::uuid IS NULL OR invoice.id = $2::uuid)
-     ORDER BY invoice.created_at DESC, invoice.id DESC`,
-    [clientAccountId, invoiceId ?? null],
+       AND ($3::uuid[] IS NULL OR invoice.id = ANY($3::uuid[]))
+       ${pagination
+         ? `AND (
+              $4::timestamptz IS NULL
+              OR (invoice.created_at, invoice.id) < ($4::timestamptz, $5::uuid)
+            )`
+         : ""}
+     ORDER BY invoice.created_at DESC, invoice.id DESC
+     ${pagination ? "LIMIT $6" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          invoiceId ?? null,
+          invoiceIds ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, invoiceId ?? null, invoiceIds ?? null],
   );
   return result.rows.map((row) => {
     const status = invoiceStatus(
@@ -314,11 +403,49 @@ export async function listInvoices(
   });
 }
 
-export async function listPayments(
+export function listInvoices(
   queryable: Queryable,
   clientAccountId: string,
   invoiceId?: string,
+): Promise<InvoiceSummary[]> {
+  return queryInvoices(queryable, clientAccountId, invoiceId, undefined);
+}
+
+function listInvoicesForIds(
+  queryable: Queryable,
+  clientAccountId: string,
+  invoiceIds: string[],
+): Promise<InvoiceSummary[]> {
+  if (invoiceIds.length === 0) return Promise.resolve([]);
+  return queryInvoices(queryable, clientAccountId, undefined, invoiceIds);
+}
+
+export async function listInvoicesPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<InvoiceSummary>> {
+  const items = await queryInvoices(queryable, clientAccountId, undefined, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (invoice) => ({
+    at: invoice.createdAt,
+    id: invoice.id,
+  }));
+}
+
+async function queryPayments(
+  queryable: Queryable,
+  clientAccountId: string,
+  invoiceId?: string,
+  invoiceIds?: string[],
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<PaymentSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(pagination.page.cursor, pagination.scope, clientAccountId)
+    : null;
   const result = await queryable.query<{
     id: string;
     invoice_id: string;
@@ -349,8 +476,25 @@ export async function listPayments(
      WHERE attempt.client_account_id = $1
        AND invoice.client_account_id = $1
        AND ($2::uuid IS NULL OR attempt.invoice_id = $2::uuid)
-     ORDER BY attempt.created_at DESC, attempt.id DESC`,
-    [clientAccountId, invoiceId ?? null],
+       AND ($3::uuid[] IS NULL OR attempt.invoice_id = ANY($3::uuid[]))
+       ${pagination
+         ? `AND (
+              $4::timestamptz IS NULL
+              OR (attempt.created_at, attempt.id) < ($4::timestamptz, $5::uuid)
+            )`
+         : ""}
+     ORDER BY attempt.created_at DESC, attempt.id DESC
+     ${pagination ? "LIMIT $6" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          invoiceId ?? null,
+          invoiceIds ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, invoiceId ?? null, invoiceIds ?? null],
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -366,19 +510,79 @@ export async function listPayments(
   }));
 }
 
-export async function loadCreditHistory(
+export function listPayments(
   queryable: Queryable,
   clientAccountId: string,
-): Promise<CreditHistory> {
-  const account = await queryable.query<{ id: string; currency: string }>(
-    `SELECT id, currency
-     FROM credit_accounts
-     WHERE client_account_id = $1 AND currency = 'USD'`,
+  invoiceId?: string,
+): Promise<PaymentSummary[]> {
+  return queryPayments(queryable, clientAccountId, invoiceId, undefined);
+}
+
+function listPaymentsForInvoiceIds(
+  queryable: Queryable,
+  clientAccountId: string,
+  invoiceIds: string[],
+): Promise<PaymentSummary[]> {
+  if (invoiceIds.length === 0) return Promise.resolve([]);
+  return queryPayments(queryable, clientAccountId, undefined, invoiceIds);
+}
+
+export async function listPaymentsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<PaymentSummary>> {
+  const items = await queryPayments(queryable, clientAccountId, undefined, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (payment) => ({
+    at: payment.createdAt,
+    id: payment.id,
+  }));
+}
+
+export async function loadCreditHistoryPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<{
+  credit: CreditHistory;
+  pagination: CollectionPage<CreditTransactionSummary>;
+}> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
+  const account = await queryable.query<{
+    id: string;
+    currency: string;
+    balance_minor: string;
+  }>(
+    `SELECT account.id,
+            account.currency,
+            COALESCE(sum(transaction.credit_minor - transaction.debit_minor), 0)::text
+              AS balance_minor
+     FROM credit_accounts account
+     LEFT JOIN credit_transactions transaction
+       ON transaction.credit_account_id = account.id
+     WHERE account.client_account_id = $1
+       AND account.currency = 'USD'
+     GROUP BY account.id`,
     [clientAccountId],
   );
   const creditAccount = account.rows[0];
   if (!creditAccount) {
-    return { currency: "USD", balanceMinor: "0", transactions: [] };
+    const pagination = collectionPage<CreditTransactionSummary>(
+      [],
+      page.limit,
+      scope,
+      clientAccountId,
+      (transaction) => ({ at: transaction.createdAt, id: transaction.id }),
+    );
+    return {
+      credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+      pagination,
+    };
   }
   const transactions = await queryable.query<{
     id: string;
@@ -402,8 +606,13 @@ export async function loadCreditHistory(
             created_at
      FROM credit_transactions
      WHERE credit_account_id = $1
-     ORDER BY created_at DESC, id DESC`,
-    [creditAccount.id],
+       AND (
+         $2::timestamptz IS NULL
+         OR (created_at, id) < ($2::timestamptz, $3::uuid)
+       )
+     ORDER BY created_at DESC, id DESC
+     LIMIT $4`,
+    [creditAccount.id, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
   );
   const items = transactions.rows.map((row) => ({
     id: row.id,
@@ -416,20 +625,32 @@ export async function loadCreditHistory(
     reason: row.reason,
     createdAt: row.created_at.toISOString(),
   }));
+  const pagination = collectionPage(
+    items,
+    page.limit,
+    scope,
+    clientAccountId,
+    (transaction) => ({ at: transaction.createdAt, id: transaction.id }),
+  );
   return {
-    currency: creditAccount.currency,
-    balanceMinor: items
-      .reduce((balance, item) => balance + BigInt(item.deltaMinor), 0n)
-      .toString(),
-    transactions: items,
+    credit: {
+      currency: creditAccount.currency,
+      balanceMinor: creditAccount.balance_minor,
+      transactions: pagination.items,
+    },
+    pagination,
   };
 }
 
-export async function listRefunds(
+async function queryRefunds(
   queryable: Queryable,
   clientAccountId: string,
   invoiceId?: string,
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<RefundSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(pagination.page.cursor, pagination.scope, clientAccountId)
+    : null;
   const result = await queryable.query<{
     id: string;
     invoice_id: string | null;
@@ -456,8 +677,23 @@ export async function listRefunds(
       AND invoice.client_account_id = refund.client_account_id
      WHERE refund.client_account_id = $1
        AND ($2::uuid IS NULL OR invoice.id = $2::uuid)
-     ORDER BY refund.created_at DESC, refund.id DESC`,
-    [clientAccountId, invoiceId ?? null],
+       ${pagination
+         ? `AND (
+              $3::timestamptz IS NULL
+              OR (refund.created_at, refund.id) < ($3::timestamptz, $4::uuid)
+            )`
+         : ""}
+     ORDER BY refund.created_at DESC, refund.id DESC
+     ${pagination ? "LIMIT $5" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          invoiceId ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, invoiceId ?? null],
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -472,11 +708,39 @@ export async function listRefunds(
   }));
 }
 
-export async function listServices(
+export function listRefunds(
+  queryable: Queryable,
+  clientAccountId: string,
+  invoiceId?: string,
+): Promise<RefundSummary[]> {
+  return queryRefunds(queryable, clientAccountId, invoiceId);
+}
+
+export async function listRefundsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<RefundSummary>> {
+  const items = await queryRefunds(queryable, clientAccountId, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (refund) => ({
+    at: refund.createdAt,
+    id: refund.id,
+  }));
+}
+
+async function queryServices(
   queryable: Queryable,
   clientAccountId: string,
   serviceId?: string,
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<ServiceSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(pagination.page.cursor, pagination.scope, clientAccountId)
+    : null;
   const result = await queryable.query<{
     id: string;
     order_id: string;
@@ -487,6 +751,7 @@ export async function listServices(
     activated_at: Date | null;
     term_start: Date | null;
     term_end: Date | null;
+    created_at: Date;
     version: number;
     cancellation_request_id: string | null;
     cancellation_effective_at: Date | null;
@@ -514,6 +779,7 @@ export async function listServices(
             service.activated_at,
             service.term_start,
             service.term_end,
+            service.created_at,
             service.version,
             service.cancellation_request_id,
             service.cancellation_effective_at,
@@ -528,8 +794,23 @@ export async function listServices(
       AND cancellation_execution.service_id = service.id
      WHERE service.client_account_id = $1
        AND ($2::uuid IS NULL OR service.id = $2::uuid)
-     ORDER BY service.created_at DESC, service.id DESC`,
-    [clientAccountId, serviceId ?? null],
+       ${pagination
+         ? `AND (
+              $3::timestamptz IS NULL
+              OR (service.created_at, service.id) < ($3::timestamptz, $4::uuid)
+            )`
+         : ""}
+     ORDER BY service.created_at DESC, service.id DESC
+     ${pagination ? "LIMIT $5" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          serviceId ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, serviceId ?? null],
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -541,6 +822,7 @@ export async function listServices(
     activatedAt: row.activated_at?.toISOString() ?? null,
     termStart: row.term_start?.toISOString() ?? null,
     termEnd: row.term_end?.toISOString() ?? null,
+    createdAt: row.created_at.toISOString(),
     version: row.version,
     cancellation:
       row.cancellation_request_id && row.cancellation_effective_at
@@ -553,11 +835,39 @@ export async function listServices(
   }));
 }
 
-export async function listRenewals(
+export function listServices(
   queryable: Queryable,
   clientAccountId: string,
   serviceId?: string,
+): Promise<ServiceSummary[]> {
+  return queryServices(queryable, clientAccountId, serviceId);
+}
+
+export async function listServicesPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<ServiceSummary>> {
+  const items = await queryServices(queryable, clientAccountId, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (service) => ({
+    at: service.createdAt,
+    id: service.id,
+  }));
+}
+
+async function queryRenewals(
+  queryable: Queryable,
+  clientAccountId: string,
+  serviceId?: string,
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<RenewalSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(pagination.page.cursor, pagination.scope, clientAccountId)
+    : null;
   const result = await queryable.query<{
     id: string;
     service_id: string;
@@ -627,8 +937,23 @@ export async function listRenewals(
      ) credit ON true
      WHERE service.client_account_id = $1
        AND ($2::uuid IS NULL OR service.id = $2::uuid)
-     ORDER BY renewal.created_at DESC, renewal.id DESC`,
-    [clientAccountId, serviceId ?? null],
+       ${pagination
+         ? `AND (
+              $3::timestamptz IS NULL
+              OR (renewal.created_at, renewal.id) < ($3::timestamptz, $4::uuid)
+            )`
+         : ""}
+     ORDER BY renewal.created_at DESC, renewal.id DESC
+     ${pagination ? "LIMIT $5" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          serviceId ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, serviceId ?? null],
   );
   return result.rows.map((row) => {
     const due = row.status === "cancelled"
@@ -654,11 +979,39 @@ export async function listRenewals(
   });
 }
 
-export async function listCancellations(
+export function listRenewals(
   queryable: Queryable,
   clientAccountId: string,
   serviceId?: string,
+): Promise<RenewalSummary[]> {
+  return queryRenewals(queryable, clientAccountId, serviceId);
+}
+
+export async function listRenewalsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<RenewalSummary>> {
+  const items = await queryRenewals(queryable, clientAccountId, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (renewal) => ({
+    at: renewal.createdAt,
+    id: renewal.id,
+  }));
+}
+
+async function queryCancellations(
+  queryable: Queryable,
+  clientAccountId: string,
+  serviceId?: string,
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<CancellationSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(pagination.page.cursor, pagination.scope, clientAccountId)
+    : null;
   const result = await queryable.query<{
     request_id: string;
     service_id: string;
@@ -688,8 +1041,23 @@ export async function listCancellations(
       AND execution.service_id = cancellation.service_id
      WHERE cancellation.client_account_id = $1
        AND ($2::uuid IS NULL OR cancellation.service_id = $2::uuid)
-     ORDER BY cancellation.created_at DESC, cancellation.id DESC`,
-    [clientAccountId, serviceId ?? null],
+       ${pagination
+         ? `AND (
+              $3::timestamptz IS NULL
+              OR (cancellation.created_at, cancellation.id) < ($3::timestamptz, $4::uuid)
+            )`
+         : ""}
+     ORDER BY cancellation.created_at DESC, cancellation.id DESC
+     ${pagination ? "LIMIT $5" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          serviceId ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, serviceId ?? null],
   );
   return result.rows.map((row) => ({
     requestId: row.request_id,
@@ -708,11 +1076,39 @@ export async function listCancellations(
   }));
 }
 
-export async function listTickets(
+export function listCancellations(
   queryable: Queryable,
   clientAccountId: string,
   serviceId?: string,
+): Promise<CancellationSummary[]> {
+  return queryCancellations(queryable, clientAccountId, serviceId);
+}
+
+export async function listCancellationsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<CancellationSummary>> {
+  const items = await queryCancellations(queryable, clientAccountId, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (cancellation) => ({
+    at: cancellation.createdAt,
+    id: cancellation.requestId,
+  }));
+}
+
+async function queryTickets(
+  queryable: Queryable,
+  clientAccountId: string,
+  serviceId?: string,
+  pagination?: { page: PageQuery; scope: string },
 ): Promise<TicketSummary[]> {
+  const cursor = pagination
+    ? decodeKeysetCursor(pagination.page.cursor, pagination.scope, clientAccountId)
+    : null;
   const result = await queryable.query<{
     id: string;
     subject: string;
@@ -727,7 +1123,8 @@ export async function listTickets(
             ticket.subject,
             ticket.status,
             service.id AS service_id,
-            item.product_name,
+            CASE WHEN ticket_order.id IS NULL THEN NULL ELSE item.product_name END
+              AS product_name,
             count(message.id) FILTER (WHERE message.visibility = 'public')::text
               AS public_message_count,
             ticket.created_at,
@@ -737,12 +1134,30 @@ export async function listTickets(
        ON service.id = ticket.service_id
       AND service.client_account_id = ticket.client_account_id
      LEFT JOIN order_items item ON item.id = service.order_item_id
+     LEFT JOIN orders ticket_order
+       ON ticket_order.id = item.order_id
+      AND ticket_order.client_account_id = ticket.client_account_id
      LEFT JOIN support_ticket_messages message ON message.ticket_id = ticket.id
      WHERE ticket.client_account_id = $1
        AND ($2::uuid IS NULL OR ticket.service_id = $2::uuid)
-     GROUP BY ticket.id, service.id, item.product_name
-     ORDER BY ticket.updated_at DESC, ticket.id DESC`,
-    [clientAccountId, serviceId ?? null],
+       ${pagination
+         ? `AND (
+              $3::timestamptz IS NULL
+              OR (ticket.updated_at, ticket.id) < ($3::timestamptz, $4::uuid)
+            )`
+         : ""}
+     GROUP BY ticket.id, service.id, item.product_name, ticket_order.id
+     ORDER BY ticket.updated_at DESC, ticket.id DESC
+     ${pagination ? "LIMIT $5" : ""}`,
+    pagination
+      ? [
+          clientAccountId,
+          serviceId ?? null,
+          cursor?.at ?? null,
+          cursor?.id ?? null,
+          pagination.page.limit + 1,
+        ]
+      : [clientAccountId, serviceId ?? null],
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -753,6 +1168,30 @@ export async function listTickets(
     publicMessageCount: Number(row.public_message_count),
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
+  }));
+}
+
+export function listTickets(
+  queryable: Queryable,
+  clientAccountId: string,
+  serviceId?: string,
+): Promise<TicketSummary[]> {
+  return queryTickets(queryable, clientAccountId, serviceId);
+}
+
+export async function listTicketsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<TicketSummary>> {
+  const items = await queryTickets(queryable, clientAccountId, undefined, {
+    page,
+    scope,
+  });
+  return collectionPage(items, page.limit, scope, clientAccountId, (ticket) => ({
+    at: ticket.updatedAt,
+    id: ticket.id,
   }));
 }
 
@@ -901,21 +1340,8 @@ async function loadInvoiceRelations(
   return result.rows[0] ?? { order_id: null, service_ids: [], renewal_ids: [] };
 }
 
-function safePdfText(font: PDFFont, value: string): string {
-  let output = "";
-  for (const character of value.replace(/[\r\n\t]+/g, " ")) {
-    try {
-      font.encodeText(character);
-      output += character;
-    } catch {
-      output += "?";
-    }
-  }
-  return output;
-}
-
 function wrapPdfText(font: PDFFont, value: string, size: number, width: number): string[] {
-  const text = safePdfText(font, value).trim();
+  const text = value.replace(/[\r\n\t]+/g, " ").trim();
   if (!text) return [""];
   const lines: string[] = [];
   let current = "";
@@ -930,6 +1356,15 @@ function wrapPdfText(font: PDFFont, value: string, size: number, width: number):
   }
   if (current) lines.push(current.trimEnd());
   return lines;
+}
+
+function pdfFontForText(regular: PDFFont, unicode: PDFFont, value: string): PDFFont {
+  try {
+    regular.encodeText(value);
+    return regular;
+  } catch {
+    return unicode;
+  }
 }
 
 function drawPdfFooter(page: PDFPage, regular: PDFFont, pageNumber: number): void {
@@ -975,6 +1410,7 @@ export async function renderInvoicePdf(input: {
   invoice: InvoiceSummary & { lines: InvoiceLine[] };
 }): Promise<Uint8Array> {
   const document = await PDFDocument.create({ updateMetadata: false });
+  document.registerFontkit(pdfLibFontkit);
   document.setTitle(`OpenSales System Laboratory Invoice ${input.invoice.id}`);
   document.setAuthor("OpenSales System Mock-only Laboratory");
   document.setSubject(PDF_LAB_WARNING);
@@ -982,11 +1418,18 @@ export async function renderInvoicePdf(input: {
   document.setCreator("OpenSales System API");
   const invoiceCreatedAt = new Date(input.invoice.createdAt);
   if (!Number.isNaN(invoiceCreatedAt.getTime())) {
-    document.setCreationDate(invoiceCreatedAt);
-    document.setModificationDate(invoiceCreatedAt);
+    const deterministicMetadataDate = new Date(
+      Math.floor(invoiceCreatedAt.getTime() / 1_000) * 1_000,
+    );
+    document.setCreationDate(deterministicMetadataDate);
+    document.setModificationDate(deterministicMetadataDate);
   }
   const regular = await document.embedFont(StandardFonts.Helvetica);
   const bold = await document.embedFont(StandardFonts.HelveticaBold);
+  const unicode = await document.embedFont(await loadInvoiceFontBytes(), {
+    subset: true,
+    customName: "OSSINV+NotoSansSC-VF",
+  });
   const pageWidth = 595.28;
   const pageHeight = 841.89;
   const margin = 48;
@@ -1020,6 +1463,7 @@ export async function renderInvoicePdf(input: {
   };
   const drawLabelValue = (label: string, value: string): void => {
     ensureSpace(18);
+    const valueFont = pdfFontForText(regular, unicode, value);
     page.drawText(label, {
       x: margin,
       y,
@@ -1027,11 +1471,11 @@ export async function renderInvoicePdf(input: {
       font: bold,
       color: rgb(0.28, 0.32, 0.38),
     });
-    page.drawText(safePdfText(regular, value), {
+    page.drawText(value.replace(/[\r\n\t]+/g, " "), {
       x: 175,
       y,
       size: 9,
-      font: regular,
+      font: valueFont,
       color: rgb(0.1, 0.13, 0.18),
     });
     y -= 16;
@@ -1055,7 +1499,7 @@ export async function renderInvoicePdf(input: {
       color: rgb(0.92, 0.94, 0.97),
     });
     page.drawText("Description", { x: margin + 8, y: y + 3, size: 9, font: bold });
-    page.drawText("Kind", { x: 385, y: y + 3, size: 9, font: bold });
+    page.drawText("Kind", { x: 380, y: y + 3, size: 9, font: bold });
     page.drawText("Amount", { x: 480, y: y + 3, size: 9, font: bold });
     y -= 21;
   };
@@ -1092,7 +1536,8 @@ export async function renderInvoicePdf(input: {
   y -= 25;
   drawInvoiceLineHeader();
   for (const line of input.invoice.lines) {
-    const descriptionLines = wrapPdfText(regular, line.description, 9, 315);
+    const descriptionFont = pdfFontForText(regular, unicode, line.description);
+    const descriptionLines = wrapPdfText(descriptionFont, line.description, 9, 300);
     const rowHeight = Math.max(22, descriptionLines.length * 12 + 8);
     if (y - rowHeight - 4 < 60) {
       drawPdfFooter(page, regular, pageNumber);
@@ -1104,11 +1549,11 @@ export async function renderInvoicePdf(input: {
         x: margin + 8,
         y: y - index * 12,
         size: 9,
-        font: regular,
+        font: descriptionFont,
       });
     });
-    page.drawText(safePdfText(regular, line.kind), {
-      x: 385,
+    page.drawText(line.kind.replace(/[\r\n\t]+/g, " "), {
+      x: 380,
       y,
       size: 9,
       font: regular,
@@ -1189,6 +1634,58 @@ async function loadInvoiceDetail(
   };
 }
 
+const businessHistoryFacetSchema = z.enum([
+  "orders",
+  "invoices",
+  "payments",
+  "creditTransactions",
+  "refunds",
+  "services",
+  "renewals",
+  "cancellations",
+  "tickets",
+]);
+
+type BusinessHistoryFacet = z.infer<typeof businessHistoryFacetSchema>;
+
+function pageMetadata<T>(page: CollectionPage<T>) {
+  return {
+    limit: page.limit,
+    hasMore: page.hasMore,
+    nextCursor: page.nextCursor,
+  };
+}
+
+async function loadBusinessHistoryFacet(
+  queryable: Queryable,
+  clientAccountId: string,
+  facet: BusinessHistoryFacet,
+  page: PageQuery,
+): Promise<CollectionPage<unknown>> {
+  const scope = `customer.business-history.${facet}`;
+  switch (facet) {
+    case "orders":
+      return listOrdersPage(queryable, clientAccountId, page, scope);
+    case "invoices":
+      return listInvoicesPage(queryable, clientAccountId, page, scope);
+    case "payments":
+      return listPaymentsPage(queryable, clientAccountId, page, scope);
+    case "creditTransactions":
+      return (await loadCreditHistoryPage(queryable, clientAccountId, page, scope))
+        .pagination;
+    case "refunds":
+      return listRefundsPage(queryable, clientAccountId, page, scope);
+    case "services":
+      return listServicesPage(queryable, clientAccountId, page, scope);
+    case "renewals":
+      return listRenewalsPage(queryable, clientAccountId, page, scope);
+    case "cancellations":
+      return listCancellationsPage(queryable, clientAccountId, page, scope);
+    case "tickets":
+      return listTicketsPage(queryable, clientAccountId, page, scope);
+  }
+}
+
 export async function registerCustomerHistoryRoutes(
   app: FastifyInstance,
   pool: DatabasePool,
@@ -1197,6 +1694,7 @@ export async function registerCustomerHistoryRoutes(
   app.get("/api/v1/customer/business-history", async (request) => {
     const user = await requireUser(request, pool, config);
     assertFinancialReadEligible(user);
+    const page = parseInitialPageQuery(request.query);
     return withReadSnapshot(pool, async (client) => {
       const account = await client.query<{ id: string; name: string }>(
         "SELECT id, name FROM client_accounts WHERE id = $1",
@@ -1204,27 +1702,110 @@ export async function registerCustomerHistoryRoutes(
       );
       const currentAccount = account.rows[0];
       if (!currentAccount) throw requestError("Client account not found", 404);
-      const orders = await listOrders(client, user.clientAccountId);
-      const invoices = await listInvoices(client, user.clientAccountId);
-      const payments = await listPayments(client, user.clientAccountId);
-      const credit = await loadCreditHistory(client, user.clientAccountId);
-      const refunds = await listRefunds(client, user.clientAccountId);
-      const services = await listServices(client, user.clientAccountId);
-      const renewals = await listRenewals(client, user.clientAccountId);
-      const cancellations = await listCancellations(client, user.clientAccountId);
-      const tickets = await listTickets(client, user.clientAccountId);
+      const orders = await listOrdersPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.orders",
+      );
+      const invoices = await listInvoicesPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.invoices",
+      );
+      const payments = await listPaymentsPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.payments",
+      );
+      const creditResult = await loadCreditHistoryPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.creditTransactions",
+      );
+      const refunds = await listRefundsPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.refunds",
+      );
+      const services = await listServicesPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.services",
+      );
+      const renewals = await listRenewalsPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.renewals",
+      );
+      const cancellations = await listCancellationsPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.cancellations",
+      );
+      const tickets = await listTicketsPage(
+        client,
+        user.clientAccountId,
+        page,
+        "customer.business-history.tickets",
+      );
       return {
         warning: LAB_WARNING,
         account: currentAccount,
-        orders,
-        invoices,
-        payments,
-        credit,
-        refunds,
-        services,
-        renewals,
-        cancellations,
-        tickets,
+        orders: orders.items,
+        invoices: invoices.items,
+        payments: payments.items,
+        credit: creditResult.credit,
+        refunds: refunds.items,
+        services: services.items,
+        renewals: renewals.items,
+        cancellations: cancellations.items,
+        tickets: tickets.items,
+        pagination: {
+          orders: pageMetadata(orders),
+          invoices: pageMetadata(invoices),
+          payments: pageMetadata(payments),
+          creditTransactions: pageMetadata(creditResult.pagination),
+          refunds: pageMetadata(refunds),
+          services: pageMetadata(services),
+          renewals: pageMetadata(renewals),
+          cancellations: pageMetadata(cancellations),
+          tickets: pageMetadata(tickets),
+        },
+      };
+    });
+  });
+
+  app.get("/api/v1/customer/business-history/:facet", async (request) => {
+    const user = await requireUser(request, pool, config);
+    assertFinancialReadEligible(user);
+    const params = z.object({ facet: businessHistoryFacetSchema }).parse(request.params);
+    const page = parsePageQuery(request.query);
+    return withReadSnapshot(pool, async (client) => {
+      const account = await client.query<{ id: string; name: string }>(
+        "SELECT id, name FROM client_accounts WHERE id = $1",
+        [user.clientAccountId],
+      );
+      const currentAccount = account.rows[0];
+      if (!currentAccount) throw requestError("Client account not found", 404);
+      const collection = await loadBusinessHistoryFacet(
+        client,
+        user.clientAccountId,
+        params.facet,
+        page,
+      );
+      return {
+        warning: LAB_WARNING,
+        account: currentAccount,
+        facet: params.facet,
+        ...collection,
       };
     });
   });
@@ -1292,15 +1873,19 @@ export async function registerCustomerHistoryRoutes(
       );
       const order = orderResult.rows[0];
       if (!order) throw requestError("Service not found", 404);
-      const invoices = await listInvoices(client, user.clientAccountId);
-      const linkedInvoices = invoices
-        .filter((invoice) => service.invoiceIds.includes(invoice.id))
+      const linkedInvoices = (await listInvoicesForIds(
+        client,
+        user.clientAccountId,
+        service.invoiceIds,
+      ))
         .map((invoice) => ({
           ...invoice,
           kind: invoice.orderId === service.orderId ? "initial" as const : "renewal" as const,
         }));
-      const payments = (await listPayments(client, user.clientAccountId)).filter((payment) =>
-        service.invoiceIds.includes(payment.invoiceId),
+      const payments = await listPaymentsForInvoiceIds(
+        client,
+        user.clientAccountId,
+        service.invoiceIds,
       );
       const periodsResult = await client.query<{
         id: string;

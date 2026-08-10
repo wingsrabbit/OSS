@@ -122,6 +122,17 @@ jobs:
       - name: Build applications and conformance code
         run: pnpm -r --if-present build
 
+      - name: Install invoice PDF inspection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes poppler-utils
+          command -v pdfinfo
+          command -v pdffonts
+          command -v pdftotext
+          command -v pdftoppm
+
       - name: Create isolated Provider database
         shell: bash
         run: >-
@@ -179,7 +190,36 @@ jobs:
         run: pnpm --filter @opensales/api test:integration:tickets
 
       - name: Run account history PostgreSQL and API journey
+        env:
+          ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
         run: pnpm --filter @opensales/api test:integration:account-history
+
+      - name: Verify Unicode multi-page invoice PDF
+        shell: bash
+        env:
+          ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
+          PDF_QA_DIRECTORY: ${{ runner.temp }}/account-history-pdf-qa
+        run: |
+          set -euo pipefail
+          test -s "${ACCOUNT_HISTORY_PDF_OUTPUT}"
+          test "$(sha256sum apps/api/assets/fonts/NotoSansSC-VF.ttf | cut -d ' ' -f 1)" = \
+            'd68bafcb48a2707749396aa12bbbd833cb70401f3a9a689fd2902c7e0d295964'
+          mkdir -p "${PDF_QA_DIRECTORY}/rendered"
+          pdfinfo "${ACCOUNT_HISTORY_PDF_OUTPUT}" > "${PDF_QA_DIRECTORY}/pdfinfo.txt"
+          pdffonts "${ACCOUNT_HISTORY_PDF_OUTPUT}" > "${PDF_QA_DIRECTORY}/pdffonts.txt"
+          pdftotext -layout "${ACCOUNT_HISTORY_PDF_OUTPUT}" \
+            "${PDF_QA_DIRECTORY}/invoice.txt"
+          pdftoppm -png -r 120 "${ACCOUNT_HISTORY_PDF_OUTPUT}" \
+            "${PDF_QA_DIRECTORY}/rendered/page"
+          pages="$(awk '/^Pages:/ { print $2 }' "${PDF_QA_DIRECTORY}/pdfinfo.txt")"
+          test "${pages}" -gt 1
+          test "$(wc -c < "${ACCOUNT_HISTORY_PDF_OUTPUT}" | tr -d ' ')" -lt 250000
+          grep -E '^OSSINV[+]NotoSansSC-VF[[:space:]]+CID TrueType[[:space:]]+Identity-H[[:space:]]+yes[[:space:]]+yes[[:space:]]+yes' \
+            "${PDF_QA_DIRECTORY}/pdffonts.txt"
+          grep -F '简体中文账单明细 - 云服务月费' "${PDF_QA_DIRECTORY}/invoice.txt"
+          grep -F '香港节点带宽续费与技术支持' "${PDF_QA_DIRECTORY}/invoice.txt"
+          test "$(find "${PDF_QA_DIRECTORY}/rendered" -name 'page-*.png' -size +0c | wc -l | tr -d ' ')" \
+            -eq "${pages}"
 
       - name: Prepare and run schema 016 Worker job boundary PostgreSQL journey
         shell: bash

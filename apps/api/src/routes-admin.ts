@@ -1560,6 +1560,7 @@ export async function registerAdminRoutes(
     const result = await pool.query<{
       service_id: string;
       order_id: string;
+      client_account_id: string;
       product_name: string;
       billing_cycle: string;
       client_account_name: string;
@@ -1570,6 +1571,7 @@ export async function registerAdminRoutes(
       `SELECT
          s.id AS service_id,
          o.id AS order_id,
+         o.client_account_id,
          oi.product_name,
          oi.billing_cycle,
          ca.name AS client_account_name,
@@ -1590,6 +1592,7 @@ export async function registerAdminRoutes(
       items: result.rows.map((row) => ({
         serviceId: row.service_id,
         orderId: row.order_id,
+        clientAccountId: row.client_account_id,
         productName: row.product_name,
         billingCycle: row.billing_cycle,
         clientAccountName: row.client_account_name,

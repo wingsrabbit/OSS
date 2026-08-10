@@ -284,6 +284,7 @@ type OrderDetail = {
 type ManualItem = {
   serviceId: string;
   orderId: string;
+  clientAccountId: string;
   productName: string;
 };
 type PaymentCommand = {
@@ -2147,7 +2148,13 @@ await request(
   200,
 );
 const queue = await request<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
-assert.ok(queue.items.some((item) => item.serviceId === paidManual.service.id));
+const queuedManualItem = queue.items.find((item) => item.serviceId === paidManual.service.id);
+assert.ok(queuedManualItem);
+const queuedManualOrder = await corePool.query<{ client_account_id: string }>(
+  "SELECT client_account_id FROM orders WHERE id = $1",
+  [paidManual.order.id],
+);
+assert.equal(queuedManualItem.clientAccountId, queuedManualOrder.rows[0]?.client_account_id);
 const manualPaymentRecords = await corePool.query<{
   payment_attempt_id: string;
   operation_id: string;

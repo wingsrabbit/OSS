@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
+import type { LightMyRequestResponse } from "fastify";
 import { PDFDocument } from "pdf-lib";
 import pg from "pg";
 import { buildApp } from "./app.js";
@@ -128,6 +129,17 @@ try {
   const mismatchedInvoiceId = randomUUID();
   const mismatchedPaymentId = randomUUID();
   const mismatchedServiceId = randomUUID();
+  const mismatchedTicketId = randomUUID();
+  const paginationOrderIds = [randomUUID(), randomUUID()];
+  const paginationItemIds = [randomUUID(), randomUUID()];
+  const paginationServiceIds = [randomUUID(), randomUUID()];
+  const paginationRenewalInvoiceIds = [randomUUID(), randomUUID()];
+  const paginationRenewalIds = [randomUUID(), randomUUID()];
+  const paginationPaymentIds = [randomUUID(), randomUUID()];
+  const paginationTicketIds = [randomUUID(), randomUUID()];
+  const paginationRefundIds = [randomUUID(), randomUUID(), randomUUID()];
+  const paginationCreditIds = [randomUUID(), randomUUID()];
+  const paginationMembershipUserIds = [randomUUID(), randomUUID()];
   const priceSnapshot = {
     currency: "USD",
     billingCycle: "monthly",
@@ -175,7 +187,11 @@ try {
       `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
        SELECT $1,
               'recurring',
-              'Synthetic History Service - monthly line ' || line_number::text,
+              CASE
+                WHEN line_number = 1 THEN '简体中文账单明细 - 云服务月费'
+                WHEN line_number = 2 THEN '香港节点带宽续费与技术支持'
+                ELSE 'Synthetic History Service - monthly line ' || line_number::text
+              END,
               10
        FROM pg_catalog.generate_series(1, 50) AS line_number`,
       [invoiceId],
@@ -487,6 +503,254 @@ try {
       term.end_at,
     ],
   );
+  await pool.query(
+    `INSERT INTO support_tickets(
+       id, client_account_id, service_id, created_by_user_id, subject
+     ) VALUES ($1, $2, $3, $4, 'Mismatched service relation ticket')`,
+    [mismatchedTicketId, customer.accountId, mismatchedServiceId, customer.userId],
+  );
+
+  for (const [index, paginationOrderId] of paginationOrderIds.entries()) {
+    const paginationItemId = paginationItemIds[index];
+    const paginationServiceId = paginationServiceIds[index];
+    const paginationRenewalInvoiceId = paginationRenewalInvoiceIds[index];
+    const paginationRenewalId = paginationRenewalIds[index];
+    const paginationPaymentId = paginationPaymentIds[index];
+    const paginationTicketId = paginationTicketIds[index];
+    if (
+      !paginationItemId ||
+      !paginationServiceId ||
+      !paginationRenewalInvoiceId ||
+      !paginationRenewalId ||
+      !paginationPaymentId ||
+      !paginationTicketId
+    ) {
+      throw new Error("Incomplete account-history pagination fixture IDs");
+    }
+    const fixtureAt = new Date(Date.now() - (index + 1) * 60_000).toISOString();
+    await pool.query(
+      `INSERT INTO orders(
+         id, client_account_id, submitted_by_user_id, status, currency, price_snapshot,
+         one_time_minor, setup_minor, recurring_minor, total_minor,
+         idempotency_key, request_fingerprint, submitted_at, updated_at
+       ) VALUES (
+         $1, $2, $3, 'completed', 'USD', $4,
+         0, 0, 500, 500, $5, $6, $7, $7
+       )`,
+      [
+        paginationOrderId,
+        customer.accountId,
+        customer.userId,
+        priceSnapshot,
+        `history-page-order:${paginationOrderId}`,
+        `history-page-order-fingerprint:${paginationOrderId}`,
+        fixtureAt,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO order_items(
+         id, order_id, product_id, product_name, fulfillment_mode,
+         billing_cycle, configuration, price_snapshot
+       ) VALUES (
+         $1, $2, 'synthetic-history-service', $3,
+         'automatic', 'monthly', '{}'::jsonb, $4
+       )`,
+      [paginationItemId, paginationOrderId, `Pagination Service ${index + 1}`, priceSnapshot],
+    );
+    await pool.query(
+      `INSERT INTO services(
+         id, client_account_id, order_item_id, status, billing_cycle,
+         external_resource_id, activated_at, term_start, term_end, created_at, updated_at
+       ) VALUES ($1, $2, $3, 'active', 'monthly', $4, $5, $5, $6, $7, $7)`,
+      [
+        paginationServiceId,
+        customer.accountId,
+        paginationItemId,
+        `mock-resource:${paginationServiceId}`,
+        term.start_at,
+        term.end_at,
+        fixtureAt,
+      ],
+    );
+    const paginationInvoiceClient = await pool.connect();
+    try {
+      await paginationInvoiceClient.query("BEGIN");
+      await paginationInvoiceClient.query(
+        `INSERT INTO invoices(
+           id, client_account_id, currency, total_minor, due_at, created_at
+         ) VALUES ($1, $2, 'USD', 500, now() + interval '21 days', $3)`,
+        [paginationRenewalInvoiceId, customer.accountId, fixtureAt],
+      );
+      await paginationInvoiceClient.query(
+        `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+         VALUES ($1, 'recurring', $2, 500)`,
+        [paginationRenewalInvoiceId, `Pagination renewal ${index + 1}`],
+      );
+      await paginationInvoiceClient.query("COMMIT");
+    } catch (error) {
+      await paginationInvoiceClient.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      paginationInvoiceClient.release();
+    }
+    await pool.query(
+      `INSERT INTO service_renewals(
+         id, service_id, invoice_id, automation_run_id,
+         period_start, period_end, recurring_minor, currency, price_snapshot, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, $4, $5,
+         ($5::timestamptz AT TIME ZONE 'UTC' + interval '1 month') AT TIME ZONE 'UTC',
+         500, 'USD', $6, $7, $7
+       )`,
+      [
+        paginationRenewalId,
+        paginationServiceId,
+        paginationRenewalInvoiceId,
+        automationRun.rows[0]?.id,
+        term.end_at,
+        priceSnapshot,
+        fixtureAt,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO payment_attempts(
+         id, client_account_id, invoice_id, provider_installation_id,
+         external_payment_id, status, amount_minor, principal_minor,
+         fee_minor, currency, scenario, idempotency_key, request_fingerprint,
+         provider_occurred_at, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, 'mock-payment', $4, 'succeeded', 1, 1,
+         0, 'USD', 'success', $5, $6, $7, $7, $7
+       )`,
+      [
+        paginationPaymentId,
+        customer.accountId,
+        paginationRenewalInvoiceId,
+        `history-page-external:${paginationPaymentId}`,
+        `history-page-payment:${paginationPaymentId}`,
+        `history-page-payment-fingerprint:${paginationPaymentId}`,
+        fixtureAt,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO fund_receipts(
+         provider_installation_id, external_payment_id, reported_payment_attempt_id,
+         client_account_id, amount_minor, allocated_minor, currency, occurred_at, disposition
+       ) VALUES ('mock-payment', $1, $2, $3, 1, 0, 'USD', $4, 'unclaimed')`,
+      [
+        `history-page-external:${paginationPaymentId}`,
+        paginationPaymentId,
+        customer.accountId,
+        fixtureAt,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO support_tickets(
+         id, client_account_id, service_id, created_by_user_id, subject,
+         created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+      [
+        paginationTicketId,
+        customer.accountId,
+        paginationServiceId,
+        customer.userId,
+        `Pagination history ticket ${index + 1}`,
+        fixtureAt,
+      ],
+    );
+  }
+
+  const customerSession = await pool.query<{ id: string }>(
+    `SELECT id FROM sessions
+     WHERE user_id = $1 AND revoked_at IS NULL
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [customer.userId],
+  );
+  const customerSessionId = customerSession.rows[0]?.id;
+  const sourceReceipt = await pool.query<{ id: string }>(
+    "SELECT id FROM fund_receipts WHERE reported_payment_attempt_id = $1",
+    [paymentId],
+  );
+  if (!customerSessionId || !sourceReceipt.rows[0]?.id) {
+    throw new Error("Unable to resolve refund pagination fixture sources");
+  }
+  for (const [index, paginationRefundId] of paginationRefundIds.entries()) {
+    const fixtureAt = new Date(Date.now() - (index + 3) * 60_000).toISOString();
+    await pool.query(
+      `INSERT INTO refunds(
+         id, invoice_id, client_account_id, source_fund_receipt_id,
+         provider_installation_id, original_external_payment_id,
+         destination, amount_mode, amount_minor, currency, status, scenario,
+         requested_by_user_id, requested_session_id, requested_client_account_id,
+         reason, idempotency_key, request_fingerprint, result, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, $4, 'mock-payment', $5,
+         'original_payment', 'partial', 1, 'USD', 'failed', 'failed',
+         $6, $7, $3, $8, $9, $10, '{}'::jsonb, $11, $11
+       )`,
+      [
+        paginationRefundId,
+        invoiceId,
+        customer.accountId,
+        sourceReceipt.rows[0].id,
+        `history-external:${paymentId}`,
+        customer.userId,
+        customerSessionId,
+        `Synthetic failed refund pagination fixture ${index + 1}`,
+        `history-page-refund:${paginationRefundId}`,
+        `history-page-refund-fingerprint:${paginationRefundId}`,
+        fixtureAt,
+      ],
+    );
+  }
+
+  const creditAccountId = creditAccount.rows[0]?.id;
+  if (!creditAccountId) throw new Error("Unable to resolve Credit pagination fixture");
+  for (const [index, paginationCreditId] of paginationCreditIds.entries()) {
+    const isCredit = index === 0;
+    await pool.query(
+      `INSERT INTO credit_transactions(
+         id, credit_account_id, kind, credit_minor, debit_minor,
+         source_type, source_id, actor_type, actor_id, reason,
+         idempotency_key, request_fingerprint, result, created_at
+       ) VALUES (
+         $1, $2, 'manual_adjustment', $3, $4,
+         'integration_fixture', $5, 'staff', $6, $7,
+         $8, $9, '{}'::jsonb, $10
+       )`,
+      [
+        paginationCreditId,
+        creditAccountId,
+        isCredit ? 1 : 0,
+        isCredit ? 0 : 1,
+        randomUUID(),
+        staff.userId,
+        `Synthetic pagination Credit fixture ${index + 1}`,
+        `history-page-credit:${paginationCreditId}`,
+        `history-page-credit-fingerprint:${paginationCreditId}`,
+        new Date(Date.now() - (index + 1) * 60_000).toISOString(),
+      ],
+    );
+  }
+
+  for (const [index, membershipUserId] of paginationMembershipUserIds.entries()) {
+    await pool.query(
+      `INSERT INTO users(id, email, password_hash, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', now())`,
+      [membershipUserId, `pagination-member-${index}-${databaseName}@example.invalid`],
+    );
+    await pool.query(
+      `INSERT INTO client_memberships(
+         client_account_id, user_id, role, permissions, created_at
+       ) VALUES ($1, $2, 'viewer', '[]'::jsonb, $3)`,
+      [
+        customer.accountId,
+        membershipUserId,
+        new Date(Date.now() - (index + 1) * 60_000).toISOString(),
+      ],
+    );
+  }
 
   const pageableAccounts = [
     await createFixture("Pageable-A"),
@@ -518,7 +782,11 @@ try {
     credit: { balanceMinor: string };
     services: Array<{ id: string; invoiceIds: string[] }>;
     renewals: Array<{ id: string; allocatedMinor: string }>;
-    tickets: Array<{ id: string; publicMessageCount: number }>;
+    tickets: Array<{ id: string; productName: string | null; publicMessageCount: number }>;
+    pagination: Record<
+      string,
+      { limit: number; hasMore: boolean; nextCursor: string | null }
+    >;
   }>(historyResponse);
   assert.deepEqual(history.orders.find((order) => order.id === orderId)?.items, [
     { id: itemId, productName: "Synthetic History Service", billingCycle: "monthly" },
@@ -540,6 +808,10 @@ try {
     history.tickets.find((ticket) => ticket.id === ticketId)?.publicMessageCount,
     1,
   );
+  assert.equal(
+    history.tickets.find((ticket) => ticket.id === mismatchedTicketId)?.productName,
+    null,
+  );
   assert.ok(!history.orders.some((order) => order.id === otherOrderId));
   assert.ok(!history.invoices.some((invoice) => invoice.id === otherInvoiceId));
   assert.ok(!history.payments.some((payment) => payment.id === otherPaymentId));
@@ -551,6 +823,119 @@ try {
     history.invoices.find((invoice) => invoice.id === mismatchedInvoiceId)?.orderId,
     null,
   );
+  const customerFacets = [
+    "orders",
+    "invoices",
+    "payments",
+    "creditTransactions",
+    "refunds",
+    "services",
+    "renewals",
+    "cancellations",
+    "tickets",
+  ] as const;
+  assert.deepEqual(Object.keys(history.pagination).sort(), [...customerFacets].sort());
+  assert.ok(
+    customerFacets.every((facet) => history.pagination[facet]?.limit === 25),
+  );
+
+  const ambiguousCustomerCursor = await app.inject({
+    method: "GET",
+    url: "/api/v1/customer/business-history?cursor=ambiguous",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(ambiguousCustomerCursor.statusCode, 400, ambiguousCustomerCursor.body);
+
+  const creditTransactionIds = await pool.query<{ id: string }>(
+    `SELECT transaction.id
+     FROM credit_transactions transaction
+     JOIN credit_accounts account ON account.id = transaction.credit_account_id
+     WHERE account.client_account_id = $1`,
+    [customer.accountId],
+  );
+  const expectedCustomerFacetIds: Record<(typeof customerFacets)[number], string[]> = {
+    orders: [orderId, ...paginationOrderIds],
+    invoices: [
+      invoiceId,
+      renewalInvoiceId,
+      mismatchedInvoiceId,
+      ...paginationRenewalInvoiceIds,
+    ],
+    payments: [paymentId, ...paginationPaymentIds],
+    creditTransactions: creditTransactionIds.rows.map((row) => row.id),
+    refunds: paginationRefundIds,
+    services: [serviceId, ...paginationServiceIds],
+    renewals: [renewalId, ...paginationRenewalIds],
+    cancellations: [],
+    tickets: [ticketId, mismatchedTicketId, ...paginationTicketIds],
+  };
+  const firstCustomerCursors = new Map<string, string>();
+  for (const facet of customerFacets) {
+    const ids: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const pageQuery: string = cursor
+        ? `?limit=2&cursor=${encodeURIComponent(cursor)}`
+        : "?limit=2";
+      const facetResponse: LightMyRequestResponse = await app.inject({
+        method: "GET",
+        url: `/api/v1/customer/business-history/${facet}${pageQuery}`,
+        headers: { cookie: customerCookie },
+      });
+      assert.equal(facetResponse.statusCode, 200, `${facet}: ${facetResponse.body}`);
+      const facetPage = responseJson<{
+        facet: string;
+        items: Array<{ id?: string; requestId?: string }>;
+        limit: number;
+        hasMore: boolean;
+        nextCursor: string | null;
+      }>(facetResponse);
+      assert.equal(facetPage.facet, facet);
+      assert.equal(facetPage.limit, 2);
+      assert.ok(facetPage.items.length <= 2);
+      for (const item of facetPage.items) {
+        const id = facet === "cancellations" ? item.requestId : item.id;
+        assert.ok(id, `${facet} page item must expose its stable identifier`);
+        ids.push(id);
+      }
+      if (facetPage.hasMore) {
+        assert.equal(typeof facetPage.nextCursor, "string");
+        if (pages === 0 && facetPage.nextCursor) {
+          firstCustomerCursors.set(facet, facetPage.nextCursor);
+        }
+      } else {
+        assert.equal(facetPage.nextCursor, null);
+      }
+      cursor = facetPage.nextCursor;
+      pages += 1;
+      assert.ok(pages < 10, `${facet} pagination did not terminate`);
+    } while (cursor);
+    assert.equal(new Set(ids).size, ids.length, `${facet} pagination repeated an item`);
+    assert.deepEqual(
+      [...ids].sort(),
+      [...expectedCustomerFacetIds[facet]].sort(),
+      `${facet} pagination omitted or added an item`,
+    );
+  }
+  const orderCursor = firstCustomerCursors.get("orders");
+  assert.ok(orderCursor);
+  const facetBoundCursor = await app.inject({
+    method: "GET",
+    url:
+      "/api/v1/customer/business-history/invoices?limit=2&cursor=" +
+      encodeURIComponent(orderCursor),
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(facetBoundCursor.statusCode, 400, facetBoundCursor.body);
+  const accountBoundCursor = await app.inject({
+    method: "GET",
+    url:
+      "/api/v1/customer/business-history/orders?limit=2&cursor=" +
+      encodeURIComponent(orderCursor),
+    headers: { cookie: otherCookie },
+  });
+  assert.equal(accountBoundCursor.statusCode, 400, accountBoundCursor.body);
 
   const otherHistoryResponse = await app.inject({
     method: "GET",
@@ -587,7 +972,7 @@ try {
       id: string;
       allocatedMinor: string;
       createdAt: string;
-      lines: Array<{ amountMinor: string }>;
+      lines: Array<{ description: string; amountMinor: string }>;
     };
     related: { orderId: string; serviceIds: string[] };
     pdfUrl: string;
@@ -596,6 +981,16 @@ try {
   assert.equal(invoiceDetail.invoice.allocatedMinor, "500");
   assert.equal(invoiceDetail.invoice.lines.length, 50);
   assert.ok(invoiceDetail.invoice.lines.every((line) => line.amountMinor === "10"));
+  assert.ok(
+    invoiceDetail.invoice.lines.some(
+      (line) => line.description === "简体中文账单明细 - 云服务月费",
+    ),
+  );
+  assert.ok(
+    invoiceDetail.invoice.lines.some(
+      (line) => line.description === "香港节点带宽续费与技术支持",
+    ),
+  );
   assert.equal(invoiceDetail.related.orderId, orderId);
   assert.deepEqual(invoiceDetail.related.serviceIds, [serviceId]);
   assert.equal(invoiceDetail.pdfUrl, `/api/v1/customer/invoices/${invoiceId}/pdf`);
@@ -837,7 +1232,13 @@ try {
   assert.equal(summary.statusCode, 200, summary.body);
   const summaryBody = responseJson<Record<string, unknown> & { memberships: unknown[] }>(summary);
   assert.equal("contacts" in summaryBody, false);
-  assert.equal(summaryBody.memberships.length, 1);
+  assert.equal(summaryBody.memberships.length, 3);
+  const ambiguousSummaryCursor = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/client-accounts/${customer.accountId}/summary?cursor=ambiguous`,
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(ambiguousSummaryCursor.statusCode, 400, ambiguousSummaryCursor.body);
 
   const ordersPanel = await app.inject({
     method: "GET",
@@ -888,6 +1289,12 @@ try {
   assert.ok(billing.payments.some((payment) => payment.id === paymentId));
   assert.equal(billing.credit.balanceMinor, "200");
   assert.ok(billing.fundReceipts.some((receipt) => receipt.allocatedMinor === "500"));
+  const ambiguousBillingCursor = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/client-accounts/${customer.accountId}/billing?cursor=ambiguous`,
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(ambiguousBillingCursor.statusCode, 400, ambiguousBillingCursor.body);
 
   await pool.query(
     `UPDATE staff_members
@@ -926,10 +1333,264 @@ try {
     1,
   );
 
+  await pool.query(
+    `UPDATE staff_members
+     SET permissions = $2::jsonb, updated_at = now()
+     WHERE user_id = $1`,
+    [
+      staff.userId,
+      JSON.stringify([
+        "accounts.view",
+        "orders.read",
+        "billing.read",
+        "services.read",
+        "support.tickets.manage",
+      ]),
+    ],
+  );
+
+  const limitedCustomerAggregate = await app.inject({
+    method: "GET",
+    url: "/api/v1/customer/business-history?limit=2",
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(
+    limitedCustomerAggregate.statusCode,
+    200,
+    limitedCustomerAggregate.body,
+  );
+  const limitedCustomerBody = responseJson<
+    Record<string, unknown> & {
+      pagination: Record<string, { limit: number; hasMore: boolean }>;
+    }
+  >(limitedCustomerAggregate);
+  for (const facet of customerFacets) {
+    const collection = facet === "creditTransactions"
+      ? (limitedCustomerBody.credit as { transactions: unknown[] }).transactions
+      : limitedCustomerBody[facet] as unknown[];
+    assert.ok(collection.length <= 2, `${facet} aggregate page exceeded limit`);
+    assert.equal(limitedCustomerBody.pagination[facet]?.limit, 2);
+    assert.equal(
+      limitedCustomerBody.pagination[facet]?.hasMore,
+      expectedCustomerFacetIds[facet].length > 2,
+    );
+  }
+
+  const limitedSummary = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/client-accounts/${customer.accountId}/summary?limit=2`,
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(limitedSummary.statusCode, 200, limitedSummary.body);
+  const limitedSummaryBody = responseJson<{
+    memberships: unknown[];
+    restrictions: unknown[];
+    pagination: Record<string, { limit: number; hasMore: boolean }>;
+  }>(limitedSummary);
+  assert.equal(limitedSummaryBody.memberships.length, 2);
+  assert.equal(limitedSummaryBody.restrictions.length, 0);
+  assert.equal(limitedSummaryBody.pagination.memberships?.hasMore, true);
+  assert.equal(limitedSummaryBody.pagination.restrictions?.hasMore, false);
+
+  const limitedBilling = await app.inject({
+    method: "GET",
+    url: `/api/v1/admin/client-accounts/${customer.accountId}/billing?limit=2`,
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(limitedBilling.statusCode, 200, limitedBilling.body);
+  const limitedBillingBody = responseJson<{
+    invoices: unknown[];
+    payments: unknown[];
+    credit: { transactions: unknown[] };
+    fundReceipts: unknown[];
+    refunds: unknown[];
+    chargebacks: unknown[];
+    pagination: Record<string, { limit: number; hasMore: boolean }>;
+  }>(limitedBilling);
+  for (const [facet, collection] of [
+    ["invoices", limitedBillingBody.invoices],
+    ["payments", limitedBillingBody.payments],
+    ["creditTransactions", limitedBillingBody.credit.transactions],
+    ["fundReceipts", limitedBillingBody.fundReceipts],
+    ["refunds", limitedBillingBody.refunds],
+    ["chargebacks", limitedBillingBody.chargebacks],
+  ] as const) {
+    assert.ok(collection.length <= 2, `${facet} billing aggregate page exceeded limit`);
+    assert.equal(limitedBillingBody.pagination[facet]?.limit, 2);
+  }
+  assert.equal(limitedBillingBody.pagination.invoices?.hasMore, true);
+  assert.equal(limitedBillingBody.pagination.payments?.hasMore, true);
+  assert.equal(limitedBillingBody.pagination.creditTransactions?.hasMore, true);
+  assert.equal(limitedBillingBody.pagination.fundReceipts?.hasMore, true);
+  assert.equal(limitedBillingBody.pagination.refunds?.hasMore, true);
+  assert.equal(limitedBillingBody.pagination.chargebacks?.hasMore, false);
+
+  const membershipIds = await pool.query<{ user_id: string }>(
+    "SELECT user_id FROM client_memberships WHERE client_account_id = $1",
+    [customer.accountId],
+  );
+  const fundReceiptIds = await pool.query<{ id: string }>(
+    "SELECT id FROM fund_receipts WHERE client_account_id = $1",
+    [customer.accountId],
+  );
+  const chargebackIds = await pool.query<{ id: string }>(
+    "SELECT id FROM add_funds_chargeback_effects WHERE client_account_id = $1",
+    [customer.accountId],
+  );
+  const adminCollections: Array<{
+    name: string;
+    path: string;
+    idKey: "id" | "requestId" | "userId";
+    expectedIds: string[];
+  }> = [
+    {
+      name: "summary memberships",
+      path: "summary/memberships",
+      idKey: "userId",
+      expectedIds: membershipIds.rows.map((row) => row.user_id),
+    },
+    {
+      name: "summary restrictions",
+      path: "summary/restrictions",
+      idKey: "id",
+      expectedIds: [],
+    },
+    {
+      name: "orders",
+      path: "orders",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.orders,
+    },
+    {
+      name: "billing invoices",
+      path: "billing/invoices",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.invoices,
+    },
+    {
+      name: "billing payments",
+      path: "billing/payments",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.payments,
+    },
+    {
+      name: "billing Credit",
+      path: "billing/creditTransactions",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.creditTransactions,
+    },
+    {
+      name: "billing receipts",
+      path: "billing/fundReceipts",
+      idKey: "id",
+      expectedIds: fundReceiptIds.rows.map((row) => row.id),
+    },
+    {
+      name: "billing refunds",
+      path: "billing/refunds",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.refunds,
+    },
+    {
+      name: "billing chargebacks",
+      path: "billing/chargebacks",
+      idKey: "id",
+      expectedIds: chargebackIds.rows.map((row) => row.id),
+    },
+    {
+      name: "services",
+      path: "services",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.services,
+    },
+    {
+      name: "renewals",
+      path: "renewals",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.renewals,
+    },
+    {
+      name: "cancellations",
+      path: "cancellations",
+      idKey: "requestId",
+      expectedIds: expectedCustomerFacetIds.cancellations,
+    },
+    {
+      name: "tickets",
+      path: "tickets",
+      idKey: "id",
+      expectedIds: expectedCustomerFacetIds.tickets,
+    },
+  ];
+  const firstAdminCursors = new Map<string, string>();
+  for (const collection of adminCollections) {
+    const ids: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const pageQuery: string = cursor
+        ? `?limit=2&cursor=${encodeURIComponent(cursor)}`
+        : "?limit=2";
+      const pageResponse: LightMyRequestResponse = await app.inject({
+        method: "GET",
+        url: `/api/v1/admin/client-accounts/${customer.accountId}/${collection.path}${pageQuery}`,
+        headers: { cookie: staffCookie },
+      });
+      assert.equal(
+        pageResponse.statusCode,
+        200,
+        `${collection.name}: ${pageResponse.body}`,
+      );
+      const pageBody = responseJson<{
+        items: Array<{ id?: string; requestId?: string; userId?: string }>;
+        limit: number;
+        hasMore: boolean;
+        nextCursor: string | null;
+      }>(pageResponse);
+      assert.equal(pageBody.limit, 2);
+      for (const item of pageBody.items) {
+        const id = item[collection.idKey];
+        assert.ok(id, `${collection.name} item must expose ${collection.idKey}`);
+        ids.push(id);
+      }
+      if (pageBody.hasMore) {
+        assert.equal(typeof pageBody.nextCursor, "string");
+        if (pages === 0 && pageBody.nextCursor) {
+          firstAdminCursors.set(collection.path, pageBody.nextCursor);
+        }
+      } else {
+        assert.equal(pageBody.nextCursor, null);
+      }
+      cursor = pageBody.nextCursor;
+      pages += 1;
+      assert.ok(pages < 10, `${collection.name} pagination did not terminate`);
+    } while (cursor);
+    assert.equal(
+      new Set(ids).size,
+      ids.length,
+      `${collection.name} pagination repeated an item`,
+    );
+    assert.deepEqual(
+      [...ids].sort(),
+      [...collection.expectedIds].sort(),
+      `${collection.name} pagination omitted or added an item`,
+    );
+  }
+  const adminOrderCursor = firstAdminCursors.get("orders");
+  assert.ok(adminOrderCursor);
+  const adminFacetCursorMismatch = await app.inject({
+    method: "GET",
+    url:
+      `/api/v1/admin/client-accounts/${customer.accountId}/services?limit=2&cursor=` +
+      encodeURIComponent(adminOrderCursor),
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(adminFacetCursorMismatch.statusCode, 400, adminFacetCursorMismatch.body);
+
   process.stdout.write(
     `accountHistoryIntegration=passed schema=${compatibility.installedSchemaVersion}` +
       ` pdfPages=${parsedPdf.getPageCount()} crossAccount404=passed` +
-      ` panelPermissions=passed permissionRevocation=passed\n`,
+      ` pagination=passed panelPermissions=passed permissionRevocation=passed\n`,
   );
 } finally {
   if (app) await app.close().catch(() => undefined);

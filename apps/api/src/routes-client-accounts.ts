@@ -6,16 +6,24 @@ import { requireUser } from "./auth.js";
 import type { Config } from "./config.js";
 import type { DatabasePool } from "./database.js";
 import {
+  collectionPage,
+  decodeKeysetCursor,
+  parseInitialPageQuery,
+  parsePageQuery,
+  type CollectionPage,
+  type PageQuery,
+} from "./keyset-pagination.js";
+import {
   LAB_WARNING,
-  listCancellations,
-  listInvoices,
-  listOrders,
-  listPayments,
-  listRefunds,
-  listRenewals,
-  listServices,
-  listTickets,
-  loadCreditHistory,
+  listCancellationsPage,
+  listInvoicesPage,
+  listOrdersPage,
+  listPaymentsPage,
+  listRefundsPage,
+  listRenewalsPage,
+  listServicesPage,
+  listTicketsPage,
+  loadCreditHistoryPage,
   withReadSnapshot,
 } from "./routes-customer-history.js";
 import { requireStaffPermission } from "./routes-admin.js";
@@ -85,6 +93,291 @@ function stringPermissions(value: unknown): string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string")
     ? value
     : [];
+}
+
+type MembershipSummary = {
+  userId: string;
+  email: string;
+  role: string;
+  permissions: string[];
+  emailVerifiedAt: string | null;
+  userRestrictedAt: string | null;
+  createdAt: string;
+  removedAt: string | null;
+};
+
+type RestrictionSummary = {
+  id: string;
+  kind: string;
+  sourceType: string;
+  sourceId: string;
+  reason: string;
+  createdAt: string;
+  releasedAt: string | null;
+  releaseReason: string | null;
+  active: boolean;
+};
+
+type FundReceiptSummary = {
+  id: string;
+  amountMinor: string;
+  allocatedMinor: string;
+  availableMinor: string;
+  currency: string;
+  disposition: string;
+  reason: string | null;
+  occurredAt: string;
+  capacityFrozen: boolean;
+};
+
+type ChargebackSummary = {
+  id: string;
+  principalMinor: string;
+  feeMinor: string;
+  externalAmountMinor: string;
+  creditRecoveredMinor: string;
+  debtMinor: string;
+  currency: string;
+  occurredAt: string;
+};
+
+function pageMetadata<T>(page: CollectionPage<T>) {
+  return {
+    limit: page.limit,
+    hasMore: page.hasMore,
+    nextCursor: page.nextCursor,
+  };
+}
+
+async function listMembershipsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<MembershipSummary>> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId, true);
+  const result = await queryable.query<{
+    user_id: string;
+    email: string;
+    role: string;
+    permissions: unknown;
+    email_verified_at: Date | null;
+    user_restricted_at: Date | null;
+    created_at: Date;
+    removed_at: Date | null;
+    active_rank: number;
+  }>(
+    `SELECT membership.user_id,
+            user_account.email::text,
+            membership.role,
+            membership.permissions,
+            user_account.email_verified_at,
+            user_account.restricted_at AS user_restricted_at,
+            membership.created_at,
+            membership.removed_at,
+            CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END AS active_rank
+     FROM client_memberships membership
+     JOIN users user_account ON user_account.id = membership.user_id
+     WHERE membership.client_account_id = $1
+       AND (
+         $2::integer IS NULL
+         OR CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END > $2::integer
+         OR (
+           CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END = $2::integer
+           AND membership.created_at > $3::timestamptz
+         )
+         OR (
+           CASE WHEN membership.removed_at IS NULL THEN 0 ELSE 1 END = $2::integer
+           AND membership.created_at = $3::timestamptz
+           AND membership.user_id > $4::uuid
+         )
+       )
+     ORDER BY active_rank, membership.created_at, membership.user_id
+     LIMIT $5`,
+    [
+      clientAccountId,
+      cursor?.rank ?? null,
+      cursor?.at ?? null,
+      cursor?.id ?? null,
+      page.limit + 1,
+    ],
+  );
+  const items = result.rows.map((membership) => ({
+    userId: membership.user_id,
+    email: membership.email,
+    role: membership.role,
+    permissions: stringPermissions(membership.permissions),
+    emailVerifiedAt: membership.email_verified_at?.toISOString() ?? null,
+    userRestrictedAt: membership.user_restricted_at?.toISOString() ?? null,
+    createdAt: membership.created_at.toISOString(),
+    removedAt: membership.removed_at?.toISOString() ?? null,
+  }));
+  return collectionPage(items, page.limit, scope, clientAccountId, (membership) => ({
+    rank: membership.removedAt === null ? 0 : 1,
+    at: membership.createdAt,
+    id: membership.userId,
+  }));
+}
+
+async function listRestrictionsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<RestrictionSummary>> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
+  const result = await queryable.query<{
+    id: string;
+    kind: string;
+    source_type: string;
+    source_id: string;
+    reason: string;
+    created_at: Date;
+    released_at: Date | null;
+    release_reason: string | null;
+  }>(
+    `SELECT restriction.id,
+            restriction.kind,
+            restriction.source_type,
+            restriction.source_id,
+            restriction.reason,
+            restriction.created_at,
+            release.created_at AS released_at,
+            release.reason AS release_reason
+     FROM client_account_restrictions restriction
+     LEFT JOIN client_account_restriction_releases release
+       ON release.restriction_id = restriction.id
+     WHERE restriction.client_account_id = $1
+       AND (
+         $2::timestamptz IS NULL
+         OR (restriction.created_at, restriction.id) < ($2::timestamptz, $3::uuid)
+       )
+     ORDER BY restriction.created_at DESC, restriction.id DESC
+     LIMIT $4`,
+    [clientAccountId, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
+  );
+  const items = result.rows.map((restriction) => ({
+    id: restriction.id,
+    kind: restriction.kind,
+    sourceType: restriction.source_type,
+    sourceId: restriction.source_id,
+    reason: restriction.reason,
+    createdAt: restriction.created_at.toISOString(),
+    releasedAt: restriction.released_at?.toISOString() ?? null,
+    releaseReason: restriction.release_reason,
+    active: !restriction.released_at,
+  }));
+  return collectionPage(items, page.limit, scope, clientAccountId, (restriction) => ({
+    at: restriction.createdAt,
+    id: restriction.id,
+  }));
+}
+
+async function listFundReceiptsPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<FundReceiptSummary>> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
+  const result = await queryable.query<{
+    id: string;
+    amount_minor: string;
+    allocated_minor: string;
+    available_minor: string;
+    currency: string;
+    disposition: string;
+    reason: string | null;
+    occurred_at: Date;
+    capacity_frozen: boolean;
+  }>(
+    `SELECT receipt.id,
+            receipt.amount_minor::text,
+            receipt.allocated_minor::text,
+            COALESCE(capacity.available_minor, 0)::text AS available_minor,
+            receipt.currency,
+            receipt.disposition,
+            receipt.reason,
+            receipt.occurred_at,
+            COALESCE(capacity.capacity_frozen, false) AS capacity_frozen
+     FROM fund_receipts receipt
+     LEFT JOIN unclaimed_fund_refund_capacity capacity
+       ON capacity.fund_receipt_id = receipt.id
+     WHERE receipt.client_account_id = $1
+       AND (
+         $2::timestamptz IS NULL
+         OR (receipt.occurred_at, receipt.id) < ($2::timestamptz, $3::uuid)
+       )
+     ORDER BY receipt.occurred_at DESC, receipt.id DESC
+     LIMIT $4`,
+    [clientAccountId, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
+  );
+  const items = result.rows.map((receipt) => ({
+    id: receipt.id,
+    amountMinor: receipt.amount_minor,
+    allocatedMinor: receipt.allocated_minor,
+    availableMinor: receipt.available_minor,
+    currency: receipt.currency,
+    disposition: receipt.disposition,
+    reason: receipt.reason,
+    occurredAt: receipt.occurred_at.toISOString(),
+    capacityFrozen: receipt.capacity_frozen,
+  }));
+  return collectionPage(items, page.limit, scope, clientAccountId, (receipt) => ({
+    at: receipt.occurredAt,
+    id: receipt.id,
+  }));
+}
+
+async function listChargebacksPage(
+  queryable: Queryable,
+  clientAccountId: string,
+  page: PageQuery,
+  scope: string,
+): Promise<CollectionPage<ChargebackSummary>> {
+  const cursor = decodeKeysetCursor(page.cursor, scope, clientAccountId);
+  const result = await queryable.query<{
+    id: string;
+    principal_minor: string;
+    fee_minor: string;
+    external_amount_minor: string;
+    credit_recovered_minor: string;
+    debt_minor: string;
+    currency: string;
+    occurred_at: Date;
+  }>(
+    `SELECT id,
+            principal_minor::text,
+            fee_minor::text,
+            external_amount_minor::text,
+            credit_recovered_minor::text,
+            debt_minor::text,
+            currency,
+            occurred_at
+     FROM add_funds_chargeback_effects
+     WHERE client_account_id = $1
+       AND (
+         $2::timestamptz IS NULL
+         OR (occurred_at, id) < ($2::timestamptz, $3::uuid)
+       )
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT $4`,
+    [clientAccountId, cursor?.at ?? null, cursor?.id ?? null, page.limit + 1],
+  );
+  const items = result.rows.map((chargeback) => ({
+    id: chargeback.id,
+    principalMinor: chargeback.principal_minor,
+    feeMinor: chargeback.fee_minor,
+    externalAmountMinor: chargeback.external_amount_minor,
+    creditRecoveredMinor: chargeback.credit_recovered_minor,
+    debtMinor: chargeback.debt_minor,
+    currency: chargeback.currency,
+    occurredAt: chargeback.occurred_at.toISOString(),
+  }));
+  return collectionPage(items, page.limit, scope, clientAccountId, (chargeback) => ({
+    at: chargeback.occurredAt,
+    id: chargeback.id,
+  }));
 }
 
 export async function registerClientAccountRoutes(
@@ -183,6 +476,7 @@ export async function registerClientAccountRoutes(
     const lastVisible = visibleRows.at(-1);
     return {
       warning: LAB_WARNING,
+      limit: query.limit,
       items: visibleRows.map((row) => ({
         id: row.id,
         name: row.name,
@@ -215,6 +509,7 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "accounts.view");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parseInitialPageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const accountResult = await client.query<{
           id: string;
@@ -241,56 +536,17 @@ export async function registerClientAccountRoutes(
         );
         const account = accountResult.rows[0];
         if (!account) throw requestError("Client account not found", 404);
-        const memberships = await client.query<{
-          user_id: string;
-          email: string;
-          role: string;
-          permissions: unknown;
-          email_verified_at: Date | null;
-          user_restricted_at: Date | null;
-          created_at: Date;
-          removed_at: Date | null;
-        }>(
-          `SELECT membership.user_id,
-                  user_account.email::text,
-                  membership.role,
-                  membership.permissions,
-                  user_account.email_verified_at,
-                  user_account.restricted_at AS user_restricted_at,
-                  membership.created_at,
-                  membership.removed_at
-           FROM client_memberships membership
-           JOIN users user_account ON user_account.id = membership.user_id
-           WHERE membership.client_account_id = $1
-           ORDER BY membership.removed_at NULLS FIRST,
-                    membership.created_at,
-                    membership.user_id`,
-          [params.clientAccountId],
+        const memberships = await listMembershipsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-summary.memberships",
         );
-        const restrictions = await client.query<{
-          id: string;
-          kind: string;
-          source_type: string;
-          source_id: string;
-          reason: string;
-          created_at: Date;
-          released_at: Date | null;
-          release_reason: string | null;
-        }>(
-          `SELECT restriction.id,
-                  restriction.kind,
-                  restriction.source_type,
-                  restriction.source_id,
-                  restriction.reason,
-                  restriction.created_at,
-                  release.created_at AS released_at,
-                  release.reason AS release_reason
-           FROM client_account_restrictions restriction
-           LEFT JOIN client_account_restriction_releases release
-             ON release.restriction_id = restriction.id
-           WHERE restriction.client_account_id = $1
-           ORDER BY restriction.created_at DESC, restriction.id DESC`,
-          [params.clientAccountId],
+        const restrictions = await listRestrictionsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-summary.restrictions",
         );
         return {
           warning: LAB_WARNING,
@@ -306,27 +562,133 @@ export async function registerClientAccountRoutes(
             emailVerifiedAt: account.owner_email_verified_at?.toISOString() ?? null,
             restrictedAt: account.owner_restricted_at?.toISOString() ?? null,
           },
-          memberships: memberships.rows.map((membership) => ({
-            userId: membership.user_id,
-            email: membership.email,
-            role: membership.role,
-            permissions: stringPermissions(membership.permissions),
-            emailVerifiedAt: membership.email_verified_at?.toISOString() ?? null,
-            userRestrictedAt: membership.user_restricted_at?.toISOString() ?? null,
-            createdAt: membership.created_at.toISOString(),
-            removedAt: membership.removed_at?.toISOString() ?? null,
-          })),
-          restrictions: restrictions.rows.map((restriction) => ({
-            id: restriction.id,
-            kind: restriction.kind,
-            sourceType: restriction.source_type,
-            sourceId: restriction.source_id,
-            reason: restriction.reason,
-            createdAt: restriction.created_at.toISOString(),
-            releasedAt: restriction.released_at?.toISOString() ?? null,
-            releaseReason: restriction.release_reason,
-            active: !restriction.released_at,
-          })),
+          memberships: memberships.items,
+          restrictions: restrictions.items,
+          pagination: {
+            memberships: pageMetadata(memberships),
+            restrictions: pageMetadata(restrictions),
+          },
+        };
+      });
+    },
+  );
+
+  app.get(
+    "/api/v1/admin/client-accounts/:clientAccountId/billing/:facet",
+    async (request) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "billing.read");
+      const params = z
+        .object({
+          clientAccountId: canonicalUuid,
+          facet: z.enum([
+            "invoices",
+            "payments",
+            "creditTransactions",
+            "fundReceipts",
+            "refunds",
+            "chargebacks",
+          ]),
+        })
+        .parse(request.params);
+      const page = parsePageQuery(request.query);
+      return withReadSnapshot(pool, async (client) => {
+        const account = await loadAccountIdentity(client, params.clientAccountId);
+        let collection: CollectionPage<unknown>;
+        switch (params.facet) {
+          case "invoices":
+            collection = await listInvoicesPage(
+              client,
+              account.id,
+              page,
+              "admin.account-billing.invoices",
+            );
+            break;
+          case "payments":
+            collection = await listPaymentsPage(
+              client,
+              account.id,
+              page,
+              "admin.account-billing.payments",
+            );
+            break;
+          case "creditTransactions":
+            collection = (
+              await loadCreditHistoryPage(
+                client,
+                account.id,
+                page,
+                "admin.account-billing.creditTransactions",
+              )
+            ).pagination;
+            break;
+          case "fundReceipts":
+            collection = await listFundReceiptsPage(
+              client,
+              account.id,
+              page,
+              "admin.account-billing.fundReceipts",
+            );
+            break;
+          case "refunds":
+            collection = await listRefundsPage(
+              client,
+              account.id,
+              page,
+              "admin.account-billing.refunds",
+            );
+            break;
+          case "chargebacks":
+            collection = await listChargebacksPage(
+              client,
+              account.id,
+              page,
+              "admin.account-billing.chargebacks",
+            );
+            break;
+        }
+        return {
+          warning: LAB_WARNING,
+          account,
+          facet: params.facet,
+          ...collection,
+        };
+      });
+    },
+  );
+
+  app.get(
+    "/api/v1/admin/client-accounts/:clientAccountId/summary/:facet",
+    async (request) => {
+      const user = await requireUser(request, pool, config);
+      await requireStaffPermission(pool, user, "accounts.view");
+      const params = z
+        .object({
+          clientAccountId: canonicalUuid,
+          facet: z.enum(["memberships", "restrictions"]),
+        })
+        .parse(request.params);
+      const page = parsePageQuery(request.query);
+      return withReadSnapshot(pool, async (client) => {
+        const account = await loadAccountIdentity(client, params.clientAccountId);
+        const collection = params.facet === "memberships"
+          ? await listMembershipsPage(
+              client,
+              account.id,
+              page,
+              "admin.account-summary.memberships",
+            )
+          : await listRestrictionsPage(
+              client,
+              account.id,
+              page,
+              "admin.account-summary.restrictions",
+            );
+        return {
+          warning: LAB_WARNING,
+          account,
+          facet: params.facet,
+          ...collection,
         };
       });
     },
@@ -338,12 +700,19 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "orders.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const account = await loadAccountIdentity(client, params.clientAccountId);
+        const orders = await listOrdersPage(
+          client,
+          account.id,
+          page,
+          "admin.account-orders",
+        );
         return {
           warning: LAB_WARNING,
           account,
-          items: await listOrders(client, account.id),
+          ...orders,
         };
       });
     },
@@ -355,61 +724,44 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "billing.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parseInitialPageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const account = await loadAccountIdentity(client, params.clientAccountId);
-        const invoices = await listInvoices(client, account.id);
-        const payments = await listPayments(client, account.id);
-        const credit = await loadCreditHistory(client, account.id);
-        const refunds = await listRefunds(client, account.id);
-        const receipts = await client.query<{
-          id: string;
-          amount_minor: string;
-          allocated_minor: string;
-          available_minor: string;
-          currency: string;
-          disposition: string;
-          reason: string | null;
-          occurred_at: Date;
-          capacity_frozen: boolean;
-        }>(
-          `SELECT receipt.id,
-                  receipt.amount_minor::text,
-                  receipt.allocated_minor::text,
-                  COALESCE(capacity.available_minor, 0)::text AS available_minor,
-                  receipt.currency,
-                  receipt.disposition,
-                  receipt.reason,
-                  receipt.occurred_at,
-                  COALESCE(capacity.capacity_frozen, false) AS capacity_frozen
-           FROM fund_receipts receipt
-           LEFT JOIN unclaimed_fund_refund_capacity capacity
-             ON capacity.fund_receipt_id = receipt.id
-           WHERE receipt.client_account_id = $1
-           ORDER BY receipt.occurred_at DESC, receipt.id DESC`,
-          [account.id],
+        const invoices = await listInvoicesPage(
+          client,
+          account.id,
+          page,
+          "admin.account-billing.invoices",
         );
-        const chargebacks = await client.query<{
-          id: string;
-          principal_minor: string;
-          fee_minor: string;
-          external_amount_minor: string;
-          credit_recovered_minor: string;
-          debt_minor: string;
-          currency: string;
-          occurred_at: Date;
-        }>(
-          `SELECT id,
-                  principal_minor::text,
-                  fee_minor::text,
-                  external_amount_minor::text,
-                  credit_recovered_minor::text,
-                  debt_minor::text,
-                  currency,
-                  occurred_at
-           FROM add_funds_chargeback_effects
-           WHERE client_account_id = $1
-           ORDER BY occurred_at DESC, id DESC`,
-          [account.id],
+        const payments = await listPaymentsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-billing.payments",
+        );
+        const creditResult = await loadCreditHistoryPage(
+          client,
+          account.id,
+          page,
+          "admin.account-billing.creditTransactions",
+        );
+        const receipts = await listFundReceiptsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-billing.fundReceipts",
+        );
+        const refunds = await listRefundsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-billing.refunds",
+        );
+        const chargebacks = await listChargebacksPage(
+          client,
+          account.id,
+          page,
+          "admin.account-billing.chargebacks",
         );
         const debt = await client.query<{ currency: string; balance_minor: string }>(
           `SELECT debt_account.currency,
@@ -426,34 +778,23 @@ export async function registerClientAccountRoutes(
         return {
           warning: LAB_WARNING,
           account,
-          invoices,
-          payments,
-          credit,
-          fundReceipts: receipts.rows.map((receipt) => ({
-            id: receipt.id,
-            amountMinor: receipt.amount_minor,
-            allocatedMinor: receipt.allocated_minor,
-            availableMinor: receipt.available_minor,
-            currency: receipt.currency,
-            disposition: receipt.disposition,
-            reason: receipt.reason,
-            occurredAt: receipt.occurred_at.toISOString(),
-            capacityFrozen: receipt.capacity_frozen,
-          })),
-          refunds,
-          chargebacks: chargebacks.rows.map((chargeback) => ({
-            id: chargeback.id,
-            principalMinor: chargeback.principal_minor,
-            feeMinor: chargeback.fee_minor,
-            externalAmountMinor: chargeback.external_amount_minor,
-            creditRecoveredMinor: chargeback.credit_recovered_minor,
-            debtMinor: chargeback.debt_minor,
-            currency: chargeback.currency,
-            occurredAt: chargeback.occurred_at.toISOString(),
-          })),
+          invoices: invoices.items,
+          payments: payments.items,
+          credit: creditResult.credit,
+          fundReceipts: receipts.items,
+          refunds: refunds.items,
+          chargebacks: chargebacks.items,
           debt: debt.rows[0]
             ? { currency: debt.rows[0].currency, balanceMinor: debt.rows[0].balance_minor }
             : { currency: "USD", balanceMinor: "0" },
+          pagination: {
+            invoices: pageMetadata(invoices),
+            payments: pageMetadata(payments),
+            creditTransactions: pageMetadata(creditResult.pagination),
+            fundReceipts: pageMetadata(receipts),
+            refunds: pageMetadata(refunds),
+            chargebacks: pageMetadata(chargebacks),
+          },
         };
       });
     },
@@ -465,12 +806,19 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "services.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const account = await loadAccountIdentity(client, params.clientAccountId);
+        const services = await listServicesPage(
+          client,
+          account.id,
+          page,
+          "admin.account-services",
+        );
         return {
           warning: LAB_WARNING,
           account,
-          items: await listServices(client, account.id),
+          ...services,
         };
       });
     },
@@ -482,12 +830,19 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "billing.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const account = await loadAccountIdentity(client, params.clientAccountId);
+        const renewals = await listRenewalsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-renewals",
+        );
         return {
           warning: LAB_WARNING,
           account,
-          items: await listRenewals(client, account.id),
+          ...renewals,
         };
       });
     },
@@ -499,12 +854,19 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "services.read");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const account = await loadAccountIdentity(client, params.clientAccountId);
+        const cancellations = await listCancellationsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-cancellations",
+        );
         return {
           warning: LAB_WARNING,
           account,
-          items: await listCancellations(client, account.id),
+          ...cancellations,
         };
       });
     },
@@ -516,9 +878,15 @@ export async function registerClientAccountRoutes(
       const user = await requireUser(request, pool, config);
       await requireStaffPermission(pool, user, "support.tickets.manage");
       const params = z.object({ clientAccountId: canonicalUuid }).parse(request.params);
+      const page = parsePageQuery(request.query);
       return withReadSnapshot(pool, async (client) => {
         const account = await loadAccountIdentity(client, params.clientAccountId);
-        const items = await listTickets(client, account.id);
+        const tickets = await listTicketsPage(
+          client,
+          account.id,
+          page,
+          "admin.account-tickets",
+        );
         const internalCounts = await client.query<{
           ticket_id: string;
           internal_count: string;
@@ -529,8 +897,9 @@ export async function registerClientAccountRoutes(
            FROM support_tickets ticket
            LEFT JOIN support_ticket_messages message ON message.ticket_id = ticket.id
            WHERE ticket.client_account_id = $1
+             AND ticket.id = ANY($2::uuid[])
            GROUP BY ticket.id`,
-          [account.id],
+          [account.id, tickets.items.map((ticket) => ticket.id)],
         );
         const counts = new Map(
           internalCounts.rows.map((row) => [row.ticket_id, Number(row.internal_count)]),
@@ -538,7 +907,8 @@ export async function registerClientAccountRoutes(
         return {
           warning: LAB_WARNING,
           account,
-          items: items.map((item) => ({
+          ...tickets,
+          items: tickets.items.map((item) => ({
             ...item,
             internalMessageCount: counts.get(item.id) ?? 0,
           })),
