@@ -158,6 +158,12 @@ type AdminOperationContext = {
   action: AdminAccountAction;
   account: { id: string; name: string };
 };
+type AdminOperationScope = {
+  operationGeneration: number;
+  accessGeneration: number;
+  accountId: string | null;
+  accessFingerprint: string;
+};
 type AdminCancellationItem = {
   requestId: string;
   executionId: string;
@@ -835,6 +841,8 @@ export function App() {
   >(null);
   const cancellationCompletionIntentKeys = useRef(new Map<string, string>());
   const [manualReceiptClientAccountId, setManualReceiptClientAccountId] = useState("");
+  const manualReceiptClientAccountIdRef = useRef("");
+  manualReceiptClientAccountIdRef.current = manualReceiptClientAccountId;
   const [manualReceiptReference, setManualReceiptReference] = useState("");
   const [manualReceiptReceivedAt, setManualReceiptReceivedAt] = useState(
     defaultManualReceiptTime,
@@ -861,7 +869,6 @@ export function App() {
   const [manualReceiptReversalOutcome, setManualReceiptReversalOutcome] =
     useState<ManualReceiptReversalOutcome | null>(null);
   const manualReceiptReversalIntentKeys = useRef(new Map<string, string>());
-  const manualReceiptDefaultedForUser = useRef<string | null>(null);
   const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
   const [refundRecords, setRefundRecords] = useState<Record<string, RefundRecord>>({});
@@ -948,6 +955,8 @@ export function App() {
     staffPrincipalFingerprint,
     staffPermissionFingerprint,
   ].join("\u0002");
+  const staffAccessFingerprintRef = useRef(staffAccessFingerprint);
+  staffAccessFingerprintRef.current = staffAccessFingerprint;
   const previousStaffPrincipalFingerprint = useRef(staffPrincipalFingerprint);
   const canReadCustomerHistory =
     me?.verification.email === "passed" && me.restrictions.user === false;
@@ -1000,6 +1009,17 @@ export function App() {
     canManageRefunds,
     canManageStaffTickets,
   ]);
+  const manualReceiptContextFingerprint = [
+    route,
+    staffAccessFingerprint,
+    canManageManualReceipts ? "manual-receipt" : "no-manual-receipt",
+    canManageUnclaimedFunds ? "reversal" : "no-reversal",
+    adminOperationContext?.action ?? "unscoped",
+    adminOperationContext?.account.id ?? "unscoped",
+  ].join("\u0003");
+  const previousManualReceiptContextFingerprint = useRef(
+    manualReceiptContextFingerprint,
+  );
 
   const clearWorkspaceTransientState = useCallback(() => {
     setNoticeRaw("");
@@ -1042,6 +1062,7 @@ export function App() {
     setAdminCancellations([]);
     setCancellationCompletionReason("");
     setCancellationCompletionPendingId(null);
+    manualReceiptClientAccountIdRef.current = "";
     setManualReceiptClientAccountId("");
     setManualReceiptReference("");
     setManualReceiptReceivedAt(defaultManualReceiptTime());
@@ -1056,7 +1077,6 @@ export function App() {
     setManualReceiptReversalReason("");
     setManualReceiptReversalPendingId(null);
     setManualReceiptReversalOutcome(null);
-    manualReceiptDefaultedForUser.current = null;
     setUnclaimedFunds([]);
     setRefundCandidates([]);
     setRefundRecords({});
@@ -1190,19 +1210,53 @@ export function App() {
       (operationAccount !== null &&
         refund.clientAccountId === operationAccount.id),
   );
+  const captureAdminOperationScope = useCallback((): AdminOperationScope => ({
+    operationGeneration: adminOperationGeneration.current,
+    accessGeneration: adminAccessGeneration.current,
+    accountId: adminOperationContextRef.current?.account.id ?? null,
+    accessFingerprint: staffAccessFingerprintRef.current,
+  }), []);
   const adminOperationRequestIsCurrent = useCallback(
-    (operationGeneration: number, accessGeneration: number, clientAccountId: string) => {
+    (scope: AdminOperationScope, clientAccountId?: string) => {
       if (
-        operationGeneration !== adminOperationGeneration.current ||
-        accessGeneration !== adminAccessGeneration.current ||
-        activeRouteRef.current !== "/admin"
+        scope.operationGeneration !== adminOperationGeneration.current ||
+        scope.accessGeneration !== adminAccessGeneration.current ||
+        scope.accessFingerprint !== staffAccessFingerprintRef.current ||
+        activeRouteRef.current !== "/admin" ||
+        (adminOperationContextRef.current?.account.id ?? null) !== scope.accountId
       ) {
         return false;
       }
-      const context = adminOperationContextRef.current;
-      return context === null || context.account.id === clientAccountId;
+      return clientAccountId === undefined ||
+        scope.accountId === null ||
+        scope.accountId === clientAccountId;
     },
     [],
+  );
+  const currentManualReceiptScopeToken = useCallback((clientAccountId: string) => {
+    const context = adminOperationContextRef.current;
+    return [
+      activeRouteRef.current,
+      routeGenerationRef.current.toString(),
+      staffAccessFingerprintRef.current,
+      adminOperationGeneration.current.toString(),
+      context?.action ?? "unscoped",
+      context?.account.id ?? "unscoped",
+      manualReceiptRequestGeneration.current.toString(),
+      clientAccountId,
+    ].join("\u0004");
+  }, []);
+  const manualReceiptScopeIsCurrent = useCallback(
+    (scopeToken: string, clientAccountId: string) => {
+      if (
+        activeRouteRef.current !== "/admin" ||
+        manualReceiptClientAccountIdRef.current.trim().toLowerCase() !== clientAccountId
+      ) return false;
+      const context = adminOperationContextRef.current;
+      if (context && context.account.id !== clientAccountId) return false;
+      return scopeToken === currentManualReceiptScopeToken(clientAccountId);
+    },
+    [currentManualReceiptScopeToken],
   );
 
   useEffect(() => {
@@ -1281,21 +1335,32 @@ export function App() {
     return result.items;
   }, [me?.eligible, route]);
 
-  const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
+  const refreshAdminRenewals = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ): Promise<AdminRenewalItem[]> => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setAdminRenewals([]);
+      if (adminOperationRequestIsCurrent(scope)) setAdminRenewals([]);
       return [];
     }
+    if (!adminOperationRequestIsCurrent(scope)) return [];
     const result = await api<{ items: AdminRenewalItem[] }>(
       "/api/v1/admin/billing/renewals",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return [];
     setAdminRenewals(result.items);
     return result.items;
-  }, [canUseFullAdminWorkspace, route]);
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
   const refreshChargebackStatus = useCallback(async () => {
     if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
@@ -1324,35 +1389,37 @@ export function App() {
     void refreshMe();
   }, [refreshMe, route]);
 
-  useEffect(() => {
-    manualReceiptRequestGeneration.current += 1;
+  useLayoutEffect(() => {
     if (
-      route !== "/admin" ||
-      activeRouteRef.current !== "/admin" ||
-      !canManageManualReceipts ||
-      !me
-    ) {
-      manualReceiptDefaultedForUser.current = null;
-      setManualReceiptClientAccountId("");
-      setManualReceiptHistory([]);
-      setManualReceiptTarget(null);
-      setManualReceiptOutcome(null);
-      setManualReceiptReversalTargetId(null);
-      setManualReceiptReversalReason("");
-      setManualReceiptReversalOutcome(null);
-      return;
-    }
-    if (manualReceiptDefaultedForUser.current === me.id) return;
-    manualReceiptDefaultedForUser.current = me.id;
-    setManualReceiptClientAccountId("");
+      previousManualReceiptContextFingerprint.current ===
+      manualReceiptContextFingerprint
+    ) return;
+    previousManualReceiptContextFingerprint.current = manualReceiptContextFingerprint;
+    manualReceiptRequestGeneration.current += 1;
+    const context = adminOperationContextRef.current;
+    const scopedAccountId =
+      route === "/admin" &&
+      canManageManualReceipts &&
+      context?.action === "manual_receipt"
+        ? context.account.id
+        : "";
+    manualReceiptClientAccountIdRef.current = scopedAccountId;
+    setManualReceiptClientAccountId(scopedAccountId);
+    setManualReceiptReference("");
     setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
     setManualReceiptHistory([]);
     setManualReceiptTarget(null);
     setManualReceiptOutcome(null);
     setManualReceiptReversalTargetId(null);
     setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
     setManualReceiptReversalOutcome(null);
-  }, [canManageManualReceipts, me, route]);
+    setAdminPassword("");
+  }, [manualReceiptContextFingerprint]);
 
   useLayoutEffect(() => {
     adminAccessGeneration.current += 1;
@@ -1653,170 +1720,244 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [order, refreshBilling, refreshPaymentSettings, route]);
 
-  const refreshManualItems = useCallback(async () => {
+  const refreshManualItems = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canManageManualFulfillment
     ) {
-      setManualItems([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setManualItems([]);
+      return false;
     }
-    const accessGeneration = adminAccessGeneration.current;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
-    if (
-      accessGeneration !== adminAccessGeneration.current ||
-      activeRouteRef.current !== "/admin"
-    ) return;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setManualItems(result.items);
-  }, [canManageManualFulfillment, route, staffAccessFingerprint]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageManualFulfillment,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshAdminCancellations = useCallback(async () => {
+  const refreshAdminCancellations = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setAdminCancellations([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setAdminCancellations([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: AdminCancellationItem[] }>(
       "/api/v1/admin/services/cancellations",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setAdminCancellations(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshUnclaimedFunds = useCallback(async () => {
+  const refreshUnclaimedFunds = useCallback(async (
+    expectedScope?: AdminOperationScope,
+    additionalIsCurrent?: () => boolean,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
+    const requestIsCurrent = () =>
+      adminOperationRequestIsCurrent(scope) &&
+      (additionalIsCurrent?.() ?? true);
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setUnclaimedFunds([]);
-      return;
+      if (requestIsCurrent()) setUnclaimedFunds([]);
+      return false;
     }
+    if (!requestIsCurrent()) return false;
     const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
+    if (!requestIsCurrent()) return false;
     setUnclaimedFunds(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundCandidates = useCallback(async () => {
+  const refreshRefundCandidates = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canManageRefunds
     ) {
-      setRefundCandidates([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundCandidates([]);
+      return false;
     }
-    const accessGeneration = adminAccessGeneration.current;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
-    if (
-      accessGeneration !== adminAccessGeneration.current ||
-      activeRouteRef.current !== "/admin"
-    ) return;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundCandidates(result.items);
-  }, [canManageRefunds, route, staffAccessFingerprint]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundRecords = useCallback(async () => {
+  const refreshRefundRecords = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canManageRefunds
     ) {
-      setRefundRecords({});
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundRecords({});
+      return false;
     }
-    const accessGeneration = adminAccessGeneration.current;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundRecord[] }>("/api/v1/admin/refunds");
-    if (
-      accessGeneration !== adminAccessGeneration.current ||
-      activeRouteRef.current !== "/admin"
-    ) return;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundRecords(
       Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
     );
-  }, [canManageRefunds, route, staffAccessFingerprint]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundSecurityHolds = useCallback(async () => {
+  const refreshRefundSecurityHolds = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canManageRefunds
     ) {
-      setRefundSecurityHolds([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundSecurityHolds([]);
+      return false;
     }
-    const accessGeneration = adminAccessGeneration.current;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundSecurityHold[] }>(
       "/api/v1/admin/refund-security-holds",
     );
-    if (
-      accessGeneration !== adminAccessGeneration.current ||
-      activeRouteRef.current !== "/admin"
-    ) return;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundSecurityHolds(result.items);
-  }, [canManageRefunds, route, staffAccessFingerprint]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundDismissalCorrections = useCallback(async () => {
+  const refreshRefundDismissalCorrections = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canManageRefunds
     ) {
-      setRefundDismissalCorrections([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundDismissalCorrections([]);
+      return false;
     }
-    const accessGeneration = adminAccessGeneration.current;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundDismissalCorrection[] }>(
       "/api/v1/admin/refund-dismissal-corrections",
     );
-    if (
-      accessGeneration !== adminAccessGeneration.current ||
-      activeRouteRef.current !== "/admin"
-    ) return;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundDismissalCorrections(result.items);
-  }, [canManageRefunds, route, staffAccessFingerprint]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
+  const refreshRefundReceiptCapacityIncidents = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canManageRefunds
     ) {
-      setRefundReceiptCapacityIncidents([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundReceiptCapacityIncidents([]);
+      return false;
     }
-    const accessGeneration = adminAccessGeneration.current;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundReceiptCapacityIncident[] }>(
       "/api/v1/admin/refund-receipt-capacity-incidents",
     );
-    if (
-      accessGeneration !== adminAccessGeneration.current ||
-      activeRouteRef.current !== "/admin"
-    ) return;
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundReceiptCapacityIncidents(result.items);
-  }, [canManageRefunds, route, staffAccessFingerprint]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshAdminChargebacks = useCallback(async () => {
+  const refreshAdminChargebacks = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setAdminChargebacks([]);
-      setAdminUnclaimedChargebacks([]);
-      setAdminChargebackHolds([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) {
+        setAdminChargebacks([]);
+        setAdminUnclaimedChargebacks([]);
+        setAdminChargebackHolds([]);
+      }
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{
       items: AddFundsChargeback[];
       unclaimedChargebacks: AddFundsUnclaimedChargeback[];
       manualHolds: AddFundsChargebackHold[];
     }>("/api/v1/admin/add-funds-chargebacks");
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setAdminChargebacks(result.items);
     setAdminUnclaimedChargebacks(result.unclaimedChargebacks);
     setAdminChargebackHolds(result.manualHolds);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
   useEffect(() => {
     void Promise.all([
@@ -1856,17 +1997,13 @@ export function App() {
     );
     if (active.length === 0) return;
     const timer = window.setInterval(() => {
-      const operationGeneration = adminOperationGeneration.current;
-      const accessGeneration = adminAccessGeneration.current;
+      const operationScope = captureAdminOperationScope();
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       void Promise.all(
         active.map((refund) =>
           api<RefundRecord>(`/api/v1/admin/refunds/${refund.refundId}`).then((updated) => {
             if (
-              !adminOperationRequestIsCurrent(
-                operationGeneration,
-                accessGeneration,
-                refund.clientAccountId,
-              )
+              !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
             ) return false;
             setRefundRecords((current) => ({ ...current, [updated.refundId]: updated }));
             return true;
@@ -1876,14 +2013,12 @@ export function App() {
         .then((accepted) => {
           if (
             !accepted.some(Boolean) ||
-            operationGeneration !== adminOperationGeneration.current ||
-            accessGeneration !== adminAccessGeneration.current ||
-            activeRouteRef.current !== "/admin"
+            !adminOperationRequestIsCurrent(operationScope)
           ) return undefined;
           return Promise.all([
-            refreshRefundCandidates(),
-            refreshRefundSecurityHolds(),
-            refreshUnclaimedFunds(),
+            refreshRefundCandidates(operationScope),
+            refreshRefundSecurityHolds(operationScope),
+            refreshUnclaimedFunds(operationScope),
           ]);
         })
         .catch(() => undefined);
@@ -1891,6 +2026,7 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [
     refundRecords,
+    captureAdminOperationScope,
     refreshRefundCandidates,
     refreshRefundSecurityHolds,
     refreshUnclaimedFunds,
@@ -2297,6 +2433,7 @@ export function App() {
 
   async function runBillingAutomation() {
     if (!canUseFullAdminRoute || automationReason.trim().length < 10) return;
+    const operationScope = captureAdminOperationScope();
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2321,7 +2458,7 @@ export function App() {
         }),
       });
       setAutomationReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      await Promise.all([refreshRenewals(), refreshAdminRenewals(operationScope)]);
       setNotice(
         `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s), ${result.delinquencyDeferralsCreated} payment reconciliation hold(s).`,
       );
@@ -2339,6 +2476,7 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
     setError("");
     setRenewalHoldPendingId(renewal.renewalId);
     try {
@@ -2357,7 +2495,7 @@ export function App() {
         }),
       });
       setRenewalHoldReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      await Promise.all([refreshRenewals(), refreshAdminRenewals(operationScope)]);
       setNotice("The funded renewal Hold was reviewed and the exact service period was granted.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
@@ -2379,6 +2517,7 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
     const requestIdentity = JSON.stringify({
       caseId: delinquency.caseId,
       action,
@@ -2417,7 +2556,7 @@ export function App() {
       );
       manualSuspensionIntentKeys.current.delete(requestIdentity);
       setManualSuspensionReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      await Promise.all([refreshRenewals(), refreshAdminRenewals(operationScope)]);
       setNotice(
         action === "confirm_suspended"
           ? `Manual suspension recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`
@@ -2439,6 +2578,7 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
     const requestIdentity = JSON.stringify({
       executionId: item.executionId,
       expectedExecutionVersion: item.executionVersion,
@@ -2474,7 +2614,10 @@ export function App() {
       });
       cancellationCompletionIntentKeys.current.delete(requestIdentity);
       setCancellationCompletionReason("");
-      await Promise.all([refreshAdminCancellations(), refreshLatestOrder()]);
+      await Promise.all([
+        refreshAdminCancellations(operationScope),
+        refreshLatestOrder(),
+      ]);
       setNotice(
         `${outcome.replayed ? "Replayed" : "Recorded"} manual cycle-end termination: Core service ${outcome.serviceStatus}, execution ${outcome.executionStatus}. No Provider request was sent.`,
       );
@@ -2535,23 +2678,28 @@ export function App() {
     }
   }
 
-  async function fetchManualReceiptHistory(clientAccountId: string): Promise<{
+  async function fetchManualReceiptHistory(
+    clientAccountId: string,
+    scopeToken: string,
+  ): Promise<{
     clientAccount: { id: string; name: string };
     items: ManualReceiptItem[];
-  }> {
+  } | null> {
     if (
       !canManageManualReceiptsRoute ||
       activeRouteRef.current !== "/admin" ||
-      routeGenerationRef.current !== renderRouteGeneration
+      routeGenerationRef.current !== renderRouteGeneration ||
+      !manualReceiptScopeIsCurrent(scopeToken, clientAccountId)
     ) {
-      throw new Error("Manual receipt permission is required");
+      return null;
     }
-    return api<{
+    const result = await api<{
       clientAccount: { id: string; name: string };
       items: ManualReceiptItem[];
     }>(
       `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
     );
+    return manualReceiptScopeIsCurrent(scopeToken, clientAccountId) ? result : null;
   }
 
   async function loadManualReceiptHistory() {
@@ -2564,27 +2712,24 @@ export function App() {
     ) {
       return;
     }
-    const generation = ++manualReceiptRequestGeneration.current;
+    manualReceiptRequestGeneration.current += 1;
+    const scopeToken = currentManualReceiptScopeToken(clientAccountId);
     setError("");
     setManualReceiptPending(true);
     try {
-      const result = await fetchManualReceiptHistory(clientAccountId);
-      if (
-        generation !== manualReceiptRequestGeneration.current ||
-        activeRouteRef.current !== "/admin" ||
-        (adminOperationContext !== null && adminOperationContext.account.id !== clientAccountId)
-      ) return;
+      const result = await fetchManualReceiptHistory(clientAccountId, scopeToken);
+      if (!result || !manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setManualReceiptTarget(result.clientAccount);
       setManualReceiptHistory(result.items);
       setNotice(
         `Verified ${result.clientAccount.name} (${result.clientAccount.id}) and refreshed its manual receipt history.`,
       );
     } catch (caught) {
-      if (generation === manualReceiptRequestGeneration.current) {
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
         setError(caught instanceof Error ? caught.message : "Manual receipt history is unavailable");
       }
     } finally {
-      if (generation === manualReceiptRequestGeneration.current) {
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
         setManualReceiptPending(false);
       }
     }
@@ -2594,7 +2739,9 @@ export function App() {
     if (!canManageManualReceiptsRoute || manualReceiptPending || !manualReceiptFormReady) return;
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     if (operationAccount !== null && operationAccount.id !== clientAccountId) return;
-    const generation = ++manualReceiptRequestGeneration.current;
+    manualReceiptRequestGeneration.current += 1;
+    const scopeToken = currentManualReceiptScopeToken(clientAccountId);
+    const operationScope = captureAdminOperationScope();
     const payload = {
       reference: manualReceiptReference.trim(),
       receivedAt: new Date(manualReceiptReceivedAt).toISOString(),
@@ -2625,11 +2772,14 @@ export function App() {
         // The in-memory key still makes a retry in this page replay-safe.
       }
 
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setAdminPassword("");
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       const outcome = await api<ManualReceiptOutcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
         {
@@ -2643,11 +2793,7 @@ export function App() {
       } catch {
         // A successful Core response is authoritative even if browser storage is unavailable.
       }
-      if (
-        generation !== manualReceiptRequestGeneration.current ||
-        activeRouteRef.current !== "/admin" ||
-        (adminOperationContext !== null && adminOperationContext.account.id !== clientAccountId)
-      ) return;
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setManualReceiptOutcome(outcome);
       setManualReceiptReference("");
       setManualReceiptGrossMinor("10000");
@@ -2655,14 +2801,14 @@ export function App() {
       setManualReceiptReason("");
       setManualReceiptReceivedAt(defaultManualReceiptTime());
       const [historyRefresh, unclaimedRefresh] = await Promise.allSettled([
-        fetchManualReceiptHistory(clientAccountId),
-        refreshUnclaimedFunds(),
+        fetchManualReceiptHistory(clientAccountId, scopeToken),
+        refreshUnclaimedFunds(
+          operationScope,
+          () => manualReceiptScopeIsCurrent(scopeToken, clientAccountId),
+        ),
       ]);
-      if (
-        generation !== manualReceiptRequestGeneration.current ||
-        activeRouteRef.current !== "/admin"
-      ) return;
-      if (historyRefresh.status === "fulfilled") {
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
+      if (historyRefresh.status === "fulfilled" && historyRefresh.value) {
         setManualReceiptTarget(historyRefresh.value.clientAccount);
         setManualReceiptHistory(historyRefresh.value.items);
       }
@@ -2675,11 +2821,11 @@ export function App() {
         setError("The receipt was saved, but one of the administrator lists could not be refreshed.");
       }
     } catch (caught) {
-      if (generation === manualReceiptRequestGeneration.current) {
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
         setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
       }
     } finally {
-      if (generation === manualReceiptRequestGeneration.current) {
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
         setManualReceiptPending(false);
       }
     }
@@ -2701,7 +2847,9 @@ export function App() {
       return;
     }
     if (operationAccount !== null && operationAccount.id !== clientAccountId) return;
-    const generation = ++manualReceiptRequestGeneration.current;
+    manualReceiptRequestGeneration.current += 1;
+    const scopeToken = currentManualReceiptScopeToken(clientAccountId);
+    const operationScope = captureAdminOperationScope();
     const payload = {
       expectedFundReceiptId: receipt.fundReceiptId,
       expectedGrossAmountMinor: receipt.grossAmountMinor,
@@ -2733,11 +2881,14 @@ export function App() {
         // The in-memory key still protects a retry in this page.
       }
 
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setAdminPassword("");
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       const outcome = await api<ManualReceiptReversalOutcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/reversal`,
         {
@@ -2751,23 +2902,19 @@ export function App() {
       } catch {
         // Core's successful response is authoritative.
       }
-      if (
-        generation !== manualReceiptRequestGeneration.current ||
-        activeRouteRef.current !== "/admin" ||
-        (adminOperationContext !== null && adminOperationContext.account.id !== clientAccountId)
-      ) return;
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setManualReceiptReversalOutcome(outcome);
       setManualReceiptReversalTargetId(null);
       setManualReceiptReversalReason("");
       const [historyRefresh, unclaimedRefresh] = await Promise.allSettled([
-        fetchManualReceiptHistory(clientAccountId),
-        refreshUnclaimedFunds(),
+        fetchManualReceiptHistory(clientAccountId, scopeToken),
+        refreshUnclaimedFunds(
+          operationScope,
+          () => manualReceiptScopeIsCurrent(scopeToken, clientAccountId),
+        ),
       ]);
-      if (
-        generation !== manualReceiptRequestGeneration.current ||
-        activeRouteRef.current !== "/admin"
-      ) return;
-      if (historyRefresh.status === "fulfilled") {
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
+      if (historyRefresh.status === "fulfilled" && historyRefresh.value) {
         setManualReceiptTarget(historyRefresh.value.clientAccount);
         setManualReceiptHistory(historyRefresh.value.items);
       }
@@ -2780,11 +2927,11 @@ export function App() {
         setError("The reversal was saved, but one of the administrator lists could not be refreshed.");
       }
     } catch (caught) {
-      if (generation === manualReceiptRequestGeneration.current) {
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
         setError(caught instanceof Error ? caught.message : "Manual receipt could not be reversed");
       }
     } finally {
-      if (generation === manualReceiptRequestGeneration.current) {
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
         setManualReceiptReversalPendingId(null);
       }
     }
@@ -2795,8 +2942,8 @@ export function App() {
       !canManageManualFulfillmentRoute ||
       (operationAccount !== null && item.clientAccountId !== operationAccount.id)
     ) return;
-    const operationGeneration = adminOperationGeneration.current;
-    const accessGeneration = adminAccessGeneration.current;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
@@ -2804,11 +2951,7 @@ export function App() {
         body: JSON.stringify({ password: adminPassword }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setAdminPassword("");
       await api(`/api/v1/admin/services/${item.serviceId}/complete-manual`, {
@@ -2816,30 +2959,18 @@ export function App() {
         body: JSON.stringify({ reason: manualReason }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setAdminPassword("");
       setManualReason("");
-      await refreshManualItems();
+      await refreshManualItems(operationScope);
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setNotice("Manual service marked Ready for Service with an audited activation time.");
     } catch (caught) {
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) {
         setError(caught instanceof Error ? caught.message : "Manual fulfillment failed");
       }
@@ -2884,6 +3015,8 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const invoiceId =
       action === "allocate_invoice"
         ? fundResolutionInvoiceId || item.suggestedInvoiceId
@@ -2905,11 +3038,14 @@ export function App() {
     setError("");
     try {
       const idempotencyKey = await fundResolutionIdempotencyKey(requestIdentity);
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       const resolution = await api<{ replayed: boolean }>(
         `/api/v1/admin/funds/${item.receiptId}/resolutions`,
         {
@@ -2923,6 +3059,7 @@ export function App() {
           }),
         },
       );
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setNotice(
         resolution.replayed
           ? "This exact fund resolution was already recorded; no second money movement occurred."
@@ -2933,21 +3070,26 @@ export function App() {
       setFundResolutionMinor("");
       setFundResolutionReason("");
       const refreshResults = await Promise.allSettled([
-        refreshUnclaimedFunds(),
+        refreshUnclaimedFunds(operationScope),
         ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
       ]);
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       if (refreshResults.some((result) => result.status === "rejected")) {
         setError("The resolution was saved, but current balances could not be refreshed.");
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Fund resolution failed");
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Fund resolution failed");
+      }
     } finally {
       fundResolutionInFlight.current.delete(item.receiptId);
-      setFundResolutionPendingReceiptIds((current) => {
-        const next = new Set(current);
-        next.delete(item.receiptId);
-        return next;
-      });
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setFundResolutionPendingReceiptIds((current) => {
+          const next = new Set(current);
+          next.delete(item.receiptId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2959,6 +3101,8 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const amountMinor = fundReturnAmountMode === "partial" ? fundReturnAmountMinor : null;
     const reason = fundReturnReason.trim();
     const identity = JSON.stringify({
@@ -2989,11 +3133,14 @@ export function App() {
       } catch {
         // The in-memory key still makes repeated clicks replay the same request.
       }
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       const refund = await api<RefundRecord>(
         `/api/v1/admin/funds/${item.receiptId}/refunds`,
         {
@@ -3014,6 +3161,7 @@ export function App() {
       } catch {
         // A retained key is safe: a later retry replays instead of returning funds twice.
       }
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
       setNotice(
         refund.replayed
@@ -3022,16 +3170,24 @@ export function App() {
       );
       setFundReturnAmountMinor("");
       setFundReturnReason("");
-      await Promise.all([refreshUnclaimedFunds(), refreshRefundRecords()]);
+      await Promise.all([
+        refreshUnclaimedFunds(operationScope),
+        refreshRefundRecords(operationScope),
+      ]);
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Unclaimed-funds return failed");
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Unclaimed-funds return failed");
+      }
     } finally {
       refundInFlight.current.delete(item.receiptId);
-      setRefundPendingReceiptIds((current) => {
-        const next = new Set(current);
-        next.delete(item.receiptId);
-        return next;
-      });
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setRefundPendingReceiptIds((current) => {
+          const next = new Set(current);
+          next.delete(item.receiptId);
+          return next;
+        });
+      }
     }
   }
 
@@ -3044,8 +3200,8 @@ export function App() {
       refundInFlight.current.has(item.receiptId) ||
       (operationAccount !== null && item.clientAccountId !== operationAccount.id)
     ) return;
-    const operationGeneration = adminOperationGeneration.current;
-    const accessGeneration = adminAccessGeneration.current;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const amountMode = destination === "none" ? "none" : refundAmountMode;
     const amountMinor =
       destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
@@ -3084,11 +3240,7 @@ export function App() {
         body: JSON.stringify({ password: adminPassword }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setAdminPassword("");
       const refund = await api<RefundRecord>(
@@ -3114,11 +3266,7 @@ export function App() {
         // A retained key is safe: a later retry will replay instead of moving money twice.
       }
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
       setNotice(
@@ -3133,34 +3281,22 @@ export function App() {
       setRefundReason("");
       setRefundAmountMinor("");
       await Promise.all([
-        refreshRefundCandidates(),
+        refreshRefundCandidates(operationScope),
         ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
       ]);
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
     } catch (caught) {
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) {
         setError(caught instanceof Error ? caught.message : "Refund decision failed");
       }
     } finally {
       refundInFlight.current.delete(item.receiptId);
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) {
         setRefundPendingReceiptIds((current) => {
           const next = new Set(current);
@@ -3183,8 +3319,8 @@ export function App() {
       refundAdjudicationInFlight.current.has(hold.holdId) ||
       (operationAccount !== null && hold.clientAccountId !== operationAccount.id)
     ) return;
-    const operationGeneration = adminOperationGeneration.current;
-    const accessGeneration = adminAccessGeneration.current;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
     refundAdjudicationInFlight.current.add(hold.holdId);
@@ -3209,11 +3345,7 @@ export function App() {
         body: JSON.stringify({ password: adminPassword }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          hold.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
       ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
@@ -3234,11 +3366,7 @@ export function App() {
         // A retained key can only replay the same immutable adjudication.
       }
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          hold.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
       ) return;
       setNotice(
         result.replayed
@@ -3251,37 +3379,25 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundSecurityHolds(),
-        refreshRefundDismissalCorrections(),
-        refreshRefundReceiptCapacityIncidents(),
-        refreshRefundCandidates(),
-        refreshRefundRecords(),
+        refreshRefundSecurityHolds(operationScope),
+        refreshRefundDismissalCorrections(operationScope),
+        refreshRefundReceiptCapacityIncidents(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundRecords(operationScope),
       ]);
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          hold.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
       ) return;
     } catch (caught) {
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          hold.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
       ) {
         setError(caught instanceof Error ? caught.message : "Refund hold adjudication failed");
       }
     } finally {
       refundAdjudicationInFlight.current.delete(hold.holdId);
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          hold.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
       ) {
         setRefundAdjudicationPendingIds((current) => {
           const next = new Set(current);
@@ -3302,8 +3418,8 @@ export function App() {
       (operationAccount !== null &&
         refund.clientAccountId !== operationAccount.id)
     ) return;
-    const operationGeneration = adminOperationGeneration.current;
-    const accessGeneration = adminAccessGeneration.current;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       refundId: refund.refundId,
@@ -3333,11 +3449,7 @@ export function App() {
         body: JSON.stringify({ password: adminPassword }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          refund.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
       ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
@@ -3358,11 +3470,7 @@ export function App() {
         // A retained key can only replay this same manual action.
       }
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          refund.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
       ) return;
       setNotice(
         result.replayed
@@ -3373,35 +3481,23 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundRecords(),
-        refreshRefundCandidates(),
-        refreshRefundSecurityHolds(),
+        refreshRefundRecords(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundSecurityHolds(operationScope),
       ]);
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          refund.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
       ) return;
     } catch (caught) {
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          refund.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
       ) {
         setError(caught instanceof Error ? caught.message : "Manual refund action failed");
       }
     } finally {
       refundManualActionInFlight.current.delete(refund.refundId);
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          refund.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
       ) {
         setRefundManualActionPendingIds((current) => {
           const next = new Set(current);
@@ -3418,8 +3514,8 @@ export function App() {
       refundCorrectionInFlight.current.has(item.adjudicationId) ||
       (operationAccount !== null && item.clientAccountId !== operationAccount.id)
     ) return;
-    const operationGeneration = adminOperationGeneration.current;
-    const accessGeneration = adminAccessGeneration.current;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       adjudicationId: item.adjudicationId,
@@ -3448,11 +3544,7 @@ export function App() {
         body: JSON.stringify({ password: adminPassword }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
@@ -3472,11 +3564,7 @@ export function App() {
         // A retained key can only replay the same immutable correction.
       }
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setNotice(
         result.replayed
@@ -3485,37 +3573,25 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundDismissalCorrections(),
-        refreshRefundReceiptCapacityIncidents(),
-        refreshRefundSecurityHolds(),
-        refreshRefundCandidates(),
-        refreshRefundRecords(),
+        refreshRefundDismissalCorrections(operationScope),
+        refreshRefundReceiptCapacityIncidents(operationScope),
+        refreshRefundSecurityHolds(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundRecords(operationScope),
       ]);
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
     } catch (caught) {
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) {
         setError(caught instanceof Error ? caught.message : "Refund dismissal correction failed");
       }
     } finally {
       refundCorrectionInFlight.current.delete(item.adjudicationId);
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          item.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) {
         setRefundCorrectionPendingIds((current) => {
           const next = new Set(current);
@@ -3536,8 +3612,8 @@ export function App() {
     ) {
       return;
     }
-    const operationGeneration = adminOperationGeneration.current;
-    const accessGeneration = adminAccessGeneration.current;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       incidentId: incident.incidentId,
@@ -3569,11 +3645,7 @@ export function App() {
         body: JSON.stringify({ password: adminPassword }),
       });
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          incident.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
       ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
@@ -3594,11 +3666,7 @@ export function App() {
         // A retained key can only replay the same acknowledgement.
       }
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          incident.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
       ) return;
       setNotice(
         result.replayed
@@ -3607,24 +3675,16 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundReceiptCapacityIncidents(),
-        refreshRefundCandidates(),
-        refreshRefundRecords(),
+        refreshRefundReceiptCapacityIncidents(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundRecords(operationScope),
       ]);
       if (
-        !adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          incident.clientAccountId,
-        )
+        !adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
       ) return;
     } catch (caught) {
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          incident.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
       ) {
         setError(
           caught instanceof Error
@@ -3635,11 +3695,7 @@ export function App() {
     } finally {
       refundCapacityAcknowledgementInFlight.current.delete(incident.incidentId);
       if (
-        adminOperationRequestIsCurrent(
-          operationGeneration,
-          accessGeneration,
-          incident.clientAccountId,
-        )
+        adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
       ) {
         setRefundCapacityAcknowledgementPendingIds((current) => {
           const next = new Set(current);
@@ -3657,6 +3713,7 @@ export function App() {
     setAdminOperationContext(null);
     setAdminPassword("");
     setManualReason("");
+    manualReceiptClientAccountIdRef.current = "";
     setManualReceiptClientAccountId("");
     setManualReceiptReference("");
     setManualReceiptReceivedAt(defaultManualReceiptTime());
@@ -3703,6 +3760,7 @@ export function App() {
     const context = { action, account };
     adminOperationContextRef.current = context;
     setAdminOperationContext(context);
+    manualReceiptClientAccountIdRef.current = account.id;
     setManualReceiptClientAccountId(account.id);
     let selector = "";
     if (action === "manual_receipt") {
@@ -4044,6 +4102,7 @@ export function App() {
           <TicketsPanel
             mode="staff"
             canManageTickets={canManageStaffTickets}
+            staffAccessFingerprint={staffAccessFingerprint}
             staffAccountContext={operationAccount}
             requireStaffAccountContext={!canUseFullAdminWorkspace && canViewAccount360}
             me={me}
@@ -5131,13 +5190,22 @@ export function App() {
                     value={manualReceiptClientAccountId}
                     onChange={(event) => {
                       manualReceiptRequestGeneration.current += 1;
+                      manualReceiptClientAccountIdRef.current = event.target.value;
                       setManualReceiptClientAccountId(event.target.value);
+                      setManualReceiptReference("");
+                      setManualReceiptReceivedAt(defaultManualReceiptTime());
+                      setManualReceiptGrossMinor("10000");
+                      setManualReceiptFeeMinor("0");
+                      setManualReceiptReason("");
+                      setManualReceiptPending(false);
                       setManualReceiptHistory([]);
                       setManualReceiptTarget(null);
                       setManualReceiptOutcome(null);
                       setManualReceiptReversalTargetId(null);
                       setManualReceiptReversalReason("");
+                      setManualReceiptReversalPendingId(null);
                       setManualReceiptReversalOutcome(null);
+                      setAdminPassword("");
                     }}
                     placeholder="Client Account UUID"
                   />
@@ -5335,17 +5403,47 @@ export function App() {
                               clientAccountId={manualReceiptTarget.id}
                               receipt={receipt}
                               password={adminPassword}
+                              scopeToken={currentManualReceiptScopeToken(
+                                manualReceiptTarget.id,
+                              )}
                               disabled={
                                 manualReceiptPending ||
                                 manualReceiptReversalPendingId !== null
                               }
-                              onPasswordConsumed={() => setAdminPassword("")}
-                              onRefresh={async () => {
+                              isScopeCurrent={(scopeToken) =>
+                                manualReceiptScopeIsCurrent(
+                                  scopeToken,
+                                  manualReceiptTarget.id,
+                                )}
+                              onPasswordConsumed={(scopeToken) => {
+                                if (
+                                  manualReceiptScopeIsCurrent(
+                                    scopeToken,
+                                    manualReceiptTarget.id,
+                                  )
+                                ) setAdminPassword("");
+                              }}
+                              onRefresh={async (scopeToken) => {
+                                if (
+                                  !manualReceiptScopeIsCurrent(
+                                    scopeToken,
+                                    manualReceiptTarget.id,
+                                  )
+                                ) return false;
                                 const refreshed = await fetchManualReceiptHistory(
                                   manualReceiptTarget.id,
+                                  scopeToken,
                                 );
+                                if (
+                                  !refreshed ||
+                                  !manualReceiptScopeIsCurrent(
+                                    scopeToken,
+                                    manualReceiptTarget.id,
+                                  )
+                                ) return false;
                                 setManualReceiptTarget(refreshed.clientAccount);
                                 setManualReceiptHistory(refreshed.items);
+                                return true;
                               }}
                               onNotice={setNotice}
                               onError={setError}

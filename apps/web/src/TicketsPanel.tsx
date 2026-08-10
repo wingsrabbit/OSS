@@ -66,6 +66,11 @@ type ScopedStaffTicketsResponse = {
   hasMore?: boolean;
   nextCursor?: string | null;
 };
+type StaffRequestScope = {
+  generation: number;
+  token: string;
+  accountId: string | null;
+};
 
 type ServiceOption = { id: string; productName: string; status: string };
 
@@ -83,6 +88,7 @@ function surfaceIsActive(surface: "customer" | "staff"): boolean {
 export function TicketsPanel({
   mode,
   canManageTickets = false,
+  staffAccessFingerprint = "",
   staffAccountContext = null,
   requireStaffAccountContext = false,
   me,
@@ -92,6 +98,7 @@ export function TicketsPanel({
 }: {
   mode: "customer" | "staff";
   canManageTickets?: boolean;
+  staffAccessFingerprint?: string;
   staffAccountContext?: { id: string; name: string } | null;
   requireStaffAccountContext?: boolean;
   me: Viewer | null;
@@ -110,19 +117,41 @@ export function TicketsPanel({
   const [customerReply, setCustomerReply] = useState("");
   const [staffReply, setStaffReply] = useState("");
   const [pending, setPending] = useState(false);
+  const staffScopeToken = [
+    mode,
+    staffAccessFingerprint,
+    canManageTickets ? "allowed" : "denied",
+    requireStaffAccountContext ? "context-required" : "context-optional",
+    staffAccountContext?.id ?? "unscoped",
+  ].join("\u0000");
   const staffRequestGeneration = useRef(0);
+  const staffRefreshSequence = useRef(0);
+  const activeStaffScopeToken = useRef(staffScopeToken);
   const activeStaffAccountId = useRef<string | null>(staffAccountContext?.id ?? null);
 
   useLayoutEffect(() => {
     const accountId = staffAccountContext?.id ?? null;
-    if (activeStaffAccountId.current === accountId) return;
+    if (activeStaffScopeToken.current === staffScopeToken) return;
+    activeStaffScopeToken.current = staffScopeToken;
     activeStaffAccountId.current = accountId;
     staffRequestGeneration.current += 1;
+    staffRefreshSequence.current += 1;
     setStaffTickets([]);
     setStaffSelected(null);
     setStaffReply("");
     setPending(false);
-  }, [staffAccountContext?.id]);
+  }, [staffAccountContext?.id, staffScopeToken]);
+
+  const captureStaffScope = useCallback((): StaffRequestScope => ({
+    generation: staffRequestGeneration.current,
+    token: activeStaffScopeToken.current,
+    accountId: activeStaffAccountId.current,
+  }), []);
+  const staffScopeIsCurrent = useCallback((scope: StaffRequestScope) =>
+    scope.generation === staffRequestGeneration.current &&
+    scope.token === activeStaffScopeToken.current &&
+    scope.accountId === activeStaffAccountId.current &&
+    surfaceIsActive("staff"), []);
 
   const refreshCustomer = useCallback(async () => {
     if (mode !== "customer" || !surfaceIsActive("customer") || !me?.eligible) {
@@ -140,21 +169,24 @@ export function TicketsPanel({
     setServices(serviceResult.items);
   }, [me?.eligible, me?.id, mode]);
 
-  const refreshStaff = useCallback(async () => {
+  const refreshStaff = useCallback(async (expectedScope?: StaffRequestScope) => {
     const accountId = staffAccountContext?.id ?? null;
+    const scope = expectedScope ?? captureStaffScope();
     if (
       mode !== "staff" ||
       !surfaceIsActive("staff") ||
-      !me?.staff ||
       !canManageTickets ||
-      (requireStaffAccountContext && !accountId)
+      (requireStaffAccountContext && !accountId) ||
+      !staffScopeIsCurrent(scope) ||
+      scope.accountId !== accountId
     ) {
-      staffRequestGeneration.current += 1;
-      setStaffTickets([]);
-      setStaffSelected(null);
-      return;
+      if (staffScopeIsCurrent(scope)) {
+        setStaffTickets([]);
+        setStaffSelected(null);
+      }
+      return false;
     }
-    const generation = ++staffRequestGeneration.current;
+    const refreshSequence = ++staffRefreshSequence.current;
     try {
       const items = accountId
         ? await api<ScopedStaffTicketsResponse>(
@@ -178,36 +210,43 @@ export function TicketsPanel({
             "/api/v1/admin/tickets",
           ).then((result) => result.items);
       if (
-        generation !== staffRequestGeneration.current ||
-        !surfaceIsActive("staff") ||
-        activeStaffAccountId.current !== accountId
-      ) return;
+        !staffScopeIsCurrent(scope) ||
+        refreshSequence !== staffRefreshSequence.current
+      ) return false;
       setStaffTickets(items);
+      return true;
     } catch (caught) {
       if (
-        generation !== staffRequestGeneration.current ||
-        !surfaceIsActive("staff") ||
-        activeStaffAccountId.current !== accountId
-      ) return;
-      throw caught;
+        !staffScopeIsCurrent(scope) ||
+        refreshSequence !== staffRefreshSequence.current
+      ) return false;
+      onError(caught instanceof Error ? caught.message : "Tickets could not be loaded");
+      return false;
     }
   }, [
     canManageTickets,
-    me?.id,
-    me?.staff,
+    captureStaffScope,
     mode,
+    onError,
     requireStaffAccountContext,
+    staffAccessFingerprint,
     staffAccountContext?.id,
+    staffScopeIsCurrent,
   ]);
 
   useEffect(() => {
-    void (mode === "customer" ? refreshCustomer() : refreshStaff()).catch((caught: unknown) =>
-      onError(caught instanceof Error ? caught.message : "Tickets could not be loaded"),
-    );
+    if (mode === "customer") {
+      void refreshCustomer().catch((caught: unknown) =>
+        onError(caught instanceof Error ? caught.message : "Tickets could not be loaded"),
+      );
+    } else {
+      void refreshStaff();
+    }
   }, [mode, onError, refreshCustomer, refreshStaff]);
 
   useEffect(() => () => {
     staffRequestGeneration.current += 1;
+    staffRefreshSequence.current += 1;
   }, []);
 
   if (mode === "customer" && !me?.eligible) return null;
@@ -283,25 +322,20 @@ export function TicketsPanel({
     if (
       mode !== "staff" ||
       !surfaceIsActive("staff") ||
-      !me?.staff ||
       !canManageTickets ||
       (requireStaffAccountContext && !accountId)
     ) return;
-    const generation = staffRequestGeneration.current;
+    const scope = captureStaffScope();
+    if (!staffScopeIsCurrent(scope) || scope.accountId !== accountId) return;
     try {
       const detail = await api<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`);
       if (
-        generation !== staffRequestGeneration.current ||
-        !surfaceIsActive("staff") ||
-        activeStaffAccountId.current !== accountId ||
+        !staffScopeIsCurrent(scope) ||
         (accountId !== null && detail.ticket.clientAccount.id !== accountId)
       ) return;
       setStaffSelected(detail);
     } catch (caught) {
-      if (
-        generation === staffRequestGeneration.current &&
-        activeStaffAccountId.current === accountId
-      ) {
+      if (staffScopeIsCurrent(scope)) {
         onError(caught instanceof Error ? caught.message : "Staff ticket could not be loaded");
       }
     }
@@ -312,7 +346,6 @@ export function TicketsPanel({
     if (
       mode !== "staff" ||
       !surfaceIsActive("staff") ||
-      !me?.staff ||
       !canManageTickets ||
       !staffSelected ||
       (requireStaffAccountContext && !accountId) ||
@@ -320,7 +353,8 @@ export function TicketsPanel({
       staffReply.trim().length === 0 ||
       pending
     ) return;
-    const generation = staffRequestGeneration.current;
+    const scope = captureStaffScope();
+    if (!staffScopeIsCurrent(scope) || scope.accountId !== accountId) return;
     setPending(true);
     try {
       const updated = await api<StaffTicketDetail>(
@@ -331,18 +365,12 @@ export function TicketsPanel({
         },
       );
       if (
-        generation !== staffRequestGeneration.current ||
-        !surfaceIsActive("staff") ||
-        activeStaffAccountId.current !== accountId ||
+        !staffScopeIsCurrent(scope) ||
         (accountId !== null && updated.ticket.clientAccount.id !== accountId)
       ) return;
       setStaffReply("");
       setStaffSelected(updated);
-      await refreshStaff();
-      if (
-        !surfaceIsActive("staff") ||
-        activeStaffAccountId.current !== accountId
-      ) return;
+      if (!await refreshStaff(scope) || !staffScopeIsCurrent(scope)) return;
       onNotice(
         kind === "internal_note"
           ? locale === "zh-CN"
@@ -353,19 +381,11 @@ export function TicketsPanel({
             : "Public reply sent.",
       );
     } catch (caught) {
-      if (
-        generation === staffRequestGeneration.current &&
-        activeStaffAccountId.current === accountId
-      ) {
+      if (staffScopeIsCurrent(scope)) {
         onError(caught instanceof Error ? caught.message : "Staff message could not be saved");
       }
     } finally {
-      if (
-        surfaceIsActive("staff") &&
-        activeStaffAccountId.current === accountId
-      ) {
-        setPending(false);
-      }
+      if (staffScopeIsCurrent(scope)) setPending(false);
     }
   }
 
