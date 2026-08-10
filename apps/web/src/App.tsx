@@ -14,7 +14,12 @@ import {
   ManualReceiptOutflowPanel,
   type ManualReceiptOriginalSourceOutflow,
 } from "./ManualReceiptOutflows.js";
+import {
+  AdminAccount360,
+  type AdminAccountAction,
+} from "./AdminAccount360.js";
 import { ApiError, api, hardResetSession } from "./api.js";
+import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
 import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
@@ -47,6 +52,7 @@ type Me = {
   clientAccountId: string;
   membershipRole: string;
   verification: { email: "pending" | "passed" };
+  restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
@@ -918,13 +924,29 @@ export function App() {
     () => parseStaffPermissions(me?.staff?.permissions),
     [me?.staff?.permissions],
   );
+  const canReadCustomerHistory =
+    me?.verification.email === "passed" && me.restrictions.user === false;
   const eligibleStaff = me?.eligible === true && me.staff !== null;
   const canManageStaffTickets =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
   const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
-  const canOpenAdminWorkspace = canManageStaffTickets || canUseFullAdminWorkspace;
+  const canViewAccount360 =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("accounts.view"));
+  const canOpenAdminWorkspace =
+    canManageStaffTickets || canViewAccount360 || canUseFullAdminWorkspace;
   const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
+  const account360Actions = useMemo<ReadonlySet<AdminAccountAction>>(() => {
+    const actions = new Set<AdminAccountAction>();
+    if (canUseFullAdminWorkspace) {
+      actions.add("manual_receipt");
+      actions.add("refund");
+      actions.add("manual_fulfillment");
+    }
+    if (canManageStaffTickets) actions.add("ticket");
+    return actions;
+  }, [canManageStaffTickets, canUseFullAdminWorkspace]);
 
   const clearWorkspaceTransientState = useCallback(() => {
     setNoticeRaw("");
@@ -3053,6 +3075,37 @@ export function App() {
     }
   }
 
+  function openAdminAccountAction(
+    action: AdminAccountAction,
+    account: { id: string; name: string },
+  ) {
+    if (route !== "/admin" || activeRouteRef.current !== "/admin") return;
+    let selector = "";
+    if (action === "manual_receipt") {
+      setManualReceiptClientAccountId(account.id);
+      setManualReceiptHistory([]);
+      setManualReceiptTarget(null);
+      setManualReceiptOutcome(null);
+      setManualReceiptReversalTargetId(null);
+      setManualReceiptReversalReason("");
+      setManualReceiptReversalOutcome(null);
+      selector = '[aria-label="Record manual receipt"]';
+      setNotice(`Manual receipt target prefilled for ${account.name}. Verify the account and load its history before recording money.`);
+    } else if (action === "refund") {
+      selector = '[aria-label="Manual refunds"]';
+      setNotice(`Refund operations opened for review. Select only a receipt belonging to ${account.name}.`);
+    } else if (action === "ticket") {
+      selector = '[aria-label="Staff support tickets"]';
+      setNotice(`Ticket operations opened. Use the Client Account name ${account.name} to select its conversation.`);
+    } else {
+      selector = '[aria-label="Manual fulfillment queue"]';
+      setNotice(`Manual fulfillment opened. Select only a service belonging to ${account.name}.`);
+    }
+    requestAnimationFrame(() => {
+      document.querySelector(selector)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
   return (
     <>
       <div className="lab-banner">{LAB_BANNER}</div>
@@ -3195,12 +3248,24 @@ export function App() {
             ) : me ? (
               <>
                 <h2>{me.email}</h2>
-                <p>{me.eligible ? text.ready : text.pending}</p>
+                <p>
+                  {me.eligible
+                    ? text.ready
+                    : me.verification.email !== "passed"
+                      ? text.pending
+                      : me.restrictions.user
+                        ? locale === "zh-CN"
+                          ? "当前用户已受限。"
+                          : "This user is restricted."
+                        : locale === "zh-CN"
+                          ? "客户账户已受限；已保存的业务历史仍可读取。"
+                          : "The Client Account is restricted; saved business history remains readable."}
+                </p>
                 <div className="status-row">
                   <span>Email verification</span>
                   <strong>{me.verification.email}</strong>
                 </div>
-                {!me.eligible && (
+                {me.verification.email !== "passed" && (
                   <>
                     <button className="primary" onClick={openLabMailbox}>
                       Open my Mock Provider mailbox
@@ -3254,11 +3319,23 @@ export function App() {
         {route === "/customer" && !me?.eligible && (
           <section className="route-access" aria-label="Customer access status">
             <p className="eyebrow">Customer access</p>
-            <h2>{me ? "Verify your email to continue" : "Sign in to open the customer workspace"}</h2>
+            <h2>
+              {!me
+                ? "Sign in to open the customer workspace"
+                : me.verification.email !== "passed"
+                  ? "Verify your email to continue"
+                  : me.restrictions.user
+                    ? "This user is restricted"
+                    : "Purchases and account changes are unavailable"}
+            </h2>
             <p>
-              {me
-                ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
-                : "Use the account forms above. Successful sign-in returns directly to this customer page."}
+              {!me
+                ? "Use the account forms above. Successful sign-in returns directly to this customer page."
+                : me.verification.email !== "passed"
+                  ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
+                  : me.restrictions.user
+                    ? "This user cannot open account history or perform customer actions while the user restriction remains active."
+                    : "The Client Account restriction prevents new purchases and customer actions, but its saved business history remains readable below."}
             </p>
           </section>
         )}
@@ -3311,6 +3388,29 @@ export function App() {
           </section>
         )}
 
+        {route === "/customer" && sessionResolved && canReadCustomerHistory && me && (
+          <CustomerBusinessHistory
+            active={route === "/customer"}
+            canReadHistory={canReadCustomerHistory}
+            clientAccountId={me.clientAccountId}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canViewAccount360 && me && (
+          <AdminAccount360
+            active={route === "/admin"}
+            permissions={staffPermissions}
+            availableActions={account360Actions}
+            onAction={openAdminAccountAction}
+            onRefreshAccess={async () => { await refreshMe(); }}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
         {route === "/customer" && (
           <TicketsPanel
             mode="customer"
@@ -3332,13 +3432,14 @@ export function App() {
           />
         )}
 
-        {route === "/admin" && canManageStaffTickets && !canUseFullAdminWorkspace && (
+        {route === "/admin" && canOpenAdminWorkspace && !canUseFullAdminWorkspace && (
           <section className="route-access" data-testid="limited-admin-scope">
             <p className="eyebrow">Permission-scoped Staff workspace</p>
-            <h2>Ticket support only</h2>
+            <h2>Permission-scoped operations</h2>
             <p>
-              This Staff session can manage support tickets. Billing, refunds, money and service
-              administration remain unmounted because wildcard permission is not present.
+              This Staff session loads only its explicitly permitted Account 360 and support
+              panels. Billing mutations, refunds, money and service administration remain
+              unmounted unless their operational workspace is available.
             </p>
           </section>
         )}
@@ -4295,10 +4396,12 @@ export function App() {
                 </div>
               )}
             </div>
-            {manualItems.length === 0 ? (
-              <p className="muted">No paid manual services are waiting.</p>
-            ) : (
-              <>
+            <div className="admin-subsection" aria-label="Manual fulfillment queue">
+              <h3>Manual fulfillment queue</h3>
+              {manualItems.length === 0 ? (
+                <p className="muted">No paid manual services are waiting.</p>
+              ) : (
+                <>
                 <div className="inline-form admin-confirm">
                   <input
                     value={manualReason}
@@ -4324,8 +4427,9 @@ export function App() {
                     </button>
                   </article>
                 ))}
-              </>
-            )}
+                </>
+              )}
+            </div>
             <div className="admin-subsection" aria-label="Record manual receipt">
               <div>
                 <p className="eyebrow">Audited offline or manual money fact</p>

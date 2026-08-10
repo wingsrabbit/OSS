@@ -9,6 +9,7 @@ type MockViewer = {
   clientAccountId: string;
   membershipRole: string;
   verification: { email: "passed" };
+  restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
@@ -17,10 +18,12 @@ function mockViewer({
   email,
   eligible = true,
   permissions = null,
+  restrictions = { user: false, clientAccount: false },
 }: {
   email: string;
   eligible?: boolean;
   permissions?: unknown;
+  restrictions?: { user: boolean; clientAccount: boolean };
 }): MockViewer {
   return {
     id: "00000000-0000-4000-8000-000000000001",
@@ -29,6 +32,7 @@ function mockViewer({
     clientAccountId: "00000000-0000-4000-8000-000000000002",
     membershipRole: "owner",
     verification: { email: "passed" },
+    restrictions,
     eligible,
     staff: permissions === null ? null : { roles: ["support"], permissions },
   };
@@ -112,6 +116,27 @@ async function installMockApi(
     }
     if (path === "/api/v1/orders") {
       await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (path === "/api/v1/customer/business-history") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          account: {
+            id: viewer?.clientAccountId ?? "",
+            name: "Synthetic route account",
+          },
+          orders: [],
+          invoices: [],
+          payments: [],
+          credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+          refunds: [],
+          services: [],
+          renewals: [],
+          cancellations: [],
+          tickets: [],
+        },
+      });
       return;
     }
     if (path === "/api/v1/billing/summary") {
@@ -465,11 +490,699 @@ test("limited ticket Staff mounts only its permitted panel and fetch", async ({ 
 
   await page.goto("/admin");
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toBeVisible();
-  await expect(page.getByTestId("limited-admin-scope")).toContainText("Ticket support only");
+  await expect(page.getByTestId("limited-admin-scope")).toContainText("Permission-scoped operations");
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
   await expect(page.getByTestId("admin-access-restricted")).toHaveCount(0);
   const adminPaths = [...new Set(requests.filter((path) => path.startsWith("/api/v1/admin/")))];
   expect(adminPaths).toEqual(["/api/v1/admin/tickets"]);
+});
+
+test("Client Account restriction keeps verified customer history readable while writes stay unavailable", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "account-restricted-history@example.invalid",
+      eligible: false,
+      restrictions: { user: false, clientAccount: true },
+    }),
+  );
+
+  await page.goto("/customer");
+  await expect(page.getByTestId("customer-business-history")).toBeVisible();
+  await expect(page.getByTestId("history-account")).toContainText("Synthetic route account");
+  await expect(page.getByRole("heading", { name: "Purchases and account changes are unavailable" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open my Mock Provider mailbox" })).toHaveCount(0);
+  expect(requests).toContain("/api/v1/customer/business-history");
+  expect(requests.filter((path) => path === "/api/v1/orders")).toEqual([]);
+});
+
+test("user restriction unmounts customer history without issuing its request", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "user-restricted-history@example.invalid",
+      eligible: false,
+      restrictions: { user: true, clientAccount: false },
+    }),
+  );
+
+  await page.goto("/customer");
+  await expect(page.getByRole("heading", { name: "This user is restricted" })).toBeVisible();
+  await expect(page.getByTestId("customer-business-history")).toHaveCount(0);
+  expect(requests.filter((path) => path === "/api/v1/customer/business-history")).toEqual([]);
+});
+
+test("changing Client Account clears old history before the new request and ignores the late old response", async ({ page }) => {
+  const accountAId = "00000000-0000-4000-8000-0000000000a1";
+  const accountBId = "00000000-0000-4000-8000-0000000000b2";
+  const invoiceAId = "00000000-0000-4000-8000-0000000000a3";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const invoiceA = {
+    id: invoiceAId,
+    orderId: null,
+    currency: "USD",
+    totalMinor: "500",
+    allocatedMinor: "500",
+    paymentAllocatedMinor: "500",
+    creditAppliedMinor: "0",
+    dueMinor: "0",
+    status: "paid",
+    dueAt: occurredAt,
+    createdAt: occurredAt,
+  };
+  const viewerA = {
+    ...mockViewer({ email: "account-a@example.invalid" }),
+    clientAccountId: accountAId,
+  };
+  const viewerB = {
+    ...mockViewer({ email: "account-b@example.invalid" }),
+    clientAccountId: accountBId,
+  };
+  let serveViewerB = false;
+  let delayNextAccountAHistory = false;
+  let releaseVerification!: () => void;
+  let releaseLateAccountA!: () => void;
+  let releaseAccountB!: () => void;
+  let markLateAccountAStarted!: () => void;
+  let markLateAccountAFulfilled!: () => void;
+  let markAccountBStarted!: () => void;
+  const verificationGate = new Promise<void>((resolve) => { releaseVerification = resolve; });
+  const lateAccountAGate = new Promise<void>((resolve) => { releaseLateAccountA = resolve; });
+  const accountBGate = new Promise<void>((resolve) => { releaseAccountB = resolve; });
+  const lateAccountAStarted = new Promise<void>((resolve) => { markLateAccountAStarted = resolve; });
+  const lateAccountAFulfilled = new Promise<void>((resolve) => { markLateAccountAFulfilled = resolve; });
+  const accountBStarted = new Promise<void>((resolve) => { markAccountBStarted = resolve; });
+  const historyPayload = (id: string, name: string) => ({
+    warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+    account: { id, name },
+    orders: [],
+    invoices: id === accountAId ? [invoiceA] : [],
+    payments: [],
+    credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+    refunds: [],
+    services: [],
+    renewals: [],
+    cancellations: [],
+    tickets: [],
+  });
+
+  await installMockApi(page, viewerA, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/me") {
+        await route.fulfill({ json: serveViewerB ? viewerB : viewerA });
+        return true;
+      }
+      if (path === "/api/v1/auth/verify-email") {
+        await verificationGate;
+        serveViewerB = true;
+        await route.fulfill({ json: { status: "verified" } });
+        return true;
+      }
+      if (path === `/api/v1/customer/invoices/${invoiceAId}`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            invoice: { ...invoiceA, lines: [] },
+            payments: [],
+            creditApplications: [],
+            refunds: [],
+            related: { orderId: null, serviceIds: [], renewalIds: [] },
+            pdfUrl: `/api/v1/customer/invoices/${invoiceAId}/pdf`,
+          },
+        });
+        return true;
+      }
+      if (path !== "/api/v1/customer/business-history") return false;
+      if (!serveViewerB && delayNextAccountAHistory) {
+        delayNextAccountAHistory = false;
+        markLateAccountAStarted();
+        await lateAccountAGate;
+        await route.fulfill({ json: historyPayload(accountAId, "Late Account A facts") });
+        markLateAccountAFulfilled();
+        return true;
+      }
+      if (serveViewerB) {
+        markAccountBStarted();
+        await accountBGate;
+        await route.fulfill({ json: historyPayload(accountBId, "Account B saved facts") });
+        return true;
+      }
+      await route.fulfill({ json: historyPayload(accountAId, "Account A saved facts") });
+      return true;
+    },
+  });
+
+  await page.goto("/customer?token=switch-account-context");
+  await expect(page.getByTestId("history-account")).toContainText("Account A saved facts");
+  await page.getByTestId("history-invoice").click();
+  await expect(page.getByTestId("customer-history-detail")).toContainText("Invoice detail");
+  await expect(page).toHaveURL(new RegExp(`invoice=${invoiceAId}`));
+  delayNextAccountAHistory = true;
+  await page.getByTestId("customer-business-history").getByRole("button", { name: "Refresh history" }).click();
+  await lateAccountAStarted;
+
+  releaseVerification();
+  await accountBStarted;
+  await expect(page.getByText("Account A saved facts")).toHaveCount(0);
+  await expect(page.getByTestId("history-account")).toHaveCount(0);
+  await expect(page.getByTestId("customer-history-detail")).toHaveCount(0);
+  await expect(page).not.toHaveURL(/invoice=|service=/);
+
+  releaseLateAccountA();
+  await lateAccountAFulfilled;
+  await page.waitForTimeout(50);
+  await expect(page.getByText("Late Account A facts")).toHaveCount(0);
+  await expect(page.getByTestId("history-account")).toHaveCount(0);
+
+  releaseAccountB();
+  await expect(page.getByTestId("history-account")).toContainText("Account B saved facts");
+  await expect(page.getByTestId("history-account")).toContainText(accountBId);
+});
+
+test("customer history restores independent facts, detail query and invoice PDF", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000101";
+  const orderId = "00000000-0000-4000-8000-000000000102";
+  const invoiceId = "00000000-0000-4000-8000-000000000103";
+  const paymentId = "00000000-0000-4000-8000-000000000104";
+  const serviceId = "00000000-0000-4000-8000-000000000105";
+  const renewalId = "00000000-0000-4000-8000-000000000106";
+  const cancellationId = "00000000-0000-4000-8000-000000000107";
+  const ticketId = "00000000-0000-4000-8000-000000000108";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const invoice = {
+    id: invoiceId,
+    orderId,
+    currency: "USD",
+    totalMinor: "500",
+    allocatedMinor: "500",
+    paymentAllocatedMinor: "400",
+    creditAppliedMinor: "100",
+    dueMinor: "0",
+    status: "paid",
+    dueAt: occurredAt,
+    createdAt: occurredAt,
+  };
+  const payment = {
+    id: paymentId,
+    invoiceId,
+    status: "succeeded",
+    amountMinor: "414",
+    principalMinor: "400",
+    feeMinor: "14",
+    currency: "USD",
+    paymentMethodCode: "card",
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+  };
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [invoiceId],
+    productName: "Synthetic history plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-10T00:00:00.000Z",
+    version: 2,
+    cancellation: { requestId: cancellationId, effectiveAt: "2026-09-10T00:00:00.000Z", status: "scheduled" },
+  };
+  const renewal = {
+    id: renewalId,
+    serviceId,
+    invoiceId,
+    status: "paid",
+    currency: "USD",
+    totalMinor: "300",
+    allocatedMinor: "300",
+    dueMinor: "0",
+    periodStart: "2026-09-10T00:00:00.000Z",
+    periodEnd: "2026-10-10T00:00:00.000Z",
+    fundedAt: occurredAt,
+    settledAt: occurredAt,
+    createdAt: occurredAt,
+  };
+  const cancellation = {
+    requestId: cancellationId,
+    serviceId,
+    effectiveAt: "2026-09-10T00:00:00.000Z",
+    reason: "Synthetic cycle-end request",
+    createdAt: occurredAt,
+    execution: { id: cancellationId, mode: "automatic", status: "scheduled", completedAt: null },
+  };
+  const ticket = {
+    id: ticketId,
+    subject: "Synthetic linked support",
+    status: "awaiting_staff",
+    serviceId,
+    productName: "Synthetic history plan",
+    publicMessageCount: 2,
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+  };
+  await installMockApi(
+    page,
+    { ...mockViewer({ email: "history@example.invalid" }), clientAccountId: accountId },
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/customer/business-history") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic history account" },
+              orders: [{
+                id: orderId,
+                status: "completed",
+                currency: "USD",
+                totalMinor: "500",
+                submittedAt: occurredAt,
+                items: [{ id: orderId, productName: "Synthetic history plan", billingCycle: "monthly" }],
+              }],
+              invoices: [invoice],
+              payments: [payment],
+              credit: {
+                currency: "USD",
+                balanceMinor: "100",
+                transactions: [{
+                  id: paymentId,
+                  kind: "adjustment",
+                  creditMinor: "100",
+                  debitMinor: "0",
+                  deltaMinor: "100",
+                  sourceType: "credit_adjustment",
+                  sourceId: paymentId,
+                  reason: "Synthetic history fixture",
+                  createdAt: occurredAt,
+                }],
+              },
+              refunds: [{
+                id: paymentId,
+                invoiceId,
+                status: "succeeded",
+                destination: "credit",
+                amountMode: "partial",
+                amountMinor: "50",
+                currency: "USD",
+                createdAt: occurredAt,
+                updatedAt: occurredAt,
+              }],
+              services: [service],
+              renewals: [renewal],
+              cancellations: [cancellation],
+              tickets: [ticket],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/customer/invoices/${invoiceId}`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              invoice: {
+                ...invoice,
+                lines: [{ id: invoiceId, kind: "recurring", description: "Synthetic monthly plan", amountMinor: "500" }],
+              },
+              payments: [payment],
+              creditApplications: [{ transactionId: paymentId, amountMinor: "100", createdAt: occurredAt }],
+              refunds: [],
+              related: { orderId, serviceIds: [serviceId], renewalIds: [renewalId] },
+              pdfUrl: `/api/v1/customer/invoices/${invoiceId}/pdf`,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/customer/invoices/${invoiceId}/pdf`) {
+          await route.fulfill({
+            body: "%PDF-1.4\nSynthetic invoice\n%%EOF",
+            contentType: "application/pdf",
+            headers: { "Content-Disposition": `attachment; filename="invoice-${invoiceId}.pdf"` },
+          });
+          return true;
+        }
+        if (path === `/api/v1/customer/services/${serviceId}`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              service: { ...service, externalResourceId: "synthetic-resource-101" },
+              order: { id: orderId, status: "completed", currency: "USD", totalMinor: "500", submittedAt: occurredAt },
+              invoices: [{ ...invoice, kind: "initial" }],
+              payments: [payment],
+              periods: [{ id: renewalId, invoiceId, kind: "initial", start: occurredAt, end: "2026-09-10T00:00:00.000Z", grantedAt: occurredAt }],
+              renewals: [renewal],
+              cancellation,
+              tickets: [ticket],
+              trace: {
+                orderId,
+                invoiceIds: [invoiceId],
+                paymentIds: [paymentId],
+                renewalIds: [renewalId],
+                cancellationRequestId: cancellationId,
+                ticketIds: [ticketId],
+              },
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  const history = page.getByTestId("customer-business-history");
+  await expect(history.getByTestId("history-account")).toContainText("Synthetic history account");
+  await expect(history.getByTestId("history-order")).toHaveCount(1);
+  await expect(history.getByTestId("history-payment")).toHaveCount(1);
+  await expect(history.getByTestId("history-credit-transaction")).toHaveCount(1);
+  await expect(history.getByTestId("history-refund")).toHaveCount(1);
+  await expect(history.getByTestId("history-renewal")).toHaveCount(1);
+  await expect(history.getByTestId("history-cancellation")).toHaveCount(1);
+  await expect(history.getByTestId("history-ticket")).toHaveCount(1);
+
+  await history.getByTestId("history-invoice").click();
+  await expect(page).toHaveURL(new RegExp(`invoice=${invoiceId}`));
+  const invoiceDetail = history.getByTestId("customer-history-detail");
+  await expect(invoiceDetail).toContainText("Synthetic monthly plan");
+  const downloadPromise = page.waitForEvent("download");
+  await invoiceDetail.getByTestId("invoice-pdf-download").click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe(`invoice-${invoiceId}.pdf`);
+
+  await page.reload();
+  await expect(page.getByTestId("customer-history-detail")).toContainText(invoiceId);
+  await page.getByTestId("history-service").click();
+  await expect(page).toHaveURL(new RegExp(`service=${serviceId}`));
+  const trace = page.getByTestId("service-trace");
+  await expect(trace).toContainText(orderId);
+  await expect(trace).toContainText(paymentId);
+  await expect(trace).toContainText(renewalId);
+  await expect(trace).toContainText(cancellationId);
+  await expect(trace).toContainText("Synthetic linked support");
+});
+
+test("failed customer history refresh reports only the error and never a success notice", async ({ page }) => {
+  let failRefresh = false;
+  await installMockApi(page, mockViewer({ email: "failed-history-refresh@example.invalid" }), {
+    intercept: async (path, route) => {
+      if (path !== "/api/v1/customer/business-history" || !failRefresh) return false;
+      await route.fulfill({ status: 500, json: { error: "Synthetic history refresh failed" } });
+      return true;
+    },
+  });
+
+  await page.goto("/customer");
+  const history = page.getByTestId("customer-business-history");
+  await expect(history.getByTestId("history-account")).toBeVisible();
+  failRefresh = true;
+  await history.getByRole("button", { name: "Refresh all saved facts" }).click();
+  await expect(page.locator(".notice.error")).toContainText("Synthetic history refresh failed");
+  await expect(page.getByText("Business history refreshed.", { exact: true })).toHaveCount(0);
+});
+
+test("Account 360 requests only the panels granted to Staff", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000201";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "billing-reader@example.invalid",
+      permissions: ["accounts.view", "billing.read"],
+    }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/client-accounts") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              items: [{
+                id: accountId,
+                name: "Synthetic 360 account",
+                owner: { userId: accountId, email: "owner@example.invalid", emailVerifiedAt: occurredAt },
+                restrictedAt: null,
+                activeMemberCount: 1,
+                createdAt: occurredAt,
+              }],
+              hasMore: false,
+              nextCursor: null,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic 360 account", createdAt: occurredAt, restrictedAt: null },
+              owner: { userId: accountId, email: "owner@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+              memberships: [{
+                userId: accountId,
+                email: "owner@example.invalid",
+                role: "owner",
+                permissions: [],
+                emailVerifiedAt: occurredAt,
+                userRestrictedAt: null,
+                createdAt: occurredAt,
+                removedAt: null,
+              }],
+              restrictions: [],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/billing`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic 360 account" },
+              invoices: [],
+              payments: [],
+              credit: { currency: "USD", balanceMinor: "125", transactions: [] },
+              fundReceipts: [],
+              refunds: [],
+              chargebacks: [],
+              debt: { currency: "USD", balanceMinor: "0" },
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/renewals`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic 360 account" },
+              items: [],
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  const workspace = page.getByTestId("client-account-360");
+  const searchInput = workspace.getByLabel("Search Client Accounts");
+  await expect(searchInput).toHaveAttribute("maxlength", "200");
+  await searchInput.fill("owner@example.invalid");
+  await workspace.getByRole("button", { name: "Search accounts" }).click();
+  await workspace.getByTestId("account360-search-results").getByRole("button", { name: /Synthetic 360 account/ }).click();
+  await expect(workspace.getByRole("heading", { name: "Account identity, verification and restrictions" })).toBeVisible();
+  await expect(workspace.getByText("Founder owner@example.invalid", { exact: true })).toBeVisible();
+  await expect(workspace.getByTestId("account360-contacts-gap")).toContainText("Contacts are not represented by Schema 018");
+  await expect(workspace.getByTestId("account360-billing")).toContainText("$1.25");
+  await expect(workspace.locator('section[aria-label="Account renewals"]')).toBeVisible();
+  await expect(workspace.locator('section[aria-label="Account orders"]')).toHaveCount(0);
+  await expect(workspace.locator('section[aria-label="Account services"]')).toHaveCount(0);
+  await expect(workspace.locator('section[aria-label="Account cancellations"]')).toHaveCount(0);
+  await expect(workspace.locator('section[aria-label="Account tickets"]')).toHaveCount(0);
+
+  const accountPaths = [...new Set(requests.filter((path) => path.includes("/client-accounts")))].sort();
+  expect(accountPaths).toEqual([
+    "/api/v1/admin/client-accounts",
+    `/api/v1/admin/client-accounts/${accountId}/billing`,
+    `/api/v1/admin/client-accounts/${accountId}/renewals`,
+    `/api/v1/admin/client-accounts/${accountId}/summary`,
+  ].sort());
+});
+
+test("Account 360 pagination binds the cursor to the query, appends uniquely and clears on query change", async ({ page }) => {
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const firstId = "00000000-0000-4000-8000-000000000221";
+  const secondId = "00000000-0000-4000-8000-000000000222";
+  const thirdId = "00000000-0000-4000-8000-000000000223";
+  const searchUrls: URL[] = [];
+  const item = (id: string, name: string) => ({
+    id,
+    name,
+    owner: { userId: id, email: `${name.toLowerCase().replaceAll(" ", "-")}@example.invalid`, emailVerifiedAt: occurredAt },
+    restrictedAt: null,
+    activeMemberCount: 1,
+    createdAt: occurredAt,
+  });
+
+  await installMockApi(
+    page,
+    mockViewer({ email: "paginated-reader@example.invalid", permissions: ["accounts.view"] }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/client-accounts") {
+          const url = new URL(route.request().url());
+          searchUrls.push(url);
+          const query = url.searchParams.get("query");
+          const cursor = url.searchParams.get("cursor");
+          if (query === "Founder" && cursor === null) {
+            await route.fulfill({
+              json: {
+                warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+                items: [item(firstId, "Founder Alpha"), item(secondId, "Founder Beta")],
+                hasMore: true,
+                nextCursor: "founder-page-2",
+              },
+            });
+            return true;
+          }
+          if (query === "Founder" && cursor === "founder-page-2") {
+            await route.fulfill({
+              json: {
+                warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+                items: [item(secondId, "Founder Beta updated"), item(thirdId, "Founder Gamma")],
+                hasMore: false,
+                nextCursor: null,
+              },
+            });
+            return true;
+          }
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              items: [item(thirdId, "Different Query")],
+              hasMore: false,
+              nextCursor: null,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${firstId}/summary`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: firstId, name: "Founder Alpha", createdAt: occurredAt, restrictedAt: null },
+              owner: { userId: firstId, email: "founder-alpha@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+              memberships: [],
+              restrictions: [],
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  const account360 = page.getByTestId("client-account-360");
+  const input = account360.getByLabel("Search Client Accounts");
+  await input.fill("  Founder  ");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  const results = account360.getByTestId("account360-search-results");
+  await expect(results.locator(":scope > button").filter({ has: page.locator("strong") })).toHaveCount(2);
+  await results.getByRole("button", { name: /Founder Alpha/ }).click();
+  await expect(account360.getByTestId("account360-workspace")).toBeVisible();
+
+  await results.getByRole("button", { name: "Load more accounts" }).click();
+  await expect(results.getByRole("button", { name: /Founder Gamma/ })).toBeVisible();
+  await expect(results.getByRole("button", { name: /Founder Beta updated/ })).toHaveCount(1);
+  await expect(results.getByRole("button", { name: "Load more accounts" })).toHaveCount(0);
+  expect(searchUrls[1]?.searchParams.get("query")).toBe("Founder");
+  expect(searchUrls[1]?.searchParams.get("limit")).toBe("20");
+  expect(searchUrls[1]?.searchParams.get("cursor")).toBe("founder-page-2");
+
+  await input.fill("Different");
+  await expect(account360.getByTestId("account360-search-results")).toHaveCount(0);
+  await expect(account360.getByTestId("account360-workspace")).toHaveCount(0);
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await expect(account360.getByRole("button", { name: /Different Query/ })).toBeVisible();
+  expect(searchUrls.at(-1)?.searchParams.get("query")).toBe("Different");
+  expect(searchUrls.at(-1)?.searchParams.has("cursor")).toBe(false);
+});
+
+test("refreshing Staff access immediately removes a loaded Account 360 after permission revocation", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000211";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const activeViewer = mockViewer({
+    email: "revoked-account-reader@example.invalid",
+    permissions: ["accounts.view"],
+  });
+  const revokedViewer = mockViewer({
+    email: "revoked-account-reader@example.invalid",
+    permissions: ["support.tickets.manage"],
+  });
+  let revoked = false;
+  const requests = await installMockApi(page, activeViewer, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/me") {
+        await route.fulfill({ json: revoked ? revokedViewer : activeViewer });
+        return true;
+      }
+      if (path === "/api/v1/admin/client-accounts") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            items: [{
+              id: accountId,
+              name: "Revocable Account 360",
+              owner: { userId: accountId, email: "founder@example.invalid", emailVerifiedAt: occurredAt },
+              restrictedAt: null,
+              activeMemberCount: 1,
+              createdAt: occurredAt,
+            }],
+            hasMore: false,
+            nextCursor: null,
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Revocable Account 360", createdAt: occurredAt, restrictedAt: null },
+            owner: { userId: accountId, email: "founder@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+            memberships: [{
+              userId: accountId,
+              email: "founder@example.invalid",
+              role: "owner",
+              permissions: [],
+              emailVerifiedAt: occurredAt,
+              userRestrictedAt: null,
+              createdAt: occurredAt,
+              removedAt: null,
+            }],
+            restrictions: [],
+          },
+        });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/admin");
+  const account360 = page.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill("founder@example.invalid");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByRole("button", { name: /Revocable Account 360/ }).click();
+  await expect(account360.getByTestId("account360-memberships")).toContainText("founder@example.invalid");
+  const accountRequestCount = requests.filter((path) => path.includes("/client-accounts")).length;
+
+  revoked = true;
+  await account360.getByRole("button", { name: "Refresh Staff access" }).click();
+  await expect(page.getByTestId("client-account-360")).toHaveCount(0);
+  await expect(page.getByText("Revocable Account 360")).toHaveCount(0);
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toBeVisible();
+  await expect(page.getByTestId("limited-admin-scope")).toBeVisible();
+  expect(requests.filter((path) => path.includes("/client-accounts"))).toHaveLength(accountRequestCount);
 });
 
 test("Staff visiting customer mounts customer tickets without Staff DOM or fetches", async ({ page }) => {
@@ -556,6 +1269,56 @@ test("reauth password rejection stays in the current workspace", async ({ page }
   await expect(page.locator(".notice.error")).toContainText("Password confirmation failed");
   await expect(page).toHaveURL(/\/customer$/);
   expect(documents).toEqual(["/customer"]);
+});
+
+test("delayed business history cannot mount facts after leaving customer", async ({ page }) => {
+  let releaseResponse!: () => void;
+  let markRequestStarted!: () => void;
+  let markResponseFulfilled!: () => void;
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  const requestStarted = new Promise<void>((resolve) => { markRequestStarted = resolve; });
+  const responseFulfilled = new Promise<void>((resolve) => { markResponseFulfilled = resolve; });
+  await installMockApi(
+    page,
+    mockViewer({ email: "delayed-history@example.invalid" }),
+    {
+      intercept: async (path, route) => {
+        if (path !== "/api/v1/customer/business-history") return false;
+        markRequestStarted();
+        await responseGate;
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: {
+              id: "00000000-0000-4000-8000-000000000301",
+              name: "Delayed history account",
+            },
+            orders: [],
+            invoices: [],
+            payments: [],
+            credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+            refunds: [],
+            services: [],
+            renewals: [],
+            cancellations: [],
+            tickets: [],
+          },
+        });
+        markResponseFulfilled();
+        return true;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  await requestStarted;
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseResponse();
+  await responseFulfilled;
+  await page.waitForTimeout(50);
+  await expect(page.getByTestId("customer-business-history")).toHaveCount(0);
+  await expect(page.getByText("Delayed history account")).toHaveCount(0);
+  await expect(page.locator(".notice")).toHaveCount(0);
 });
 
 for (const sessionError of ["Session is invalid or expired", "Authentication required"]) {

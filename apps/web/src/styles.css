@@ -804,3 +804,183 @@ select:focus {
     display: none;
   }
 }
+
+.history-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 1rem;
+  width: 100%;
+}
+
+.history-card,
+.account360-panel,
+.history-detail {
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: rgba(3, 10, 20, 0.35);
+  padding: 1rem;
+}
+
+.history-card h3,
+.account360-panel h3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0;
+}
+
+.history-count {
+  display: inline-flex;
+  min-width: 1.8rem;
+  height: 1.8rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(97, 217, 207, 0.12);
+  font-size: 0.8rem;
+}
+
+.history-card details,
+.account360-billing details {
+  border-top: 1px solid var(--line);
+  padding: 0.75rem 0;
+}
+
+.history-card details:first-of-type,
+.account360-billing details:first-of-type {
+  border-top: 0;
+}
+
+.history-card details span,
+.account360-billing details span,
+.trace-grid > span {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.history-card summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.history-row {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  padding: 0.75rem 0;
+  text-align: left;
+}
+
+.history-row:first-of-type {
+  border-top: 0;
+}
+
+.history-detail {
+  position: relative;
+  width: 100%;
+  scroll-margin-top: 1rem;
+}
+
+.history-detail-close {
+  float: right;
+}
+
+.history-facts,
+.trace-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.65rem;
+  margin: 1rem 0;
+}
+
+.history-facts > span,
+.trace-grid > a,
+.trace-grid > button,
+.trace-grid > span {
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: rgba(3, 10, 20, 0.32);
+  padding: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.history-refresh-bottom {
+  align-self: flex-start;
+}
+
+.account360-search {
+  display: grid;
+  grid-template-columns: minmax(16rem, 1fr) auto;
+  align-items: end;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.account360-search label {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.account360-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.account360-results button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.account360-workspace {
+  display: grid;
+  gap: 1rem;
+  width: 100%;
+}
+
+.account360-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.account360-billing h4 {
+  margin: 1.25rem 0 0.4rem;
+}
+
+@media (max-width: 760px) {
+  .history-heading {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .account360-search {
+    grid-template-columns: 1fr;
+  }
+
+  .history-heading > button,
+  .account360-search > button {
+    width: 100%;
+  }
+}
