@@ -228,18 +228,65 @@ export async function listInvoices(
     renewal_cancelled: boolean;
   }>(
     `SELECT invoice.id,
-            invoice.order_id,
+            customer_order.id AS order_id,
             invoice.currency,
             invoice.total_minor::text,
-            allocation.allocated_minor::text,
-            allocation.payment_minor::text,
-            allocation.credit_minor::text,
+            (
+              COALESCE(payment.amount_minor, 0)
+              + COALESCE(fund_receipt.amount_minor, 0)
+              + COALESCE(credit.amount_minor, 0)
+            )::text AS allocated_minor,
+            (
+              COALESCE(payment.amount_minor, 0)
+              + COALESCE(fund_receipt.amount_minor, 0)
+            )::text AS payment_minor,
+            COALESCE(credit.amount_minor, 0)::text AS credit_minor,
             invoice.due_at,
             invoice.created_at,
-            COALESCE(renewal.status = 'cancelled', false) AS renewal_cancelled
+            COALESCE(
+              renewal.status = 'cancelled' AND renewal_service.id IS NOT NULL,
+              false
+            ) AS renewal_cancelled
      FROM invoices invoice
-     JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+     LEFT JOIN LATERAL (
+       SELECT sum(allocation.amount_minor)::bigint AS amount_minor
+       FROM payment_allocations allocation
+       JOIN payment_attempts attempt
+         ON attempt.id = allocation.payment_attempt_id
+        AND attempt.client_account_id = invoice.client_account_id
+        AND attempt.invoice_id = invoice.id
+       WHERE allocation.invoice_id = invoice.id
+     ) payment ON true
+     LEFT JOIN LATERAL (
+       SELECT sum(allocation.amount_minor)::bigint AS amount_minor
+       FROM fund_receipt_allocations allocation
+       JOIN fund_receipts receipt
+         ON receipt.id = allocation.fund_receipt_id
+        AND receipt.client_account_id = invoice.client_account_id
+       JOIN fund_receipt_resolutions resolution
+         ON resolution.id = allocation.resolution_id
+        AND resolution.fund_receipt_id = receipt.id
+        AND resolution.client_account_id = invoice.client_account_id
+        AND resolution.invoice_id = invoice.id
+       WHERE allocation.invoice_id = invoice.id
+     ) fund_receipt ON true
+     LEFT JOIN LATERAL (
+       SELECT sum(allocation.amount_minor)::bigint AS amount_minor
+       FROM credit_allocations allocation
+       JOIN credit_transactions transaction
+         ON transaction.id = allocation.credit_transaction_id
+       JOIN credit_accounts credit_account
+         ON credit_account.id = transaction.credit_account_id
+        AND credit_account.client_account_id = invoice.client_account_id
+       WHERE allocation.invoice_id = invoice.id
+     ) credit ON true
+     LEFT JOIN orders customer_order
+       ON customer_order.id = invoice.order_id
+      AND customer_order.client_account_id = invoice.client_account_id
      LEFT JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+     LEFT JOIN services renewal_service
+       ON renewal_service.id = renewal.service_id
+      AND renewal_service.client_account_id = invoice.client_account_id
      WHERE invoice.client_account_id = $1
        AND ($2::uuid IS NULL OR invoice.id = $2::uuid)
      ORDER BY invoice.created_at DESC, invoice.id DESC`,
@@ -285,7 +332,7 @@ export async function listPayments(
     updated_at: Date;
   }>(
     `SELECT attempt.id,
-            attempt.invoice_id,
+            invoice.id AS invoice_id,
             attempt.status,
             attempt.amount_minor::text,
             COALESCE(attempt.principal_minor, attempt.amount_minor - attempt.fee_minor)::text
@@ -296,7 +343,11 @@ export async function listPayments(
             attempt.created_at,
             attempt.updated_at
      FROM payment_attempts attempt
+     JOIN invoices invoice
+       ON invoice.id = attempt.invoice_id
+      AND invoice.client_account_id = attempt.client_account_id
      WHERE attempt.client_account_id = $1
+       AND invoice.client_account_id = $1
        AND ($2::uuid IS NULL OR attempt.invoice_id = $2::uuid)
      ORDER BY attempt.created_at DESC, attempt.id DESC`,
     [clientAccountId, invoiceId ?? null],
@@ -390,19 +441,22 @@ export async function listRefunds(
     created_at: Date;
     updated_at: Date;
   }>(
-    `SELECT id,
-            invoice_id,
-            status,
-            destination,
-            amount_mode,
-            amount_minor::text,
-            currency,
-            created_at,
-            updated_at
-     FROM refunds
-     WHERE client_account_id = $1
-       AND ($2::uuid IS NULL OR invoice_id = $2::uuid)
-     ORDER BY created_at DESC, id DESC`,
+    `SELECT refund.id,
+            invoice.id AS invoice_id,
+            refund.status,
+            refund.destination,
+            refund.amount_mode,
+            refund.amount_minor::text,
+            refund.currency,
+            refund.created_at,
+            refund.updated_at
+     FROM refunds refund
+     LEFT JOIN invoices invoice
+       ON invoice.id = refund.invoice_id
+      AND invoice.client_account_id = refund.client_account_id
+     WHERE refund.client_account_id = $1
+       AND ($2::uuid IS NULL OR invoice.id = $2::uuid)
+     ORDER BY refund.created_at DESC, refund.id DESC`,
     [clientAccountId, invoiceId ?? null],
   );
   return result.rows.map((row) => ({
@@ -444,9 +498,13 @@ export async function listServices(
               SELECT linked_invoice.id
               FROM invoices linked_invoice
               WHERE linked_invoice.order_id = customer_order.id
+                AND linked_invoice.client_account_id = service.client_account_id
               UNION
-              SELECT renewal.invoice_id
+              SELECT renewal_invoice.id
               FROM service_renewals renewal
+              JOIN invoices renewal_invoice
+                ON renewal_invoice.id = renewal.invoice_id
+               AND renewal_invoice.client_account_id = service.client_account_id
               WHERE renewal.service_id = service.id
               ORDER BY 1
             ) AS invoice_ids,
@@ -462,9 +520,12 @@ export async function listServices(
             cancellation_execution.status AS cancellation_status
      FROM services service
      JOIN order_items item ON item.id = service.order_item_id
-     JOIN orders customer_order ON customer_order.id = item.order_id
+     JOIN orders customer_order
+       ON customer_order.id = item.order_id
+      AND customer_order.client_account_id = service.client_account_id
      LEFT JOIN service_cancellation_executions cancellation_execution
        ON cancellation_execution.cancellation_request_id = service.cancellation_request_id
+      AND cancellation_execution.service_id = service.id
      WHERE service.client_account_id = $1
        AND ($2::uuid IS NULL OR service.id = $2::uuid)
      ORDER BY service.created_at DESC, service.id DESC`,
@@ -512,12 +573,16 @@ export async function listRenewals(
     created_at: Date;
   }>(
     `SELECT renewal.id,
-            renewal.service_id,
-            renewal.invoice_id,
+            service.id AS service_id,
+            invoice.id AS invoice_id,
             renewal.status,
             renewal.currency,
             invoice.total_minor::text,
-            allocation.allocated_minor::text,
+            (
+              COALESCE(payment.amount_minor, 0)
+              + COALESCE(fund_receipt.amount_minor, 0)
+              + COALESCE(credit.amount_minor, 0)
+            )::text AS allocated_minor,
             renewal.period_start,
             renewal.period_end,
             renewal.funded_at,
@@ -525,8 +590,41 @@ export async function listRenewals(
             renewal.created_at
      FROM service_renewals renewal
      JOIN services service ON service.id = renewal.service_id
-     JOIN invoices invoice ON invoice.id = renewal.invoice_id
-     JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
+     JOIN invoices invoice
+       ON invoice.id = renewal.invoice_id
+      AND invoice.client_account_id = service.client_account_id
+     LEFT JOIN LATERAL (
+       SELECT sum(allocation.amount_minor)::bigint AS amount_minor
+       FROM payment_allocations allocation
+       JOIN payment_attempts attempt
+         ON attempt.id = allocation.payment_attempt_id
+        AND attempt.client_account_id = invoice.client_account_id
+        AND attempt.invoice_id = invoice.id
+       WHERE allocation.invoice_id = invoice.id
+     ) payment ON true
+     LEFT JOIN LATERAL (
+       SELECT sum(allocation.amount_minor)::bigint AS amount_minor
+       FROM fund_receipt_allocations allocation
+       JOIN fund_receipts receipt
+         ON receipt.id = allocation.fund_receipt_id
+        AND receipt.client_account_id = invoice.client_account_id
+       JOIN fund_receipt_resolutions resolution
+         ON resolution.id = allocation.resolution_id
+        AND resolution.fund_receipt_id = receipt.id
+        AND resolution.client_account_id = invoice.client_account_id
+        AND resolution.invoice_id = invoice.id
+       WHERE allocation.invoice_id = invoice.id
+     ) fund_receipt ON true
+     LEFT JOIN LATERAL (
+       SELECT sum(allocation.amount_minor)::bigint AS amount_minor
+       FROM credit_allocations allocation
+       JOIN credit_transactions transaction
+         ON transaction.id = allocation.credit_transaction_id
+       JOIN credit_accounts credit_account
+         ON credit_account.id = transaction.credit_account_id
+        AND credit_account.client_account_id = invoice.client_account_id
+       WHERE allocation.invoice_id = invoice.id
+     ) credit ON true
      WHERE service.client_account_id = $1
        AND ($2::uuid IS NULL OR service.id = $2::uuid)
      ORDER BY renewal.created_at DESC, renewal.id DESC`,
@@ -573,7 +671,7 @@ export async function listCancellations(
     completed_at: Date | null;
   }>(
     `SELECT cancellation.id AS request_id,
-            cancellation.service_id,
+            service.id AS service_id,
             cancellation.effective_at,
             cancellation.reason,
             cancellation.created_at,
@@ -582,8 +680,12 @@ export async function listCancellations(
             execution.status AS execution_status,
             execution.completed_at
      FROM service_cancellation_requests cancellation
+     JOIN services service
+       ON service.id = cancellation.service_id
+      AND service.client_account_id = cancellation.client_account_id
      LEFT JOIN service_cancellation_executions execution
        ON execution.cancellation_request_id = cancellation.id
+      AND execution.service_id = cancellation.service_id
      WHERE cancellation.client_account_id = $1
        AND ($2::uuid IS NULL OR cancellation.service_id = $2::uuid)
      ORDER BY cancellation.created_at DESC, cancellation.id DESC`,
@@ -621,22 +723,24 @@ export async function listTickets(
     created_at: Date;
     updated_at: Date;
   }>(
-    `SELECT ticket.id,
+     `SELECT ticket.id,
             ticket.subject,
             ticket.status,
-            ticket.service_id,
+            service.id AS service_id,
             item.product_name,
             count(message.id) FILTER (WHERE message.visibility = 'public')::text
               AS public_message_count,
             ticket.created_at,
             ticket.updated_at
      FROM support_tickets ticket
-     LEFT JOIN services service ON service.id = ticket.service_id
+     LEFT JOIN services service
+       ON service.id = ticket.service_id
+      AND service.client_account_id = ticket.client_account_id
      LEFT JOIN order_items item ON item.id = service.order_item_id
      LEFT JOIN support_ticket_messages message ON message.ticket_id = ticket.id
      WHERE ticket.client_account_id = $1
        AND ($2::uuid IS NULL OR ticket.service_id = $2::uuid)
-     GROUP BY ticket.id, item.product_name
+     GROUP BY ticket.id, service.id, item.product_name
      ORDER BY ticket.updated_at DESC, ticket.id DESC`,
     [clientAccountId, serviceId ?? null],
   );
@@ -652,7 +756,7 @@ export async function listTickets(
   }));
 }
 
-async function withReadSnapshot<T>(
+export async function withReadSnapshot<T>(
   pool: DatabasePool,
   work: (client: DatabaseClient) => Promise<T>,
 ): Promise<T> {
@@ -707,6 +811,7 @@ async function loadInvoiceLines(
 
 async function loadCreditApplications(
   queryable: Queryable,
+  clientAccountId: string,
   invoiceId: string,
 ): Promise<Array<{ transactionId: string; amountMinor: string; createdAt: string }>> {
   const result = await queryable.query<{
@@ -720,9 +825,15 @@ async function loadCreditApplications(
      FROM credit_allocations allocation
      JOIN credit_transactions transaction
        ON transaction.id = allocation.credit_transaction_id
+     JOIN credit_accounts credit_account
+       ON credit_account.id = transaction.credit_account_id
+     JOIN invoices invoice
+       ON invoice.id = allocation.invoice_id
+      AND invoice.client_account_id = credit_account.client_account_id
      WHERE allocation.invoice_id = $1
+       AND invoice.client_account_id = $2
      ORDER BY allocation.created_at, allocation.id`,
-    [invoiceId],
+    [invoiceId, clientAccountId],
   );
   return result.rows.map((row) => ({
     transactionId: row.transaction_id,
@@ -733,6 +844,7 @@ async function loadCreditApplications(
 
 async function loadInvoiceRelations(
   queryable: Queryable,
+  clientAccountId: string,
   invoiceId: string,
 ): Promise<{ order_id: string | null; service_ids: string[]; renewal_ids: string[] }> {
   const result = await queryable.query<{
@@ -741,35 +853,50 @@ async function loadInvoiceRelations(
     renewal_ids: string[];
   }>(
     `SELECT COALESCE(
-              invoice.order_id,
+              initial_order.id,
               (
-                SELECT item.order_id
+                SELECT renewal_order.id
                 FROM service_renewals renewal
                 JOIN services service ON service.id = renewal.service_id
                 JOIN order_items item ON item.id = service.order_item_id
+                JOIN orders renewal_order
+                  ON renewal_order.id = item.order_id
+                 AND renewal_order.client_account_id = service.client_account_id
                 WHERE renewal.invoice_id = invoice.id
+                  AND service.client_account_id = invoice.client_account_id
               )
             ) AS order_id,
             ARRAY(
               SELECT service.id
               FROM services service
               JOIN order_items item ON item.id = service.order_item_id
-              WHERE item.order_id = invoice.order_id
+              WHERE item.order_id = initial_order.id
+                AND service.client_account_id = invoice.client_account_id
               UNION
-              SELECT renewal.service_id
+              SELECT service.id
               FROM service_renewals renewal
+              JOIN services service
+                ON service.id = renewal.service_id
+               AND service.client_account_id = invoice.client_account_id
               WHERE renewal.invoice_id = invoice.id
               ORDER BY 1
             ) AS service_ids,
             ARRAY(
               SELECT renewal.id
               FROM service_renewals renewal
+              JOIN services service
+                ON service.id = renewal.service_id
+               AND service.client_account_id = invoice.client_account_id
               WHERE renewal.invoice_id = invoice.id
               ORDER BY renewal.id
             ) AS renewal_ids
      FROM invoices invoice
-     WHERE invoice.id = $1`,
-    [invoiceId],
+     LEFT JOIN orders initial_order
+       ON initial_order.id = invoice.order_id
+      AND initial_order.client_account_id = invoice.client_account_id
+     WHERE invoice.id = $1
+       AND invoice.client_account_id = $2`,
+    [invoiceId, clientAccountId],
   );
   return result.rows[0] ?? { order_id: null, service_ids: [], renewal_ids: [] };
 }
@@ -847,12 +974,17 @@ export async function renderInvoicePdf(input: {
   relatedOrderId: string | null;
   invoice: InvoiceSummary & { lines: InvoiceLine[] };
 }): Promise<Uint8Array> {
-  const document = await PDFDocument.create();
+  const document = await PDFDocument.create({ updateMetadata: false });
   document.setTitle(`OpenSales System Laboratory Invoice ${input.invoice.id}`);
   document.setAuthor("OpenSales System Mock-only Laboratory");
   document.setSubject(PDF_LAB_WARNING);
   document.setProducer("OpenSales System / pdf-lib");
   document.setCreator("OpenSales System API");
+  const invoiceCreatedAt = new Date(input.invoice.createdAt);
+  if (!Number.isNaN(invoiceCreatedAt.getTime())) {
+    document.setCreationDate(invoiceCreatedAt);
+    document.setModificationDate(invoiceCreatedAt);
+  }
   const regular = await document.embedFont(StandardFonts.Helvetica);
   const bold = await document.embedFont(StandardFonts.HelveticaBold);
   const pageWidth = 595.28;
@@ -904,6 +1036,29 @@ export async function renderInvoicePdf(input: {
     });
     y -= 16;
   };
+  const drawInvoiceLineHeader = (continued = false): void => {
+    if (continued) {
+      page.drawText("Immutable invoice lines (continued)", {
+        x: margin,
+        y,
+        size: 14,
+        font: bold,
+        color: rgb(0.08, 0.16, 0.28),
+      });
+      y -= 25;
+    }
+    page.drawRectangle({
+      x: margin,
+      y: y - 4,
+      width: pageWidth - margin * 2,
+      height: 22,
+      color: rgb(0.92, 0.94, 0.97),
+    });
+    page.drawText("Description", { x: margin + 8, y: y + 3, size: 9, font: bold });
+    page.drawText("Kind", { x: 385, y: y + 3, size: 9, font: bold });
+    page.drawText("Amount", { x: 480, y: y + 3, size: 9, font: bold });
+    y -= 21;
+  };
 
   addPage();
   page.drawText("OpenSales System Laboratory Invoice", {
@@ -935,21 +1090,15 @@ export async function renderInvoicePdf(input: {
     color: rgb(0.08, 0.16, 0.28),
   });
   y -= 25;
-  page.drawRectangle({
-    x: margin,
-    y: y - 4,
-    width: pageWidth - margin * 2,
-    height: 22,
-    color: rgb(0.92, 0.94, 0.97),
-  });
-  page.drawText("Description", { x: margin + 8, y: y + 3, size: 9, font: bold });
-  page.drawText("Kind", { x: 385, y: y + 3, size: 9, font: bold });
-  page.drawText("Amount", { x: 480, y: y + 3, size: 9, font: bold });
-  y -= 21;
+  drawInvoiceLineHeader();
   for (const line of input.invoice.lines) {
     const descriptionLines = wrapPdfText(regular, line.description, 9, 315);
     const rowHeight = Math.max(22, descriptionLines.length * 12 + 8);
-    ensureSpace(rowHeight + 4);
+    if (y - rowHeight - 4 < 60) {
+      drawPdfFooter(page, regular, pageNumber);
+      addPage();
+      drawInvoiceLineHeader(true);
+    }
     descriptionLines.forEach((description, index) => {
       page.drawText(description, {
         x: margin + 8,
@@ -1018,9 +1167,13 @@ async function loadInvoiceDetail(
   if (!invoice) throw requestError("Invoice not found", 404);
   const lines = await loadInvoiceLines(queryable, invoiceId);
   const payments = await listPayments(queryable, clientAccountId, invoiceId);
-  const creditApplications = await loadCreditApplications(queryable, invoiceId);
+  const creditApplications = await loadCreditApplications(
+    queryable,
+    clientAccountId,
+    invoiceId,
+  );
   const refunds = await listRefunds(queryable, clientAccountId, invoiceId);
-  const relations = await loadInvoiceRelations(queryable, invoiceId);
+  const relations = await loadInvoiceRelations(queryable, clientAccountId, invoiceId);
   return {
     warning: LAB_WARNING,
     invoice: { ...invoice, lines },
@@ -1129,8 +1282,12 @@ export async function registerCustomerHistoryRoutes(
                 service.external_resource_id
          FROM services service
          JOIN order_items item ON item.id = service.order_item_id
-         JOIN orders customer_order ON customer_order.id = item.order_id
-         WHERE service.id = $1 AND service.client_account_id = $2`,
+         JOIN orders customer_order
+           ON customer_order.id = item.order_id
+          AND customer_order.client_account_id = service.client_account_id
+         WHERE service.id = $1
+           AND service.client_account_id = $2
+           AND customer_order.client_account_id = $2`,
         [service.id, user.clientAccountId],
       );
       const order = orderResult.rows[0];
@@ -1153,11 +1310,19 @@ export async function registerCustomerHistoryRoutes(
         period_end: Date;
         granted_at: Date;
       }>(
-        `SELECT id, invoice_id, period_kind, period_start, period_end, granted_at
-         FROM service_periods
-         WHERE service_id = $1
-         ORDER BY period_start, id`,
-        [service.id],
+        `SELECT period.id,
+                invoice.id AS invoice_id,
+                period.period_kind,
+                period.period_start,
+                period.period_end,
+                period.granted_at
+         FROM service_periods period
+         JOIN invoices invoice
+           ON invoice.id = period.invoice_id
+          AND invoice.client_account_id = $2
+         WHERE period.service_id = $1
+         ORDER BY period.period_start, period.id`,
+        [service.id, user.clientAccountId],
       );
       const periods = periodsResult.rows.map((row) => ({
         id: row.id,

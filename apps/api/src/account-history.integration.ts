@@ -117,6 +117,17 @@ try {
   const renewalInvoiceId = randomUUID();
   const renewalId = randomUUID();
   const ticketId = randomUUID();
+  const otherOrderId = randomUUID();
+  const otherItemId = randomUUID();
+  const otherTraceOrderId = randomUUID();
+  const otherTraceItemId = randomUUID();
+  const otherInvoiceId = randomUUID();
+  const otherPaymentId = randomUUID();
+  const otherServiceId = randomUUID();
+  const otherTicketId = randomUUID();
+  const mismatchedInvoiceId = randomUUID();
+  const mismatchedPaymentId = randomUUID();
+  const mismatchedServiceId = randomUUID();
   const priceSnapshot = {
     currency: "USD",
     billingCycle: "monthly",
@@ -162,7 +173,11 @@ try {
     );
     await initialInvoiceClient.query(
       `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
-       VALUES ($1, 'recurring', 'Synthetic History Service - monthly', 500)`,
+       SELECT $1,
+              'recurring',
+              'Synthetic History Service - monthly line ' || line_number::text,
+              10
+       FROM pg_catalog.generate_series(1, 50) AS line_number`,
       [invoiceId],
     );
     await initialInvoiceClient.query("COMMIT");
@@ -299,6 +314,186 @@ try {
     [ticketId, customer.userId, staff.userId],
   );
 
+  await pool.query(
+    `INSERT INTO orders(
+       id, client_account_id, submitted_by_user_id, status, currency, price_snapshot,
+       one_time_minor, setup_minor, recurring_minor, total_minor,
+       idempotency_key, request_fingerprint
+     ) VALUES ($1, $2, $3, 'completed', 'USD', $4, 0, 0, 500, 500, $5, $6)`,
+    [
+      otherOrderId,
+      otherCustomer.accountId,
+      otherCustomer.userId,
+      priceSnapshot,
+      `history-order:${otherOrderId}`,
+      `history-order-fingerprint:${otherOrderId}`,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO order_items(
+       id, order_id, product_id, product_name, fulfillment_mode,
+       billing_cycle, configuration, price_snapshot
+     ) VALUES ($1, $2, 'synthetic-history-service', 'Synthetic Beta History Service',
+       'automatic', 'monthly', '{}'::jsonb, $3)`,
+    [otherItemId, otherOrderId, priceSnapshot],
+  );
+  await pool.query(
+    `INSERT INTO orders(
+       id, client_account_id, submitted_by_user_id, status, currency, price_snapshot,
+       one_time_minor, setup_minor, recurring_minor, total_minor,
+       idempotency_key, request_fingerprint
+     ) VALUES ($1, $2, $3, 'completed', 'USD', $4, 0, 0, 500, 500, $5, $6)`,
+    [
+      otherTraceOrderId,
+      otherCustomer.accountId,
+      otherCustomer.userId,
+      priceSnapshot,
+      `history-order:${otherTraceOrderId}`,
+      `history-order-fingerprint:${otherTraceOrderId}`,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO order_items(
+       id, order_id, product_id, product_name, fulfillment_mode,
+       billing_cycle, configuration, price_snapshot
+     ) VALUES ($1, $2, 'synthetic-history-service', 'Synthetic Beta Trace Item',
+       'automatic', 'monthly', '{}'::jsonb, $3)`,
+    [otherTraceItemId, otherTraceOrderId, priceSnapshot],
+  );
+  const otherInvoiceClient = await pool.connect();
+  try {
+    await otherInvoiceClient.query("BEGIN");
+    await otherInvoiceClient.query(
+      `INSERT INTO invoices(id, client_account_id, order_id, currency, total_minor, due_at)
+       VALUES ($1, $2, $3, 'USD', 500, now() + interval '7 days')`,
+      [otherInvoiceId, otherCustomer.accountId, otherOrderId],
+    );
+    await otherInvoiceClient.query(
+      `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
+       VALUES ($1, 'recurring', 'Synthetic Beta History Service - monthly', 500)`,
+      [otherInvoiceId],
+    );
+    await otherInvoiceClient.query("COMMIT");
+  } catch (error) {
+    await otherInvoiceClient.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    otherInvoiceClient.release();
+  }
+  await pool.query(
+    `INSERT INTO payment_attempts(
+       id, client_account_id, invoice_id, provider_installation_id,
+       external_payment_id, status, amount_minor, principal_minor,
+       fee_minor, currency, scenario, idempotency_key, request_fingerprint,
+       provider_occurred_at
+     ) VALUES (
+       $1, $2, $3, 'mock-payment', $4, 'succeeded', 500, 500,
+       0, 'USD', 'success', $5, $6, now()
+     )`,
+    [
+      otherPaymentId,
+      otherCustomer.accountId,
+      otherInvoiceId,
+      `history-external:${otherPaymentId}`,
+      `history-payment:${otherPaymentId}`,
+      `history-payment-fingerprint:${otherPaymentId}`,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO payment_allocations(payment_attempt_id, invoice_id, amount_minor)
+     VALUES ($1, $2, 500)`,
+    [otherPaymentId, otherInvoiceId],
+  );
+  await pool.query(
+    `INSERT INTO fund_receipts(
+       provider_installation_id, external_payment_id, reported_payment_attempt_id,
+       client_account_id, amount_minor, allocated_minor, currency, occurred_at, disposition
+     ) VALUES ('mock-payment', $1, $2, $3, 500, 500, 'USD', now(), 'allocated')`,
+    [`history-external:${otherPaymentId}`, otherPaymentId, otherCustomer.accountId],
+  );
+  await pool.query(
+    `INSERT INTO services(
+       id, client_account_id, order_item_id, status, billing_cycle,
+       external_resource_id, activated_at, term_start, term_end
+     ) VALUES ($1, $2, $3, 'active', 'monthly', $4, $5, $5, $6)`,
+    [
+      otherServiceId,
+      otherCustomer.accountId,
+      otherItemId,
+      `mock-resource:${otherServiceId}`,
+      term.start_at,
+      term.end_at,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO service_periods(
+       service_id, invoice_id, period_kind, period_start, period_end, granted_at
+     ) VALUES ($1, $2, 'initial', $3, $4, $3)`,
+    [otherServiceId, otherInvoiceId, term.start_at, term.end_at],
+  );
+  await pool.query(
+    `INSERT INTO support_tickets(
+       id, client_account_id, service_id, created_by_user_id, subject
+     ) VALUES ($1, $2, $3, $4, 'Synthetic Beta account history ticket')`,
+    [otherTicketId, otherCustomer.accountId, otherServiceId, otherCustomer.userId],
+  );
+  await pool.query(
+    `INSERT INTO support_ticket_messages(
+       ticket_id, author_user_id, author_type, visibility, body
+     ) VALUES ($1, $2, 'customer', 'public', 'Synthetic Beta customer-visible history')`,
+    [otherTicketId, otherCustomer.userId],
+  );
+
+  await pool.query(
+    `INSERT INTO invoices(id, client_account_id, order_id, currency, total_minor, due_at)
+     VALUES ($1, $2, $3, 'USD', 0, now() + interval '7 days')`,
+    [mismatchedInvoiceId, customer.accountId, otherTraceOrderId],
+  );
+  await pool.query(
+    `INSERT INTO payment_attempts(
+       id, client_account_id, invoice_id, provider_installation_id,
+       external_payment_id, status, amount_minor, principal_minor,
+       fee_minor, currency, scenario, idempotency_key, request_fingerprint,
+       provider_occurred_at
+     ) VALUES (
+       $1, $2, $3, 'mock-payment', $4, 'failed', 500, 500,
+       0, 'USD', 'decline', $5, $6, now()
+     )`,
+    [
+      mismatchedPaymentId,
+      customer.accountId,
+      otherInvoiceId,
+      `history-external:${mismatchedPaymentId}`,
+      `history-payment:${mismatchedPaymentId}`,
+      `history-payment-fingerprint:${mismatchedPaymentId}`,
+    ],
+  );
+  await pool.query(
+    `INSERT INTO payment_allocations(payment_attempt_id, invoice_id, amount_minor)
+     VALUES ($1, $2, 100), ($1, $3, 100)`,
+    [mismatchedPaymentId, invoiceId, renewalInvoiceId],
+  );
+  await pool.query(
+    `INSERT INTO services(
+       id, client_account_id, order_item_id, status, billing_cycle,
+       external_resource_id, activated_at, term_start, term_end
+     ) VALUES ($1, $2, $3, 'active', 'monthly', $4, $5, $5, $6)`,
+    [
+      mismatchedServiceId,
+      customer.accountId,
+      otherTraceItemId,
+      `mock-resource:${mismatchedServiceId}`,
+      term.start_at,
+      term.end_at,
+    ],
+  );
+
+  const pageableAccounts = [
+    await createFixture("Pageable-A"),
+    await createFixture("Pageable-B"),
+    await createFixture("Pageable-C"),
+  ];
+
   ({ app } = await buildApp(config, pool));
   await app.ready();
   const customerCookie = `${config.SESSION_COOKIE_NAME}=${customer.sessionToken}`;
@@ -313,28 +508,73 @@ try {
   assert.equal(historyResponse.statusCode, 200, historyResponse.body);
   const history = responseJson<{
     orders: Array<{ id: string; items: Array<{ id: string }> }>;
-    invoices: Array<{ id: string; status: string }>;
+    invoices: Array<{
+      id: string;
+      orderId: string | null;
+      allocatedMinor: string;
+      status: string;
+    }>;
     payments: Array<{ id: string }>;
     credit: { balanceMinor: string };
     services: Array<{ id: string; invoiceIds: string[] }>;
-    renewals: Array<{ id: string }>;
+    renewals: Array<{ id: string; allocatedMinor: string }>;
     tickets: Array<{ id: string; publicMessageCount: number }>;
   }>(historyResponse);
   assert.deepEqual(history.orders.find((order) => order.id === orderId)?.items, [
     { id: itemId, productName: "Synthetic History Service", billingCycle: "monthly" },
   ]);
-  assert.equal(history.invoices.find((invoice) => invoice.id === invoiceId)?.status, "paid");
+  const initialInvoiceSummary = history.invoices.find((invoice) => invoice.id === invoiceId);
+  assert.equal(initialInvoiceSummary?.status, "paid");
+  assert.equal(initialInvoiceSummary?.allocatedMinor, "500");
   assert.ok(history.payments.some((payment) => payment.id === paymentId));
   assert.equal(history.credit.balanceMinor, "200");
   assert.deepEqual(
     history.services.find((service) => service.id === serviceId)?.invoiceIds.sort(),
     [invoiceId, renewalInvoiceId].sort(),
   );
-  assert.ok(history.renewals.some((renewal) => renewal.id === renewalId));
+  assert.equal(
+    history.renewals.find((renewal) => renewal.id === renewalId)?.allocatedMinor,
+    "0",
+  );
   assert.equal(
     history.tickets.find((ticket) => ticket.id === ticketId)?.publicMessageCount,
     1,
   );
+  assert.ok(!history.orders.some((order) => order.id === otherOrderId));
+  assert.ok(!history.invoices.some((invoice) => invoice.id === otherInvoiceId));
+  assert.ok(!history.payments.some((payment) => payment.id === otherPaymentId));
+  assert.ok(!history.payments.some((payment) => payment.id === mismatchedPaymentId));
+  assert.ok(!history.services.some((service) => service.id === otherServiceId));
+  assert.ok(!history.services.some((service) => service.id === mismatchedServiceId));
+  assert.ok(!history.tickets.some((ticket) => ticket.id === otherTicketId));
+  assert.equal(
+    history.invoices.find((invoice) => invoice.id === mismatchedInvoiceId)?.orderId,
+    null,
+  );
+
+  const otherHistoryResponse = await app.inject({
+    method: "GET",
+    url: "/api/v1/customer/business-history",
+    headers: { cookie: otherCookie },
+  });
+  assert.equal(otherHistoryResponse.statusCode, 200, otherHistoryResponse.body);
+  const otherHistory = responseJson<{
+    orders: Array<{ id: string }>;
+    invoices: Array<{ id: string }>;
+    payments: Array<{ id: string }>;
+    services: Array<{ id: string }>;
+    tickets: Array<{ id: string }>;
+  }>(otherHistoryResponse);
+  assert.ok(otherHistory.orders.some((order) => order.id === otherOrderId));
+  assert.ok(otherHistory.invoices.some((invoice) => invoice.id === otherInvoiceId));
+  assert.ok(otherHistory.payments.some((payment) => payment.id === otherPaymentId));
+  assert.ok(otherHistory.services.some((service) => service.id === otherServiceId));
+  assert.ok(otherHistory.tickets.some((ticket) => ticket.id === otherTicketId));
+  assert.ok(!otherHistory.orders.some((order) => order.id === orderId));
+  assert.ok(!otherHistory.invoices.some((invoice) => invoice.id === invoiceId));
+  assert.ok(!otherHistory.payments.some((payment) => payment.id === paymentId));
+  assert.ok(!otherHistory.services.some((service) => service.id === serviceId));
+  assert.ok(!otherHistory.tickets.some((ticket) => ticket.id === ticketId));
 
   const invoiceDetailResponse = await app.inject({
     method: "GET",
@@ -343,12 +583,19 @@ try {
   });
   assert.equal(invoiceDetailResponse.statusCode, 200, invoiceDetailResponse.body);
   const invoiceDetail = responseJson<{
-    invoice: { id: string; lines: Array<{ amountMinor: string }> };
+    invoice: {
+      id: string;
+      allocatedMinor: string;
+      createdAt: string;
+      lines: Array<{ amountMinor: string }>;
+    };
     related: { orderId: string; serviceIds: string[] };
     pdfUrl: string;
   }>(invoiceDetailResponse);
   assert.equal(invoiceDetail.invoice.id, invoiceId);
-  assert.deepEqual(invoiceDetail.invoice.lines.map((line) => line.amountMinor), ["500"]);
+  assert.equal(invoiceDetail.invoice.allocatedMinor, "500");
+  assert.equal(invoiceDetail.invoice.lines.length, 50);
+  assert.ok(invoiceDetail.invoice.lines.every((line) => line.amountMinor === "10"));
   assert.equal(invoiceDetail.related.orderId, orderId);
   assert.deepEqual(invoiceDetail.related.serviceIds, [serviceId]);
   assert.equal(invoiceDetail.pdfUrl, `/api/v1/customer/invoices/${invoiceId}/pdf`);
@@ -366,7 +613,19 @@ try {
   );
   assert.equal(invoicePdfResponse.rawPayload.subarray(0, 5).toString(), "%PDF-");
   const parsedPdf = await PDFDocument.load(invoicePdfResponse.rawPayload);
-  assert.ok(parsedPdf.getPageCount() >= 1);
+  assert.ok(parsedPdf.getPageCount() > 1);
+  const pdfCreationDate = parsedPdf.getCreationDate();
+  const pdfModificationDate = parsedPdf.getModificationDate();
+  assert.ok(pdfCreationDate);
+  assert.ok(pdfModificationDate);
+  assert.equal(
+    Math.floor(pdfCreationDate.getTime() / 1_000),
+    Math.floor(new Date(invoiceDetail.invoice.createdAt).getTime() / 1_000),
+  );
+  assert.equal(
+    Math.floor(pdfModificationDate.getTime() / 1_000),
+    Math.floor(new Date(invoiceDetail.invoice.createdAt).getTime() / 1_000),
+  );
   const pdfOutput = process.env.ACCOUNT_HISTORY_PDF_OUTPUT;
   if (pdfOutput) await writeFile(pdfOutput, invoicePdfResponse.rawPayload);
 
@@ -393,6 +652,33 @@ try {
   assert.deepEqual(serviceDetail.trace.renewalIds, [renewalId]);
   assert.deepEqual(serviceDetail.trace.ticketIds, [ticketId]);
 
+  const mismatchedInvoiceResponse = await app.inject({
+    method: "GET",
+    url: `/api/v1/customer/invoices/${mismatchedInvoiceId}`,
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(
+    mismatchedInvoiceResponse.statusCode,
+    200,
+    mismatchedInvoiceResponse.body,
+  );
+  const mismatchedInvoice = responseJson<{
+    invoice: { id: string; orderId: string | null };
+    related: { orderId: string | null; serviceIds: string[]; renewalIds: string[] };
+  }>(mismatchedInvoiceResponse);
+  assert.equal(mismatchedInvoice.invoice.id, mismatchedInvoiceId);
+  assert.equal(mismatchedInvoice.invoice.orderId, null);
+  assert.equal(mismatchedInvoice.related.orderId, null);
+  assert.deepEqual(mismatchedInvoice.related.serviceIds, []);
+  assert.deepEqual(mismatchedInvoice.related.renewalIds, []);
+
+  const mismatchedServiceResponse = await app.inject({
+    method: "GET",
+    url: `/api/v1/customer/services/${mismatchedServiceId}`,
+    headers: { cookie: customerCookie },
+  });
+  assert.equal(mismatchedServiceResponse.statusCode, 404, mismatchedServiceResponse.body);
+
   for (const url of [
     `/api/v1/customer/invoices/${invoiceId}`,
     `/api/v1/customer/invoices/${invoiceId}/pdf`,
@@ -402,6 +688,18 @@ try {
       method: "GET",
       url,
       headers: { cookie: otherCookie },
+    });
+    assert.equal(crossAccount.statusCode, 404, `${url}: ${crossAccount.body}`);
+  }
+  for (const url of [
+    `/api/v1/customer/invoices/${otherInvoiceId}`,
+    `/api/v1/customer/invoices/${otherInvoiceId}/pdf`,
+    `/api/v1/customer/services/${otherServiceId}`,
+  ]) {
+    const crossAccount = await app.inject({
+      method: "GET",
+      url,
+      headers: { cookie: customerCookie },
     });
     assert.equal(crossAccount.statusCode, 404, `${url}: ${crossAccount.body}`);
   }
@@ -479,6 +777,58 @@ try {
       ),
     );
   }
+  const firstSearchPage = await app.inject({
+    method: "GET",
+    url: "/api/v1/admin/client-accounts?query=Pageable-&limit=2",
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(firstSearchPage.statusCode, 200, firstSearchPage.body);
+  const firstSearchPageBody = responseJson<{
+    items: Array<{ id: string; name: string }>;
+    hasMore: boolean;
+    nextCursor: string | null;
+  }>(firstSearchPage);
+  assert.equal(firstSearchPageBody.items.length, 2);
+  assert.equal(firstSearchPageBody.hasMore, true);
+  assert.equal(typeof firstSearchPageBody.nextCursor, "string");
+  const secondSearchPage = await app.inject({
+    method: "GET",
+    url:
+      "/api/v1/admin/client-accounts?query=Pageable-&limit=2&cursor=" +
+      encodeURIComponent(firstSearchPageBody.nextCursor ?? ""),
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(secondSearchPage.statusCode, 200, secondSearchPage.body);
+  const secondSearchPageBody = responseJson<{
+    items: Array<{ id: string; name: string }>;
+    hasMore: boolean;
+    nextCursor: string | null;
+  }>(secondSearchPage);
+  assert.equal(secondSearchPageBody.items.length, 1);
+  assert.equal(secondSearchPageBody.hasMore, false);
+  assert.equal(secondSearchPageBody.nextCursor, null);
+  const pagedItems = [...firstSearchPageBody.items, ...secondSearchPageBody.items];
+  assert.equal(new Set(pagedItems.map((account) => account.id)).size, 3);
+  assert.deepEqual(
+    pagedItems.map((account) => account.id).sort(),
+    pageableAccounts.map((account) => account.accountId).sort(),
+  );
+  assert.deepEqual(
+    pagedItems.map((account) => account.name),
+    [
+      "Synthetic Pageable-A Account",
+      "Synthetic Pageable-B Account",
+      "Synthetic Pageable-C Account",
+    ],
+  );
+  const cursorQueryMismatch = await app.inject({
+    method: "GET",
+    url:
+      "/api/v1/admin/client-accounts?query=Customer&limit=2&cursor=" +
+      encodeURIComponent(firstSearchPageBody.nextCursor ?? ""),
+    headers: { cookie: staffCookie },
+  });
+  assert.equal(cursorQueryMismatch.statusCode, 400, cursorQueryMismatch.body);
   const summary = await app.inject({
     method: "GET",
     url: `/api/v1/admin/client-accounts/${customer.accountId}/summary`,

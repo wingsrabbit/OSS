@@ -178,6 +178,9 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/support_tickets
         run: pnpm --filter @opensales/api test:integration:tickets
 
+      - name: Run account history PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:account-history
+
       - name: Prepare and run schema 016 Worker job boundary PostgreSQL journey
         shell: bash
         env:
