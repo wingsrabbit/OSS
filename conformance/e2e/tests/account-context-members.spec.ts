@@ -26,6 +26,7 @@ type AccountContext = {
 const recognizedAccountCapabilities = [
   "account.contacts.manage",
   "account.contacts.read",
+  "account.history.read",
   "account.members.manage",
   "account.members.read",
   "billing.read",
@@ -38,7 +39,7 @@ const recognizedAccountCapabilities = [
 function derivedCapabilities(context: Pick<AccountContext, "role" | "permissions" | "capabilities">): string[] {
   if (context.capabilities) return [...context.capabilities].sort();
   if (context.role === "owner") return [...recognizedAccountCapabilities];
-  const result = new Set<string>(["billing.read"]);
+  const result = new Set<string>(["account.history.read", "billing.read"]);
   if (context.role === "billing") {
     result.add("orders.create");
     result.add("billing.write");
@@ -123,6 +124,43 @@ function viewer(state: MockState) {
 
 function page<T>(items: T[]) {
   return { items, limit: 25, hasMore: false, nextCursor: null };
+}
+
+function notificationDelivery(
+  id: string,
+  operationState: "manual" | "unknown" | "succeeded",
+  outcomeStatus: "failed" | "skipped" | null,
+  recipient: string,
+) {
+  return {
+    id,
+    attemptNumber: operationState === "succeeded" ? 2 : 1,
+    eventType: "notification.renewal_pre_due",
+    templateRevision: "renewal-pre-due-v1",
+    category: "billing",
+    recipientKind: "contact",
+    recipient,
+    locale: "en",
+    status: operationState,
+    operationState,
+    outcomeStatus,
+    reason:
+      operationState === "manual"
+        ? "operator_attention_required"
+        : operationState === "unknown"
+          ? "provider_reconciliation_required"
+          : outcomeStatus === "skipped"
+            ? "not_sent"
+            : null,
+    requiresAttention: operationState === "manual" || operationState === "unknown",
+    attempts: operationState === "manual" ? 3 : 1,
+    provider: "mock-mail-v1",
+    dispatchStartedAt: occurredAt,
+    lastCheckedAt: occurredAt,
+    providerOccurredAt: outcomeStatus ? occurredAt : null,
+    recordedAt: outcomeStatus ? occurredAt : null,
+    createdAt: occurredAt,
+  };
 }
 
 function businessHistory(accountId: string, name: string) {
@@ -268,6 +306,16 @@ async function installMockApi(
     } else if (url.pathname === "/api/v1/customer/business-history") {
       const context = activeContext(state)!;
       await route.fulfill({ headers: authenticatedHeaders, json: businessHistory(context.clientAccountId, context.name) });
+    } else if (url.pathname === "/api/v1/customer/notification-deliveries") {
+      const context = activeContext(state)!;
+      await route.fulfill({
+        headers: authenticatedHeaders,
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          account: { id: context.clientAccountId, name: context.name },
+          ...page([]),
+        },
+      });
     } else if (url.pathname === "/api/v1/billing/summary") {
       await route.fulfill({ headers: authenticatedHeaders, json: billingSummary() });
     } else if (url.pathname === "/api/v1/billing/payment-settings") {
@@ -456,19 +504,18 @@ test("account context pagination pins an active account beyond page one and dedu
   expect(nextPageRequests).toBe(1);
 });
 
-test("a mutation learns the version from a 428 error and retries with that exact header", async ({ page: browserPage }) => {
+test("a 428 mutation is not replayed automatically and an explicit retry keeps the exact version", async ({ page: browserPage }) => {
   let creates = 0;
   const state = baseState({
     contexts: [{ clientAccountId: accountA, name: "Account Alpha", role: "owner", permissions: ["*"], restrictions: { membership: false, clientAccount: false } }],
   });
   state.contacts = [];
   const seen = await installMockApi(browserPage, state, {
-    omitContextHeaders: true,
     intercept: async (path, route) => {
       if (path === "/api/v1/account/contacts" && route.request().method() === "POST") {
         creates += 1;
         if (creates === 1) {
-          expect(route.request().headers()[contextVersionHeader.toLowerCase()]).toBeUndefined();
+          expect(route.request().headers()[contextVersionHeader.toLowerCase()]).toBe("1");
           await route.fulfill({
             status: 428,
             headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA },
@@ -495,20 +542,16 @@ test("a mutation learns the version from a 428 error and retries with that exact
   await panel.getByRole("button", { name: "Create Contact" }).click();
   await expect(panel.getByTestId("account-contact")).toContainText("Finance Desk");
   expect(creates).toBe(2);
-  expect(seen.filter((fact) => fact.path === "/api/v1/account/contacts" && fact.method === "POST").map((fact) => fact.version)).toEqual([null, "1"]);
+  expect(seen.filter((fact) => fact.path === "/api/v1/account/contacts" && fact.method === "POST").map((fact) => fact.version)).toEqual(["1", "1"]);
 });
 
-test("safe reads wait for login completion and an old v18 response cannot overwrite the new v0 session", async ({ page: browserPage }) => {
-  let releaseLogin!: () => void;
-  let loginStarted!: () => void;
-  let releaseOldRead!: () => void;
-  let oldReadStarted!: () => void;
-  const loginGate = new Promise<void>((resolve) => { releaseLogin = resolve; });
-  const loginSeen = new Promise<void>((resolve) => { loginStarted = resolve; });
-  const oldReadGate = new Promise<void>((resolve) => { releaseOldRead = resolve; });
-  const oldReadSeen = new Promise<void>((resolve) => { oldReadStarted = resolve; });
-  let oldReadCalls = 0;
-  let duringTransitionCalls = 0;
+test("a mutation holds the shared session lock until its response is captured, then login replaces context", async ({ page: browserPage }) => {
+  let releaseMutation!: () => void;
+  let mutationStarted!: () => void;
+  const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve; });
+  const mutationSeen = new Promise<void>((resolve) => { mutationStarted = resolve; });
+  let mutationCalls = 0;
+  let loginCalls = 0;
   await browserPage.route("**/api/v1/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/v1/catalog") {
@@ -518,22 +561,15 @@ test("safe reads wait for login completion and an old v18 response cannot overwr
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
     } else if (url.pathname === "/api/v1/test/seed") {
       await route.fulfill({ headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: { seeded: true } });
-    } else if (url.pathname === "/api/v1/test/old-read") {
-      oldReadCalls += 1;
-      if (oldReadCalls === 1) {
-        oldReadStarted();
-        await oldReadGate;
-        await route.fulfill({ headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: { source: "old" } });
-      } else {
-        await route.fulfill({ headers: { [contextVersionHeader]: "0" }, json: { source: "new" } });
-      }
+    } else if (url.pathname === "/api/v1/account/locked-mutation") {
+      mutationCalls += 1;
+      expect(route.request().headers()[contextVersionHeader.toLowerCase()]).toBe("18");
+      mutationStarted();
+      await mutationGate;
+      await route.fulfill({ headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: { committed: true } });
     } else if (url.pathname === "/api/v1/auth/login") {
-      loginStarted();
-      await loginGate;
+      loginCalls += 1;
       await route.fulfill({ status: 409, headers: { [contextVersionHeader]: "0" }, json: { error: "Select an account", code: "ACCOUNT_CONTEXT_REQUIRED" } });
-    } else if (url.pathname === "/api/v1/test/during-transition") {
-      duringTransitionCalls += 1;
-      await route.fulfill({ headers: { [contextVersionHeader]: "0" }, json: { session: "new" } });
     } else {
       await route.fulfill({ status: 401, json: { error: "Authentication required" } });
     }
@@ -544,55 +580,43 @@ test("safe reads wait for login completion and an old v18 response cannot overwr
     const client = await import(modulePath);
     (globalThis as Record<string, unknown>).ossTestClient = client;
     await client.api("/api/v1/test/seed");
+    (globalThis as Record<string, unknown>).mutationPromise = client.api(
+      "/api/v1/account/locked-mutation",
+      { method: "POST", body: "{}" },
+    );
   });
+  await mutationSeen;
   await browserPage.evaluate(() => {
     const client = (globalThis as Record<string, any>).ossTestClient;
-    (globalThis as Record<string, unknown>).oldReadPromise = client.api("/api/v1/test/old-read");
-  });
-  await oldReadSeen;
-  await browserPage.evaluate(() => {
-    const client = (globalThis as Record<string, any>).ossTestClient;
-    (globalThis as Record<string, unknown>).loginPromise = client.api("/api/v1/auth/login", { method: "POST", body: "{}" }).catch((error: { code?: string }) => error.code);
-  });
-  await loginSeen;
-  await browserPage.evaluate(() => {
-    const client = (globalThis as Record<string, any>).ossTestClient;
-    (globalThis as Record<string, unknown>).duringPromise = client.api("/api/v1/test/during-transition");
+    (globalThis as Record<string, unknown>).loginPromise = client
+      .api("/api/v1/auth/login", { method: "POST", body: "{}" })
+      .catch((error: { code?: string }) => error.code);
   });
   const lockState = await browserPage.evaluate(async () => navigator.locks.query());
-  expect((lockState.held ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "exclusive")).toBe(true);
-  expect((lockState.pending ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "shared")).toBe(true);
-  expect(duringTransitionCalls).toBe(0);
-  releaseLogin();
-  expect(await browserPage.evaluate(async () => await (globalThis as unknown as Record<string, Promise<unknown>>).loginPromise)).toBe("ACCOUNT_CONTEXT_REQUIRED");
-  await expect.poll(() => duringTransitionCalls).toBe(1);
-  releaseOldRead();
+  expect((lockState.held ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "shared")).toBe(true);
+  expect((lockState.pending ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "exclusive")).toBe(true);
+  expect(loginCalls).toBe(0);
+  releaseMutation();
   const outcome = await browserPage.evaluate(async () => {
     const global = globalThis as Record<string, any>;
-    const [oldRead, during] = await Promise.all([global.oldReadPromise, global.duringPromise]);
-    return { oldRead, during, snapshot: global.ossTestClient.getAccountContextSnapshot() };
+    const [mutation, login] = await Promise.all([global.mutationPromise, global.loginPromise]);
+    return { mutation, login, snapshot: global.ossTestClient.getAccountContextSnapshot() };
   });
   expect(outcome).toEqual({
-    oldRead: { source: "new" },
-    during: { session: "new" },
+    mutation: { committed: true },
+    login: "ACCOUNT_CONTEXT_REQUIRED",
     snapshot: { clientAccountId: null, version: "0", generation: expect.any(Number) },
   });
-  expect(oldReadCalls).toBe(2);
+  expect(mutationCalls).toBe(1);
+  expect(loginCalls).toBe(1);
 });
 
-test("failed auth transitions preserve context, concurrent login fails closed, and successful logout rejects an old response", async ({ page: browserPage }) => {
-  let releaseFirstLogin!: () => void;
-  let firstLoginStarted!: () => void;
-  let releaseOldRead!: () => void;
-  let oldReadStarted!: () => void;
-  const firstLoginGate = new Promise<void>((resolve) => { releaseFirstLogin = resolve; });
-  const firstLoginSeen = new Promise<void>((resolve) => { firstLoginStarted = resolve; });
-  const oldReadGate = new Promise<void>((resolve) => { releaseOldRead = resolve; });
-  const oldReadSeen = new Promise<void>((resolve) => { oldReadStarted = resolve; });
-  let loginCalls = 0;
-  let logoutCalls = 0;
-  let oldReadCalls = 0;
-  const mutationVersions: Array<string | null> = [];
+test("login holds the exclusive lock and a queued mutation uses the new same-version account context", async ({ page: browserPage }) => {
+  let releaseLogin!: () => void;
+  let loginStarted!: () => void;
+  const loginGate = new Promise<void>((resolve) => { releaseLogin = resolve; });
+  const loginSeen = new Promise<void>((resolve) => { loginStarted = resolve; });
+  let mutationCalls = 0;
   await browserPage.route("**/api/v1/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/v1/catalog") {
@@ -601,33 +625,15 @@ test("failed auth transitions preserve context, concurrent login fails closed, a
       const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
     } else if (url.pathname === "/api/v1/test/seed") {
-      await route.fulfill({ headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: {} });
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA }, json: {} });
     } else if (url.pathname === "/api/v1/auth/login") {
-      loginCalls += 1;
-      if (loginCalls === 1) {
-        firstLoginStarted();
-        await firstLoginGate;
-      }
-      await route.fulfill({ status: 401, json: { error: "Wrong credentials", code: "INVALID_CREDENTIALS" } });
-    } else if (url.pathname === "/api/v1/auth/logout") {
-      logoutCalls += 1;
-      if (logoutCalls === 1) {
-        await route.fulfill({ status: 503, headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: { error: "Temporary logout failure" } });
-      } else {
-        await route.fulfill({ status: 204, headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA } });
-      }
-    } else if (url.pathname === "/api/v1/test/mutation") {
-      mutationVersions.push(route.request().headers()[contextVersionHeader.toLowerCase()] ?? null);
-      await route.fulfill({ headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: { ok: true } });
-    } else if (url.pathname === "/api/v1/test/old-after-logout") {
-      oldReadCalls += 1;
-      if (oldReadCalls === 1) {
-        oldReadStarted();
-        await oldReadGate;
-        await route.fulfill({ headers: { [contextVersionHeader]: "18", [contextIdHeader]: accountA }, json: { source: "old" } });
-      } else {
-        await route.fulfill({ json: { source: "logged-out" } });
-      }
+      loginStarted();
+      await loginGate;
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountB }, json: { expiresAt: occurredAt } });
+    } else if (url.pathname === "/api/v1/account/after-login") {
+      mutationCalls += 1;
+      expect(route.request().headers()[contextVersionHeader.toLowerCase()]).toBe("1");
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountB }, json: { account: accountB } });
     } else {
       await route.fulfill({ status: 401, json: { error: "Authentication required" } });
     }
@@ -638,41 +644,231 @@ test("failed auth transitions preserve context, concurrent login fails closed, a
     const client = await import(modulePath);
     (globalThis as Record<string, unknown>).ossTestClient = client;
     await client.api("/api/v1/test/seed");
-    (globalThis as Record<string, unknown>).firstLoginPromise = client.api("/api/v1/auth/login", { method: "POST", body: "{}" }).catch((error: { code?: string }) => error.code);
+    (globalThis as Record<string, unknown>).loginPromise = client.api("/api/v1/auth/login", { method: "POST", body: "{}" });
   });
-  await firstLoginSeen;
-  const concurrentCode = await browserPage.evaluate(async () => {
+  await loginSeen;
+  await browserPage.evaluate(() => {
     const client = (globalThis as Record<string, any>).ossTestClient;
-    return client.api("/api/v1/auth/login", { method: "POST", body: "{}" }).catch((error: { code?: string }) => error.code);
+    (globalThis as Record<string, unknown>).mutationPromise = client.api(
+      "/api/v1/account/after-login",
+      { method: "POST", body: "{}" },
+    );
   });
-  expect(concurrentCode).toBe("AUTH_TRANSITION_IN_PROGRESS");
-  expect(loginCalls).toBe(1);
-  releaseFirstLogin();
-  expect(await browserPage.evaluate(async () => await (globalThis as unknown as Record<string, Promise<unknown>>).firstLoginPromise)).toBe("INVALID_CREDENTIALS");
-  await browserPage.evaluate(async () => {
-    const client = (globalThis as Record<string, any>).ossTestClient;
-    await client.api("/api/v1/test/mutation", { method: "POST", body: "{}" });
-    await client.api("/api/v1/auth/logout", { method: "POST", body: "{}" }).catch(() => undefined);
-    await client.api("/api/v1/test/mutation", { method: "POST", body: "{}" });
-    (globalThis as Record<string, unknown>).oldLogoutPromise = client.api("/api/v1/test/old-after-logout");
-  });
-  await oldReadSeen;
-  await browserPage.evaluate(async () => {
-    const client = (globalThis as Record<string, any>).ossTestClient;
-    await client.api("/api/v1/auth/logout", { method: "POST", body: "{}" });
-  });
-  releaseOldRead();
+  const lockState = await browserPage.evaluate(async () => navigator.locks.query());
+  expect((lockState.held ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "exclusive")).toBe(true);
+  expect((lockState.pending ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "shared")).toBe(true);
+  expect(mutationCalls).toBe(0);
+  releaseLogin();
   const outcome = await browserPage.evaluate(async () => {
     const global = globalThis as Record<string, any>;
-    const result = await global.oldLogoutPromise;
-    return { result, snapshot: global.ossTestClient.getAccountContextSnapshot() };
+    const [login, mutation] = await Promise.all([global.loginPromise, global.mutationPromise]);
+    return { login, mutation, snapshot: global.ossTestClient.getAccountContextSnapshot() };
   });
-  expect(mutationVersions).toEqual(["18", "18"]);
   expect(outcome).toEqual({
-    result: { source: "logged-out" },
+    login: { expiresAt: occurredAt },
+    mutation: { account: accountB },
+    snapshot: { clientAccountId: accountB, version: "1", generation: expect.any(Number) },
+  });
+  expect(mutationCalls).toBe(1);
+});
+
+test("logout waits exclusively for an in-flight shared read and clears context only after the read is captured", async ({ page: browserPage }) => {
+  let releaseRead!: () => void;
+  let readStarted!: () => void;
+  const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const readSeen = new Promise<void>((resolve) => { readStarted = resolve; });
+  let logoutCalls = 0;
+  await browserPage.route("**/api/v1/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/catalog") {
+      await route.fulfill({ json: { products: [] } });
+    } else if (url.pathname === "/api/v1/legal/current") {
+      const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
+      await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/test/seed") {
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA }, json: {} });
+    } else if (url.pathname === "/api/v1/test/held-read") {
+      readStarted();
+      await readGate;
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA }, json: { captured: true } });
+    } else if (url.pathname === "/api/v1/auth/logout") {
+      logoutCalls += 1;
+      await route.fulfill({ status: 204 });
+    } else {
+      await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+    }
+  });
+  await browserPage.goto("/");
+  await browserPage.evaluate(async () => {
+    const modulePath = "/src/api.ts";
+    const client = await import(modulePath);
+    (globalThis as Record<string, unknown>).ossTestClient = client;
+    await client.api("/api/v1/test/seed");
+    (globalThis as Record<string, unknown>).readPromise = client.api("/api/v1/test/held-read");
+  });
+  await readSeen;
+  await browserPage.evaluate(() => {
+    const client = (globalThis as Record<string, any>).ossTestClient;
+    (globalThis as Record<string, unknown>).logoutPromise = client.api(
+      "/api/v1/auth/logout",
+      { method: "POST", body: "{}" },
+    );
+  });
+  const lockState = await browserPage.evaluate(async () => navigator.locks.query());
+  expect((lockState.held ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "shared")).toBe(true);
+  expect((lockState.pending ?? []).some((lock) => lock.name === "opensales-auth-transition-v1" && lock.mode === "exclusive")).toBe(true);
+  expect(logoutCalls).toBe(0);
+  releaseRead();
+  const outcome = await browserPage.evaluate(async () => {
+    const global = globalThis as Record<string, any>;
+    const [read, logout] = await Promise.all([global.readPromise, global.logoutPromise]);
+    return {
+      read,
+      logoutReturnedNoBody: logout === undefined,
+      snapshot: global.ossTestClient.getAccountContextSnapshot(),
+    };
+  });
+  expect(outcome).toEqual({
+    read: { captured: true },
+    logoutReturnedNoBody: true,
     snapshot: { clientAccountId: null, version: null, generation: expect.any(Number) },
   });
-  expect(oldReadCalls).toBe(2);
+  expect(logoutCalls).toBe(1);
+});
+
+test("an incorrect reauthentication password preserves a valid session context", async ({ page: browserPage }) => {
+  await browserPage.route("**/api/v1/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/catalog") {
+      await route.fulfill({ json: { products: [] } });
+    } else if (url.pathname === "/api/v1/legal/current") {
+      const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
+      await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/test/seed") {
+      await route.fulfill({ headers: { [contextVersionHeader]: "7", [contextIdHeader]: accountA }, json: {} });
+    } else if (url.pathname === "/api/v1/auth/reauth") {
+      await route.fulfill({
+        status: 401,
+        headers: { [contextVersionHeader]: "7", [contextIdHeader]: accountA },
+        json: { error: "Password confirmation failed" },
+      });
+    } else {
+      await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+    }
+  });
+  await browserPage.goto("/");
+  const outcome = await browserPage.evaluate(async () => {
+    const modulePath = "/src/api.ts";
+    const client = await import(modulePath);
+    await client.api("/api/v1/test/seed");
+    const status = await client
+      .api("/api/v1/auth/reauth", { method: "POST", body: "{}" })
+      .catch((error: { status?: number }) => error.status);
+    return { status, snapshot: client.getAccountContextSnapshot() };
+  });
+  expect(outcome).toEqual({
+    status: 401,
+    snapshot: { clientAccountId: accountA, version: "7", generation: expect.any(Number) },
+  });
+});
+
+test("invalid or missing protected response context is recovered once and mutations are never replayed", async ({ page: browserPage }) => {
+  let reads = 0;
+  let mutations = 0;
+  let meReads = 0;
+  await browserPage.route("**/api/v1/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/catalog") {
+      await route.fulfill({ json: { products: [] } });
+    } else if (url.pathname === "/api/v1/legal/current") {
+      const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
+      await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/test/seed") {
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA }, json: {} });
+    } else if (url.pathname === "/api/v1/customer/bad-read") {
+      reads += 1;
+      await route.fulfill(reads === 1
+        ? { json: { discarded: true } }
+        : { headers: { [contextVersionHeader]: "2", [contextIdHeader]: accountB }, json: { authoritative: true } });
+    } else if (url.pathname === "/api/v1/account/bad-mutation") {
+      mutations += 1;
+      await route.fulfill({ headers: { [contextVersionHeader]: "not-a-decimal", [contextIdHeader]: accountB }, json: { committed: true } });
+    } else if (url.pathname === "/api/v1/auth/me") {
+      meReads += 1;
+      await route.fulfill({ headers: { [contextVersionHeader]: "2", [contextIdHeader]: accountB }, json: { id: viewerId } });
+    } else {
+      await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+    }
+  });
+  await browserPage.goto("/");
+  const outcome = await browserPage.evaluate(async () => {
+    const modulePath = "/src/api.ts";
+    const client = await import(modulePath);
+    const invalidations: string[] = [];
+    const unsubscribe = client.subscribeAccountContextInvalidation(
+      (error: { code?: string }) => invalidations.push(error.code ?? "unknown"),
+    );
+    await client.api("/api/v1/test/seed");
+    const read = await client.api("/api/v1/customer/bad-read");
+    const mutationCode = await client
+      .api("/api/v1/account/bad-mutation", { method: "POST", body: "{}" })
+      .catch((error: { code?: string }) => error.code);
+    unsubscribe();
+    return { read, mutationCode, invalidations, snapshot: client.getAccountContextSnapshot() };
+  });
+  expect(outcome).toEqual({
+    read: { authoritative: true },
+    mutationCode: "SESSION_CONTEXT_INVALID",
+    invalidations: ["SESSION_CHANGED", "SESSION_CONTEXT_INVALID"],
+    snapshot: { clientAccountId: accountB, version: "2", generation: expect.any(Number) },
+  });
+  expect({ reads, mutations, meReads }).toEqual({ reads: 2, mutations: 1, meReads: 2 });
+});
+
+test("a rotated login cookie with bad context headers clears old state and uses only authoritative recovery", async ({ page: browserPage }) => {
+  let loginCalls = 0;
+  let meReads = 0;
+  await browserPage.route("**/api/v1/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/catalog") {
+      await route.fulfill({ json: { products: [] } });
+    } else if (url.pathname === "/api/v1/legal/current") {
+      const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
+      await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/test/seed") {
+      await route.fulfill({ headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountA }, json: {} });
+    } else if (url.pathname === "/api/v1/auth/login") {
+      loginCalls += 1;
+      await route.fulfill({ headers: loginCalls === 1 ? {} : { [contextVersionHeader]: "broken" }, json: { expiresAt: occurredAt } });
+    } else if (url.pathname === "/api/v1/auth/me") {
+      meReads += 1;
+      await route.fulfill(meReads === 1
+        ? { headers: { [contextVersionHeader]: "1", [contextIdHeader]: accountB }, json: { id: viewerId } }
+        : { headers: { [contextVersionHeader]: "still-broken", [contextIdHeader]: accountA }, json: { id: viewerId } });
+    } else {
+      await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+    }
+  });
+  await browserPage.goto("/");
+  const outcome = await browserPage.evaluate(async () => {
+    const modulePath = "/src/api.ts";
+    const client = await import(modulePath);
+    await client.api("/api/v1/test/seed");
+    const first = await client.api("/api/v1/auth/login", { method: "POST", body: "{}" });
+    const recovered = client.getAccountContextSnapshot();
+    const secondCode = await client
+      .api("/api/v1/auth/login", { method: "POST", body: "{}" })
+      .catch((error: { code?: string }) => error.code);
+    return { first, recovered, secondCode, final: client.getAccountContextSnapshot() };
+  });
+  expect(outcome).toEqual({
+    first: { expiresAt: occurredAt },
+    recovered: { clientAccountId: accountB, version: "1", generation: expect.any(Number) },
+    secondCode: "SESSION_CONTEXT_INVALID",
+    final: { clientAccountId: null, version: null, generation: expect.any(Number) },
+  });
+  expect(loginCalls).toBe(2);
+  expect(meReads).toBeGreaterThanOrEqual(2);
 });
 
 test("a tab that closes after broadcasting begin cannot permanently block safe reads", async ({ page: browserPage, context }) => {
@@ -686,7 +882,7 @@ test("a tab that closes after broadcasting begin cannot permanently block safe r
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
     } else if (url.pathname === "/api/v1/test/crash-read") {
       crashReadCalls += 1;
-      await route.fulfill({ json: { recovered: true } });
+      await route.fulfill({ headers: { [contextVersionHeader]: "0" }, json: { recovered: true } });
     } else {
       await route.fulfill({ status: 401, json: { error: "Authentication required" } });
     }
@@ -721,6 +917,71 @@ test("a tab that closes after broadcasting begin cannot permanently block safe r
   await sourcePage.close();
   expect(await browserPage.evaluate(async () => await (globalThis as unknown as Record<string, Promise<unknown>>).crashReadPromise)).toEqual({ recovered: true });
   expect(crashReadCalls).toBe(1);
+});
+
+test("customer notification history renders masked manual, unknown and skipped facts with an opaque load-more cursor", async ({ page: browserPage }) => {
+  const state = baseState();
+  const cursor = "customer.notification:2026-08-10T00:00:00.123456Z:opaque";
+  let initialNotificationFetches = 0;
+  let pagedNotificationFetches = 0;
+  await installMockApi(browserPage, state, {
+    intercept: async (path, route) => {
+      if (path !== "/api/v1/customer/notification-deliveries") return false;
+      const requestUrl = new URL(route.request().url());
+      if (requestUrl.searchParams.get("cursor") === null) {
+        initialNotificationFetches += 1;
+        await route.fulfill({
+          headers: headers(state),
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountA, name: "Account Alpha" },
+            items: [
+              {
+                ...notificationDelivery("00000000-0000-4000-8000-000000001930", "manual", "failed", "f***@example.invalid"),
+                payload: "SECRET_PAYLOAD_MUST_NOT_RENDER",
+                renderedBody: "SECRET_BODY_MUST_NOT_RENDER",
+                token: "SECRET_TOKEN_MUST_NOT_RENDER",
+                providerOperationId: "SECRET_PROVIDER_ID_MUST_NOT_RENDER",
+              },
+              notificationDelivery("00000000-0000-4000-8000-000000001931", "unknown", null, "o***@example.invalid"),
+            ],
+            limit: 20,
+            hasMore: true,
+            nextCursor: cursor,
+          },
+        });
+      } else {
+        pagedNotificationFetches += 1;
+        expect(requestUrl.searchParams.get("cursor")).toBe(cursor);
+        await route.fulfill({
+          headers: headers(state),
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountA, name: "Account Alpha" },
+            items: [notificationDelivery("00000000-0000-4000-8000-000000001932", "succeeded", "skipped", "s***@example.invalid")],
+            limit: 20,
+            hasMore: false,
+            nextCursor: null,
+          },
+        });
+      }
+      return true;
+    },
+  });
+  await browserPage.goto("/customer");
+  const history = browserPage.getByTestId("customer-notification-history");
+  await expect(history).toContainText("f***@example.invalid");
+  await expect(history).toContainText("operation manual");
+  await expect(history).toContainText("operation unknown");
+  await expect(history).not.toContainText("SECRET_PAYLOAD_MUST_NOT_RENDER");
+  await expect(history).not.toContainText("SECRET_BODY_MUST_NOT_RENDER");
+  await expect(history).not.toContainText("SECRET_TOKEN_MUST_NOT_RENDER");
+  await expect(history).not.toContainText("SECRET_PROVIDER_ID_MUST_NOT_RENDER");
+  await history.getByTestId("customer-notification-deliveries-load-more").click();
+  await expect(history).toContainText("s***@example.invalid");
+  await expect(history).toContainText("outcome skipped");
+  expect(initialNotificationFetches).toBeGreaterThanOrEqual(1);
+  expect(pagedNotificationFetches).toBe(1);
 });
 
 test("stale context errors clear protected account state before refreshing the new context", async ({ page: browserPage }) => {
@@ -849,6 +1110,143 @@ for (const contactsAuthorized of [false, true]) {
     }
   });
 }
+
+test("Admin notification history is permission-gated, masked and paginated for the selected account", async ({ page: browserPage }) => {
+  const state = baseState({
+    activeId: null,
+    version: "0",
+    role: null,
+    permissions: [],
+    contexts: [],
+    staffPermissions: ["accounts.view", "accounts.notification.read"],
+  });
+  const cursor = "admin.notification:2026-08-10T00:00:00.123456Z:opaque";
+  let initialNotificationFetches = 0;
+  let pagedNotificationFetches = 0;
+  await installMockApi(browserPage, state, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/admin/client-accounts") {
+        await route.fulfill({ headers: headers(state), json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          items: [{
+            id: accountA,
+            name: "Admin Notification Account",
+            owner: { userId: viewerId, email: "founder@example.invalid", emailVerifiedAt: occurredAt },
+            restrictedAt: null,
+            activeMemberCount: 1,
+            createdAt: occurredAt,
+          }],
+          hasMore: false,
+          nextCursor: null,
+        } });
+        return true;
+      }
+      if (path === `/api/v1/admin/client-accounts/${accountA}/summary`) {
+        await route.fulfill({ headers: headers(state), json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          account: { id: accountA, name: "Admin Notification Account", createdAt: occurredAt, restrictedAt: null },
+          owner: { userId: viewerId, email: "founder@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+          memberships: [],
+          restrictions: [],
+        } });
+        return true;
+      }
+      if (path === `/api/v1/admin/client-accounts/${accountA}/notification-deliveries`) {
+        const requestUrl = new URL(route.request().url());
+        const paged = requestUrl.searchParams.get("cursor") !== null;
+        if (paged) {
+          pagedNotificationFetches += 1;
+          expect(requestUrl.searchParams.get("cursor")).toBe(cursor);
+        } else {
+          initialNotificationFetches += 1;
+        }
+        await route.fulfill({ headers: headers(state), json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          account: { id: accountA, name: "Admin Notification Account" },
+          items: paged
+            ? [notificationDelivery("00000000-0000-4000-8000-000000001934", "succeeded", "skipped", "b***@example.invalid")]
+            : [{
+                ...notificationDelivery("00000000-0000-4000-8000-000000001933", "manual", "failed", "a***@example.invalid"),
+                body: "ADMIN_SECRET_BODY_MUST_NOT_RENDER",
+                providerMessageId: "ADMIN_PROVIDER_ID_MUST_NOT_RENDER",
+              }],
+          limit: 20,
+          hasMore: !paged,
+          nextCursor: paged ? null : cursor,
+        } });
+        return true;
+      }
+      return false;
+    },
+  });
+  await browserPage.goto("/admin");
+  const account360 = browserPage.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill("Admin Notification Account");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByTestId("account360-search-results").getByRole("button", { name: /Admin Notification Account/ }).click();
+  const history = account360.getByTestId("admin-notification-history");
+  await expect(history).toContainText("a***@example.invalid");
+  await expect(history).toContainText("operation manual");
+  await expect(history).not.toContainText("ADMIN_SECRET_BODY_MUST_NOT_RENDER");
+  await expect(history).not.toContainText("ADMIN_PROVIDER_ID_MUST_NOT_RENDER");
+  await history.getByTestId("admin-notification-deliveries-load-more").click();
+  await expect(history).toContainText("b***@example.invalid");
+  await expect(history).toContainText("outcome skipped");
+  expect(initialNotificationFetches).toBeGreaterThanOrEqual(1);
+  expect(pagedNotificationFetches).toBe(1);
+});
+
+test("Admin Account 360 never requests notification history without its server permission", async ({ page: browserPage }) => {
+  const state = baseState({
+    activeId: null,
+    version: "0",
+    role: null,
+    permissions: [],
+    contexts: [],
+    staffPermissions: ["accounts.view"],
+  });
+  let notificationFetches = 0;
+  await installMockApi(browserPage, state, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/admin/client-accounts") {
+        await route.fulfill({ headers: headers(state), json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          items: [{
+            id: accountA,
+            name: "No Notification Permission",
+            owner: { userId: viewerId, email: "founder@example.invalid", emailVerifiedAt: occurredAt },
+            restrictedAt: null,
+            activeMemberCount: 1,
+            createdAt: occurredAt,
+          }],
+          hasMore: false,
+          nextCursor: null,
+        } });
+        return true;
+      }
+      if (path === `/api/v1/admin/client-accounts/${accountA}/summary`) {
+        await route.fulfill({ headers: headers(state), json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          account: { id: accountA, name: "No Notification Permission", createdAt: occurredAt, restrictedAt: null },
+          owner: { userId: viewerId, email: "founder@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+          memberships: [],
+          restrictions: [],
+        } });
+        return true;
+      }
+      if (path.endsWith("/notification-deliveries")) notificationFetches += 1;
+      return false;
+    },
+  });
+  await browserPage.goto("/admin");
+  const account360 = browserPage.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill("No Notification Permission");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByTestId("account360-search-results").getByRole("button", { name: /No Notification Permission/ }).click();
+  await expect(account360.getByTestId("account360-memberships")).toHaveCount(1);
+  await expect(account360.getByTestId("admin-notification-history")).toHaveCount(0);
+  expect(notificationFetches).toBe(0);
+});
 
 for (const membershipRole of ["viewer", "billing", "technical"] as const) {
   test(`${membershipRole} derived capabilities keep reads mounted and expose only authorized writes`, async ({ page: browserPage }) => {

@@ -141,6 +141,36 @@ const pool = new pg.Pool({
   application_name: "opensales-mock-lab",
 });
 
+const inFlightMailWrites = new Map<string, Promise<void>>();
+
+async function serializeMailWrite<T>(operationId: string, work: () => Promise<T>): Promise<T> {
+  const predecessor = inFlightMailWrites.get(operationId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.then(() => current);
+  inFlightMailWrites.set(operationId, tail);
+  await predecessor;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (inFlightMailWrites.get(operationId) === tail) {
+      inFlightMailWrites.delete(operationId);
+    }
+  }
+}
+
+async function waitForInFlightMailWrite(operationId: string): Promise<void> {
+  while (true) {
+    const pending = inFlightMailWrites.get(operationId);
+    if (!pending) return;
+    await pending;
+    if (inFlightMailWrites.get(operationId) === pending) return;
+  }
+}
+
 await pool.query(`
   CREATE EXTENSION IF NOT EXISTS citext;
   CREATE TABLE IF NOT EXISTS mock_payment_operations (
@@ -1512,30 +1542,48 @@ app.post("/v1/mail", async (request, reply) => {
   }
   const normalizedBody = { ...body, scenario: body.scenario ?? "delivered" } as const;
   const fingerprint = requestFingerprint("mail.send:v1", normalizedBody);
-  const result = await pool.query<{
+  const result = await serializeMailWrite(normalizedBody.operationId, async () => {
+    const client = await pool.connect();
+    let transactionResult: pg.QueryResult<{
     status: "delivered" | "bounced" | "failed";
     delivered_at: Date;
-  }>(
-    `INSERT INTO mock_mail_messages(
-       operation_id, recipient, template, locale, subject, body, sensitive,
-       status, request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT (operation_id) DO UPDATE
-       SET delivery_calls = mock_mail_messages.delivery_calls + 1
-       WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
-     RETURNING status, delivered_at`,
-    [
-      normalizedBody.operationId,
-      normalizedBody.recipient,
-      normalizedBody.template,
-      normalizedBody.locale,
-      normalizedBody.subject,
-      normalizedBody.body,
-      normalizedBody.sensitive,
-      normalizedBody.scenario,
-      fingerprint,
-    ],
-  );
+    }>;
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`mock-mail-operation:${normalizedBody.operationId}`],
+      );
+      transactionResult = await client.query(
+        `INSERT INTO mock_mail_messages(
+           operation_id, recipient, template, locale, subject, body, sensitive,
+           status, request_fingerprint
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (operation_id) DO UPDATE
+           SET delivery_calls = mock_mail_messages.delivery_calls + 1
+           WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
+         RETURNING status, delivered_at`,
+        [
+          normalizedBody.operationId,
+          normalizedBody.recipient,
+          normalizedBody.template,
+          normalizedBody.locale,
+          normalizedBody.subject,
+          normalizedBody.body,
+          normalizedBody.sensitive,
+          normalizedBody.scenario,
+          fingerprint,
+        ],
+      );
+      await client.query("COMMIT");
+      return transactionResult;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
   if (!result.rows[0]) {
     return reply.code(409).send({ error: "idempotency key was reused with a different message" });
   }
@@ -1551,16 +1599,32 @@ app.get("/v1/mail/:operationId", async (request, reply) => {
   if (!params.success) {
     return reply.code(400).send({ error: "operationId must be a UUID" });
   }
-  const result = await pool.query<{
+  await waitForInFlightMailWrite(params.data.operationId);
+  const client = await pool.connect();
+  let result: pg.QueryResult<{
     operation_id: string;
     status: "delivered" | "bounced" | "failed";
     delivered_at: Date;
-  }>(
-    `SELECT operation_id, status, delivered_at
-     FROM mock_mail_messages
-     WHERE operation_id = $1`,
-    [params.data.operationId],
-  );
+  }>;
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`mock-mail-operation:${params.data.operationId}`],
+    );
+    result = await client.query(
+      `SELECT operation_id, status, delivered_at
+       FROM mock_mail_messages
+       WHERE operation_id = $1`,
+      [params.data.operationId],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
   const row = result.rows[0];
   if (!row) return reply.code(404).send({ error: "operation not found" });
   return {

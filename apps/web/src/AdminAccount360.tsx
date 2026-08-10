@@ -2,6 +2,7 @@
 
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
+import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
 import type {
   CancellationHistory,
   CreditHistory,
@@ -206,6 +207,7 @@ export function AdminAccount360({
   const [cancellations, setCancellations] = useState<Loadable<CancellationsResponse>>(emptyLoadable);
   const [tickets, setTickets] = useState<Loadable<TicketsResponse>>(emptyLoadable);
   const [contacts, setContacts] = useState<Loadable<ContactsResponse>>(emptyLoadable);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const searchGeneration = useRef(0);
   const accountGeneration = useRef(0);
 
@@ -215,6 +217,7 @@ export function AdminAccount360({
   const canReadServices = permissionSetHas(permissions, "services.read");
   const canReadTickets = permissionSetHas(permissions, "support.tickets.manage");
   const canReadContacts = permissionSetHas(permissions, "accounts.contacts.read");
+  const canReadNotificationHistory = permissionSetHas(permissions, "accounts.notification.read");
 
   function clearAccountWorkspace() {
     accountGeneration.current += 1;
@@ -320,6 +323,7 @@ export function AdminAccount360({
 
   function openAccount(account: SearchItem) {
     const generation = ++accountGeneration.current;
+    setWorkspaceRevision((current) => current + 1);
     setSelected(account);
     onSelectedAccountChange(account);
     setSummary({ loading: true, data: null, error: null });
@@ -522,6 +526,19 @@ export function AdminAccount360({
                 </>
               )}
             </Panel>
+          )}
+
+          {canReadNotificationHistory && (
+            <NotificationDeliveryHistory
+              active={active && selected !== null}
+              endpoint={`/api/v1/admin/client-accounts/${selected.id}/notification-deliveries`}
+              accountId={selected.id}
+              scopeKey={`${accessFingerprint}:${selected.id}`}
+              refreshKey={workspaceRevision}
+              locale={locale}
+              variant="admin"
+              onError={onError}
+            />
           )}
 
           {canReadOrders && (

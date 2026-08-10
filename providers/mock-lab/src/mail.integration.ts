@@ -106,6 +106,29 @@ async function responseJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
+async function waitForMockMailAdvisoryWait(
+  observer: pg.Client,
+  expected: number,
+): Promise<void> {
+  for (let poll = 0; poll < 200; poll += 1) {
+    const result = await observer.query<{ waiting: string }>(
+      `SELECT count(*)::text AS waiting
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND application_name = 'opensales-mock-lab'
+         AND wait_event_type = 'Lock'
+         AND pid IN (
+           SELECT lock.pid
+           FROM pg_locks lock
+           WHERE lock.locktype = 'advisory' AND NOT lock.granted
+         )`,
+    );
+    if (Number(result.rows[0]?.waiting ?? "0") >= expected) return;
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for ${expected} Mock Mail advisory waiter(s)`);
+}
+
 try {
   await admin.connect();
   await admin.query(`CREATE DATABASE "${databaseName}"`);
@@ -154,6 +177,106 @@ try {
   );
   assert.equal(missing.status, 404);
   assert.deepEqual(await responseJson(missing), { error: "operation not found" });
+
+  const linearization = new pg.Client({ connectionString: testDatabaseUrl.toString() });
+  await linearization.connect();
+  try {
+    const inFlightOperationId = randomUUID();
+    const inFlightMessage = {
+      ...message,
+      operationId: inFlightOperationId,
+      recipient: `in-flight-${inFlightOperationId}@example.invalid`,
+    };
+    await linearization.query("BEGIN");
+    await linearization.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`mock-mail-operation:${inFlightOperationId}`],
+    );
+    let postSettled = false;
+    const inFlightPost = fetch(new URL("/v1/mail", providerBaseUrl), {
+      method: "POST",
+      headers: providerHeaders(inFlightOperationId),
+      body: JSON.stringify(inFlightMessage),
+    });
+    void inFlightPost.then(
+      () => {
+        postSettled = true;
+      },
+      () => {
+        postSettled = true;
+      },
+    );
+    await waitForMockMailAdvisoryWait(linearization, 1);
+    let getSettled = false;
+    const inFlightGet = fetch(
+      new URL(`/v1/mail/${inFlightOperationId}`, providerBaseUrl),
+      { headers: providerHeaders() },
+    );
+    void inFlightGet.then(
+      () => {
+        getSettled = true;
+      },
+      () => {
+        getSettled = true;
+      },
+    );
+    await delay(50);
+    assert.equal(postSettled, false, "POST must remain blocked before its fact commits");
+    assert.equal(getSettled, false, "GET must await the in-flight POST instead of returning 404");
+    await linearization.query("COMMIT");
+    const committedPost = await inFlightPost;
+    const committedGet = await inFlightGet;
+    assert.equal(committedPost.status, 202);
+    assert.equal(committedGet.status, 200);
+    assert.deepEqual(
+      await responseJson<MailDeliveryFact>(committedGet),
+      await responseJson<MailDeliveryFact>(committedPost),
+    );
+
+    const rolledBackOperationId = randomUUID();
+    await linearization.query("BEGIN");
+    await linearization.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`mock-mail-operation:${rolledBackOperationId}`],
+    );
+    await linearization.query(
+      `INSERT INTO mock_mail_messages(
+         operation_id, recipient, template, locale, subject, body,
+         sensitive, request_fingerprint
+       ) VALUES ($1, $2, 'integration.rollback', 'en', 'rollback', 'rollback', true, $3)`,
+      [
+        rolledBackOperationId,
+        `rollback-${rolledBackOperationId}@example.invalid`,
+        `rollback:${rolledBackOperationId}`,
+      ],
+    );
+    let rollbackGetSettled = false;
+    const rolledBackGet = fetch(
+      new URL(`/v1/mail/${rolledBackOperationId}`, providerBaseUrl),
+      { headers: providerHeaders() },
+    );
+    void rolledBackGet.then(
+      () => {
+        rollbackGetSettled = true;
+      },
+      () => {
+        rollbackGetSettled = true;
+      },
+    );
+    await waitForMockMailAdvisoryWait(linearization, 1);
+    assert.equal(
+      rollbackGetSettled,
+      false,
+      "GET must wait until a potentially-sent Provider transaction resolves",
+    );
+    await linearization.query("ROLLBACK");
+    const rolledBackResult = await rolledBackGet;
+    assert.equal(rolledBackResult.status, 404);
+    assert.deepEqual(await responseJson(rolledBackResult), { error: "operation not found" });
+  } finally {
+    await linearization.query("ROLLBACK").catch(() => undefined);
+    await linearization.end();
+  }
 
   const created = await fetch(new URL("/v1/mail", providerBaseUrl), {
     method: "POST",

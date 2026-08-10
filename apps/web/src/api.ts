@@ -27,6 +27,8 @@ const CONTEXT_INVALIDATION_CODES = new Set([
 ]);
 const SESSION_CHANNEL_NAME = "opensales-session-epoch-v1";
 const SESSION_LOCK_NAME = "opensales-auth-transition-v1";
+const CANONICAL_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export type AccountContextSnapshot = Readonly<{
   clientAccountId: string | null;
@@ -41,6 +43,15 @@ type SessionBroadcast = Readonly<{
   transitionId: string;
   phase: "begin" | "replace" | "end";
 }>;
+type ParsedResponseContext =
+  | Readonly<{
+      kind: "valid";
+      clientAccountId: string | null;
+      version: string;
+    }>
+  | Readonly<{ kind: "missing" | "invalid" }>;
+type ResponseContextRequirement = "none" | "session" | "account";
+type ErrorBody = Readonly<{ error?: string; code?: string }>;
 
 let accountContext: AccountContextSnapshot = {
   clientAccountId: null,
@@ -68,18 +79,25 @@ function compareVersions(left: string, right: string): number {
   return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }
 
-function responseContext(response: Response): Pick<AccountContextSnapshot, "clientAccountId" | "version"> | null {
+function responseContext(response: Response): ParsedResponseContext {
   const version = response.headers.get(ACCOUNT_CONTEXT_VERSION_HEADER);
-  if (!isDecimalVersion(version)) return null;
+  const clientAccountId = response.headers.get(CLIENT_ACCOUNT_CONTEXT_HEADER);
+  if (version === null && clientAccountId === null) return { kind: "missing" };
+  if (
+    !isDecimalVersion(version) ||
+    (clientAccountId !== null && !CANONICAL_UUID.test(clientAccountId))
+  ) return { kind: "invalid" };
   return {
-    clientAccountId: response.headers.get(CLIENT_ACCOUNT_CONTEXT_HEADER),
+    kind: "valid",
+    clientAccountId,
     version,
   };
 }
 
-function captureResponseContext(response: Response, force = false): boolean {
-  const incoming = responseContext(response);
-  if (!incoming || incoming.version === null) return true;
+function captureResponseContext(
+  incoming: Extract<ParsedResponseContext, { kind: "valid" }>,
+  force = false,
+): boolean {
   if (
     !force &&
     accountContext.version !== null &&
@@ -94,7 +112,8 @@ function captureResponseContext(response: Response, force = false): boolean {
     accountContext.clientAccountId === incoming.clientAccountId
   ) return true;
   accountContext = {
-    ...incoming,
+    clientAccountId: incoming.clientAccountId,
+    version: incoming.version,
     generation: accountContext.generation + 1,
   };
   return true;
@@ -153,20 +172,17 @@ function endSessionEpochTransition(transitionId: string, broadcast = true): void
   }
 }
 
-async function waitForSessionTransitions(): Promise<void> {
-  if (navigator.locks) {
-    // The shared lock is the crash-safe source of truth. If another tab closes
-    // after broadcasting begin, the browser releases its exclusive lock even
-    // though no BroadcastChannel end message can be sent.
-    await navigator.locks.request(SESSION_LOCK_NAME, { mode: "shared" }, () => undefined);
-    if (pendingSessionTransitions.size > 0) {
-      pendingSessionTransitions.clear();
-      const waiters = transitionWaiters;
-      transitionWaiters = [];
-      for (const resolve of waiters) resolve();
-    }
-    return;
-  }
+function settlePendingTransitionsAfterLockBarrier(): void {
+  // Acquiring either Web Lock proves that every earlier exclusive holder has
+  // ended (including a tab that crashed before it could broadcast `end`).
+  if (pendingSessionTransitions.size === 0) return;
+  pendingSessionTransitions.clear();
+  const waiters = transitionWaiters;
+  transitionWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
+async function waitForSessionTransitionsWithoutWebLocks(): Promise<void> {
   if (pendingSessionTransitions.size === 0) return;
   let timeoutId: number | undefined;
   await Promise.race([
@@ -232,6 +248,57 @@ function isProtectedApiPath(path: string): boolean {
   );
 }
 
+function isPublicApiPath(pathname: string): boolean {
+  return (
+    pathname === "/api/v1/catalog" ||
+    pathname.startsWith("/api/v1/legal/") ||
+    pathname === "/api/v1/auth/register" ||
+    pathname === "/api/v1/auth/invitation-registrations" ||
+    pathname === "/api/v1/auth/verify-email"
+  );
+}
+
+function isAccountScopedPath(pathname: string): boolean {
+  return (
+    pathname.startsWith("/api/v1/account/") ||
+    pathname.startsWith("/api/v1/customer/") ||
+    pathname.startsWith("/api/v1/billing/") ||
+    pathname === "/api/v1/orders" ||
+    pathname.startsWith("/api/v1/orders/") ||
+    pathname.startsWith("/api/v1/invoices/") ||
+    pathname.startsWith("/api/v1/services/") ||
+    pathname === "/api/v1/tickets" ||
+    pathname.startsWith("/api/v1/tickets/")
+  );
+}
+
+function loginEstablished(response: Response, errorBody: ErrorBody): boolean {
+  return response.ok ||
+    (response.status === 409 && errorBody.code === "ACCOUNT_CONTEXT_REQUIRED");
+}
+
+function responseMeansSessionAbsent(response: Response, errorBody: ErrorBody): boolean {
+  return response.status === 401 &&
+    (errorBody.error === "Authentication required" ||
+      errorBody.error === "Session is invalid or expired");
+}
+
+function responseContextRequirement(
+  pathname: string,
+  response: Response,
+  errorBody: ErrorBody,
+  transition: AuthTransition | null,
+): ResponseContextRequirement {
+  if (isPublicApiPath(pathname)) return "none";
+  if (transition === "login") return loginEstablished(response, errorBody) ? "session" : "none";
+  if (transition === "logout" && response.ok) return "none";
+  // An unauthenticated response has no session row from which a version could
+  // be derived. It is itself authoritative only for session absence.
+  if (responseMeansSessionAbsent(response, errorBody)) return "none";
+  if (response.ok && isAccountScopedPath(pathname)) return "account";
+  return pathname.startsWith("/api/v1/") ? "session" : "none";
+}
+
 function reauthenticationMeansSessionExpired(path: string, status: number, message?: string): boolean {
   const pathname = new URL(path, window.location.origin).pathname;
   return (
@@ -241,19 +308,26 @@ function reauthenticationMeansSessionExpired(path: string, status: number, messa
   );
 }
 
-function mutationHeaders(path: string, init?: RequestInit): Headers {
+function mutationHeaders(
+  path: string,
+  init: RequestInit | undefined,
+  context: AccountContextSnapshot,
+): Headers {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
   const method = (init?.method ?? "GET").toUpperCase();
   const pathname = new URL(path, window.location.origin).pathname;
   if (
     pathname.startsWith("/api/v1/") &&
+    !isPublicApiPath(pathname) &&
+    pathname !== "/api/v1/auth/login" &&
+    pathname !== "/api/v1/auth/logout" &&
     method !== "GET" &&
     method !== "HEAD" &&
-    accountContext.version !== null &&
+    context.version !== null &&
     !headers.has(ACCOUNT_CONTEXT_VERSION_HEADER)
   ) {
-    headers.set(ACCOUNT_CONTEXT_VERSION_HEADER, accountContext.version);
+    headers.set(ACCOUNT_CONTEXT_VERSION_HEADER, context.version);
   }
   return headers;
 }
@@ -263,7 +337,50 @@ function isSafeRead(init?: RequestInit): boolean {
   return method === "GET" || method === "HEAD";
 }
 
-async function request<T>(path: string, init: RequestInit | undefined, retryObsoleteRead: boolean): Promise<T> {
+function contextProtocolError(message: string): ApiError {
+  return new ApiError(message, 502, "SESSION_CONTEXT_INVALID");
+}
+
+async function errorBody(response: Response): Promise<ErrorBody> {
+  if (response.ok || response.status === 204) return {};
+  return (await response.clone().json().catch(() => ({}))) as ErrorBody;
+}
+
+async function authoritativeSessionRebootstrap(): Promise<void> {
+  clearAccountContext();
+  const response = await fetch("/api/v1/auth/me", {
+    credentials: "include",
+    headers: new Headers({ "Content-Type": "application/json" }),
+  });
+  const body = await errorBody(response);
+  if (response.status === 401) {
+    throw new ApiError(
+      body.error ?? "Authentication required",
+      response.status,
+      body.code,
+    );
+  }
+  if (!response.ok) {
+    throw contextProtocolError("The authoritative session context could not be loaded");
+  }
+  const incoming = responseContext(response);
+  if (incoming.kind !== "valid" || !captureResponseContext(incoming)) {
+    throw contextProtocolError("The authoritative session response had invalid context headers");
+  }
+}
+
+function publishProtocolFailure(message: string, clear = true): ApiError {
+  if (clear) clearAccountContext();
+  const error = contextProtocolError(message);
+  publishContextInvalidation(error);
+  return error;
+}
+
+async function request<T>(
+  path: string,
+  init: RequestInit | undefined,
+  allowAuthoritativeRecovery: boolean,
+): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
   const transition: AuthTransition | null = pathname === "/api/v1/auth/login"
     ? "login"
@@ -275,43 +392,96 @@ async function request<T>(path: string, init: RequestInit | undefined, retryObso
   }
   if (transition) {
     authTransition = transition;
-  } else {
-    await waitForSessionTransitions();
   }
   const transitionId = transition === null ? null : newTransitionId();
   if (transitionId) beginSessionEpochTransition(transitionId);
   const requestEpoch = sessionEpoch;
+  const requestContext = accountContext;
   try {
     const response = await fetch(path, {
       ...init,
       credentials: "include",
-      headers: mutationHeaders(path, init),
+      headers: mutationHeaders(path, init, requestContext),
     });
-    const establishingLogin = transition === "login" && responseContext(response) !== null;
+    const body = await errorBody(response);
+    const establishingLogin = transition === "login" && loginEstablished(response, body);
     if (establishingLogin) {
       replaceSessionContext(transitionId!);
-      if (!captureResponseContext(response, true)) throw new ObsoleteSessionResponseError();
-    } else if (transition === null && requestEpoch !== sessionEpoch) {
-      throw new ObsoleteSessionResponseError();
-    } else if (!captureResponseContext(response)) {
-      throw new ObsoleteSessionResponseError();
+    }
+
+    const sessionAbsent = transition !== "login" && responseMeansSessionAbsent(response, body);
+    if (sessionAbsent) {
+      clearAccountContext();
+    }
+
+    if (transition === "logout" && response.ok) {
+      replaceSessionContext(transitionId!);
+    } else {
+      const requirement = responseContextRequirement(pathname, response, body, transition);
+      const incoming = responseContext(response);
+      const epochChanged = transition === null && requestEpoch !== sessionEpoch;
+      const contextInvalid =
+        requirement !== "none" &&
+        (incoming.kind !== "valid" ||
+          (requirement === "account" && incoming.clientAccountId === null));
+      const obsolete =
+        !contextInvalid &&
+        requirement !== "none" &&
+        incoming.kind === "valid" &&
+        !captureResponseContext(incoming, establishingLogin);
+
+      if (epochChanged || contextInvalid || obsolete) {
+        if (!allowAuthoritativeRecovery) {
+          throw publishProtocolFailure(
+            contextInvalid
+              ? "The response omitted or corrupted its required session context"
+              : "The response belonged to an obsolete browser session context",
+          );
+        }
+        const contextBeforeRecovery = accountContext;
+        try {
+          await authoritativeSessionRebootstrap();
+        } catch (caught) {
+          if (caught instanceof ApiError && caught.status === 401 && isProtectedApiPath(path)) {
+            hardResetSession();
+          }
+          throw publishProtocolFailure("The browser session context could not be re-established");
+        }
+        if (transition === null && isSafeRead(init)) {
+          if (
+            contextBeforeRecovery.version !== accountContext.version ||
+            contextBeforeRecovery.clientAccountId !== accountContext.clientAccountId
+          ) {
+            publishContextInvalidation(
+              new ApiError(
+                "The browser session context changed during authoritative recovery",
+                409,
+                "SESSION_CHANGED",
+              ),
+            );
+          }
+          return request<T>(path, init, false);
+        }
+        if (!establishingLogin) {
+          throw publishProtocolFailure(
+            "The request completed without a trustworthy session context; it was not replayed",
+            false,
+          );
+        }
+      }
     }
 
     if (!response.ok) {
-      const errorBody = (await response.json().catch(() => ({}))) as {
-        error?: string;
-        code?: string;
-      };
       if (
-        (response.status === 401 && isProtectedApiPath(path)) ||
-        reauthenticationMeansSessionExpired(path, response.status, errorBody.error)
+        (sessionAbsent && isProtectedApiPath(path)) ||
+        reauthenticationMeansSessionExpired(path, response.status, body.error)
       ) {
         hardResetSession();
       }
       const error = new ApiError(
-        errorBody.error ?? `Request failed (${response.status})`,
+        body.error ?? `Request failed (${response.status})`,
         response.status,
-        errorBody.code,
+        body.code,
       );
       if (
         pathname !== "/api/v1/auth/login" &&
@@ -325,15 +495,8 @@ async function request<T>(path: string, init: RequestInit | undefined, retryObso
     if (transition === "login" && !establishingLogin) {
       throw new ApiError("Sign-in response did not establish a session context", 502, "SESSION_CONTEXT_MISSING");
     }
-    if (transition === "logout") replaceSessionContext(transitionId!);
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
-  } catch (caught) {
-    if (caught instanceof ObsoleteSessionResponseError && retryObsoleteRead && isSafeRead(init)) {
-      await waitForSessionTransitions();
-      return request<T>(path, init, false);
-    }
-    throw caught;
   } finally {
     if (transitionId) endSessionEpochTransition(transitionId);
     if (transition) authTransition = null;
@@ -343,15 +506,29 @@ async function request<T>(path: string, init: RequestInit | undefined, retryObso
 export function api<T>(path: string, init?: RequestInit): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
   const isAuthTransition = pathname === "/api/v1/auth/login" || pathname === "/api/v1/auth/logout";
-  if (!isAuthTransition) return request<T>(path, init, true);
+  const locks = navigator.locks;
+  if (!isAuthTransition) {
+    const execute = async () => {
+      if (locks) settlePendingTransitionsAfterLockBarrier();
+      else await waitForSessionTransitionsWithoutWebLocks();
+      return request<T>(path, init, true);
+    };
+    // The lock covers the context snapshot, mutation header, fetch and response
+    // capture. Login/logout therefore cannot rotate the cookie mid-request.
+    return locks
+      ? locks.request(SESSION_LOCK_NAME, { mode: "shared" }, execute)
+      : execute();
+  }
   if (authRequestReserved) {
     return Promise.reject(
       new ApiError("Another sign-in or sign-out operation is already in progress", 409, "AUTH_TRANSITION_IN_PROGRESS"),
     );
   }
   authRequestReserved = true;
-  const execute = () => request<T>(path, init, true);
-  const locks = navigator.locks;
+  const execute = () => {
+    if (locks) settlePendingTransitionsAfterLockBarrier();
+    return request<T>(path, init, true);
+  };
   const pending = locks
     ? locks.request(SESSION_LOCK_NAME, { mode: "exclusive" }, execute)
     : execute();

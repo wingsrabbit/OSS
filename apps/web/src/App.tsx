@@ -30,6 +30,7 @@ import {
   subscribeAccountContextInvalidation,
 } from "./api.js";
 import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
+import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
 import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
@@ -520,6 +521,7 @@ type RenewalReminder = {
     | "delivered"
     | "bounced"
     | "failed"
+    | "skipped"
     | "suppressed"
     | "retrying"
     | "manual";
@@ -1007,6 +1009,8 @@ export function App() {
   const accountCapabilities = new Set(me?.context?.capabilities ?? []);
   const accountPermissionGranted = (permission: string) => accountCapabilities.has(permission);
   const canReadCustomerHistory = canReadCustomerAccount;
+  const canReadCustomerNotificationHistory =
+    canReadCustomerAccount && accountPermissionGranted("account.history.read");
   const canUseCustomerSupport = canReadCustomerAccount;
   const canWriteCustomerSupport =
     canUseCustomerSupport && accountPermissionGranted("support.tickets.write");
@@ -2442,6 +2446,11 @@ export function App() {
 
   async function logout() {
     setError("");
+    // Invalidate every route- and account-bound continuation as soon as the
+    // exclusive session transition is requested. An in-flight shared request
+    // may finish first, but it must not resume a stale mutation while logout
+    // is waiting for the Web Lock.
+    clearWorkspaceTransientState();
     try {
       await api("/api/v1/auth/logout", { method: "POST", body: "{}" });
       hardResetSession();
@@ -4615,6 +4624,19 @@ export function App() {
             clientAccountId={me.clientAccountId}
             locale={locale}
             onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && canReadCustomerNotificationHistory && me?.context && (
+          <NotificationDeliveryHistory
+            active={route === "/customer"}
+            endpoint="/api/v1/customer/notification-deliveries"
+            accountId={me.context.clientAccountId}
+            scopeKey={`${me.id}:${me.context.clientAccountId}:${me.context.version}`}
+            refreshKey={me.context.version}
+            locale={locale}
+            variant="customer"
             onError={showTicketError}
           />
         )}

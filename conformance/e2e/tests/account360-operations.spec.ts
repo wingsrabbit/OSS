@@ -11,6 +11,27 @@ type RequestFact = { method: string; path: string; query: string; body: string |
 type Interceptor = (path: string, route: Route) => Promise<boolean>;
 let unexpectedRequests: RequestFact[] = [];
 
+function withStaffSessionContext(route: Route): Route {
+  return new Proxy(route, {
+    get(target, property, receiver) {
+      if (property === "fulfill") {
+        return (options: Parameters<Route["fulfill"]>[0]) => {
+          const response = options ?? {};
+          return target.fulfill({
+            ...response,
+            headers: {
+              "X-OSS-Account-Context-Version": "0",
+              ...(response.headers ?? {}),
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 test.beforeEach(() => {
   unexpectedRequests = [];
 });
@@ -650,7 +671,8 @@ async function installApi(
   interceptor?: Interceptor,
 ): Promise<RequestFact[]> {
   const requests: RequestFact[] = [];
-  await page.route("**/api/v1/**", async (route) => {
+  await page.route("**/api/v1/**", async (rawRoute) => {
+    const route = withStaffSessionContext(rawRoute);
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
@@ -1773,7 +1795,7 @@ test("switching Account A to B during manual-receipt reauth prevents the Account
   await expect(page.getByRole("button", { name: "Verify account & load history" })).toBeEnabled();
 });
 
-test("signing out during manual-receipt reauth prevents the abandoned POST", async ({ page }) => {
+test("signing out waits exclusively for manual-receipt reauth and prevents the abandoned POST", async ({ page }) => {
   const reauth = barrier();
   const recordPath = `/api/v1/admin/client-accounts/${accountA}/manual-receipts`;
   const requests = await installApi(
@@ -1797,7 +1819,7 @@ test("signing out during manual-receipt reauth prevents the abandoned POST", asy
             json: { expiresAt: "2026-08-10T00:15:00.000Z", fixedWindowMinutes: 15 },
           });
         } catch {
-          // The hard sign-out navigation is allowed to abort the old document's reauth request.
+          // Closing the test page may still abort an unresolved synthetic response.
         }
         return true;
       }
@@ -1823,8 +1845,10 @@ test("signing out during manual-receipt reauth prevents the abandoned POST", asy
   await reauth.reached;
 
   await page.getByRole("button", { name: "Sign out" }).click();
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/admin$/);
+  expect(requests.filter((request) => request.path === "/api/v1/auth/logout")).toHaveLength(0);
   reauth.release();
+  await expect(page).toHaveURL(/\/$/);
 
   expect(requests.filter((request) =>
     request.method === "POST" && request.path === recordPath
