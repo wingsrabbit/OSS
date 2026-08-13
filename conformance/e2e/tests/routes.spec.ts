@@ -17,7 +17,7 @@ type MockViewer = {
     capabilities: string[];
     version: string;
   };
-  verification: { email: "passed" };
+  verification: { email: "passed" | "pending" };
   restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
@@ -92,9 +92,15 @@ function withViewerSessionContext(route: Route, viewer: MockViewer | null): Rout
   });
 }
 
+type MockViewerSource = MockViewer | null | (() => MockViewer | null);
+
+function currentMockViewer(source: MockViewerSource): MockViewer | null {
+  return typeof source === "function" ? source() : source;
+}
+
 async function installMockApi(
   page: Page,
-  viewer: MockViewer | null,
+  viewerSource: MockViewerSource,
   options: {
     unauthorizedPath?: string;
     unauthorizedError?: string;
@@ -103,6 +109,7 @@ async function installMockApi(
 ): Promise<string[]> {
   const requests: string[] = [];
   await page.route("**/api/v1/**", async (rawRoute) => {
+    const viewer = currentMockViewer(viewerSource);
     const route = withViewerSessionContext(rawRoute, viewer);
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -154,7 +161,7 @@ async function installMockApi(
     if (path === options.unauthorizedPath) {
       await route.fulfill({
         status: 401,
-        json: { error: options.unauthorizedError ?? "Session expired" },
+        json: { error: options.unauthorizedError ?? "Session is invalid or expired" },
       });
       return;
     }
@@ -395,6 +402,49 @@ test("customer and Staff sessions stay separated and can switch accounts through
     process.env.OSS_E2E_STAFF_EMAIL ?? "stage-a-browser-admin@example.invalid";
   const staffPassword =
     process.env.OSS_E2E_STAFF_PASSWORD ?? "Synthetic-Stage-A-Browser-Admin-Only!";
+
+  const customer = {
+    ...mockViewer({ email: customerEmail }),
+    verification: { email: "pending" as const },
+    eligible: false,
+  };
+  const staff = mockViewer({ email: staffEmail, permissions: ["*"] });
+  let activeViewer: MockViewer | null = null;
+  await installMockApi(page, () => activeViewer, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/register") {
+        await route.fulfill({ status: 201, json: { registered: true } });
+        return true;
+      }
+      if (path === "/api/v1/auth/login") {
+        const body = route.request().postDataJSON() as { email?: unknown; password?: unknown };
+        const nextViewer = body.email === customerEmail && body.password === customerPassword
+          ? customer
+          : body.email === staffEmail && body.password === staffPassword
+            ? staff
+            : null;
+        if (!nextViewer) {
+          await route.fulfill({ status: 401, json: { error: "Invalid email or password" } });
+          return true;
+        }
+        activeViewer = nextViewer;
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": nextViewer.accountContextVersion,
+            "X-OSS-Client-Account-Id": nextViewer.clientAccountId,
+          },
+          json: { requiresAccountContext: false },
+        });
+        return true;
+      }
+      if (path === "/api/v1/auth/logout") {
+        activeViewer = null;
+        await route.fulfill({ status: 204, body: "" });
+        return true;
+      }
+      return false;
+    },
+  });
 
   await page.goto("/");
   await page.getByPlaceholder("Client account name").fill(`Route Customer ${unique.slice(0, 8)}`);

@@ -1205,6 +1205,89 @@ for (const identityLoss of [
   });
 }
 
+test("a Billing to Viewer authorization epoch change unmounts old writes before Me recovery completes", async ({ page: browserPage }) => {
+  let authorizationDowngraded = false;
+  let meReads = 0;
+  let recoveryMeReads = 0;
+  let historyReads = 0;
+  let releaseRecoveryMe!: () => void;
+  let markRecoveryMeStarted!: () => void;
+  const recoveryMeGate = new Promise<void>((resolve) => { releaseRecoveryMe = resolve; });
+  const recoveryMeStarted = new Promise<void>((resolve) => { markRecoveryMeStarted = resolve; });
+  const state = baseState({
+    role: "billing",
+    contexts: [{
+      clientAccountId: accountA,
+      name: "Account Alpha",
+      role: "billing",
+      permissions: [],
+      restrictions: { membership: false, clientAccount: false },
+    }],
+  });
+  await installMockApi(browserPage, state, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/me") {
+        meReads += 1;
+        if (authorizationDowngraded) {
+          recoveryMeReads += 1;
+          markRecoveryMeStarted();
+          await recoveryMeGate;
+        }
+        await route.fulfill({ headers: headers(state), json: viewer(state) });
+        return true;
+      }
+      if (path === "/api/v1/customer/business-history") {
+        historyReads += 1;
+        await route.fulfill({
+          headers: headers(state),
+          json: businessHistory(accountA, authorizationDowngraded ? "VIEWER READ" : "BILLING READ"),
+        });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await browserPage.goto("/customer");
+  const createTicket = browserPage
+    .locator('section[aria-label="Customer support tickets"]')
+    .getByRole("button", { name: "Create ticket" });
+  await expect(createTicket).toBeVisible();
+  await expect(browserPage.getByTestId("history-account")).toContainText("BILLING READ");
+  const initialMeReads = meReads;
+  const initialHistoryReads = historyReads;
+
+  // A server-side membership change keeps the same account but advances the
+  // authorization epoch and removes Billing writes.
+  state.version = "2";
+  state.role = "viewer";
+  state.contexts[0] = { ...state.contexts[0]!, role: "viewer" };
+  authorizationDowngraded = true;
+  await browserPage.getByTestId("customer-business-history")
+    .getByRole("button", { name: "Refresh history" })
+    .click();
+  await recoveryMeStarted;
+
+  // The v2 read body is discarded and the v1 Billing workspace is cleared
+  // synchronously, before either authoritative Me request can complete.
+  await expect(createTicket).toHaveCount(0);
+  await expect(browserPage.getByTestId("customer-business-history")).toHaveCount(0);
+  await expect(browserPage.getByText("VIEWER READ")).toHaveCount(0);
+  await expect.poll(() => recoveryMeReads).toBe(2);
+  expect(meReads).toBe(initialMeReads + 2);
+
+  releaseRecoveryMe();
+  await expect(browserPage.getByTestId("customer-business-history")).toBeVisible();
+  await expect(browserPage.getByTestId("history-account")).toContainText("VIEWER READ");
+  await expect(createTicket).toHaveCount(0);
+  // The clicked safe read itself executes once before recovery and at most
+  // once after it. React StrictMode may then mount the new Viewer history
+  // surface twice, so those independent mount reads are not part of the
+  // replay count asserted by the focused protocol test above.
+  expect(historyReads).toBeGreaterThanOrEqual(initialHistoryReads + 2);
+  expect(recoveryMeReads).toBe(2);
+});
+
 test("Staff identity with null customer context can open permission-scoped Admin", async ({ page: browserPage }) => {
   const state = baseState({
     activeId: null,

@@ -471,24 +471,25 @@ async function request<T>(
         requirement !== "none" &&
         (incoming.kind !== "valid" ||
           (requirement === "account" && incoming.clientAccountId === null));
-      const responseAccountChanged =
+      const responseAuthorizationChanged =
         transition === null &&
         !intentionalContextTransition &&
         requirement !== "none" &&
         requestContext.version !== null &&
         incoming.kind === "valid" &&
-        incoming.clientAccountId !== requestContext.clientAccountId;
+        (incoming.version !== requestContext.version ||
+          incoming.clientAccountId !== requestContext.clientAccountId);
       const obsolete =
         !contextInvalid &&
-        !responseAccountChanged &&
+        !responseAuthorizationChanged &&
         requirement !== "none" &&
         incoming.kind === "valid" &&
         !captureResponseContext(incoming, establishingLogin);
 
-      if (responseAccountChanged && !invalidationPublished) {
+      if (responseAuthorizationChanged && !invalidationPublished) {
         invalidateSessionContextAcrossTabs(
           new ApiError(
-            "The response belonged to a different Client Account context",
+            "The response belonged to a different authorization context",
             409,
             "SESSION_CHANGED",
           ),
@@ -496,7 +497,7 @@ async function request<T>(
         invalidationPublished = true;
       }
 
-      if (epochChanged || contextInvalid || responseAccountChanged || obsolete) {
+      if (epochChanged || contextInvalid || responseAuthorizationChanged || obsolete) {
         if (!allowAuthoritativeRecovery) {
           throw publishProtocolFailure(
             contextInvalid
