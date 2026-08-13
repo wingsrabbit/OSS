@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import {
@@ -282,10 +283,51 @@ test("create, verify, and deep verify use encrypted fixture artifacts without le
     assertSchemaValid(JSON.parse(serialized));
     assert.doesNotMatch(serialized, /fixture-password-never-recorded|postgresql:\/\//);
     assert.doesNotMatch(serialized, new RegExp(directory.replaceAll("/", "\\/")));
+
+    const repositoryBackupDirectory = join(repositoryRoot, "operator-backups");
+    mkdirSync(repositoryBackupDirectory);
+    writeFileSync(join(repositoryRoot, ".git", "info", "exclude"), "/operator-backups/\n", { flag: "a" });
+    const repositoryBackupAlias = join(directory, "lexically-outside-repository");
+    symlinkSync(repositoryBackupDirectory, repositoryBackupAlias);
+    await assert.rejects(
+      createBackup({
+        profile: "TestA",
+        output: join(repositoryBackupAlias, "escaped-backup"),
+        recipient: "age1fixturefixturefixturefixturefixturefixturefixture",
+        configurationVersion: "config-fixture-1",
+        credentialSetVersion: "credential-fixture-1",
+        pausedAt: new Date(Date.now() - 1_000).toISOString(),
+        repositoryRoot,
+        env,
+        stdin: [Buffer.from("private fixture configuration")],
+      }),
+      /backup output must be outside the repository/,
+    );
+    assert.equal(existsSync(join(repositoryBackupDirectory, "escaped-backup")), false);
+
     const shallow = await verifyBackup({ archive: output, deep: false, env });
     assert.equal(shallow.deep, "not-requested");
     const deep = await verifyBackup({ archive: output, deep: true, env });
     assert.equal(deep.deep, "passed");
+
+    const archiveAlias = join(directory, "lexically-outside-archive");
+    symlinkSync(output, archiveAlias);
+    const restorePlanResult = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("./lab-backup.mjs", import.meta.url)),
+        "restore-plan",
+        "--archive",
+        output,
+        "--output",
+        join(archiveAlias, "escaped-restore-plan.json"),
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(restorePlanResult.status, 1);
+    assert.match(restorePlanResult.stderr, /restore plan output must be outside the immutable backup archive/);
+    assert.equal(existsSync(join(output, "escaped-restore-plan.json")), false);
+
     const archiveLink = join(directory, "backup-link");
     symlinkSync(output, archiveLink);
     await assert.rejects(

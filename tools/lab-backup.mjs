@@ -130,6 +130,23 @@ function jsonFile(path, value) {
   });
 }
 
+function canonicalProspectivePath(path) {
+  const suffix = [];
+  let ancestor = resolve(path);
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) fail("cannot resolve an existing parent directory");
+    suffix.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  return resolve(realpathSync(ancestor), ...suffix);
+}
+
+function pathIsWithin(parent, candidate) {
+  const pathFromParent = relative(parent, candidate);
+  return pathFromParent === "" || (pathFromParent !== ".." && !pathFromParent.startsWith(`..${sep}`));
+}
+
 function commandVersion(binary, label, env) {
   const result = spawnSync(binary, ["--version"], {
     env: safeProcessEnvironment(env),
@@ -601,8 +618,9 @@ export async function createBackup(options) {
   const pausedAt = parseIso(options.pausedAt, "pausedAt");
   const repositoryRoot = resolve(options.repositoryRoot);
   const output = resolve(options.output);
-  const outputFromRepository = relative(repositoryRoot, output);
-  if (outputFromRepository === "" || (!outputFromRepository.startsWith(`..${sep}`) && outputFromRepository !== "..")) {
+  const canonicalRepositoryRoot = realpathSync(repositoryRoot);
+  const canonicalOutput = canonicalProspectivePath(output);
+  if (pathIsWithin(canonicalRepositoryRoot, canonicalOutput)) {
     fail("backup output must be outside the repository");
   }
   if (existsSync(output)) fail("backup output must not already exist");
@@ -963,8 +981,7 @@ async function main(argv = process.argv.slice(2)) {
     const archive = resolve(requireOption(values, "archive"));
     const verification = await verifyBackup({ archive, deep: false, env: process.env });
     const output = resolve(requireOption(values, "output"));
-    const outputFromArchive = relative(archive, output);
-    if (outputFromArchive === "" || (!outputFromArchive.startsWith(`..${sep}`) && outputFromArchive !== "..")) {
+    if (pathIsWithin(realpathSync(archive), canonicalProspectivePath(output))) {
       fail("restore plan output must be outside the immutable backup archive");
     }
     if (existsSync(output)) fail("restore plan output must not already exist");
