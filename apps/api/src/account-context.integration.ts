@@ -2265,50 +2265,50 @@ try {
 
   const supportNotificationTicketId = randomUUID();
   const otherSupportNotificationTicketId = randomUUID();
-  const supportNotificationStatusEventId = randomUUID();
-  const otherSupportNotificationStatusEventId = randomUUID();
-  const supportNotificationStaffUserId = randomUUID();
   const publicSupportMessageId = randomUUID();
   const internalSupportMessageId = randomUUID();
   const crossTicketSupportMessageId = randomUUID();
   const rewrittenSupportMessageId = randomUUID();
   const malformedSupportMessageId = randomUUID();
+  const supportStatusEventId = randomUUID();
+  const otherSupportStatusEventId = randomUUID();
+  const notificationSupportStaffId = randomUUID();
   const supportSubject = "Schema 019 notification message binding";
   const publicSupportBody = "Exact public Staff reply for notification evidence";
-  await pool.query(
-    `INSERT INTO users(id, email, password_hash, email_verified_at)
-     VALUES ($1, $2, 'synthetic-not-a-password', pg_catalog.now())`,
-    [
-      supportNotificationStaffUserId,
-      `support-notification-staff-${databaseName}@example.invalid`,
-    ],
-  );
-  await pool.query(
-    `INSERT INTO staff_members(user_id, roles, permissions)
-     VALUES ($1, ARRAY['Support'], '["support.tickets.manage"]'::jsonb)`,
-    [supportNotificationStaffUserId],
-  );
   await transaction(pool, async (client) => {
-    const department = await client.query<{ current_revision_id: string }>(
-      `SELECT current_revision_id
-       FROM support_departments
-       WHERE code = 'general-support'
-       FOR SHARE`,
+    await client.query(
+      `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', 'en', pg_catalog.now())`,
+      [
+        notificationSupportStaffId,
+        `notification-support-${databaseName}@example.invalid`,
+      ],
     );
-    const departmentRevisionId = department.rows[0]?.current_revision_id;
-    assert.ok(departmentRevisionId, "Schema 021 must retain the default Support revision");
+    await client.query(
+      `INSERT INTO staff_members(user_id, roles, permissions)
+       VALUES ($1, ARRAY['support']::text[], '["support.tickets.manage"]'::jsonb)`,
+      [notificationSupportStaffId],
+    );
+    const department = await client.query<{ id: string }>(
+      `SELECT revision.id
+       FROM support_departments department
+       JOIN support_department_revisions revision
+         ON revision.id = department.current_revision_id
+       WHERE department.code = 'general-support'
+       FOR SHARE OF department, revision`,
+    );
+    const departmentRevisionId = department.rows[0]?.id;
+    assert.ok(departmentRevisionId);
     await client.query(
       `INSERT INTO support_ticket_status_events(
          id, ticket_id, previous_status, status,
          actor_type, actor_user_id, reason
        ) VALUES
-         ($1, $3, NULL, 'awaiting_staff', 'customer', $5,
-          'Customer created the notification fixture ticket'),
-         ($2, $4, NULL, 'awaiting_staff', 'customer', $5,
-          'Customer created the second notification fixture ticket')`,
+         ($1, $3, NULL, 'awaiting_staff', 'customer', $5, 'Notification fixture Ticket created'),
+         ($2, $4, NULL, 'awaiting_staff', 'customer', $5, 'Other notification fixture Ticket created')`,
       [
-        supportNotificationStatusEventId,
-        otherSupportNotificationStatusEventId,
+        supportStatusEventId,
+        otherSupportStatusEventId,
         supportNotificationTicketId,
         otherSupportNotificationTicketId,
         owner.userId,
@@ -2317,10 +2317,10 @@ try {
     await client.query(
       `INSERT INTO support_tickets(
          id, client_account_id, created_by_user_id, subject,
-         department_revision_id, priority, current_status_event_id
+         department_revision_id, current_status_event_id
        ) VALUES
-         ($1, $3, $4, $5, $6, 'normal', $7),
-         ($2, $3, $4, 'Other notification Ticket', $6, 'normal', $8)`,
+         ($1, $3, $4, $5, $6, $7),
+         ($2, $3, $4, 'Other notification Ticket', $6, $8)`,
       [
         supportNotificationTicketId,
         otherSupportNotificationTicketId,
@@ -2328,8 +2328,8 @@ try {
         owner.userId,
         supportSubject,
         departmentRevisionId,
-        supportNotificationStatusEventId,
-        otherSupportNotificationStatusEventId,
+        supportStatusEventId,
+        otherSupportStatusEventId,
       ],
     );
   });
@@ -2347,7 +2347,7 @@ try {
       internalSupportMessageId,
       crossTicketSupportMessageId,
       supportNotificationTicketId,
-      supportNotificationStaffUserId,
+      notificationSupportStaffId,
       publicSupportBody,
       otherSupportNotificationTicketId,
       rewrittenSupportMessageId,
@@ -3944,8 +3944,8 @@ try {
   const capabilityProductId = `capability-product-${databaseName}`;
   const capabilityProductRevisionId = randomUUID();
   const capabilityPriceId = randomUUID();
-  const capabilityTermsVersion = `ct-${randomUUID()}`;
-  const capabilityAupVersion = `ca-${randomUUID()}`;
+  const capabilityTermsVersion = "mock-lab-v1";
+  const capabilityAupVersion = "mock-lab-v1";
   await pool.query(
     `INSERT INTO product_groups(id, sort_order, names)
      VALUES ($1, 9001, '{"en":"Capability Matrix"}'::jsonb)`,
@@ -3991,13 +3991,6 @@ try {
        'self_service', 'manual', 0
      )`,
     [capabilityProductId],
-  );
-  await pool.query(
-    `INSERT INTO legal_documents(kind, locale, version, title, body)
-     VALUES
-       ('terms', 'en', $1, 'Capability Terms', 'Synthetic capability terms'),
-       ('aup', 'en', $2, 'Capability AUP', 'Synthetic capability AUP')`,
-    [capabilityTermsVersion, capabilityAupVersion],
   );
   await pool.query(
     `INSERT INTO payment_methods(

@@ -50,12 +50,34 @@ const checkoutSchema = z
       .default(null),
     termsVersion: z.string().min(1).max(64),
     aupVersion: z.string().min(1).max(64),
+    termsDocumentId: z.uuid().optional(),
+    aupDocumentId: z.uuid().optional(),
+    legalLocale: z.enum(["en", "zh-CN"]).optional(),
+    termsLocale: z.enum(["en", "zh-CN"]).optional(),
+    aupLocale: z.enum(["en", "zh-CN"]).optional(),
     marketingConsent: z.boolean().default(false),
     marketingConsentPolicyVersion: z.string().min(1).max(80).optional(),
     idempotencyKey: z.string().min(8).max(128),
   })
   .strict()
   .superRefine((body, context) => {
+    const exactLegalSelection = [
+      body.termsDocumentId,
+      body.aupDocumentId,
+      body.legalLocale,
+      body.termsLocale,
+      body.aupLocale,
+    ];
+    if (
+      exactLegalSelection.some((value) => value !== undefined) &&
+      exactLegalSelection.some((value) => value === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["termsDocumentId"],
+        message: "Exact legal document IDs, requested locale, and resolved locales must be supplied together",
+      });
+    }
     if (body.marketingConsent !== (body.marketingConsentPolicyVersion !== undefined)) {
       context.addIssue({
         code: "custom",
@@ -187,15 +209,28 @@ export async function registerOrderRoutes(
       aupVersion: body.aupVersion,
     };
     const fingerprint =
-      body.promotionCode === null && !body.marketingConsent
-        ? requestFingerprint("orders.create:v1", baseFingerprintInput)
-        : requestFingerprint("orders.create:v2", {
+      body.termsDocumentId !== undefined && body.aupDocumentId !== undefined
+        ? requestFingerprint("orders.create:v3", {
             ...baseFingerprintInput,
+            termsDocumentId: body.termsDocumentId,
+            aupDocumentId: body.aupDocumentId,
+            legalLocale: body.legalLocale,
+            termsLocale: body.termsLocale,
+            aupLocale: body.aupLocale,
             promotionCode: body.promotionCode,
             marketingConsent: body.marketingConsent,
             marketingConsentPolicyVersion:
               body.marketingConsentPolicyVersion ?? null,
-          });
+          })
+        : body.promotionCode === null && !body.marketingConsent
+          ? requestFingerprint("orders.create:v1", baseFingerprintInput)
+          : requestFingerprint("orders.create:v2", {
+              ...baseFingerprintInput,
+              promotionCode: body.promotionCode,
+              marketingConsent: body.marketingConsent,
+              marketingConsentPolicyVersion:
+                body.marketingConsentPolicyVersion ?? null,
+            });
 
     const created = await transaction(pool, async (client) => {
       const context = await lockAccountContextForMutation(
@@ -218,7 +253,7 @@ export async function registerOrderRoutes(
       await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       const offer = await lockCatalogOffer(client, {
         priceId: body.priceId,
-        locale: user.locale,
+        locale: body.legalLocale ?? user.locale,
         allowQuote: false,
       });
       const promotion = await lockPromotion(client, {
@@ -235,9 +270,13 @@ export async function registerOrderRoutes(
         commit: true,
       });
       const legal = await loadLegalDocuments(client, {
-        locale: user.locale,
+        locale: body.legalLocale ?? user.locale,
         termsVersion: body.termsVersion,
         aupVersion: body.aupVersion,
+        termsDocumentId: body.termsDocumentId,
+        aupDocumentId: body.aupDocumentId,
+        termsLocale: body.termsLocale,
+        aupLocale: body.aupLocale,
       });
       const issued = await issueCommercialOrder(client, {
         clientAccountId: user.clientAccountId,

@@ -55,8 +55,8 @@ export type CapacityDecision = Readonly<{
 }>;
 
 export type LegalDocumentPair = Readonly<{
-  terms: Readonly<{ id: string; version: string }>;
-  aup: Readonly<{ id: string; version: string }>;
+  terms: Readonly<{ id: string; version: string; locale: "en" | "zh-CN" }>;
+  aup: Readonly<{ id: string; version: string; locale: "en" | "zh-CN" }>;
 }>;
 
 export type IssuedCommercialOrder = Readonly<{
@@ -715,20 +715,55 @@ export async function loadLegalDocuments(
     locale: "en" | "zh-CN";
     termsVersion: string;
     aupVersion: string;
+    termsDocumentId?: string | undefined;
+    aupDocumentId?: string | undefined;
+    termsLocale?: "en" | "zh-CN" | undefined;
+    aupLocale?: "en" | "zh-CN" | undefined;
   }>,
 ): Promise<LegalDocumentPair> {
-  const result = await client.query<{ id: string; kind: "terms" | "aup"; version: string }>(
-    `SELECT id, kind, version
-     FROM legal_documents
-     WHERE locale = $1
-       AND ((kind = 'terms' AND version = $2) OR (kind = 'aup' AND version = $3))
-     ORDER BY kind
+  await client.query(
+    `SELECT kind, locale
+     FROM public.legal_document_channels
+     WHERE kind IN ('aup', 'terms')
+       AND locale IN ($1::text, 'en')
+     ORDER BY kind COLLATE "C", locale COLLATE "C"
      FOR SHARE`,
-    [input.locale, input.termsVersion, input.aupVersion],
+    [input.locale],
+  );
+  const result = await client.query<{
+    id: string;
+    kind: "terms" | "aup";
+    version: string;
+    locale: "en" | "zh-CN";
+  }>(
+    `SELECT DISTINCT ON (requested.kind)
+            document.document_id AS id,
+            requested.kind,
+            document.version,
+            document.locale
+     FROM (VALUES ('terms'::text), ('aup'::text)) requested(kind)
+     JOIN public.current_legal_documents document
+       ON document.kind = requested.kind
+      AND document.locale IN ($1::text, 'en')
+     ORDER BY requested.kind,
+              (document.locale = $1::text) DESC,
+              document.locale COLLATE "C",
+              document.document_id`,
+    [input.locale],
   );
   const terms = result.rows.find((document) => document.kind === "terms");
   const aup = result.rows.find((document) => document.kind === "aup");
-  if (!terms || !aup || result.rows.length !== 2) {
+  if (
+    !terms ||
+    !aup ||
+    result.rows.length !== 2 ||
+    terms.version !== input.termsVersion ||
+    aup.version !== input.aupVersion ||
+    (input.termsDocumentId !== undefined && terms.id !== input.termsDocumentId) ||
+    (input.aupDocumentId !== undefined && aup.id !== input.aupDocumentId) ||
+    (input.termsLocale !== undefined && terms.locale !== input.termsLocale) ||
+    (input.aupLocale !== undefined && aup.locale !== input.aupLocale)
+  ) {
     throw commerceError(
       "The selected legal document version is not available",
       409,

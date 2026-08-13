@@ -207,18 +207,6 @@ await transaction(pool, async (client) => {
   }
 
   await client.query(
-    `INSERT INTO legal_documents(kind, locale, version, title, body)
-     VALUES
-       ('terms', 'en', 'lab-2026-07-29', 'Laboratory Terms', 'Synthetic laboratory terms. No real service is sold.'),
-       ('aup', 'en', 'lab-2026-07-29', 'Laboratory Acceptable Use Policy', 'Synthetic laboratory AUP. Mock providers only.'),
-       ('privacy', 'en', 'lab-2026-07-29', 'Laboratory Privacy Policy', 'Only synthetic laboratory data is permitted.'),
-       ('terms', 'zh-CN', 'lab-2026-07-29', '实验室服务条款', '仅用于合成数据实验，不销售真实服务。'),
-       ('aup', 'zh-CN', 'lab-2026-07-29', '实验室可接受使用政策', '仅限 Mock Provider 实验室。'),
-       ('privacy', 'zh-CN', 'lab-2026-07-29', '实验室隐私政策', '仅允许使用合成实验数据。')
-     ON CONFLICT (kind, locale, version) DO NOTHING`,
-  );
-
-  await client.query(
     `INSERT INTO payment_methods(
        code, display_name, provider_installation_id, fee_basis_points, enabled,
        add_funds_enabled, saved_method_enabled, automatic_renewal_enabled

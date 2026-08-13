@@ -44,6 +44,7 @@ import { registerTicketRoutes } from "./routes-tickets.js";
 import { registerSupportOperationRoutes } from "./routes-support-operations.js";
 import { registerIdentitySecurityRoutes } from "./routes-identity-security.js";
 import { registerCustomerApiRoutes } from "./routes-customer-api.js";
+import { registerContentRoutes } from "./routes-content.js";
 
 export async function buildApp(
   config: Config,
@@ -287,6 +288,7 @@ export async function buildApp(
   await registerServiceOperationRoutes(app, pool, config);
   await registerTicketRoutes(app, pool, config);
   await registerSupportOperationRoutes(app, pool, config);
+  await registerContentRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
     return { app, pool };

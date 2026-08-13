@@ -174,30 +174,4 @@ export async function registerCatalogRoutes(
     });
   });
 
-  app.get("/api/v1/legal/current", async (request) => {
-    const locale =
-      typeof request.query === "object" &&
-      request.query !== null &&
-      "locale" in request.query &&
-      request.query.locale === "zh-CN"
-        ? "zh-CN"
-        : "en";
-    const result = await pool.query<{
-      id: string;
-      kind: "terms" | "aup" | "privacy";
-      version: string;
-      title: string;
-      body: string;
-    }>(
-      `SELECT DISTINCT ON (kind) id, kind, version, title, body
-       FROM legal_documents
-       WHERE locale = $1 AND published_at <= now()
-       ORDER BY kind, published_at DESC`,
-      [locale],
-    );
-    return {
-      locale,
-      documents: Object.fromEntries(result.rows.map((document) => [document.kind, document])),
-    };
-  });
 }

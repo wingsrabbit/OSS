@@ -245,8 +245,32 @@ const quoteAcceptancePreviewSchema = z
   .object({
     termsVersion: z.string().trim().min(1).max(64),
     aupVersion: z.string().trim().min(1).max(64),
+    termsDocumentId: canonicalUuid.optional(),
+    aupDocumentId: canonicalUuid.optional(),
+    legalLocale: z.enum(["en", "zh-CN"]).optional(),
+    termsLocale: z.enum(["en", "zh-CN"]).optional(),
+    aupLocale: z.enum(["en", "zh-CN"]).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((body, context) => {
+    const exactLegalSelection = [
+      body.termsDocumentId,
+      body.aupDocumentId,
+      body.legalLocale,
+      body.termsLocale,
+      body.aupLocale,
+    ];
+    if (
+      exactLegalSelection.some((value) => value !== undefined) &&
+      exactLegalSelection.some((value) => value === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["termsDocumentId"],
+        message: "Exact legal document IDs, requested locale, and resolved locales must be supplied together",
+      });
+    }
+  });
 
 const quoteAcceptanceSchema = quoteAcceptancePreviewSchema
   .extend({
@@ -1840,9 +1864,13 @@ export async function registerCommerceRoutes(
         commit: false,
       });
       const legal = await loadLegalDocuments(client, {
-        locale: user.locale,
+        locale: body.legalLocale ?? user.locale,
         termsVersion: body.termsVersion,
         aupVersion: body.aupVersion,
+        termsDocumentId: body.termsDocumentId,
+        aupDocumentId: body.aupDocumentId,
+        termsLocale: body.termsLocale,
+        aupLocale: body.aupLocale,
       });
       return {
         warning: LAB_BANNER,
@@ -1875,13 +1903,24 @@ export async function registerCommerceRoutes(
     assertCustomerCapability(user, "orders.create");
     const params = z.object({ quoteId: canonicalUuid }).parse(request.params);
     const body = quoteAcceptanceSchema.parse(request.body);
-    const fingerprint = requestFingerprint("quotes.accept:v1", {
+    const legacyFingerprintInput = {
       quoteId: params.quoteId,
       termsVersion: body.termsVersion,
       aupVersion: body.aupVersion,
       marketingConsent: body.marketingConsent,
       marketingConsentPolicyVersion: body.marketingConsentPolicyVersion ?? null,
-    });
+    };
+    const fingerprint =
+      body.termsDocumentId !== undefined && body.aupDocumentId !== undefined
+        ? requestFingerprint("quotes.accept:v2", {
+            ...legacyFingerprintInput,
+            termsDocumentId: body.termsDocumentId,
+            aupDocumentId: body.aupDocumentId,
+            legalLocale: body.legalLocale,
+            termsLocale: body.termsLocale,
+            aupLocale: body.aupLocale,
+          })
+        : requestFingerprint("quotes.accept:v1", legacyFingerprintInput);
     const accepted = await transaction(pool, async (client) => {
       const context = await lockAccountContextForMutation(
         client,
@@ -2018,9 +2057,13 @@ export async function registerCommerceRoutes(
         commit: true,
       });
       const legal = await loadLegalDocuments(client, {
-        locale: user.locale,
+        locale: body.legalLocale ?? user.locale,
         termsVersion: body.termsVersion,
         aupVersion: body.aupVersion,
+        termsDocumentId: body.termsDocumentId,
+        aupDocumentId: body.aupDocumentId,
+        termsLocale: body.termsLocale,
+        aupLocale: body.aupLocale,
       });
       const issued = await issueCommercialOrder(client, {
         clientAccountId: user.clientAccountId,

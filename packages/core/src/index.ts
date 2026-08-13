@@ -2,6 +2,18 @@
 
 export const LAB_BANNER = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY" as const;
 
+export {
+  CONTENT_KINDS,
+  CONTENT_LOCALES,
+  CONTENT_STATUS_LEVELS,
+  contentLocale,
+  resolveLocalizedCurrent,
+  type ContentKind,
+  type ContentLocale,
+  type ContentStatusLevel,
+  type LocalizedCurrentRevision,
+} from "./content-operations.js";
+
 export const CUSTOMER_CAPABILITIES = [
   "account.contacts.manage",
   "account.contacts.read",

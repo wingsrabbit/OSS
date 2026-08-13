@@ -106,7 +106,7 @@ export async function requireStaffActionLocked(
   user: SessionIdentity,
   permission: string,
   affectedUserIds: readonly string[] = [],
-): Promise<void> {
+): Promise<string> {
   const identity = await lockSessionIdentityForMutation(
     client,
     user,
@@ -126,7 +126,7 @@ export async function requireStaffActionLocked(
     [user.userId],
   );
   const permissions = result.rows[0]?.permissions;
-  const grant = await client.query(
+  const grant = await client.query<{ id: string }>(
     `SELECT id
      FROM reauth_grants
      WHERE user_id = $1
@@ -154,6 +154,11 @@ export async function requireStaffActionLocked(
       code: "STAFF_AUTHORIZATION_REQUIRED",
     });
   }
+  const grantId = grant.rows[0]?.id;
+  if (!grantId) {
+    throw new Error("Locked Staff reauthentication grant disappeared");
+  }
+  return grantId;
 }
 
 export async function requireRecentReauth(

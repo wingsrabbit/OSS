@@ -9,6 +9,7 @@ import { assertSchema020CatalogShape } from "@opensales/core/schema-019-020-nati
 import { assertSchema021CatalogShape } from "@opensales/core/schema-020-021-native-compatibility";
 import { assertSchema022CatalogShape } from "@opensales/core/schema-021-022-native-compatibility";
 import { digestToken } from "./auth.js";
+import { requestFingerprint } from "./idempotency.js";
 import type { FastifyError, FastifyReply, FastifyRequest } from "fastify";
 import type { Config } from "./config.js";
 import { runMigrations, transaction, type DatabasePool } from "./database.js";
@@ -392,13 +393,6 @@ try {
   const customerA = await createCustomer("commerce-a");
   const customerB = await createCustomer("commerce-b");
 
-  await pool.query(
-    `INSERT INTO legal_documents(kind, locale, version, title, body)
-     VALUES
-       ('terms', 'en', 'commerce-v1', 'Synthetic Commerce Terms', 'Mock-only terms.'),
-       ('aup', 'en', 'commerce-v1', 'Synthetic Commerce AUP', 'Mock-only AUP.')`,
-  );
-
   const deniedProduct = await app.inject({
     method: "POST",
     url: "/api/v1/admin/catalog/products",
@@ -592,8 +586,8 @@ try {
       private_note: "must-never-persist",
     },
     promotionCode: "LABFREE",
-    termsVersion: "commerce-v1",
-    aupVersion: "commerce-v1",
+    termsVersion: "mock-lab-v1",
+    aupVersion: "mock-lab-v1",
     marketingConsent: true,
     marketingConsentPolicyVersion: "mock-lab-marketing-v1",
     idempotencyKey: `checkout-${randomUUID()}`,
@@ -640,6 +634,23 @@ try {
   });
   assert.equal(replay.statusCode, 200, replay.body);
   assert.equal(json<{ orderId: string }>(replay).orderId, winningOrder.orderId);
+  const savedOrderFingerprint = await pool.query<{ request_fingerprint: string }>(
+    `SELECT request_fingerprint FROM public.orders WHERE id = $1`,
+    [winningOrder.orderId],
+  );
+  assert.equal(
+    savedOrderFingerprint.rows[0]?.request_fingerprint,
+    requestFingerprint("orders.create:v2", {
+      priceId: winningPayload.priceId,
+      configuration: winningPayload.configuration,
+      termsVersion: winningPayload.termsVersion,
+      aupVersion: winningPayload.aupVersion,
+      promotionCode: winningPayload.promotionCode,
+      marketingConsent: winningPayload.marketingConsent,
+      marketingConsentPolicyVersion: winningPayload.marketingConsentPolicyVersion,
+    }),
+    "Schema 025 must replay a saved Schema 022 Order with its unchanged v2 fingerprint",
+  );
 
   const commercialFacts = await pool.query<{
     promotions: string;
@@ -874,7 +885,7 @@ try {
     method: "POST",
     url: `/api/v1/quotes/${quoteId}/acceptance-preview`,
     headers: customerHeaders(customerA),
-    payload: { termsVersion: "commerce-v1", aupVersion: "commerce-v1" },
+    payload: { termsVersion: "mock-lab-v1", aupVersion: "mock-lab-v1" },
   });
   assert.equal(acceptancePreview.statusCode, 200, acceptancePreview.body);
   assert.equal(
@@ -953,9 +964,9 @@ try {
          )
          SELECT $1, $2, $3, $4, $5,
                 (SELECT id FROM legal_documents
-                 WHERE kind = 'terms' AND locale = 'en' AND version = 'commerce-v1'),
+                 WHERE kind = 'terms' AND locale = 'en' AND version = 'mock-lab-v1'),
                 (SELECT id FROM legal_documents
-                 WHERE kind = 'aup' AND locale = 'en' AND version = 'commerce-v1'),
+                 WHERE kind = 'aup' AND locale = 'en' AND version = 'mock-lab-v1'),
                 $6, $7`,
         [
           expiryQuoteId,
@@ -996,8 +1007,8 @@ try {
     payload: {
       priceId: currentPriceId,
       configuration: { units: 1 },
-      termsVersion: "commerce-v1",
-      aupVersion: "commerce-v1",
+      termsVersion: "mock-lab-v1",
+      aupVersion: "mock-lab-v1",
       idempotencyKey: `quote:${quoteId}`,
     },
   });
@@ -1072,8 +1083,8 @@ try {
   assert.deepEqual(afterDuplicateRelease.rows[0], { committed: "0", releases: "2" });
 
   const acceptancePayload = {
-    termsVersion: "commerce-v1",
-    aupVersion: "commerce-v1",
+    termsVersion: "mock-lab-v1",
+    aupVersion: "mock-lab-v1",
     idempotencyKey: `accept-quote-${randomUUID()}`,
   };
   const acceptance = await app.inject({
@@ -1092,6 +1103,25 @@ try {
   });
   assert.equal(acceptanceReplay.statusCode, 200, acceptanceReplay.body);
   assert.equal(json<{ orderId: string }>(acceptanceReplay).orderId, acceptedOrder.orderId);
+  const savedQuoteAcceptanceFingerprint = await pool.query<{
+    request_fingerprint: string;
+  }>(
+    `SELECT request_fingerprint
+     FROM public.sales_quote_acceptances
+     WHERE quote_id = $1`,
+    [quoteId],
+  );
+  assert.equal(
+    savedQuoteAcceptanceFingerprint.rows[0]?.request_fingerprint,
+    requestFingerprint("quotes.accept:v1", {
+      quoteId,
+      termsVersion: acceptancePayload.termsVersion,
+      aupVersion: acceptancePayload.aupVersion,
+      marketingConsent: false,
+      marketingConsentPolicyVersion: null,
+    }),
+    "Schema 025 must replay a saved Schema 022 Quote acceptance with its unchanged v1 fingerprint",
+  );
 
   const voidQuote = await app.inject({
     method: "POST",
