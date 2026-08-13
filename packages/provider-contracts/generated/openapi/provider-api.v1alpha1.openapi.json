@@ -1,0 +1,5434 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OpenSales System Provider API",
+    "version": "v1alpha1",
+    "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Apache-2.0 public process-boundary contract.",
+    "license": {
+      "name": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://provider.example.test/provider"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/v1alpha1/payment/operations": {
+      "post": {
+        "operationId": "payment-execute",
+        "summary": "Execute one idempotent payment operation",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Must equal body.operationId. Reuse with a different request is a conflict."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted Provider fact; status may require reconciliation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflict"
+          },
+          "504": {
+            "description": "Outcome unknown; query the operation before another mutation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/payment/operations/{operationId}": {
+      "get": {
+        "operationId": "payment-reconcile",
+        "summary": "Reconcile one payment operation without creating a new side effect",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Provider fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown operation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/provisioning/operations": {
+      "post": {
+        "operationId": "provisioning-execute",
+        "summary": "Execute one idempotent provisioning operation",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Must equal body.operationId. Reuse with a different request is a conflict."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted Provider fact; status may require reconciliation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflict"
+          },
+          "504": {
+            "description": "Outcome unknown; query the operation before another mutation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/provisioning/operations/{operationId}": {
+      "get": {
+        "operationId": "provisioning-reconcile",
+        "summary": "Reconcile one provisioning operation without creating a new side effect",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Provider fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown operation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/mail/operations": {
+      "post": {
+        "operationId": "mail-execute",
+        "summary": "Execute one idempotent mail operation",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Must equal body.operationId. Reuse with a different request is a conflict."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted Provider fact; status may require reconciliation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflict"
+          },
+          "504": {
+            "description": "Outcome unknown; query the operation before another mutation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/mail/operations/{operationId}": {
+      "get": {
+        "operationId": "mail-reconcile",
+        "summary": "Reconcile one mail operation without creating a new side effect",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Provider fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown operation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/verification/operations": {
+      "post": {
+        "operationId": "verification-execute",
+        "summary": "Execute one idempotent verification operation",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Must equal body.operationId. Reuse with a different request is a conflict."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted Provider fact; status may require reconciliation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflict"
+          },
+          "504": {
+            "description": "Outcome unknown; query the operation before another mutation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/verification/operations/{operationId}": {
+      "get": {
+        "operationId": "verification-reconcile",
+        "summary": "Reconcile one verification operation without creating a new side effect",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Provider fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown operation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/tax/operations": {
+      "post": {
+        "operationId": "tax-execute",
+        "summary": "Execute one idempotent tax operation",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Must equal body.operationId. Reuse with a different request is a conflict."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted Provider fact; status may require reconciliation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflict"
+          },
+          "504": {
+            "description": "Outcome unknown; query the operation before another mutation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/tax/operations/{operationId}": {
+      "get": {
+        "operationId": "tax-reconcile",
+        "summary": "Reconcile one tax operation without creating a new side effect",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Provider fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown operation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/anti_abuse_challenge/operations": {
+      "post": {
+        "operationId": "anti-abuse-challenge-execute",
+        "summary": "Execute one idempotent anti_abuse_challenge operation",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Must equal body.operationId. Reuse with a different request is a conflict."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted Provider fact; status may require reconciliation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflict"
+          },
+          "504": {
+            "description": "Outcome unknown; query the operation before another mutation"
+          }
+        }
+      }
+    },
+    "/v1alpha1/anti_abuse_challenge/operations/{operationId}": {
+      "get": {
+        "operationId": "anti-abuse-challenge-reconcile",
+        "summary": "Reconcile one anti_abuse_challenge operation without creating a new side effect",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Provider fact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown operation"
+          }
+        }
+      }
+    },
+    "/v1/manifest": {
+      "get": {
+        "operationId": "get-provider-manifest",
+        "summary": "Read declared versions, capabilities, permissions, data, secrets, limits, retention, and lifecycle guards",
+        "responses": {
+          "200": {
+            "description": "Provider manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Manifest"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "operationId": "list-provider-events",
+        "summary": "Read at-least-once Provider events; consumers deduplicate by eventId and reject stale sequence numbers",
+        "parameters": [
+          {
+            "name": "operationId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPage"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "Manifest": {
+        "$comment": "SPDX-License-Identifier: Apache-2.0",
+        "title": "OpenSales System Provider Manifest v1",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "manifestVersion",
+          "providerId",
+          "displayName",
+          "description",
+          "endpointBaseUrl",
+          "publisher",
+          "license",
+          "capabilities",
+          "permissions",
+          "limits",
+          "retention",
+          "lifecycle"
+        ],
+        "properties": {
+          "manifestVersion": {
+            "const": "v1"
+          },
+          "providerId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9.-]{2,99}$"
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "endpointBaseUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "publisher": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "website",
+              "supportUrl"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "website": {
+                "type": "string",
+                "format": "uri"
+              },
+              "supportUrl": {
+                "type": "string",
+                "format": "uri"
+              }
+            }
+          },
+          "license": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "identifier",
+              "url"
+            ],
+            "properties": {
+              "identifier": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "url": {
+                "type": "string",
+                "format": "uri"
+              }
+            }
+          },
+          "capabilities": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "capability",
+                    "contractVersion",
+                    "operations",
+                    "eventSubscriptions"
+                  ],
+                  "properties": {
+                    "capability": {
+                      "const": "payment"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "payment.authorize",
+                          "payment.capture",
+                          "payment.refund",
+                          "payment.reconcile"
+                        ]
+                      }
+                    },
+                    "eventSubscriptions": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "capability",
+                    "contractVersion",
+                    "operations",
+                    "eventSubscriptions"
+                  ],
+                  "properties": {
+                    "capability": {
+                      "const": "provisioning"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "resource.create",
+                          "resource.start",
+                          "resource.stop",
+                          "resource.reboot",
+                          "resource.change_password",
+                          "resource.change_plan",
+                          "resource.terminate",
+                          "resource.reconcile"
+                        ]
+                      }
+                    },
+                    "eventSubscriptions": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "capability",
+                    "contractVersion",
+                    "operations",
+                    "eventSubscriptions"
+                  ],
+                  "properties": {
+                    "capability": {
+                      "const": "mail"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "mail.send",
+                          "mail.reconcile"
+                        ]
+                      }
+                    },
+                    "eventSubscriptions": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "capability",
+                    "contractVersion",
+                    "operations",
+                    "eventSubscriptions"
+                  ],
+                  "properties": {
+                    "capability": {
+                      "const": "verification"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "verification.evaluate",
+                          "verification.reconcile"
+                        ]
+                      }
+                    },
+                    "eventSubscriptions": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "capability",
+                    "contractVersion",
+                    "operations",
+                    "eventSubscriptions"
+                  ],
+                  "properties": {
+                    "capability": {
+                      "const": "tax"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "tax.quote",
+                          "tax.reconcile"
+                        ]
+                      }
+                    },
+                    "eventSubscriptions": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "capability",
+                    "contractVersion",
+                    "operations",
+                    "eventSubscriptions"
+                  ],
+                  "properties": {
+                    "capability": {
+                      "const": "anti_abuse_challenge"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "operations": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "enum": [
+                          "challenge.evaluate",
+                          "challenge.reconcile"
+                        ]
+                      }
+                    },
+                    "eventSubscriptions": {
+                      "type": "array",
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "permissions": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "scopes",
+              "dataFields",
+              "secrets"
+            ],
+            "properties": {
+              "scopes": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "dataFields": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "secrets": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name",
+                    "purpose",
+                    "required",
+                    "rotation"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^[A-Z][A-Z0-9_]{2,79}$"
+                    },
+                    "purpose": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 240
+                    },
+                    "required": {
+                      "type": "boolean"
+                    },
+                    "rotation": {
+                      "enum": [
+                        "supported",
+                        "required"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "limits": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "maxConcurrentOperations",
+              "maxAmountMinor",
+              "maxOwnedResources"
+            ],
+            "properties": {
+              "maxConcurrentOperations": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "maxAmountMinor": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "maxOwnedResources": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "retention": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "operationDays",
+              "eventDays",
+              "piiDays"
+            ],
+            "properties": {
+              "operationDays": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "eventDays": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "piiDays": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "lifecycle": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "supportsPause",
+              "supportsCredentialRotation",
+              "supportsManualTakeover",
+              "uninstallRequiresNoUnknownOperations",
+              "uninstallRequiresNoOwnedResources",
+              "uninstallRequiresNoPendingFunds"
+            ],
+            "properties": {
+              "supportsPause": {
+                "type": "boolean"
+              },
+              "supportsCredentialRotation": {
+                "type": "boolean"
+              },
+              "supportsManualTakeover": {
+                "type": "boolean"
+              },
+              "uninstallRequiresNoUnknownOperations": {
+                "type": "boolean"
+              },
+              "uninstallRequiresNoOwnedResources": {
+                "type": "boolean"
+              },
+              "uninstallRequiresNoPendingFunds": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "OperationRequest": {
+        "$comment": "SPDX-License-Identifier: Apache-2.0",
+        "title": "OpenSales System Provider Operation Request v1alpha1",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "operationId",
+              "requestedAt",
+              "intentRef",
+              "capability",
+              "action",
+              "input"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "intentRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "capability": {
+                "const": "payment"
+              },
+              "action": {
+                "enum": [
+                  "payment.authorize",
+                  "payment.capture",
+                  "payment.refund",
+                  "payment.reconcile"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "amountMinor",
+                  "currency"
+                ],
+                "properties": {
+                  "amountMinor": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{3}$"
+                  },
+                  "customerRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "externalPaymentRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "operationId",
+              "requestedAt",
+              "intentRef",
+              "capability",
+              "action",
+              "input"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "intentRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "capability": {
+                "const": "provisioning"
+              },
+              "action": {
+                "enum": [
+                  "resource.create",
+                  "resource.start",
+                  "resource.stop",
+                  "resource.reboot",
+                  "resource.change_password",
+                  "resource.change_plan",
+                  "resource.terminate",
+                  "resource.reconcile"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "serviceRef",
+                  "planRef"
+                ],
+                "properties": {
+                  "serviceRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "planRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "externalResourceRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "configuration": {
+                    "type": "object",
+                    "maxProperties": 100,
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "operationId",
+              "requestedAt",
+              "intentRef",
+              "capability",
+              "action",
+              "input"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "intentRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "capability": {
+                "const": "mail"
+              },
+              "action": {
+                "enum": [
+                  "mail.send",
+                  "mail.reconcile"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "recipient",
+                  "templateRef",
+                  "locale",
+                  "subject",
+                  "textBody"
+                ],
+                "properties": {
+                  "recipient": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 320
+                  },
+                  "templateRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "locale": {
+                    "enum": [
+                      "en",
+                      "zh-CN"
+                    ]
+                  },
+                  "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "textBody": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 20000
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "operationId",
+              "requestedAt",
+              "intentRef",
+              "capability",
+              "action",
+              "input"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "intentRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "capability": {
+                "const": "verification"
+              },
+              "action": {
+                "enum": [
+                  "verification.evaluate",
+                  "verification.reconcile"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "subjectRef",
+                  "purpose",
+                  "checks"
+                ],
+                "properties": {
+                  "subjectRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "purpose": {
+                    "enum": [
+                      "account_eligibility",
+                      "manual_review"
+                    ]
+                  },
+                  "checks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "email_ownership",
+                        "identity",
+                        "business"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "operationId",
+              "requestedAt",
+              "intentRef",
+              "capability",
+              "action",
+              "input"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "intentRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "capability": {
+                "const": "tax"
+              },
+              "action": {
+                "enum": [
+                  "tax.quote",
+                  "tax.reconcile"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "currency",
+                  "jurisdictionCountry",
+                  "lines"
+                ],
+                "properties": {
+                  "currency": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{3}$"
+                  },
+                  "jurisdictionCountry": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{2}$"
+                  },
+                  "jurisdictionRegion": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100
+                  },
+                  "lines": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 500,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "lineRef",
+                        "amountMinor",
+                        "taxCode"
+                      ],
+                      "properties": {
+                        "lineRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "amountMinor": {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "taxCode": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "operationId",
+              "requestedAt",
+              "intentRef",
+              "capability",
+              "action",
+              "input"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "intentRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "capability": {
+                "const": "anti_abuse_challenge"
+              },
+              "action": {
+                "enum": [
+                  "challenge.evaluate",
+                  "challenge.reconcile"
+                ]
+              },
+              "input": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "subjectRef",
+                  "actionRef",
+                  "signals"
+                ],
+                "properties": {
+                  "subjectRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "actionRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "signals": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 100,
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "OperationResult": {
+        "$comment": "SPDX-License-Identifier: Apache-2.0",
+        "title": "OpenSales System Provider Operation Result v1alpha1",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "capability",
+              "operationId",
+              "status",
+              "revision",
+              "observedAt"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "capability": {
+                "const": "payment"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "succeeded",
+                  "failed",
+                  "unknown"
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "externalPaymentRef",
+                  "paymentState",
+                  "amountMinor",
+                  "currency"
+                ],
+                "properties": {
+                  "externalPaymentRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "paymentState": {
+                    "enum": [
+                      "authorized",
+                      "captured",
+                      "refunded",
+                      "declined"
+                    ]
+                  },
+                  "amountMinor": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{3}$"
+                  }
+                }
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalPaymentRef",
+                        "paymentState",
+                        "amountMinor",
+                        "currency"
+                      ],
+                      "properties": {
+                        "externalPaymentRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "paymentState": {
+                          "enum": [
+                            "authorized",
+                            "captured",
+                            "refunded",
+                            "declined"
+                          ]
+                        },
+                        "amountMinor": {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "currency": {
+                          "type": "string",
+                          "pattern": "^[A-Z]{3}$"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "output"
+                  ],
+                  "not": {
+                    "type": "object",
+                    "properties": {
+                      "error": {}
+                    },
+                    "required": [
+                      "error"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "capability",
+              "operationId",
+              "status",
+              "revision",
+              "observedAt"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "capability": {
+                "const": "provisioning"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "succeeded",
+                  "failed",
+                  "unknown"
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "externalResourceRef",
+                  "resourceState"
+                ],
+                "properties": {
+                  "externalResourceRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "resourceState": {
+                    "enum": [
+                      "pending",
+                      "ready",
+                      "stopped",
+                      "terminated"
+                    ]
+                  },
+                  "readyAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalResourceRef",
+                        "resourceState"
+                      ],
+                      "properties": {
+                        "externalResourceRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "resourceState": {
+                          "enum": [
+                            "pending",
+                            "ready",
+                            "stopped",
+                            "terminated"
+                          ]
+                        },
+                        "readyAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "output"
+                  ],
+                  "not": {
+                    "type": "object",
+                    "properties": {
+                      "error": {}
+                    },
+                    "required": [
+                      "error"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "capability",
+              "operationId",
+              "status",
+              "revision",
+              "observedAt"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "capability": {
+                "const": "mail"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "succeeded",
+                  "failed",
+                  "unknown"
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "externalDeliveryRef",
+                  "deliveryState"
+                ],
+                "properties": {
+                  "externalDeliveryRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "deliveryState": {
+                    "enum": [
+                      "delivered",
+                      "bounced",
+                      "failed"
+                    ]
+                  }
+                }
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalDeliveryRef",
+                        "deliveryState"
+                      ],
+                      "properties": {
+                        "externalDeliveryRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "deliveryState": {
+                          "enum": [
+                            "delivered",
+                            "bounced",
+                            "failed"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "output"
+                  ],
+                  "not": {
+                    "type": "object",
+                    "properties": {
+                      "error": {}
+                    },
+                    "required": [
+                      "error"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "capability",
+              "operationId",
+              "status",
+              "revision",
+              "observedAt"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "capability": {
+                "const": "verification"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "succeeded",
+                  "failed",
+                  "unknown"
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "externalEvidenceRef",
+                  "verdict",
+                  "assurance",
+                  "checked"
+                ],
+                "properties": {
+                  "externalEvidenceRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "verdict": {
+                    "enum": [
+                      "verified",
+                      "rejected",
+                      "manual_review"
+                    ]
+                  },
+                  "assurance": {
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  },
+                  "checked": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "email_ownership",
+                        "identity",
+                        "business"
+                      ]
+                    }
+                  }
+                }
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalEvidenceRef",
+                        "verdict",
+                        "assurance",
+                        "checked"
+                      ],
+                      "properties": {
+                        "externalEvidenceRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "verdict": {
+                          "enum": [
+                            "verified",
+                            "rejected",
+                            "manual_review"
+                          ]
+                        },
+                        "assurance": {
+                          "enum": [
+                            "low",
+                            "medium",
+                            "high"
+                          ]
+                        },
+                        "checked": {
+                          "type": "array",
+                          "minItems": 1,
+                          "uniqueItems": true,
+                          "items": {
+                            "enum": [
+                              "email_ownership",
+                              "identity",
+                              "business"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "output"
+                  ],
+                  "not": {
+                    "type": "object",
+                    "properties": {
+                      "error": {}
+                    },
+                    "required": [
+                      "error"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "capability",
+              "operationId",
+              "status",
+              "revision",
+              "observedAt"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "capability": {
+                "const": "tax"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "succeeded",
+                  "failed",
+                  "unknown"
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "externalQuoteRef",
+                  "currency",
+                  "totalTaxMinor",
+                  "lines"
+                ],
+                "properties": {
+                  "externalQuoteRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "currency": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{3}$"
+                  },
+                  "totalTaxMinor": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "lines": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "lineRef",
+                        "taxMinor",
+                        "rateBasisPoints"
+                      ],
+                      "properties": {
+                        "lineRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "taxMinor": {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "rateBasisPoints": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 100000
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalQuoteRef",
+                        "currency",
+                        "totalTaxMinor",
+                        "lines"
+                      ],
+                      "properties": {
+                        "externalQuoteRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "currency": {
+                          "type": "string",
+                          "pattern": "^[A-Z]{3}$"
+                        },
+                        "totalTaxMinor": {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "lines": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "lineRef",
+                              "taxMinor",
+                              "rateBasisPoints"
+                            ],
+                            "properties": {
+                              "lineRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "taxMinor": {
+                                "type": "string",
+                                "pattern": "^(0|[1-9][0-9]*)$"
+                              },
+                              "rateBasisPoints": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 100000
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "output"
+                  ],
+                  "not": {
+                    "type": "object",
+                    "properties": {
+                      "error": {}
+                    },
+                    "required": [
+                      "error"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transportVersion",
+              "contractVersion",
+              "capability",
+              "operationId",
+              "status",
+              "revision",
+              "observedAt"
+            ],
+            "properties": {
+              "transportVersion": {
+                "const": "v1"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "capability": {
+                "const": "anti_abuse_challenge"
+              },
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "succeeded",
+                  "failed",
+                  "unknown"
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "externalDecisionRef",
+                  "decision"
+                ],
+                "properties": {
+                  "externalDecisionRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "decision": {
+                    "enum": [
+                      "allow",
+                      "challenge",
+                      "deny"
+                    ]
+                  },
+                  "challengeRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "challengeState": {
+                    "enum": [
+                      "pending",
+                      "satisfied",
+                      "failed"
+                    ]
+                  }
+                }
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalDecisionRef",
+                        "decision"
+                      ],
+                      "properties": {
+                        "externalDecisionRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "decision": {
+                          "enum": [
+                            "allow",
+                            "challenge",
+                            "deny"
+                          ]
+                        },
+                        "challengeRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "challengeState": {
+                          "enum": [
+                            "pending",
+                            "satisfied",
+                            "failed"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "output"
+                  ],
+                  "not": {
+                    "type": "object",
+                    "properties": {
+                      "error": {}
+                    },
+                    "required": [
+                      "error"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "Event": {
+        "$comment": "SPDX-License-Identifier: Apache-2.0",
+        "title": "OpenSales System Provider Event v1alpha1",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "transportVersion",
+          "contractVersion",
+          "eventId",
+          "providerId",
+          "capability",
+          "operationId",
+          "sequence",
+          "eventType",
+          "observedAt",
+          "result"
+        ],
+        "properties": {
+          "transportVersion": {
+            "const": "v1"
+          },
+          "contractVersion": {
+            "const": "v1alpha1"
+          },
+          "eventId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "providerId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9.-]{2,99}$"
+          },
+          "capability": {
+            "enum": [
+              "payment",
+              "provisioning",
+              "mail",
+              "verification",
+              "tax",
+              "anti_abuse_challenge"
+            ]
+          },
+          "operationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "eventType": {
+            "enum": [
+              "operation.pending",
+              "operation.succeeded",
+              "operation.failed",
+              "operation.unknown"
+            ]
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "result": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://schemas.opensales.system/provider/v1alpha1/operation-result.schema.json",
+            "$comment": "SPDX-License-Identifier: Apache-2.0",
+            "title": "OpenSales System Provider Operation Result v1alpha1",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transportVersion",
+                  "contractVersion",
+                  "capability",
+                  "operationId",
+                  "status",
+                  "revision",
+                  "observedAt"
+                ],
+                "properties": {
+                  "transportVersion": {
+                    "const": "v1"
+                  },
+                  "contractVersion": {
+                    "const": "v1alpha1"
+                  },
+                  "capability": {
+                    "const": "payment"
+                  },
+                  "operationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "succeeded",
+                      "failed",
+                      "unknown"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "output": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "externalPaymentRef",
+                      "paymentState",
+                      "amountMinor",
+                      "currency"
+                    ],
+                    "properties": {
+                      "externalPaymentRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "paymentState": {
+                        "enum": [
+                          "authorized",
+                          "captured",
+                          "refunded",
+                          "declined"
+                        ]
+                      },
+                      "amountMinor": {
+                        "type": "string",
+                        "pattern": "^(0|[1-9][0-9]*)$"
+                      },
+                      "currency": {
+                        "type": "string",
+                        "pattern": "^[A-Z]{3}$"
+                      }
+                    }
+                  },
+                  "error": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "code",
+                      "message",
+                      "retryable"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                      },
+                      "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500
+                      },
+                      "retryable": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalPaymentRef",
+                            "paymentState",
+                            "amountMinor",
+                            "currency"
+                          ],
+                          "properties": {
+                            "externalPaymentRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "paymentState": {
+                              "enum": [
+                                "authorized",
+                                "captured",
+                                "refunded",
+                                "declined"
+                              ]
+                            },
+                            "amountMinor": {
+                              "type": "string",
+                              "pattern": "^(0|[1-9][0-9]*)$"
+                            },
+                            "currency": {
+                              "type": "string",
+                              "pattern": "^[A-Z]{3}$"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "output"
+                      ],
+                      "not": {
+                        "type": "object",
+                        "properties": {
+                          "error": {}
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string"
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transportVersion",
+                  "contractVersion",
+                  "capability",
+                  "operationId",
+                  "status",
+                  "revision",
+                  "observedAt"
+                ],
+                "properties": {
+                  "transportVersion": {
+                    "const": "v1"
+                  },
+                  "contractVersion": {
+                    "const": "v1alpha1"
+                  },
+                  "capability": {
+                    "const": "provisioning"
+                  },
+                  "operationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "succeeded",
+                      "failed",
+                      "unknown"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "output": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "externalResourceRef",
+                      "resourceState"
+                    ],
+                    "properties": {
+                      "externalResourceRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "resourceState": {
+                        "enum": [
+                          "pending",
+                          "ready",
+                          "stopped",
+                          "terminated"
+                        ]
+                      },
+                      "readyAt": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    }
+                  },
+                  "error": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "code",
+                      "message",
+                      "retryable"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                      },
+                      "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500
+                      },
+                      "retryable": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalResourceRef",
+                            "resourceState"
+                          ],
+                          "properties": {
+                            "externalResourceRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "resourceState": {
+                              "enum": [
+                                "pending",
+                                "ready",
+                                "stopped",
+                                "terminated"
+                              ]
+                            },
+                            "readyAt": {
+                              "type": "string",
+                              "format": "date-time"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "output"
+                      ],
+                      "not": {
+                        "type": "object",
+                        "properties": {
+                          "error": {}
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string"
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transportVersion",
+                  "contractVersion",
+                  "capability",
+                  "operationId",
+                  "status",
+                  "revision",
+                  "observedAt"
+                ],
+                "properties": {
+                  "transportVersion": {
+                    "const": "v1"
+                  },
+                  "contractVersion": {
+                    "const": "v1alpha1"
+                  },
+                  "capability": {
+                    "const": "mail"
+                  },
+                  "operationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "succeeded",
+                      "failed",
+                      "unknown"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "output": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "externalDeliveryRef",
+                      "deliveryState"
+                    ],
+                    "properties": {
+                      "externalDeliveryRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "deliveryState": {
+                        "enum": [
+                          "delivered",
+                          "bounced",
+                          "failed"
+                        ]
+                      }
+                    }
+                  },
+                  "error": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "code",
+                      "message",
+                      "retryable"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                      },
+                      "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500
+                      },
+                      "retryable": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalDeliveryRef",
+                            "deliveryState"
+                          ],
+                          "properties": {
+                            "externalDeliveryRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "deliveryState": {
+                              "enum": [
+                                "delivered",
+                                "bounced",
+                                "failed"
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "output"
+                      ],
+                      "not": {
+                        "type": "object",
+                        "properties": {
+                          "error": {}
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string"
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transportVersion",
+                  "contractVersion",
+                  "capability",
+                  "operationId",
+                  "status",
+                  "revision",
+                  "observedAt"
+                ],
+                "properties": {
+                  "transportVersion": {
+                    "const": "v1"
+                  },
+                  "contractVersion": {
+                    "const": "v1alpha1"
+                  },
+                  "capability": {
+                    "const": "verification"
+                  },
+                  "operationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "succeeded",
+                      "failed",
+                      "unknown"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "output": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "externalEvidenceRef",
+                      "verdict",
+                      "assurance",
+                      "checked"
+                    ],
+                    "properties": {
+                      "externalEvidenceRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "verdict": {
+                        "enum": [
+                          "verified",
+                          "rejected",
+                          "manual_review"
+                        ]
+                      },
+                      "assurance": {
+                        "enum": [
+                          "low",
+                          "medium",
+                          "high"
+                        ]
+                      },
+                      "checked": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                          "enum": [
+                            "email_ownership",
+                            "identity",
+                            "business"
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "error": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "code",
+                      "message",
+                      "retryable"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                      },
+                      "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500
+                      },
+                      "retryable": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalEvidenceRef",
+                            "verdict",
+                            "assurance",
+                            "checked"
+                          ],
+                          "properties": {
+                            "externalEvidenceRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "verdict": {
+                              "enum": [
+                                "verified",
+                                "rejected",
+                                "manual_review"
+                              ]
+                            },
+                            "assurance": {
+                              "enum": [
+                                "low",
+                                "medium",
+                                "high"
+                              ]
+                            },
+                            "checked": {
+                              "type": "array",
+                              "minItems": 1,
+                              "uniqueItems": true,
+                              "items": {
+                                "enum": [
+                                  "email_ownership",
+                                  "identity",
+                                  "business"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "output"
+                      ],
+                      "not": {
+                        "type": "object",
+                        "properties": {
+                          "error": {}
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string"
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transportVersion",
+                  "contractVersion",
+                  "capability",
+                  "operationId",
+                  "status",
+                  "revision",
+                  "observedAt"
+                ],
+                "properties": {
+                  "transportVersion": {
+                    "const": "v1"
+                  },
+                  "contractVersion": {
+                    "const": "v1alpha1"
+                  },
+                  "capability": {
+                    "const": "tax"
+                  },
+                  "operationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "succeeded",
+                      "failed",
+                      "unknown"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "output": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "externalQuoteRef",
+                      "currency",
+                      "totalTaxMinor",
+                      "lines"
+                    ],
+                    "properties": {
+                      "externalQuoteRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "currency": {
+                        "type": "string",
+                        "pattern": "^[A-Z]{3}$"
+                      },
+                      "totalTaxMinor": {
+                        "type": "string",
+                        "pattern": "^(0|[1-9][0-9]*)$"
+                      },
+                      "lines": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "lineRef",
+                            "taxMinor",
+                            "rateBasisPoints"
+                          ],
+                          "properties": {
+                            "lineRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "taxMinor": {
+                              "type": "string",
+                              "pattern": "^(0|[1-9][0-9]*)$"
+                            },
+                            "rateBasisPoints": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 100000
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "error": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "code",
+                      "message",
+                      "retryable"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                      },
+                      "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500
+                      },
+                      "retryable": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalQuoteRef",
+                            "currency",
+                            "totalTaxMinor",
+                            "lines"
+                          ],
+                          "properties": {
+                            "externalQuoteRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "currency": {
+                              "type": "string",
+                              "pattern": "^[A-Z]{3}$"
+                            },
+                            "totalTaxMinor": {
+                              "type": "string",
+                              "pattern": "^(0|[1-9][0-9]*)$"
+                            },
+                            "lines": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "lineRef",
+                                  "taxMinor",
+                                  "rateBasisPoints"
+                                ],
+                                "properties": {
+                                  "lineRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "taxMinor": {
+                                    "type": "string",
+                                    "pattern": "^(0|[1-9][0-9]*)$"
+                                  },
+                                  "rateBasisPoints": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 100000
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "output"
+                      ],
+                      "not": {
+                        "type": "object",
+                        "properties": {
+                          "error": {}
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string"
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "transportVersion",
+                  "contractVersion",
+                  "capability",
+                  "operationId",
+                  "status",
+                  "revision",
+                  "observedAt"
+                ],
+                "properties": {
+                  "transportVersion": {
+                    "const": "v1"
+                  },
+                  "contractVersion": {
+                    "const": "v1alpha1"
+                  },
+                  "capability": {
+                    "const": "anti_abuse_challenge"
+                  },
+                  "operationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "succeeded",
+                      "failed",
+                      "unknown"
+                    ]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "output": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "externalDecisionRef",
+                      "decision"
+                    ],
+                    "properties": {
+                      "externalDecisionRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "decision": {
+                        "enum": [
+                          "allow",
+                          "challenge",
+                          "deny"
+                        ]
+                      },
+                      "challengeRef": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "challengeState": {
+                        "enum": [
+                          "pending",
+                          "satisfied",
+                          "failed"
+                        ]
+                      }
+                    }
+                  },
+                  "error": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "code",
+                      "message",
+                      "retryable"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                      },
+                      "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500
+                      },
+                      "retryable": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "succeeded"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalDecisionRef",
+                            "decision"
+                          ],
+                          "properties": {
+                            "externalDecisionRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "decision": {
+                              "enum": [
+                                "allow",
+                                "challenge",
+                                "deny"
+                              ]
+                            },
+                            "challengeRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "challengeState": {
+                              "enum": [
+                                "pending",
+                                "satisfied",
+                                "failed"
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "output"
+                      ],
+                      "not": {
+                        "type": "object",
+                        "properties": {
+                          "error": {}
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string"
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "EventPage": {
+        "$comment": "SPDX-License-Identifier: Apache-2.0",
+        "title": "OpenSales System Provider Event Page v1",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "nextCursor"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "$id": "https://schemas.opensales.system/provider/v1alpha1/event.schema.json",
+              "$comment": "SPDX-License-Identifier: Apache-2.0",
+              "title": "OpenSales System Provider Event v1alpha1",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "transportVersion",
+                "contractVersion",
+                "eventId",
+                "providerId",
+                "capability",
+                "operationId",
+                "sequence",
+                "eventType",
+                "observedAt",
+                "result"
+              ],
+              "properties": {
+                "transportVersion": {
+                  "const": "v1"
+                },
+                "contractVersion": {
+                  "const": "v1alpha1"
+                },
+                "eventId": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "providerId": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9.-]{2,99}$"
+                },
+                "capability": {
+                  "enum": [
+                    "payment",
+                    "provisioning",
+                    "mail",
+                    "verification",
+                    "tax",
+                    "anti_abuse_challenge"
+                  ]
+                },
+                "operationId": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "eventType": {
+                  "enum": [
+                    "operation.pending",
+                    "operation.succeeded",
+                    "operation.failed",
+                    "operation.unknown"
+                  ]
+                },
+                "observedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "result": {
+                  "$schema": "https://json-schema.org/draft/2020-12/schema",
+                  "$id": "https://schemas.opensales.system/provider/v1alpha1/operation-result.schema.json",
+                  "$comment": "SPDX-License-Identifier: Apache-2.0",
+                  "title": "OpenSales System Provider Operation Result v1alpha1",
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "transportVersion",
+                        "contractVersion",
+                        "capability",
+                        "operationId",
+                        "status",
+                        "revision",
+                        "observedAt"
+                      ],
+                      "properties": {
+                        "transportVersion": {
+                          "const": "v1"
+                        },
+                        "contractVersion": {
+                          "const": "v1alpha1"
+                        },
+                        "capability": {
+                          "const": "payment"
+                        },
+                        "operationId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "enum": [
+                            "pending",
+                            "succeeded",
+                            "failed",
+                            "unknown"
+                          ]
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "observedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalPaymentRef",
+                            "paymentState",
+                            "amountMinor",
+                            "currency"
+                          ],
+                          "properties": {
+                            "externalPaymentRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "paymentState": {
+                              "enum": [
+                                "authorized",
+                                "captured",
+                                "refunded",
+                                "declined"
+                              ]
+                            },
+                            "amountMinor": {
+                              "type": "string",
+                              "pattern": "^(0|[1-9][0-9]*)$"
+                            },
+                            "currency": {
+                              "type": "string",
+                              "pattern": "^[A-Z]{3}$"
+                            }
+                          }
+                        },
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 500
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "succeeded"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "output": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "externalPaymentRef",
+                                  "paymentState",
+                                  "amountMinor",
+                                  "currency"
+                                ],
+                                "properties": {
+                                  "externalPaymentRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "paymentState": {
+                                    "enum": [
+                                      "authorized",
+                                      "captured",
+                                      "refunded",
+                                      "declined"
+                                    ]
+                                  },
+                                  "amountMinor": {
+                                    "type": "string",
+                                    "pattern": "^(0|[1-9][0-9]*)$"
+                                  },
+                                  "currency": {
+                                    "type": "string",
+                                    "pattern": "^[A-Z]{3}$"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "output"
+                            ],
+                            "not": {
+                              "type": "object",
+                              "properties": {
+                                "error": {}
+                              },
+                              "required": [
+                                "error"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "failed"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "error": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "code",
+                                  "message",
+                                  "retryable"
+                                ],
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "retryable": {
+                                    "type": "boolean"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "error"
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "transportVersion",
+                        "contractVersion",
+                        "capability",
+                        "operationId",
+                        "status",
+                        "revision",
+                        "observedAt"
+                      ],
+                      "properties": {
+                        "transportVersion": {
+                          "const": "v1"
+                        },
+                        "contractVersion": {
+                          "const": "v1alpha1"
+                        },
+                        "capability": {
+                          "const": "provisioning"
+                        },
+                        "operationId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "enum": [
+                            "pending",
+                            "succeeded",
+                            "failed",
+                            "unknown"
+                          ]
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "observedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalResourceRef",
+                            "resourceState"
+                          ],
+                          "properties": {
+                            "externalResourceRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "resourceState": {
+                              "enum": [
+                                "pending",
+                                "ready",
+                                "stopped",
+                                "terminated"
+                              ]
+                            },
+                            "readyAt": {
+                              "type": "string",
+                              "format": "date-time"
+                            }
+                          }
+                        },
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 500
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "succeeded"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "output": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "externalResourceRef",
+                                  "resourceState"
+                                ],
+                                "properties": {
+                                  "externalResourceRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "resourceState": {
+                                    "enum": [
+                                      "pending",
+                                      "ready",
+                                      "stopped",
+                                      "terminated"
+                                    ]
+                                  },
+                                  "readyAt": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "output"
+                            ],
+                            "not": {
+                              "type": "object",
+                              "properties": {
+                                "error": {}
+                              },
+                              "required": [
+                                "error"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "failed"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "error": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "code",
+                                  "message",
+                                  "retryable"
+                                ],
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "retryable": {
+                                    "type": "boolean"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "error"
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "transportVersion",
+                        "contractVersion",
+                        "capability",
+                        "operationId",
+                        "status",
+                        "revision",
+                        "observedAt"
+                      ],
+                      "properties": {
+                        "transportVersion": {
+                          "const": "v1"
+                        },
+                        "contractVersion": {
+                          "const": "v1alpha1"
+                        },
+                        "capability": {
+                          "const": "mail"
+                        },
+                        "operationId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "enum": [
+                            "pending",
+                            "succeeded",
+                            "failed",
+                            "unknown"
+                          ]
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "observedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalDeliveryRef",
+                            "deliveryState"
+                          ],
+                          "properties": {
+                            "externalDeliveryRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "deliveryState": {
+                              "enum": [
+                                "delivered",
+                                "bounced",
+                                "failed"
+                              ]
+                            }
+                          }
+                        },
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 500
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "succeeded"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "output": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "externalDeliveryRef",
+                                  "deliveryState"
+                                ],
+                                "properties": {
+                                  "externalDeliveryRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "deliveryState": {
+                                    "enum": [
+                                      "delivered",
+                                      "bounced",
+                                      "failed"
+                                    ]
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "output"
+                            ],
+                            "not": {
+                              "type": "object",
+                              "properties": {
+                                "error": {}
+                              },
+                              "required": [
+                                "error"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "failed"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "error": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "code",
+                                  "message",
+                                  "retryable"
+                                ],
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "retryable": {
+                                    "type": "boolean"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "error"
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "transportVersion",
+                        "contractVersion",
+                        "capability",
+                        "operationId",
+                        "status",
+                        "revision",
+                        "observedAt"
+                      ],
+                      "properties": {
+                        "transportVersion": {
+                          "const": "v1"
+                        },
+                        "contractVersion": {
+                          "const": "v1alpha1"
+                        },
+                        "capability": {
+                          "const": "verification"
+                        },
+                        "operationId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "enum": [
+                            "pending",
+                            "succeeded",
+                            "failed",
+                            "unknown"
+                          ]
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "observedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalEvidenceRef",
+                            "verdict",
+                            "assurance",
+                            "checked"
+                          ],
+                          "properties": {
+                            "externalEvidenceRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "verdict": {
+                              "enum": [
+                                "verified",
+                                "rejected",
+                                "manual_review"
+                              ]
+                            },
+                            "assurance": {
+                              "enum": [
+                                "low",
+                                "medium",
+                                "high"
+                              ]
+                            },
+                            "checked": {
+                              "type": "array",
+                              "minItems": 1,
+                              "uniqueItems": true,
+                              "items": {
+                                "enum": [
+                                  "email_ownership",
+                                  "identity",
+                                  "business"
+                                ]
+                              }
+                            }
+                          }
+                        },
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 500
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "succeeded"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "output": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "externalEvidenceRef",
+                                  "verdict",
+                                  "assurance",
+                                  "checked"
+                                ],
+                                "properties": {
+                                  "externalEvidenceRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "verdict": {
+                                    "enum": [
+                                      "verified",
+                                      "rejected",
+                                      "manual_review"
+                                    ]
+                                  },
+                                  "assurance": {
+                                    "enum": [
+                                      "low",
+                                      "medium",
+                                      "high"
+                                    ]
+                                  },
+                                  "checked": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "uniqueItems": true,
+                                    "items": {
+                                      "enum": [
+                                        "email_ownership",
+                                        "identity",
+                                        "business"
+                                      ]
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "output"
+                            ],
+                            "not": {
+                              "type": "object",
+                              "properties": {
+                                "error": {}
+                              },
+                              "required": [
+                                "error"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "failed"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "error": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "code",
+                                  "message",
+                                  "retryable"
+                                ],
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "retryable": {
+                                    "type": "boolean"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "error"
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "transportVersion",
+                        "contractVersion",
+                        "capability",
+                        "operationId",
+                        "status",
+                        "revision",
+                        "observedAt"
+                      ],
+                      "properties": {
+                        "transportVersion": {
+                          "const": "v1"
+                        },
+                        "contractVersion": {
+                          "const": "v1alpha1"
+                        },
+                        "capability": {
+                          "const": "tax"
+                        },
+                        "operationId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "enum": [
+                            "pending",
+                            "succeeded",
+                            "failed",
+                            "unknown"
+                          ]
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "observedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalQuoteRef",
+                            "currency",
+                            "totalTaxMinor",
+                            "lines"
+                          ],
+                          "properties": {
+                            "externalQuoteRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "currency": {
+                              "type": "string",
+                              "pattern": "^[A-Z]{3}$"
+                            },
+                            "totalTaxMinor": {
+                              "type": "string",
+                              "pattern": "^(0|[1-9][0-9]*)$"
+                            },
+                            "lines": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "lineRef",
+                                  "taxMinor",
+                                  "rateBasisPoints"
+                                ],
+                                "properties": {
+                                  "lineRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "taxMinor": {
+                                    "type": "string",
+                                    "pattern": "^(0|[1-9][0-9]*)$"
+                                  },
+                                  "rateBasisPoints": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 100000
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 500
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "succeeded"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "output": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "externalQuoteRef",
+                                  "currency",
+                                  "totalTaxMinor",
+                                  "lines"
+                                ],
+                                "properties": {
+                                  "externalQuoteRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "currency": {
+                                    "type": "string",
+                                    "pattern": "^[A-Z]{3}$"
+                                  },
+                                  "totalTaxMinor": {
+                                    "type": "string",
+                                    "pattern": "^(0|[1-9][0-9]*)$"
+                                  },
+                                  "lines": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "additionalProperties": false,
+                                      "required": [
+                                        "lineRef",
+                                        "taxMinor",
+                                        "rateBasisPoints"
+                                      ],
+                                      "properties": {
+                                        "lineRef": {
+                                          "type": "string",
+                                          "minLength": 1,
+                                          "maxLength": 200
+                                        },
+                                        "taxMinor": {
+                                          "type": "string",
+                                          "pattern": "^(0|[1-9][0-9]*)$"
+                                        },
+                                        "rateBasisPoints": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 100000
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "output"
+                            ],
+                            "not": {
+                              "type": "object",
+                              "properties": {
+                                "error": {}
+                              },
+                              "required": [
+                                "error"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "failed"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "error": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "code",
+                                  "message",
+                                  "retryable"
+                                ],
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "retryable": {
+                                    "type": "boolean"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "error"
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "transportVersion",
+                        "contractVersion",
+                        "capability",
+                        "operationId",
+                        "status",
+                        "revision",
+                        "observedAt"
+                      ],
+                      "properties": {
+                        "transportVersion": {
+                          "const": "v1"
+                        },
+                        "contractVersion": {
+                          "const": "v1alpha1"
+                        },
+                        "capability": {
+                          "const": "anti_abuse_challenge"
+                        },
+                        "operationId": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "enum": [
+                            "pending",
+                            "succeeded",
+                            "failed",
+                            "unknown"
+                          ]
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "observedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "output": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "externalDecisionRef",
+                            "decision"
+                          ],
+                          "properties": {
+                            "externalDecisionRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "decision": {
+                              "enum": [
+                                "allow",
+                                "challenge",
+                                "deny"
+                              ]
+                            },
+                            "challengeRef": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 200
+                            },
+                            "challengeState": {
+                              "enum": [
+                                "pending",
+                                "satisfied",
+                                "failed"
+                              ]
+                            }
+                          }
+                        },
+                        "error": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "code",
+                            "message",
+                            "retryable"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 500
+                            },
+                            "retryable": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "succeeded"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "output": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "externalDecisionRef",
+                                  "decision"
+                                ],
+                                "properties": {
+                                  "externalDecisionRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "decision": {
+                                    "enum": [
+                                      "allow",
+                                      "challenge",
+                                      "deny"
+                                    ]
+                                  },
+                                  "challengeRef": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  },
+                                  "challengeState": {
+                                    "enum": [
+                                      "pending",
+                                      "satisfied",
+                                      "failed"
+                                    ]
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "output"
+                            ],
+                            "not": {
+                              "type": "object",
+                              "properties": {
+                                "error": {}
+                              },
+                              "required": [
+                                "error"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "properties": {
+                              "status": {
+                                "const": "failed"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ]
+                          },
+                          "then": {
+                            "properties": {
+                              "error": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "code",
+                                  "message",
+                                  "retryable"
+                                ],
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "retryable": {
+                                    "type": "boolean"
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "error"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

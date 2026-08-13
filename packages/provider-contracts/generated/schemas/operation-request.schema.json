@@ -1,0 +1,504 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.opensales.system/provider/v1alpha1/operation-request.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "OpenSales System Provider Operation Request v1alpha1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transportVersion",
+        "contractVersion",
+        "operationId",
+        "requestedAt",
+        "intentRef",
+        "capability",
+        "action",
+        "input"
+      ],
+      "properties": {
+        "transportVersion": {
+          "const": "v1"
+        },
+        "contractVersion": {
+          "const": "v1alpha1"
+        },
+        "operationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "capability": {
+          "const": "payment"
+        },
+        "action": {
+          "enum": [
+            "payment.authorize",
+            "payment.capture",
+            "payment.refund",
+            "payment.reconcile"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "amountMinor",
+            "currency"
+          ],
+          "properties": {
+            "amountMinor": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$"
+            },
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$"
+            },
+            "customerRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "externalPaymentRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transportVersion",
+        "contractVersion",
+        "operationId",
+        "requestedAt",
+        "intentRef",
+        "capability",
+        "action",
+        "input"
+      ],
+      "properties": {
+        "transportVersion": {
+          "const": "v1"
+        },
+        "contractVersion": {
+          "const": "v1alpha1"
+        },
+        "operationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "capability": {
+          "const": "provisioning"
+        },
+        "action": {
+          "enum": [
+            "resource.create",
+            "resource.start",
+            "resource.stop",
+            "resource.reboot",
+            "resource.change_password",
+            "resource.change_plan",
+            "resource.terminate",
+            "resource.reconcile"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "serviceRef",
+            "planRef"
+          ],
+          "properties": {
+            "serviceRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "planRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "externalResourceRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "configuration": {
+              "type": "object",
+              "maxProperties": 100,
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transportVersion",
+        "contractVersion",
+        "operationId",
+        "requestedAt",
+        "intentRef",
+        "capability",
+        "action",
+        "input"
+      ],
+      "properties": {
+        "transportVersion": {
+          "const": "v1"
+        },
+        "contractVersion": {
+          "const": "v1alpha1"
+        },
+        "operationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "capability": {
+          "const": "mail"
+        },
+        "action": {
+          "enum": [
+            "mail.send",
+            "mail.reconcile"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "recipient",
+            "templateRef",
+            "locale",
+            "subject",
+            "textBody"
+          ],
+          "properties": {
+            "recipient": {
+              "type": "string",
+              "format": "email",
+              "maxLength": 320
+            },
+            "templateRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "locale": {
+              "enum": [
+                "en",
+                "zh-CN"
+              ]
+            },
+            "subject": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            },
+            "textBody": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 20000
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transportVersion",
+        "contractVersion",
+        "operationId",
+        "requestedAt",
+        "intentRef",
+        "capability",
+        "action",
+        "input"
+      ],
+      "properties": {
+        "transportVersion": {
+          "const": "v1"
+        },
+        "contractVersion": {
+          "const": "v1alpha1"
+        },
+        "operationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "capability": {
+          "const": "verification"
+        },
+        "action": {
+          "enum": [
+            "verification.evaluate",
+            "verification.reconcile"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subjectRef",
+            "purpose",
+            "checks"
+          ],
+          "properties": {
+            "subjectRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "purpose": {
+              "enum": [
+                "account_eligibility",
+                "manual_review"
+              ]
+            },
+            "checks": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "email_ownership",
+                  "identity",
+                  "business"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transportVersion",
+        "contractVersion",
+        "operationId",
+        "requestedAt",
+        "intentRef",
+        "capability",
+        "action",
+        "input"
+      ],
+      "properties": {
+        "transportVersion": {
+          "const": "v1"
+        },
+        "contractVersion": {
+          "const": "v1alpha1"
+        },
+        "operationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "capability": {
+          "const": "tax"
+        },
+        "action": {
+          "enum": [
+            "tax.quote",
+            "tax.reconcile"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "currency",
+            "jurisdictionCountry",
+            "lines"
+          ],
+          "properties": {
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$"
+            },
+            "jurisdictionCountry": {
+              "type": "string",
+              "pattern": "^[A-Z]{2}$"
+            },
+            "jurisdictionRegion": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "lines": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 500,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "lineRef",
+                  "amountMinor",
+                  "taxCode"
+                ],
+                "properties": {
+                  "lineRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "amountMinor": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "taxCode": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transportVersion",
+        "contractVersion",
+        "operationId",
+        "requestedAt",
+        "intentRef",
+        "capability",
+        "action",
+        "input"
+      ],
+      "properties": {
+        "transportVersion": {
+          "const": "v1"
+        },
+        "contractVersion": {
+          "const": "v1alpha1"
+        },
+        "operationId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "capability": {
+          "const": "anti_abuse_challenge"
+        },
+        "action": {
+          "enum": [
+            "challenge.evaluate",
+            "challenge.reconcile"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subjectRef",
+            "actionRef",
+            "signals"
+          ],
+          "properties": {
+            "subjectRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "actionRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "signals": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 100,
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

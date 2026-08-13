@@ -1,0 +1,28 @@
+{
+  "name": "@opensales/provider-sdk-typescript",
+  "version": "0.1.0",
+  "description": "Official TypeScript SDK for OpenSales System Provider contracts",
+  "type": "module",
+  "license": "Apache-2.0",
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test dist/**/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@opensales/provider-contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.13",
+    "typescript": "7.0.2"
+  },
+  "engines": { "node": "24.18.0" },
+  "publishConfig": { "access": "public" }
+}

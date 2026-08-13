@@ -1,0 +1,477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.opensales.system/provider/v1/manifest.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "OpenSales System Provider Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifestVersion",
+    "providerId",
+    "displayName",
+    "description",
+    "endpointBaseUrl",
+    "publisher",
+    "license",
+    "capabilities",
+    "permissions",
+    "limits",
+    "retention",
+    "lifecycle"
+  ],
+  "properties": {
+    "manifestVersion": {
+      "const": "v1"
+    },
+    "providerId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9.-]{2,99}$"
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "endpointBaseUrl": {
+      "type": "string",
+      "format": "uri"
+    },
+    "publisher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "website",
+        "supportUrl"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "website": {
+          "type": "string",
+          "format": "uri"
+        },
+        "supportUrl": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "url"
+      ],
+      "properties": {
+        "identifier": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "contractVersion",
+              "operations",
+              "eventSubscriptions"
+            ],
+            "properties": {
+              "capability": {
+                "const": "payment"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operations": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "payment.authorize",
+                    "payment.capture",
+                    "payment.refund",
+                    "payment.reconcile"
+                  ]
+                }
+              },
+              "eventSubscriptions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "contractVersion",
+              "operations",
+              "eventSubscriptions"
+            ],
+            "properties": {
+              "capability": {
+                "const": "provisioning"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operations": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "resource.create",
+                    "resource.start",
+                    "resource.stop",
+                    "resource.reboot",
+                    "resource.change_password",
+                    "resource.change_plan",
+                    "resource.terminate",
+                    "resource.reconcile"
+                  ]
+                }
+              },
+              "eventSubscriptions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "contractVersion",
+              "operations",
+              "eventSubscriptions"
+            ],
+            "properties": {
+              "capability": {
+                "const": "mail"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operations": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "mail.send",
+                    "mail.reconcile"
+                  ]
+                }
+              },
+              "eventSubscriptions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "contractVersion",
+              "operations",
+              "eventSubscriptions"
+            ],
+            "properties": {
+              "capability": {
+                "const": "verification"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operations": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "verification.evaluate",
+                    "verification.reconcile"
+                  ]
+                }
+              },
+              "eventSubscriptions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "contractVersion",
+              "operations",
+              "eventSubscriptions"
+            ],
+            "properties": {
+              "capability": {
+                "const": "tax"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operations": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "tax.quote",
+                    "tax.reconcile"
+                  ]
+                }
+              },
+              "eventSubscriptions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "contractVersion",
+              "operations",
+              "eventSubscriptions"
+            ],
+            "properties": {
+              "capability": {
+                "const": "anti_abuse_challenge"
+              },
+              "contractVersion": {
+                "const": "v1alpha1"
+              },
+              "operations": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "challenge.evaluate",
+                    "challenge.reconcile"
+                  ]
+                }
+              },
+              "eventSubscriptions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scopes",
+        "dataFields",
+        "secrets"
+      ],
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "dataFields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "purpose",
+              "required",
+              "rotation"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9_]{2,79}$"
+              },
+              "purpose": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "rotation": {
+                "enum": [
+                  "supported",
+                  "required"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxConcurrentOperations",
+        "maxAmountMinor",
+        "maxOwnedResources"
+      ],
+      "properties": {
+        "maxConcurrentOperations": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxAmountMinor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "maxOwnedResources": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationDays",
+        "eventDays",
+        "piiDays"
+      ],
+      "properties": {
+        "operationDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "eventDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "piiDays": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supportsPause",
+        "supportsCredentialRotation",
+        "supportsManualTakeover",
+        "uninstallRequiresNoUnknownOperations",
+        "uninstallRequiresNoOwnedResources",
+        "uninstallRequiresNoPendingFunds"
+      ],
+      "properties": {
+        "supportsPause": {
+          "type": "boolean"
+        },
+        "supportsCredentialRotation": {
+          "type": "boolean"
+        },
+        "supportsManualTakeover": {
+          "type": "boolean"
+        },
+        "uninstallRequiresNoUnknownOperations": {
+          "type": "boolean"
+        },
+        "uninstallRequiresNoOwnedResources": {
+          "type": "boolean"
+        },
+        "uninstallRequiresNoPendingFunds": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
