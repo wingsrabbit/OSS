@@ -45,18 +45,19 @@ export async function advancePaidInvoice(
     automatic_user_id: string | null;
   }>(
     `SELECT invoice.client_account_id,
-            pg_catalog.coalesce(
+            COALESCE(
               order_record.submitted_by_user_id,
               original_order.submitted_by_user_id
             ) AS submitted_by_user_id,
-            authorization.granted_by_user_id AS automatic_user_id
+            renewal_authorization.granted_by_user_id AS automatic_user_id
      FROM invoices invoice
      LEFT JOIN orders order_record ON order_record.id = invoice.order_id
      LEFT JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
      LEFT JOIN services service ON service.id = renewal.service_id
      LEFT JOIN order_items item ON item.id = service.order_item_id
      LEFT JOIN orders original_order ON original_order.id = item.order_id
-     LEFT JOIN automatic_renewal_authorizations authorization ON authorization.id = $2
+     LEFT JOIN automatic_renewal_authorizations renewal_authorization
+       ON renewal_authorization.id = $2
      WHERE invoice.id = $1`,
     [
       invoiceId,
@@ -243,7 +244,11 @@ export async function advancePaidInvoice(
     return { invoiceStatus: "paid", orderStatus: "on_hold" };
   }
 
-  if (order.fulfillment_mode === "manual" || order.fulfillment_mode === "review") {
+  if (
+    order.fulfillment_mode === "manual" ||
+    order.fulfillment_mode === "review" ||
+    order.fulfillment_mode === "quote"
+  ) {
     await client.query(
       `UPDATE orders
        SET status = 'awaiting_manual', updated_at = now(), version = version + 1

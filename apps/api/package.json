@@ -20,6 +20,7 @@
     "test:integration:tickets": "node dist/tickets.integration.js",
     "test:integration:account-history": "node dist/account-history.integration.js",
     "test:integration:account-context": "node dist/account-context.integration.js",
+    "test:integration:catalog-commerce": "node dist/catalog-commerce.integration.js",
     "test:integration:database-role-boundary": "node dist/database-role-boundary.integration.js",
     "test:integration:schema-rollback-preflight": "node dist/schema-rollback-preflight.integration.js",
     "test:integration:schema-015-016-rollback-preflight": "node dist/schema-015-016-rollback-preflight.integration.js",
