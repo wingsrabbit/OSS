@@ -175,6 +175,12 @@ importers:
 
   providers/mock-lab:
     dependencies:
+      '@opensales/provider-contracts':
+        specifier: workspace:*
+        version: link:../../packages/provider-contracts
+      '@opensales/provider-sdk-typescript':
+        specifier: workspace:*
+        version: link:../../packages/provider-sdk-typescript
       fastify:
         specifier: 5.10.0
         version: 5.10.0

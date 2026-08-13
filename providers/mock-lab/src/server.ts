@@ -4,6 +4,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import Fastify from "fastify";
 import pg from "pg";
 import { z } from "zod";
+import { registerProviderPlatformRoutes } from "./provider-platform.js";
 
 const config = z
   .object({
@@ -11,6 +12,8 @@ const config = z
     MOCK_PAYMENT_PROVIDER_TOKEN: z.string().min(32).optional(),
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32).optional(),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32).optional(),
+    MOCK_PROVIDER_PLATFORM_TOKEN: z.string().min(32).optional(),
+    MOCK_PROVIDER_PUBLIC_BASE_URL: z.url().optional(),
     LAB_MAILBOX_TOKEN: z.string().min(32).optional(),
     MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32).optional(),
     MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32).optional(),
@@ -514,9 +517,12 @@ const app = Fastify({
 
 app.addHook("onRequest", async (request, reply) => {
   const requestPath = new URL(request.url, "http://127.0.0.1").pathname;
-  if (!requestPath.startsWith("/v1/")) return;
+  if (requestPath === "/v1/manifest") return;
+  if (!requestPath.startsWith("/v1/") && !requestPath.startsWith("/v1alpha1/")) return;
   const expectedToken =
-    requestPath.startsWith("/v1/payments") || requestPath.startsWith("/v1/refunds")
+    requestPath.startsWith("/v1alpha1/") || requestPath === "/v1/events"
+      ? config.MOCK_PROVIDER_PLATFORM_TOKEN
+      : requestPath.startsWith("/v1/payments") || requestPath.startsWith("/v1/refunds")
       ? config.MOCK_PAYMENT_PROVIDER_TOKEN
       : requestPath.startsWith("/v1/resources") ||
           requestPath.startsWith("/v1/resource-actions")
@@ -545,6 +551,12 @@ app.addHook("onRequest", async (request, reply) => {
       );
     }
   }
+});
+
+await registerProviderPlatformRoutes(app, pool, {
+  publicBaseUrl:
+    config.MOCK_PROVIDER_PUBLIC_BASE_URL ??
+    `http://127.0.0.1:${config.PROVIDER_PORT}`,
 });
 
 function releaseIncomingMailRequest(request: object): void {
