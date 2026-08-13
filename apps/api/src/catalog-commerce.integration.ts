@@ -181,7 +181,7 @@ try {
      ) VALUES ($1, 'legacy-commerce-product', 1, 'USD', 'monthly', 0, 0, 1234)`,
     [legacyPriceId],
   );
-  await runMigrations(pool);
+  await runMigrations(pool, { throughVersion: "020_stage_c_catalog_commerce" });
   const upgradedLegacy = await pool.query<{
     revision_count: string;
     catalog_product_revision_id: string | null;
@@ -200,6 +200,110 @@ try {
   assert.equal(upgradedLegacy.rows[0]?.revision_count, "1");
   assert.ok(upgradedLegacy.rows[0]?.catalog_product_revision_id);
   assert.equal(upgradedLegacy.rows[0]?.recurring_minor, "1234");
+
+  const savedCustomerUserId = randomUUID();
+  const savedStaffUserId = randomUUID();
+  const savedAccountId = randomUUID();
+  const savedOrderId = randomUUID();
+  const savedOrderItemId = randomUUID();
+  const savedServiceId = randomUUID();
+  await transaction(pool, async (client) => {
+    await client.query(
+      `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+       VALUES
+         ($1, $2, 'synthetic-not-a-password', 'en', pg_catalog.now()),
+         ($3, $4, 'synthetic-not-a-password', 'en', pg_catalog.now())`,
+      [
+        savedCustomerUserId,
+        `saved-customer-${databaseName}@example.invalid`,
+        savedStaffUserId,
+        `saved-staff-${databaseName}@example.invalid`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO client_accounts(id, name, owner_user_id)
+       VALUES ($1, 'Saved Schema 020 account', $2)`,
+      [savedAccountId, savedCustomerUserId],
+    );
+    await client.query(
+      `INSERT INTO client_memberships(
+         client_account_id, user_id, role, permissions
+       ) VALUES ($1, $2, 'owner', '["*"]'::jsonb)`,
+      [savedAccountId, savedCustomerUserId],
+    );
+    await client.query(
+      `INSERT INTO staff_members(user_id, roles, permissions)
+       VALUES ($1, ARRAY['operations']::text[], '["catalog.supply.manage"]'::jsonb)`,
+      [savedStaffUserId],
+    );
+    await client.query(
+      `INSERT INTO product_supply_capacities(
+         product_id, mode, available_units, committed_units,
+         updated_by_staff_user_id
+       ) VALUES ('legacy-commerce-product', 'tracked', 10, 2, $1)`,
+      [savedStaffUserId],
+    );
+    await client.query(
+      `INSERT INTO orders(
+         id, client_account_id, submitted_by_user_id, status, currency,
+         price_snapshot, one_time_minor, setup_minor, recurring_minor,
+         total_minor, idempotency_key, request_fingerprint
+       ) VALUES (
+         $1, $2, $3, 'cancelled', 'USD', '{}'::jsonb,
+         0, 0, 1234, 1234, $4, $5
+       )`,
+      [
+        savedOrderId,
+        savedAccountId,
+        savedCustomerUserId,
+        `saved-order-${randomUUID()}`,
+        `saved-order-fingerprint-${randomUUID()}`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO order_items(
+         id, order_id, client_account_id, product_id, product_name,
+         fulfillment_mode, billing_cycle, configuration, price_snapshot
+       ) VALUES (
+         $1, $2, $3, 'legacy-commerce-product', 'Legacy Product',
+         'manual', 'monthly', '{}'::jsonb, '{}'::jsonb
+       )`,
+      [savedOrderItemId, savedOrderId, savedAccountId],
+    );
+    await client.query(
+      `INSERT INTO services(
+         id, client_account_id, order_item_id, status, billing_cycle
+       ) VALUES ($1, $2, $3, 'pending', 'monthly')`,
+      [savedServiceId, savedAccountId, savedOrderItemId],
+    );
+    await client.query(
+      `INSERT INTO supply_capacity_reservations(
+         client_account_id, product_id, order_id, units, capacity_snapshot
+       ) VALUES ($1, 'legacy-commerce-product', $2, 2, '{}'::jsonb)`,
+      [savedAccountId, savedOrderId],
+    );
+  });
+  await runMigrations(pool);
+  const forwardUpgrade = await pool.query<{
+    committed: string;
+    releases: string;
+    reason: string;
+  }>(
+    `SELECT
+       capacity.committed_units::text AS committed,
+       pg_catalog.count(release_fact.id)::text AS releases,
+       pg_catalog.min(release_fact.reason) AS reason
+     FROM product_supply_capacities capacity
+     LEFT JOIN supply_capacity_releases release_fact
+       ON release_fact.product_id = capacity.product_id
+     WHERE capacity.product_id = 'legacy-commerce-product'
+     GROUP BY capacity.committed_units`,
+  );
+  assert.deepEqual(forwardUpgrade.rows[0], {
+    committed: "0",
+    releases: "1",
+    reason: "order_cancelled",
+  });
 
   app = Fastify({ logger: false });
   await app.register(cookie);
@@ -510,13 +614,26 @@ try {
   }>(
     `SELECT
        (SELECT pg_catalog.count(*)::text FROM promotion_redemptions) AS promotions,
-       (SELECT pg_catalog.count(*)::text FROM supply_capacity_reservations) AS reservations,
+       (SELECT pg_catalog.count(*)::text
+        FROM supply_capacity_reservations
+        WHERE product_id = 'mock-capacity-service') AS reservations,
        (SELECT committed_units::text FROM product_supply_capacities
         WHERE product_id = 'mock-capacity-service') AS committed,
-       (SELECT pg_catalog.count(*)::text FROM orders) AS orders,
-       (SELECT pg_catalog.count(*)::text FROM invoices) AS invoices,
-       (SELECT pg_catalog.count(*)::text FROM services) AS services,
-       (SELECT pg_catalog.count(*)::text FROM order_legal_acceptances) AS legal_acceptances,
+       (SELECT pg_catalog.count(DISTINCT item.order_id)::text
+        FROM order_items item
+        WHERE item.product_id = 'mock-capacity-service') AS orders,
+       (SELECT pg_catalog.count(DISTINCT invoice.id)::text
+        FROM invoices invoice
+        JOIN order_items item ON item.order_id = invoice.order_id
+        WHERE item.product_id = 'mock-capacity-service') AS invoices,
+       (SELECT pg_catalog.count(service.id)::text
+        FROM services service
+        JOIN order_items item ON item.id = service.order_item_id
+        WHERE item.product_id = 'mock-capacity-service') AS services,
+       (SELECT pg_catalog.count(acceptance.legal_acceptance_id)::text
+        FROM order_legal_acceptances acceptance
+        JOIN order_items item ON item.order_id = acceptance.order_id
+        WHERE item.product_id = 'mock-capacity-service') AS legal_acceptances,
        (SELECT pg_catalog.count(*)::text FROM ledger_journals
         WHERE sealed_at IS NULL) AS unsealed`,
   );
@@ -1050,7 +1167,7 @@ try {
   });
 
   console.log(
-    "Catalog Commerce PostgreSQL 18 integration: PASS — Staff definitions, immutable non-overlapping price and Promotion revisions, options, Promotion exhaustion, supply reservation/release projection, zero Order, Marketing Consent withdrawal, Quote wall-clock expiry/preview/accept/replay/void and idempotency isolation, tenant isolation, legal snapshots, and balanced sealed ledgers.",
+    "Catalog Commerce PostgreSQL 18 integration: PASS — saved Schema 020 forward upgrade, Staff definitions, immutable non-overlapping price and Promotion revisions, options, Promotion exhaustion, supply reservation/release projection, zero Order, Marketing Consent withdrawal, Quote wall-clock expiry/preview/accept/replay/void and idempotency isolation, tenant isolation, legal snapshots, and balanced sealed ledgers.",
   );
 } finally {
   await app?.close().catch(() => undefined);
