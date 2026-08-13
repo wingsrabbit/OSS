@@ -499,6 +499,7 @@ export async function runDemoSmoke({
 
   const catalog = await session.request("/api/v1/catalog?locale=en");
   const legal = await session.request("/api/v1/legal/current?locale=en");
+  const publicContent = await session.request("/api/v1/content?locale=en");
   const automaticProduct = catalog.products.find((product) => product.id === "hkbgp-vps");
   const automaticPrice = automaticProduct?.prices.find(
     (price) => price.billingCycle === "monthly",
@@ -507,6 +508,26 @@ export async function runDemoSmoke({
   assert.ok(automaticPrice, "Synthetic HKBGP VPS monthly price is missing");
   assert.ok(legal.documents?.terms?.version, "Synthetic Terms are missing");
   assert.ok(legal.documents?.aup?.version, "Synthetic AUP is missing");
+  assert.ok(legal.documents?.privacy?.version, "Synthetic Privacy notice is missing");
+  for (const kind of ["terms", "aup", "privacy"]) {
+    assert.match(legal.documents[kind].documentId, /^[0-9a-f-]{36}$/);
+    assert.equal(legal.documents[kind].locale, "en");
+    assert.equal(legal.documents[kind].fallback, false);
+    assert.match(legal.documents[kind].revision, /^(?:0|[1-9]\d*)$/);
+  }
+  assert.ok(
+    publicContent.items.some((item) => item.kind === "announcement"),
+    "Published synthetic Announcement is missing",
+  );
+  assert.ok(
+    publicContent.items.some((item) => item.kind === "network_status"),
+    "Published synthetic Network Status is missing",
+  );
+  assert.equal(
+    publicContent.items.some((item) => item.audience !== "public"),
+    false,
+    "Public Content returned a non-public entry",
+  );
 
   const administratorAccess = bootstrapToken
     ? await createAdministrator({
@@ -523,6 +544,17 @@ export async function runDemoSmoke({
   const identity = syntheticIdentity("customer");
   const registeredCustomer = await registerAndVerify({ session, identity, timeoutMs });
   const registration = registeredCustomer.registration;
+  const customerContent = await session.request("/api/v1/customer/content?locale=zh-CN");
+  assert.ok(
+    customerContent.items.some((item) => item.kind === "knowledge_base"),
+    "Published synthetic Customer Knowledge Base is missing",
+  );
+  assert.ok(
+    customerContent.items.every(
+      (item) => item.locale === "zh-CN" || (item.locale === "en" && item.fallback === true),
+    ),
+    "Customer Content did not use deterministic zh-CN then English fallback",
+  );
 
   const created = await session.request(
     "/api/v1/orders",
@@ -533,6 +565,11 @@ export async function runDemoSmoke({
         configuration: {},
         termsVersion: legal.documents.terms.version,
         aupVersion: legal.documents.aup.version,
+        termsDocumentId: legal.documents.terms.documentId,
+        aupDocumentId: legal.documents.aup.documentId,
+        legalLocale: "en",
+        termsLocale: legal.documents.terms.locale,
+        aupLocale: legal.documents.aup.locale,
         idempotencyKey: randomUUID(),
       }),
     },

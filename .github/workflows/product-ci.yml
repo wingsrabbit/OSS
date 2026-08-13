@@ -239,6 +239,9 @@ jobs:
       - name: Verify Schema 019 native catalog freeze through the latest schema
         run: pnpm --filter @opensales/api test:integration:schema-019-native
 
+      - name: Run Content Operations PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:content-operations
+
       - name: Run account history PostgreSQL and API journey
         env:
           ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
