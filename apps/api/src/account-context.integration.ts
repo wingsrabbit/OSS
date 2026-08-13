@@ -47,6 +47,7 @@ const config: Config = {
     "synthetic-account-context-provider-capability",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 81).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 82).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 83).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-account-context-payment-hook",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-account-context-provisioning-hook",

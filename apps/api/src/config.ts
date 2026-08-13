@@ -6,6 +6,10 @@ import {
   createProviderTokenKeyring,
   type ProviderTokenKeyring,
 } from "@opensales/core/provider-token-vault";
+import {
+  createIdentitySecretKeyring,
+  type IdentitySecretKeyring,
+} from "@opensales/core/identity-security";
 
 const schema = z.object({
   DATABASE_URL: z.string().min(1),
@@ -34,6 +38,9 @@ const schema = z.object({
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: z.coerce.number().int().positive().optional(),
   PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: z.string().optional(),
+  IDENTITY_SECRET_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  IDENTITY_SECRET_KEY_VERSION: z.coerce.number().int().positive().optional(),
+  IDENTITY_SECRET_PREVIOUS_KEYS: z.string().optional(),
   OSS_SCHEMA_ROLLBACK_BRIDGE: z
     .enum(["disabled", "016-to-017"])
     .optional(),
@@ -46,6 +53,14 @@ const schema = z.object({
 });
 
 export type Config = z.infer<typeof schema>;
+
+export function identitySecretKeyring(config: Config): IdentitySecretKeyring {
+  return createIdentitySecretKeyring(
+    config.IDENTITY_SECRET_KEY_VERSION ?? 1,
+    config.IDENTITY_SECRET_KEY,
+    config.IDENTITY_SECRET_PREVIOUS_KEYS,
+  );
+}
 
 export function paymentMethodTokenKeyrings(config: Config): Readonly<{
   encryption: ProviderTokenKeyring;
@@ -68,5 +83,6 @@ export function paymentMethodTokenKeyrings(config: Config): Readonly<{
 export function loadConfig(): Config {
   const config = schema.parse(process.env);
   paymentMethodTokenKeyrings(config);
+  identitySecretKeyring(config);
   return config;
 }

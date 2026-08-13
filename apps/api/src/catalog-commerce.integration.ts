@@ -46,6 +46,7 @@ const config: Config = {
     "synthetic-catalog-commerce-provider-operation-secret",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 111).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 112).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 113).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-catalog-commerce-payment-secret",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-catalog-commerce-provisioning-secret",

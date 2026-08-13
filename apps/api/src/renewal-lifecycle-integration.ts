@@ -46,6 +46,7 @@ function buildIntegrationConfig(sessionCookieName = "oss_renewal_integration_ses
       "manual-action-capability-secret-0000000000000000",
     PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 9).toString("base64url"),
     PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 10).toString("base64url"),
+    IDENTITY_SECRET_KEY: Buffer.alloc(32, 11).toString("base64url"),
     MOCK_PAYMENT_WEBHOOK_SECRET: "manual-action-payment-secret-000000000000000000",
     MOCK_PROVISIONING_WEBHOOK_SECRET:
       "manual-action-provisioning-secret-0000000000000000",

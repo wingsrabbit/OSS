@@ -62,6 +62,7 @@ const config: Config = {
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: newLookupKey,
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: 2,
   PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: `1:${oldLookupKey}`,
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 35).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-payment-webhook-secret-for-rotation-test",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-provision-webhook-secret-for-rotation-test",

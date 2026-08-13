@@ -32,14 +32,19 @@ import {
 } from "./api.js";
 import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
 import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
+import { EmailChangePage, PasswordRecoveryPage, SecurityPanel } from "./SecurityPanel.js";
 import { TicketsPanel } from "./TicketsPanel.js";
 
 type Locale = "en" | "zh-CN";
-type AppRoute = "/" | "/customer" | "/admin";
+type AppRoute = "/" | "/customer" | "/admin" | "/security" | "/password-recovery" | "/email-change";
 
 function routeFromPath(pathname: string): AppRoute {
   const normalized = pathname.replace(/\/+$/, "") || "/";
-  if (normalized === "/customer" || normalized === "/admin") return normalized;
+  if (
+    normalized === "/customer" || normalized === "/admin" ||
+    normalized === "/security" || normalized === "/password-recovery" ||
+    normalized === "/email-change"
+  ) return normalized;
   if (normalized === "/membership-invitations/accept") return "/customer";
   return "/";
 }
@@ -805,6 +810,11 @@ export function App() {
   meRef.current = me;
   const meRequestGeneration = useRef(0);
   const [sessionResolved, setSessionResolved] = useState(false);
+  const [loginChallenge, setLoginChallenge] = useState<{
+    id: string;
+    token: string;
+    methods: string[];
+  } | null>(null);
   const [membershipInvitationToken, setMembershipInvitationToken] = useState<string | null>(() => {
     const path = window.location.pathname.replace(/\/+$/, "") || "/";
     if (path !== "/membership-invitations/accept") return null;
@@ -1096,6 +1106,7 @@ export function App() {
     }
     setNoticeRaw("");
     setErrorRaw("");
+    setLoginChallenge(null);
     setSelected(null);
     setOrder(null);
     setBilling(null);
@@ -2405,10 +2416,23 @@ export function App() {
     try {
       let requiresAccountContext = false;
       try {
-        await api("/api/v1/auth/login", {
+        const result = await api<{
+          challenge?: { id: string; token: string; methods: string[] };
+        }>("/api/v1/auth/login", {
           method: "POST",
           body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
         });
+        if (result.challenge) {
+          setLoginChallenge(result.challenge);
+          setSessionResolved(true);
+          setNoticeRaw(
+            locale === "zh-CN"
+              ? "密码已确认；请输入 TOTP 或一次性恢复码。"
+              : "Password confirmed; enter a TOTP or one-time recovery code.",
+          );
+          event.currentTarget.reset();
+          return;
+        }
       } catch (caught) {
         if (caught instanceof ApiError && caught.code === "ACCOUNT_CONTEXT_REQUIRED") {
           // Login deliberately returns 409 after setting the session cookie
@@ -2453,6 +2477,48 @@ export function App() {
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
+    }
+  }
+
+  async function completeLoginChallenge(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!loginChallenge) return;
+    const data = new FormData(event.currentTarget);
+    setError("");
+    try {
+      let requiresAccountContext = false;
+      try {
+        await api("/api/v1/auth/login-challenges/complete", {
+          method: "POST",
+          body: JSON.stringify({
+            challengeId: loginChallenge.id,
+            challengeToken: loginChallenge.token,
+            factorCode: data.get("factorCode"),
+          }),
+        });
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.code === "ACCOUNT_CONTEXT_REQUIRED") {
+          requiresAccountContext = true;
+        } else {
+          throw caught;
+        }
+      }
+      setLoginChallenge(null);
+      const viewer = await refreshMe();
+      const permissions = parseStaffPermissions(viewer?.staff?.permissions);
+      const target = route === "/"
+        ? viewer?.staff && (permissions.has("*") || permissions.size > 0)
+          ? "/admin"
+          : "/customer"
+        : route;
+      const staysOnResolvedRoute = route === target;
+      openRoute(target);
+      if (staysOnResolvedRoute) setSessionResolved(true);
+      setNoticeRaw(requiresAccountContext
+        ? locale === "zh-CN" ? "已登录。请选择当前客户账户。" : "Signed in. Select an active Client Account."
+        : locale === "zh-CN" ? "双因素登录成功。" : "Two-factor sign-in completed.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Login challenge failed");
     }
   }
 
@@ -4254,6 +4320,13 @@ export function App() {
           >
             Admin
           </a>
+          <a
+            aria-current={route === "/security" ? "page" : undefined}
+            href="/security"
+            onClick={(event) => followRouteLink(event, "/security")}
+          >
+            Security
+          </a>
         </nav>
         <div className="header-actions">
           <button onClick={() => setLocale(locale === "en" ? "zh-CN" : "en")}>
@@ -4278,21 +4351,33 @@ export function App() {
               ? "Public · Mock-only laboratory"
               : route === "/customer"
                 ? "Customer workspace · Mock-only"
-                : "Staff workspace · Mock-only"}
+                : route === "/admin"
+                  ? "Staff workspace · Mock-only"
+                  : route === "/security"
+                    ? "Shared User Security · Mock-only"
+                    : "Identity recovery · Mock-only"}
           </p>
           <h1>
             {route === "/"
               ? "Customer, billing and service operations — without vendor lock-in."
               : route === "/customer"
                 ? "Orders, billing, services and support in one customer workspace."
-                : "Audited support, money and service operations for Staff."}
+                : route === "/admin"
+                  ? "Audited support, money and service operations for Staff."
+                  : route === "/security"
+                    ? "One identity security surface for Customer and Staff."
+                    : "Complete a one-time identity link without exposing its secret."}
           </h1>
           <p>
             {route === "/"
               ? "Explore the synthetic catalog, create an account or sign in. Customer and Staff data stay inside their dedicated workspaces."
               : route === "/customer"
                 ? "Continue the real Mock Provider journey: open tickets, manage billing and follow each order through service delivery."
-                : "Public replies, internal notes, manual receipts, refunds and operational decisions remain explicit and reviewable."}
+                : route === "/admin"
+                  ? "Public replies, internal notes, manual receipts, refunds and operational decisions remain explicit and reviewable."
+                  : route === "/security"
+                    ? "Manage password, verified email, optional TOTP, sessions and low-risk customer API keys with fresh authorization checks."
+                    : "Tokens stay in memory only and are removed from the address bar before use."}
           </p>
         </section>
 
@@ -4301,6 +4386,52 @@ export function App() {
             {error || notice}
             <button onClick={() => (error ? setError("") : setNotice(""))}>×</button>
           </div>
+        )}
+
+        {loginChallenge && (
+          <section className="route-access" aria-label="Login factor challenge" data-testid="login-factor-challenge">
+            <p className="eyebrow">{locale === "zh-CN" ? "登录第二步" : "Sign-in second step"}</p>
+            <h2>{locale === "zh-CN" ? "确认身份因子" : "Confirm an identity factor"}</h2>
+            <p>{locale === "zh-CN" ? "输入当前 TOTP，或使用一条尚未使用的一次性恢复码。" : "Enter the current TOTP, or one unused single-use recovery code."}</p>
+            <form onSubmit={completeLoginChallenge}>
+              <label>{locale === "zh-CN" ? "TOTP / 恢复码" : "TOTP / recovery code"}<input name="factorCode" autoComplete="one-time-code" required /></label>
+              <button className="primary" type="submit">{locale === "zh-CN" ? "完成登录" : "Complete sign in"}</button>
+              <button type="button" onClick={() => setLoginChallenge(null)}>{locale === "zh-CN" ? "取消" : "Cancel"}</button>
+            </form>
+          </section>
+        )}
+
+        {route === "/security" && sessionResolved && (
+          <SecurityPanel
+            active
+            authenticated={Boolean(
+              me && me.verification.email === "passed" && !me.restrictions.user,
+            )}
+            customerApiEligible={Boolean(me?.clientAccountId && me?.context)}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/password-recovery" && (
+          <PasswordRecoveryPage
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/email-change" && sessionResolved && (
+          <EmailChangePage
+            authenticated={Boolean(
+              me && me.verification.email === "passed" && !me.restrictions.user,
+            )}
+            locale={locale}
+            onCompleted={async () => { await refreshMe(); }}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
         )}
 
         {route === "/customer" && membershipInvitationToken && (

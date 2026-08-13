@@ -5,6 +5,7 @@ import type pg from "pg";
 export const SCHEMA_016_GENERIC_RECOVERY_JOB_TYPES = Object.freeze([
   "billing.automation.scheduled",
   "notification.send",
+  "identity.notification.send",
   "payment.start",
   "payment.reconcile",
   "add_funds.start",

@@ -20,6 +20,7 @@ export class ObsoleteSessionResponseError extends Error {
 
 const ACCOUNT_CONTEXT_VERSION_HEADER = "X-OSS-Account-Context-Version";
 const CLIENT_ACCOUNT_CONTEXT_HEADER = "X-OSS-Client-Account-Id";
+const AUTHORIZATION_EPOCH_HEADER = "X-OSS-Authorization-Epoch";
 const CONTEXT_INVALIDATION_CODES = new Set([
   "ACCOUNT_CONTEXT_STALE",
   "ACCOUNT_CONTEXT_REQUIRED",
@@ -39,6 +40,7 @@ const CANONICAL_UUID =
 export type AccountContextSnapshot = Readonly<{
   clientAccountId: string | null;
   version: string | null;
+  authorizationEpoch: string | null;
   generation: number;
 }>;
 
@@ -54,6 +56,7 @@ type ParsedResponseContext =
       kind: "valid";
       clientAccountId: string | null;
       version: string;
+      authorizationEpoch: string;
     }>
   | Readonly<{ kind: "missing" | "invalid" }>;
 type ResponseContextRequirement = "none" | "session" | "account";
@@ -62,6 +65,7 @@ type ErrorBody = Readonly<{ error?: string; code?: string }>;
 let accountContext: AccountContextSnapshot = {
   clientAccountId: null,
   version: null,
+  authorizationEpoch: null,
   generation: 0,
 };
 let sessionEpoch = 0;
@@ -88,15 +92,20 @@ function compareVersions(left: string, right: string): number {
 function responseContext(response: Response): ParsedResponseContext {
   const version = response.headers.get(ACCOUNT_CONTEXT_VERSION_HEADER);
   const clientAccountId = response.headers.get(CLIENT_ACCOUNT_CONTEXT_HEADER);
-  if (version === null && clientAccountId === null) return { kind: "missing" };
+  const authorizationEpoch = response.headers.get(AUTHORIZATION_EPOCH_HEADER);
+  if (version === null && clientAccountId === null && authorizationEpoch === null) {
+    return { kind: "missing" };
+  }
   if (
     !isDecimalVersion(version) ||
+    !isDecimalVersion(authorizationEpoch) ||
     (clientAccountId !== null && !CANONICAL_UUID.test(clientAccountId))
   ) return { kind: "invalid" };
   return {
     kind: "valid",
     clientAccountId,
     version,
+    authorizationEpoch,
   };
 }
 
@@ -108,6 +117,8 @@ function captureResponseContext(
     !force &&
     accountContext.version !== null &&
     (compareVersions(incoming.version, accountContext.version) < 0 ||
+      (accountContext.authorizationEpoch !== null &&
+        compareVersions(incoming.authorizationEpoch, accountContext.authorizationEpoch) < 0) ||
       (incoming.version === accountContext.version &&
         incoming.clientAccountId !== accountContext.clientAccountId))
   ) {
@@ -115,11 +126,13 @@ function captureResponseContext(
   }
   if (
     accountContext.version === incoming.version &&
+    accountContext.authorizationEpoch === incoming.authorizationEpoch &&
     accountContext.clientAccountId === incoming.clientAccountId
   ) return true;
   accountContext = {
     clientAccountId: incoming.clientAccountId,
     version: incoming.version,
+    authorizationEpoch: incoming.authorizationEpoch,
     generation: accountContext.generation + 1,
   };
   return true;
@@ -133,6 +146,7 @@ export function clearAccountContext(): void {
   accountContext = {
     clientAccountId: null,
     version: null,
+    authorizationEpoch: null,
     generation: accountContext.generation + 1,
   };
 }
@@ -276,7 +290,9 @@ function isPublicApiPath(pathname: string): boolean {
     pathname.startsWith("/api/v1/legal/") ||
     pathname === "/api/v1/auth/register" ||
     pathname === "/api/v1/auth/invitation-registrations" ||
-    pathname === "/api/v1/auth/verify-email"
+    pathname === "/api/v1/auth/verify-email" ||
+    pathname === "/api/v1/auth/password-recovery/request" ||
+    pathname === "/api/v1/auth/password-recovery/complete"
   );
 }
 
@@ -295,7 +311,7 @@ function isAccountScopedPath(pathname: string): boolean {
 }
 
 function loginEstablished(response: Response, errorBody: ErrorBody): boolean {
-  return response.ok ||
+  return (response.ok && response.status !== 202) ||
     (response.status === 409 && errorBody.code === "ACCOUNT_CONTEXT_REQUIRED");
 }
 
@@ -303,6 +319,15 @@ function responseMeansSessionAbsent(response: Response, errorBody: ErrorBody): b
   return response.status === 401 &&
     (errorBody.error === "Authentication required" ||
       errorBody.error === "Session is invalid or expired");
+}
+
+function isExplicitSessionEndingMutation(pathname: string, init?: RequestInit): boolean {
+  const method = (init?.method ?? "GET").toUpperCase();
+  return (method === "DELETE" && pathname.startsWith("/api/v1/security/sessions/")) ||
+    (method === "POST" && (
+      pathname === "/api/v1/security/sessions/revoke-all" ||
+      pathname === "/api/v1/auth/password-recovery/complete"
+    ));
 }
 
 function responseContextRequirement(
@@ -364,6 +389,18 @@ function isIntentionalAccountContextTransition(pathname: string, init?: RequestI
     (init?.method ?? "GET").toUpperCase() === "PUT";
 }
 
+function isIntentionalAuthorizationTransition(pathname: string, init?: RequestInit): boolean {
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method !== "POST") return false;
+  return new Set([
+    "/api/v1/security/password",
+    "/api/v1/security/email-change/complete",
+    "/api/v1/security/totp/confirm",
+    "/api/v1/security/totp/disable",
+    "/api/v1/security/totp/recovery-codes",
+  ]).has(pathname);
+}
+
 function contextProtocolError(message: string): ApiError {
   return new ApiError(message, 502, "SESSION_CONTEXT_INVALID");
 }
@@ -410,7 +447,9 @@ async function request<T>(
   inheritedInvalidation = false,
 ): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
-  const transition: AuthTransition | null = pathname === "/api/v1/auth/login"
+  const transition: AuthTransition | null =
+    pathname === "/api/v1/auth/login" ||
+    pathname === "/api/v1/auth/login-challenges/complete"
     ? "login"
     : pathname === "/api/v1/auth/logout"
       ? "logout"
@@ -466,6 +505,10 @@ async function request<T>(
       const incoming = responseContext(response);
       const intentionalContextTransition =
         response.ok && isIntentionalAccountContextTransition(pathname, init);
+      const intentionalAuthorizationTransition =
+        response.ok && isIntentionalAuthorizationTransition(pathname, init);
+      const intentionalSessionContextTransition =
+        intentionalContextTransition || intentionalAuthorizationTransition;
       const epochChanged = transition === null && requestEpoch !== sessionEpoch;
       const contextInvalid =
         requirement !== "none" &&
@@ -473,11 +516,12 @@ async function request<T>(
           (requirement === "account" && incoming.clientAccountId === null));
       const responseAuthorizationChanged =
         transition === null &&
-        !intentionalContextTransition &&
+        !intentionalSessionContextTransition &&
         requirement !== "none" &&
         requestContext.version !== null &&
         incoming.kind === "valid" &&
         (incoming.version !== requestContext.version ||
+          incoming.authorizationEpoch !== requestContext.authorizationEpoch ||
           incoming.clientAccountId !== requestContext.clientAccountId);
       const obsolete =
         !contextInvalid &&
@@ -540,10 +584,12 @@ async function request<T>(
         }
       }
       if (
-        intentionalContextTransition &&
+        intentionalSessionContextTransition &&
         requestContext.version !== null &&
         incoming.kind === "valid" &&
-        incoming.clientAccountId !== requestContext.clientAccountId
+        (incoming.version !== requestContext.version ||
+          incoming.authorizationEpoch !== requestContext.authorizationEpoch ||
+          incoming.clientAccountId !== requestContext.clientAccountId)
       ) {
         broadcastIntentionalContextReplacement();
       }
@@ -576,7 +622,18 @@ async function request<T>(
       }
       throw error;
     }
-    if (transition === "login" && !establishingLogin) {
+    if (isExplicitSessionEndingMutation(pathname, init)) {
+      const sessionEnded = (await response.clone().json().catch(() => ({}))) as {
+        sessionEnded?: boolean;
+      };
+      if (sessionEnded.sessionEnded === true) {
+        // The response is an explicit identity boundary. Never retain or
+        // replay the old workspace, even if stale context headers are present.
+        hardResetSession();
+        return sessionEnded as T;
+      }
+    }
+    if (transition === "login" && !establishingLogin && response.status !== 202) {
       throw new ApiError("Sign-in response did not establish a session context", 502, "SESSION_CONTEXT_MISSING");
     }
     if (response.status === 204) return undefined as T;
@@ -589,7 +646,9 @@ async function request<T>(
 
 export function api<T>(path: string, init?: RequestInit): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
-  const isAuthTransition = pathname === "/api/v1/auth/login" || pathname === "/api/v1/auth/logout";
+  const isAuthTransition = pathname === "/api/v1/auth/login" ||
+    pathname === "/api/v1/auth/login-challenges/complete" ||
+    pathname === "/api/v1/auth/logout";
   const locks = navigator.locks;
   if (!isAuthTransition) {
     const execute = async () => {

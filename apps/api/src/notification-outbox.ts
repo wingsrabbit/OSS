@@ -158,7 +158,7 @@ async function lockNotificationRecipient(
       const token = await client.query<{ eligible: boolean }>(
         `SELECT used_at IS NULL
                   AND invalidated_at IS NULL
-                  AND expires_at > pg_catalog.now() AS eligible
+                  AND expires_at > pg_catalog.clock_timestamp() AS eligible
          FROM public.email_verification_tokens
          WHERE id = $1
            AND user_id = $2
@@ -254,7 +254,7 @@ async function lockNotificationRecipient(
       `SELECT email::text, locale,
               accepted_at IS NULL
                 AND revoked_at IS NULL
-                AND expires_at > pg_catalog.now() AS eligible
+                AND expires_at > pg_catalog.clock_timestamp() AS eligible
        FROM public.client_membership_invitations
        WHERE id = $1
          AND client_account_id = $2

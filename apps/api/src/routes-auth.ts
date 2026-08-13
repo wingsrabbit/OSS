@@ -14,6 +14,7 @@ import {
   requireSessionIdentity,
   setAccountContextForRequest,
   setAccountContextHeaders,
+  setAuthorizationEpochForRequest,
   type MembershipRole,
   type SessionIdentity,
 } from "./auth.js";
@@ -26,6 +27,7 @@ import {
   type KeysetPosition,
 } from "./keyset-pagination.js";
 import { enqueueNotification } from "./notification-outbox.js";
+import { activeTotpCredential, verifyConfiguredFactorLocked } from "./identity-factor.js";
 
 const registrationSchema = z.object({
   email: z.email().max(320),
@@ -46,12 +48,19 @@ const loginSchema = z.object({
   password: z.string().max(256),
 });
 
+const loginChallengeSchema = z.object({
+  challengeId: z.uuid(),
+  challengeToken: z.string().length(43).regex(/^[A-Za-z0-9_-]+$/),
+  factorCode: z.string().min(6).max(23),
+});
+
 const verificationSchema = z.object({
   token: z.string().min(32).max(256),
 });
 
 const reauthSchema = z.object({
   password: z.string().max(256),
+  factorCode: z.string().min(6).max(23).optional(),
 });
 
 const bootstrapSchema = z.object({
@@ -221,7 +230,6 @@ export async function registerAuthRoutes(
     const body = registrationSchema.parse(request.body);
     const encodedPassword = await passwordHash(body.password);
     const verificationToken = createOpaqueToken();
-    const expiresAt = new Date(Date.now() + config.VERIFICATION_TTL_MINUTES * 60_000);
 
     try {
       const user = await transaction(pool, async (client) => {
@@ -251,22 +259,26 @@ export async function registerAuthRoutes(
            VALUES ($1, '{"all":[{"requirement":"email"}]}'::jsonb)`,
           [userId],
         );
-        const tokenResult = await client.query<{ id: string }>(
+        const tokenResult = await client.query<{ id: string; expires_at: Date }>(
           `INSERT INTO email_verification_tokens(user_id, token_digest, expires_at)
-           VALUES ($1, $2, $3)
-           RETURNING id`,
-          [userId, digestToken(verificationToken), expiresAt],
+           VALUES (
+             $1, $2,
+             pg_catalog.clock_timestamp() +
+               pg_catalog.make_interval(mins => $3::integer)
+           )
+           RETURNING id, expires_at`,
+          [userId, digestToken(verificationToken), config.VERIFICATION_TTL_MINUTES],
         );
-        const verificationTokenId = tokenResult.rows[0]?.id;
-        if (!verificationTokenId) throw new Error("Unable to create verification token");
+        const verification = tokenResult.rows[0];
+        if (!verification) throw new Error("Unable to create verification token");
         await enqueueNotification(client, {
           eventType: "notification.email_verification_requested",
           templateRevision: "email-verification-v1",
           uniqueKey: `registration:${userId}`,
           payload: {
-            verificationTokenId,
+            verificationTokenId: verification.id,
             verificationUrl: `${config.OSS_PUBLIC_URL}/verify?token=${verificationToken}`,
-            expiresAt: expiresAt.toISOString(),
+            expiresAt: verification.expires_at.toISOString(),
           },
           recipient: {
             kind: "identity_user",
@@ -276,13 +288,13 @@ export async function registerAuthRoutes(
             locale: body.locale,
           },
         });
-        return { userId, clientAccountId };
+        return { userId, clientAccountId, expiresAt: verification.expires_at };
       });
       return reply.code(201).send({
         ...user,
         verification: {
           status: "pending",
-          expiresAt: expiresAt.toISOString(),
+          expiresAt: user.expiresAt.toISOString(),
         },
       });
     } catch (error) {
@@ -313,9 +325,6 @@ export async function registerAuthRoutes(
     }
     const encodedPassword = await passwordHash(body.password);
     const verificationToken = createOpaqueToken();
-    const verificationExpiresAt = new Date(
-      Date.now() + config.VERIFICATION_TTL_MINUTES * 60_000,
-    );
     try {
       const result = await transaction(pool, async (client) => {
         const invitationResult = await client.query<{
@@ -325,7 +334,7 @@ export async function registerAuthRoutes(
           revoked_at: Date | null;
         }>(
           `SELECT email = $3 AS email_matches,
-                  expires_at <= pg_catalog.now() AS expired,
+                  expires_at <= pg_catalog.clock_timestamp() AS expired,
                   accepted_at,
                   revoked_at
            FROM client_membership_invitations
@@ -357,22 +366,26 @@ export async function registerAuthRoutes(
            VALUES ($1, '{"all":[{"requirement":"email"}]}'::jsonb)`,
           [userId],
         );
-        const tokenResult = await client.query<{ id: string }>(
+        const tokenResult = await client.query<{ id: string; expires_at: Date }>(
           `INSERT INTO email_verification_tokens(user_id, token_digest, expires_at)
-           VALUES ($1, $2, $3)
-           RETURNING id`,
-          [userId, digestToken(verificationToken), verificationExpiresAt],
+           VALUES (
+             $1, $2,
+             pg_catalog.clock_timestamp() +
+               pg_catalog.make_interval(mins => $3::integer)
+           )
+           RETURNING id, expires_at`,
+          [userId, digestToken(verificationToken), config.VERIFICATION_TTL_MINUTES],
         );
-        const verificationTokenId = tokenResult.rows[0]?.id;
-        if (!verificationTokenId) throw new Error("Unable to create verification token");
+        const verification = tokenResult.rows[0];
+        if (!verification) throw new Error("Unable to create verification token");
         await enqueueNotification(client, {
           eventType: "notification.email_verification_requested",
           templateRevision: "email-verification-v1",
           uniqueKey: `invitation-registration:${userId}`,
           payload: {
-            verificationTokenId,
+            verificationTokenId: verification.id,
             verificationUrl: `${config.OSS_PUBLIC_URL}/verify?token=${verificationToken}`,
-            expiresAt: verificationExpiresAt.toISOString(),
+            expiresAt: verification.expires_at.toISOString(),
           },
           recipient: {
             kind: "identity_user",
@@ -382,7 +395,11 @@ export async function registerAuthRoutes(
             locale: body.locale,
           },
         });
-        return { status: "created" as const, userId };
+        return {
+          status: "created" as const,
+          userId,
+          expiresAt: verification.expires_at,
+        };
       });
       if (result.status === "invalid") {
         return reply.code(400).send({
@@ -419,7 +436,7 @@ export async function registerAuthRoutes(
         registrationMode: "membership_invitation",
         verification: {
           status: "pending",
-          expiresAt: verificationExpiresAt.toISOString(),
+          expiresAt: result.expiresAt.toISOString(),
         },
       });
     } catch (error) {
@@ -450,8 +467,8 @@ export async function registerAuthRoutes(
       return reply.code(401).send({ error: "Invalid email or password" });
     }
     const sessionToken = createOpaqueToken();
-    const expiresAt = new Date(Date.now() + config.SESSION_TTL_HOURS * 60 * 60_000);
-    const createdSession = await transaction(pool, async (client) => {
+    const challengeToken = createOpaqueToken();
+    const loginOutcome = await transaction(pool, async (client) => {
       // Membership authorization changes take this same User lock before
       // scanning Sessions, so the membership snapshot and Session insert are
       // one serialized decision.
@@ -459,9 +476,11 @@ export async function registerAuthRoutes(
         password_hash: string;
         email_verified_at: Date | null;
         user_restricted_at: Date | null;
+        authorization_epoch: string;
       }>(
         `SELECT password_hash, email_verified_at,
-                restricted_at AS user_restricted_at
+                restricted_at AS user_restricted_at,
+                authorization_epoch::text
          FROM users
          WHERE id = $1
          FOR UPDATE`,
@@ -471,9 +490,34 @@ export async function registerAuthRoutes(
       if (!principal || principal.password_hash !== user.password_hash) {
         throw Object.assign(new Error("Invalid email or password"), { statusCode: 401 });
       }
+      await client.query(
+        `SELECT id FROM sessions
+         WHERE user_id = $1 AND revoked_at IS NULL
+         ORDER BY id FOR UPDATE`,
+        [user.id],
+      );
+      const credential = await activeTotpCredential(client, user.id);
+      if (credential) {
+        await client.query(
+          `UPDATE login_challenges
+           SET invalidated_at = pg_catalog.now()
+           WHERE user_id = $1 AND used_at IS NULL AND invalidated_at IS NULL`,
+          [user.id],
+        );
+        const challenge = await client.query<{ id: string }>(
+          `INSERT INTO login_challenges(user_id, token_digest, expires_at)
+           VALUES ($1, $2, pg_catalog.clock_timestamp() + interval '5 minutes')
+           RETURNING id`,
+          [user.id, digestToken(challengeToken)],
+        );
+        const challengeId = challenge.rows[0]?.id;
+        if (!challengeId) throw new Error("Unable to create login challenge");
+        return { kind: "challenge" as const, challengeId };
+      }
       const sessionResult = await client.query<{
         active_client_account_id: string | null;
         account_context_version: string;
+        expires_at: Date;
       }>(
         `WITH active_memberships AS (
          SELECT
@@ -491,7 +535,9 @@ export async function registerAuthRoutes(
          active_client_account_id, account_context_version
        )
        SELECT
-         $1, $2, $3,
+         $1, $2,
+         pg_catalog.clock_timestamp() +
+           pg_catalog.make_interval(hours => $3::integer),
          CASE
            WHEN membership_count = 1 AND unrestricted_membership_count = 1
              THEN only_client_account_id
@@ -503,40 +549,183 @@ export async function registerAuthRoutes(
            ELSE 0
          END
        FROM active_memberships
-       RETURNING active_client_account_id, account_context_version::text`,
-        [user.id, digestToken(sessionToken), expiresAt],
+       RETURNING active_client_account_id, account_context_version::text,
+                 expires_at`,
+        [user.id, digestToken(sessionToken), config.SESSION_TTL_HOURS],
       );
       const context = sessionResult.rows[0];
       if (!context) throw new Error("Unable to create session");
       return {
+        kind: "session" as const,
         context,
         identityEligible:
           Boolean(principal.email_verified_at) && !principal.user_restricted_at,
+        authorizationEpoch: principal.authorization_epoch,
       };
     });
+    if (loginOutcome.kind === "challenge") {
+      return reply.code(202).send({
+        challenge: {
+          id: loginOutcome.challengeId,
+          token: challengeToken,
+          expiresInSeconds: 300,
+          methods: ["totp", "recovery_code"],
+        },
+      });
+    }
     reply.setCookie(config.SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(config));
-    const context = createdSession.context;
+    const context = loginOutcome.context;
     setAccountContextHeaders(reply, {
-      clientAccountId: createdSession.identityEligible
+      clientAccountId: loginOutcome.identityEligible
         ? context.active_client_account_id
         : null,
       accountContextVersion: context.account_context_version,
     });
+    setAuthorizationEpochForRequest(request, loginOutcome.authorizationEpoch);
     if (!context.active_client_account_id) {
       return reply.code(409).send({
         error: "Select an active Client Account before continuing",
         code: "ACCOUNT_CONTEXT_REQUIRED",
-        expiresAt: expiresAt.toISOString(),
+        expiresAt: context.expires_at.toISOString(),
         context: null,
         requiresAccountContext: true,
       });
     }
     return {
-      expiresAt: expiresAt.toISOString(),
-      context: createdSession.identityEligible
+      expiresAt: context.expires_at.toISOString(),
+      context: loginOutcome.identityEligible
         ? {
             clientAccountId: context.active_client_account_id,
             version: context.account_context_version,
+          }
+        : null,
+      requiresAccountContext: false,
+    };
+  });
+
+  app.post("/api/v1/auth/login-challenges/complete", async (request, reply) => {
+    if (request.cookies[config.SESSION_COOKIE_NAME]) {
+      return reply.code(400).send({
+        error: "Sign out before completing another login challenge",
+        code: "AMBIGUOUS_AUTHENTICATION",
+      });
+    }
+    const body = loginChallengeSchema.parse(request.body);
+    const pointer = await pool.query<{ user_id: string }>(
+      `SELECT user_id FROM login_challenges
+       WHERE id = $1 AND token_digest = $2`,
+      [body.challengeId, digestToken(body.challengeToken)],
+    );
+    const pointerUserId = pointer.rows[0]?.user_id;
+    if (!pointerUserId) {
+      return reply.code(401).send({ error: "Login challenge is invalid or expired" });
+    }
+    const sessionToken = createOpaqueToken();
+    const outcome = await transaction(pool, async (client) => {
+      const principal = await client.query<{
+        email_verified_at: Date | null;
+        restricted_at: Date | null;
+        authorization_epoch: string;
+      }>(
+        `SELECT email_verified_at, restricted_at, authorization_epoch::text
+         FROM users WHERE id = $1 FOR UPDATE`,
+        [pointerUserId],
+      );
+      if (!principal.rows[0] || principal.rows[0].restricted_at) return null;
+      await client.query(
+        `SELECT id FROM sessions
+         WHERE user_id = $1 AND revoked_at IS NULL
+         ORDER BY id FOR UPDATE`,
+        [pointerUserId],
+      );
+      const credential = await activeTotpCredential(client, pointerUserId);
+      if (!credential) return null;
+      const challenge = await client.query<{ id: string }>(
+        `SELECT id FROM login_challenges
+         WHERE id = $1 AND user_id = $2 AND token_digest = $3
+           AND used_at IS NULL AND invalidated_at IS NULL
+           AND expires_at > pg_catalog.clock_timestamp()
+         FOR UPDATE`,
+        [body.challengeId, pointerUserId, digestToken(body.challengeToken)],
+      );
+      if (!challenge.rows[0]) return null;
+      const factorMethod = await verifyConfiguredFactorLocked(
+        client,
+        config,
+        pointerUserId,
+        body.factorCode,
+        "login",
+        { credential, required: true },
+      );
+      if (!factorMethod || factorMethod === "password") return null;
+      await client.query(
+        `UPDATE login_challenges
+         SET used_at = pg_catalog.now(), satisfied_by = $2
+         WHERE id = $1`,
+        [body.challengeId, factorMethod],
+      );
+      const sessionResult = await client.query<{
+        active_client_account_id: string | null;
+        account_context_version: string;
+        expires_at: Date;
+      }>(
+        `WITH active_memberships AS (
+           SELECT pg_catalog.count(*) AS membership_count,
+                  pg_catalog.count(*) FILTER (WHERE restricted_at IS NULL)
+                    AS unrestricted_membership_count,
+                  (pg_catalog.min(client_account_id::text)
+                    FILTER (WHERE restricted_at IS NULL))::uuid AS only_client_account_id
+           FROM client_memberships
+           WHERE user_id = $1 AND removed_at IS NULL
+         )
+         INSERT INTO sessions(
+           user_id, token_digest, expires_at,
+           active_client_account_id, account_context_version
+         )
+         SELECT $1, $2,
+                pg_catalog.clock_timestamp() +
+                  pg_catalog.make_interval(hours => $3::integer),
+                CASE WHEN membership_count = 1 AND unrestricted_membership_count = 1
+                  THEN only_client_account_id ELSE NULL END,
+                CASE WHEN membership_count = 1 AND unrestricted_membership_count = 1
+                  THEN 1 ELSE 0 END
+         FROM active_memberships
+         RETURNING active_client_account_id, account_context_version::text,
+                   expires_at`,
+        [pointerUserId, digestToken(sessionToken), config.SESSION_TTL_HOURS],
+      );
+      return {
+        context: sessionResult.rows[0]!,
+        identityEligible: Boolean(principal.rows[0].email_verified_at),
+        authorizationEpoch: principal.rows[0].authorization_epoch,
+      };
+    });
+    if (!outcome) {
+      return reply.code(401).send({ error: "Login challenge is invalid or expired" });
+    }
+    reply.setCookie(config.SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(config));
+    setAccountContextHeaders(reply, {
+      clientAccountId: outcome.identityEligible
+        ? outcome.context.active_client_account_id
+        : null,
+      accountContextVersion: outcome.context.account_context_version,
+    });
+    setAuthorizationEpochForRequest(request, outcome.authorizationEpoch);
+    if (!outcome.context.active_client_account_id) {
+      return reply.code(409).send({
+        error: "Select an active Client Account before continuing",
+        code: "ACCOUNT_CONTEXT_REQUIRED",
+        expiresAt: outcome.context.expires_at.toISOString(),
+        context: null,
+        requiresAccountContext: true,
+      });
+    }
+    return {
+      expiresAt: outcome.context.expires_at.toISOString(),
+      context: outcome.identityEligible
+        ? {
+            clientAccountId: outcome.context.active_client_account_id,
+            version: outcome.context.account_context_version,
           }
         : null,
       requiresAccountContext: false,
@@ -620,6 +809,7 @@ export async function registerAuthRoutes(
       clientAccountId: active?.clientAccountId ?? null,
       membershipRole: active?.role ?? null,
       accountContextVersion: identity.accountContextVersion,
+      authorizationEpoch: identity.authorizationEpoch,
       context: active
         ? {
             clientAccountId: active.clientAccountId,
@@ -756,7 +946,6 @@ export async function registerAuthRoutes(
   app.post("/api/v1/auth/reauth", async (request, reply) => {
     const identity = await requireSessionIdentity(request, pool, config);
     const body = reauthSchema.parse(request.body);
-    const expiresAt = new Date(Date.now() + 15 * 60_000);
     const granted = await transaction(pool, async (client) => {
       const session = await lockSessionIdentityForMutation(client, identity);
       const principal = await client.query<{
@@ -774,21 +963,39 @@ export async function registerAuthRoutes(
       if (!(await passwordVerify(current.password_hash, body.password))) {
         return "invalid_password" as const;
       }
+      const factorMethod = await verifyConfiguredFactorLocked(
+        client,
+        config,
+        identity.userId,
+        body.factorCode,
+        "reauth",
+      );
+      if (!factorMethod) return "invalid_factor" as const;
       await client.query(
         `UPDATE reauth_grants
          SET invalidated_at = now()
          WHERE user_id = $1 AND session_id = $2 AND invalidated_at IS NULL`,
         [identity.userId, identity.sessionId],
       );
-      await client.query(
-        `INSERT INTO reauth_grants(user_id, session_id, expires_at)
-         VALUES ($1, $2, $3)`,
-        [identity.userId, identity.sessionId, expiresAt],
+      const inserted = await client.query<{ expires_at: Date }>(
+        `INSERT INTO reauth_grants(user_id, session_id, expires_at, factor_method)
+         VALUES (
+           $1, $2,
+           pg_catalog.clock_timestamp() + interval '15 minutes',
+           $3
+         )
+         RETURNING expires_at`,
+        [identity.userId, identity.sessionId, factorMethod],
       );
-      return "granted" as const;
+      const expiresAt = inserted.rows[0]?.expires_at;
+      if (!expiresAt) throw new Error("Unable to create reauthentication grant");
+      return { status: "granted" as const, expiresAt };
     });
     if (granted === "invalid_password") {
       return reply.code(401).send({ error: "Password confirmation failed" });
+    }
+    if (granted === "invalid_factor") {
+      return reply.code(401).send({ error: "Authentication factor confirmation failed" });
     }
     if (granted === "ineligible") {
       return reply.code(403).send({ error: "Account is not eligible for password confirmation" });
@@ -797,7 +1004,7 @@ export async function registerAuthRoutes(
       clientAccountId: identity.activeClientAccountId,
       accountContextVersion: identity.accountContextVersion,
     });
-    return { expiresAt: expiresAt.toISOString(), fixedWindowMinutes: 15 };
+    return { expiresAt: granted.expiresAt.toISOString(), fixedWindowMinutes: 15 };
   });
 
   app.post("/api/v1/admin/bootstrap", async (request, reply) => {
@@ -817,16 +1024,17 @@ export async function registerAuthRoutes(
       const tokenResult = await client.query<{
         id: string;
         used_at: Date | null;
-        expires_at: Date;
+        unexpired: boolean;
       }>(
-        `SELECT id, used_at, expires_at
+        `SELECT id, used_at,
+                expires_at > pg_catalog.clock_timestamp() AS unexpired
          FROM staff_bootstrap_tokens
          WHERE token_digest = $1
          FOR UPDATE`,
         [digestToken(body.bootstrapToken)],
       );
       const token = tokenResult.rows[0];
-      if (!token || token.used_at || token.expires_at.getTime() <= Date.now()) {
+      if (!token || token.used_at || !token.unexpired) {
         return false;
       }
       await client.query(
@@ -891,9 +1099,10 @@ export async function registerAuthRoutes(
         id: string;
         user_id: string;
         used_at: Date | null;
-        expires_at: Date;
+        unexpired: boolean;
       }>(
-        `SELECT id, user_id, used_at, expires_at
+        `SELECT id, user_id, used_at,
+                expires_at > pg_catalog.clock_timestamp() AS unexpired
          FROM email_verification_tokens
          WHERE id = $1
            AND user_id = $2
@@ -907,7 +1116,7 @@ export async function registerAuthRoutes(
       if (principalResult.rows[0]?.email_verified_at || token.used_at) {
         return { status: "already_verified" as const };
       }
-      if (token.expires_at.getTime() <= Date.now()) return { status: "expired" as const };
+      if (!token.unexpired) return { status: "expired" as const };
       await client.query("UPDATE users SET email_verified_at = now(), updated_at = now() WHERE id = $1", [
         token.user_id,
       ]);
@@ -932,7 +1141,6 @@ export async function registerAuthRoutes(
       return reply.code(200).send({ status: "already_verified" });
     }
     const verificationToken = createOpaqueToken();
-    const expiresAt = new Date(Date.now() + config.VERIFICATION_TTL_MINUTES * 60_000);
     const outcome = await transaction(pool, async (client) => {
       const session = await lockSessionIdentityForMutation(client, identity);
       const current = await client.query<{
@@ -940,14 +1148,18 @@ export async function registerAuthRoutes(
         locale: string;
         email_verified_at: Date | null;
         restricted_at: Date | null;
-        last_created_at: Date | null;
+        rate_limited: boolean;
       }>(
         `SELECT
            u.email,
            u.locale,
            u.email_verified_at,
            u.restricted_at,
-           latest.last_created_at
+           COALESCE(
+             latest.last_created_at >
+               pg_catalog.clock_timestamp() - interval '1 minute',
+             false
+           ) AS rate_limited
          FROM users u
          LEFT JOIN LATERAL (
            SELECT max(created_at) AS last_created_at
@@ -963,10 +1175,7 @@ export async function registerAuthRoutes(
         return { status: "ineligible" as const };
       }
       if (principal.email_verified_at) return { status: "already_verified" as const };
-      if (
-        principal.last_created_at &&
-        principal.last_created_at.getTime() > Date.now() - 60_000
-      ) {
+      if (principal.rate_limited) {
         return { status: "rate_limited" as const };
       }
       await client.query(
@@ -975,22 +1184,30 @@ export async function registerAuthRoutes(
          WHERE user_id = $1 AND used_at IS NULL AND invalidated_at IS NULL`,
         [identity.userId],
       );
-      const tokenResult = await client.query<{ id: string }>(
+      const tokenResult = await client.query<{ id: string; expires_at: Date }>(
         `INSERT INTO email_verification_tokens(user_id, token_digest, expires_at)
-         VALUES ($1, $2, $3)
-         RETURNING id`,
-        [identity.userId, digestToken(verificationToken), expiresAt],
+         VALUES (
+           $1, $2,
+           pg_catalog.clock_timestamp() +
+             pg_catalog.make_interval(mins => $3::integer)
+         )
+         RETURNING id, expires_at`,
+        [
+          identity.userId,
+          digestToken(verificationToken),
+          config.VERIFICATION_TTL_MINUTES,
+        ],
       );
-      const tokenId = tokenResult.rows[0]?.id;
-      if (!tokenId) throw new Error("Unable to create verification token");
+      const verification = tokenResult.rows[0];
+      if (!verification) throw new Error("Unable to create verification token");
       await enqueueNotification(client, {
         eventType: "notification.email_verification_requested",
         templateRevision: "email-verification-v1",
-        uniqueKey: `verification:${tokenId}`,
+        uniqueKey: `verification:${verification.id}`,
         payload: {
-          verificationTokenId: tokenId,
+          verificationTokenId: verification.id,
           verificationUrl: `${config.OSS_PUBLIC_URL}/verify?token=${verificationToken}`,
-          expiresAt: expiresAt.toISOString(),
+          expiresAt: verification.expires_at.toISOString(),
         },
         recipient: {
           kind: "identity_user",
@@ -1000,7 +1217,7 @@ export async function registerAuthRoutes(
           locale: principal.locale === "zh-CN" ? "zh-CN" : "en",
         },
       });
-      return { status: "resent" as const };
+      return { status: "resent" as const, expiresAt: verification.expires_at };
     });
     if (outcome.status === "rate_limited") {
       return reply.code(429).send({ error: "Please wait before requesting another email" });
@@ -1010,7 +1227,9 @@ export async function registerAuthRoutes(
     }
     return reply.code(200).send({
       status: outcome.status,
-      ...(outcome.status === "resent" ? { expiresAt: expiresAt.toISOString() } : {}),
+      ...(outcome.status === "resent"
+        ? { expiresAt: outcome.expiresAt.toISOString() }
+        : {}),
     });
   });
 

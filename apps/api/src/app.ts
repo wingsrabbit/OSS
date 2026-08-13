@@ -17,6 +17,8 @@ import {
 import {
   ACCOUNT_CONTEXT_VERSION_HEADER,
   accountContextForRequest,
+  AUTHORIZATION_EPOCH_HEADER,
+  authorizationEpochForRequest,
   CLIENT_ACCOUNT_CONTEXT_HEADER,
   setAccountContextForRequest,
 } from "./auth.js";
@@ -40,6 +42,8 @@ import { registerServiceRoutes } from "./routes-services.js";
 import { registerServiceOperationRoutes } from "./routes-service-operations.js";
 import { registerTicketRoutes } from "./routes-tickets.js";
 import { registerSupportOperationRoutes } from "./routes-support-operations.js";
+import { registerIdentitySecurityRoutes } from "./routes-identity-security.js";
+import { registerCustomerApiRoutes } from "./routes-customer-api.js";
 
 export async function buildApp(
   config: Config,
@@ -56,8 +60,34 @@ export async function buildApp(
           "req.headers.x-oss-signature",
           "req.headers.x-oss-presales-token",
           "req.body.password",
+          "req.body.currentPassword",
+          "req.body.newPassword",
           "req.body.token",
+          "req.body.challengeToken",
+          "req.body.resetToken",
+          "req.body.emailChangeToken",
+          "req.body.factorCode",
+          "req.body.recoveryCode",
+          "req.body.apiKey",
+          "req.body.encryptedPayload",
+          "req.body.encrypted_payload",
           "req.body.bootstrapToken",
+          "res.body.challengeToken",
+          "res.body.resetToken",
+          "res.body.emailChangeToken",
+          "res.body.factorCode",
+          "res.body.recoveryCode",
+          "res.body.apiKey",
+          "res.body.encryptedPayload",
+          "res.body.encrypted_payload",
+          "err.challengeToken",
+          "err.resetToken",
+          "err.emailChangeToken",
+          "err.factorCode",
+          "err.recoveryCode",
+          "err.apiKey",
+          "err.encryptedPayload",
+          "err.encrypted_payload",
           "res.headers.set-cookie",
         ],
         censor: "[REDACTED]",
@@ -106,6 +136,23 @@ export async function buildApp(
     app.addHook("onClose", cleanup);
 
     await app.register(cookie);
+  app.addHook("preValidation", async (request) => {
+    const authorization = request.headers.authorization;
+    const sessionCookie = request.cookies[config.SESSION_COOKIE_NAME];
+    if (authorization && sessionCookie) {
+      throw Object.assign(
+        new Error("Cookie and customer API key authentication cannot be combined"),
+        { statusCode: 400, code: "AMBIGUOUS_AUTHENTICATION" },
+      );
+    }
+    const pathname = request.url.split("?", 1)[0] ?? request.url;
+    if (authorization && !pathname.startsWith("/api/v1/customer-api/")) {
+      throw Object.assign(
+        new Error("Customer API keys are accepted only by /api/v1/customer-api routes"),
+        { statusCode: 400, code: "API_KEY_ROUTE_REQUIRED" },
+      );
+    }
+  });
   await app.register(cors, {
     origin: config.WEB_ORIGIN,
     credentials: true,
@@ -113,6 +160,7 @@ export async function buildApp(
     exposedHeaders: [
       CLIENT_ACCOUNT_CONTEXT_HEADER,
       ACCOUNT_CONTEXT_VERSION_HEADER,
+      AUTHORIZATION_EPOCH_HEADER,
     ],
   });
   await app.register(rateLimit, {
@@ -133,6 +181,10 @@ export async function buildApp(
       !reply.hasHeader(CLIENT_ACCOUNT_CONTEXT_HEADER)
     ) {
       reply.header(CLIENT_ACCOUNT_CONTEXT_HEADER, context.clientAccountId);
+    }
+    const authorizationEpoch = authorizationEpochForRequest(request);
+    if (authorizationEpoch && !reply.hasHeader(AUTHORIZATION_EPOCH_HEADER)) {
+      reply.header(AUTHORIZATION_EPOCH_HEADER, authorizationEpoch);
     }
     reply.header("X-Robots-Tag", "noindex, nofollow, noarchive");
     reply.header("X-Content-Type-Options", "nosniff");
@@ -215,6 +267,8 @@ export async function buildApp(
   });
 
   await registerAuthRoutes(app, pool, config);
+  await registerIdentitySecurityRoutes(app, pool, config);
+  await registerCustomerApiRoutes(app, pool, config);
   await registerAccountContextRoutes(app, pool, config);
   await registerAdminRoutes(app, pool, config);
   await registerClientAccountRoutes(app, pool, config);

@@ -1226,7 +1226,7 @@ try {
   let invitationExpired = false;
   for (let poll = 0; poll < 200 && !invitationExpired; poll += 1) {
     const expiry = await pool.query<{ expired: boolean }>(
-      `SELECT expires_at <= pg_catalog.now() AS expired
+      `SELECT expires_at <= pg_catalog.clock_timestamp() AS expired
        FROM public.client_membership_invitations
        WHERE id = $1`,
       [expiringInvitation.invitationId],

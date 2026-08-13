@@ -6,6 +6,12 @@ import {
   customerMembershipCapabilities,
   type CustomerCapability,
 } from "@opensales/core";
+import {
+  canonicalCustomerApiKeyScopes,
+  digestCustomerApiKey,
+  parseCustomerApiKey,
+  type CustomerApiKeyScope,
+} from "@opensales/core/identity-security";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Config } from "./config.js";
 import type { DatabaseClient, DatabasePool } from "./database.js";
@@ -13,6 +19,7 @@ import type { DatabaseClient, DatabasePool } from "./database.js";
 export const CLIENT_ACCOUNT_CONTEXT_HEADER = "X-OSS-Client-Account-Id" as const;
 export const ACCOUNT_CONTEXT_VERSION_HEADER =
   "X-OSS-Account-Context-Version" as const;
+export const AUTHORIZATION_EPOCH_HEADER = "X-OSS-Authorization-Epoch" as const;
 
 export type MembershipRole = "owner" | "billing" | "technical" | "viewer";
 export type { CustomerCapability };
@@ -26,6 +33,7 @@ export type SessionIdentity = {
   userRestrictedAt: Date | null;
   activeClientAccountId: string | null;
   accountContextVersion: string;
+  authorizationEpoch: string;
 };
 
 export type AuthenticatedUser = {
@@ -41,6 +49,7 @@ export type AuthenticatedUser = {
   membershipPermissions: readonly string[];
   membershipRestrictedAt: Date | null;
   accountContextVersion: string;
+  authorizationEpoch: string;
 };
 
 type SessionPrincipalRow = {
@@ -52,6 +61,7 @@ type SessionPrincipalRow = {
   user_restricted_at: Date | null;
   active_client_account_id: string | null;
   account_context_version: string;
+  authorization_epoch: string;
   client_account_restricted_at: Date | null;
   membership_role: MembershipRole | null;
   membership_permissions: unknown;
@@ -62,6 +72,18 @@ const requestAccountContexts = new WeakMap<
   FastifyRequest,
   Readonly<{ clientAccountId: string | null; accountContextVersion: string }>
 >();
+const requestAuthorizationEpochs = new WeakMap<FastifyRequest, string>();
+
+export function authorizationEpochForRequest(request: FastifyRequest): string | null {
+  return requestAuthorizationEpochs.get(request) ?? null;
+}
+
+export function setAuthorizationEpochForRequest(
+  request: FastifyRequest,
+  epoch: string,
+): void {
+  requestAuthorizationEpochs.set(request, epoch);
+}
 
 export function accountContextForRequest(
   request: FastifyRequest,
@@ -152,6 +174,7 @@ async function requireSessionPrincipal(
        u.restricted_at AS user_restricted_at,
        s.active_client_account_id,
        s.account_context_version::text,
+       u.authorization_epoch::text,
        ca.restricted_at AS client_account_restricted_at,
        cm.role AS membership_role,
        cm.permissions AS membership_permissions,
@@ -166,7 +189,7 @@ async function requireSessionPrincipal(
      LEFT JOIN client_accounts ca ON ca.id = s.active_client_account_id
      WHERE s.token_digest = $1
        AND s.revoked_at IS NULL
-       AND s.expires_at > now()`,
+       AND s.expires_at > pg_catalog.clock_timestamp()`,
     [digestToken(token)],
   );
   const row = result.rows[0];
@@ -180,6 +203,7 @@ async function requireSessionPrincipal(
         : null,
     accountContextVersion: row.account_context_version,
   });
+  requestAuthorizationEpochs.set(request, row.authorization_epoch);
   return row;
 }
 
@@ -198,6 +222,7 @@ export async function requireSessionIdentity(
     userRestrictedAt: row.user_restricted_at,
     activeClientAccountId: row.active_client_account_id,
     accountContextVersion: row.account_context_version,
+    authorizationEpoch: row.authorization_epoch,
   };
 }
 
@@ -232,7 +257,200 @@ export async function requireUser(
     membershipPermissions: permissionArray(row.membership_permissions),
     membershipRestrictedAt: row.membership_restricted_at,
     accountContextVersion: row.account_context_version,
+    authorizationEpoch: row.authorization_epoch,
   };
+}
+
+export type CustomerApiKeyPrincipal = Readonly<{
+  apiKeyId: string;
+  userId: string;
+  email: string;
+  clientAccountId: string;
+  scopes: readonly CustomerApiKeyScope[];
+  membershipRole: MembershipRole;
+  membershipPermissions: readonly string[];
+  authorizationEpoch: string;
+}>;
+
+function requiredMembershipCapabilityForApiKeyScope(
+  scope: CustomerApiKeyScope,
+): CustomerCapability {
+  if (scope === "billing.read") return "billing.read";
+  if (scope === "support.write") return "support.tickets.write";
+  return "account.history.read";
+}
+
+export function assertApiKeyScopesAllowedForMembership(
+  scopes: readonly CustomerApiKeyScope[],
+  membership: Readonly<{
+    membershipRole: MembershipRole;
+    membershipPermissions: readonly string[];
+  }>,
+): void {
+  const capabilities = membershipCapabilities(membership);
+  for (const scope of scopes) {
+    const required = requiredMembershipCapabilityForApiKeyScope(scope);
+    if (!capabilities.includes(required)) {
+      throw Object.assign(
+        new Error(`Membership capability ${required} is required for API key scope ${scope}`),
+        { statusCode: 403, code: "API_KEY_SCOPE_NOT_AUTHORIZED" },
+      );
+    }
+  }
+}
+
+function customerApiKeyRequest(
+  request: FastifyRequest,
+  config: Config,
+): Readonly<{ rawKey: string; keyId: string; digest: Buffer }> {
+  const authorization = request.headers.authorization;
+  const cookieToken = request.cookies[config.SESSION_COOKIE_NAME];
+  if (authorization && cookieToken) {
+    throw Object.assign(
+      new Error("Cookie and customer API key authentication cannot be combined"),
+      { statusCode: 400, code: "AMBIGUOUS_AUTHENTICATION" },
+    );
+  }
+  const match = typeof authorization === "string"
+    ? /^Bearer ([^\s]+)$/.exec(authorization)
+    : null;
+  const parsed = match?.[1] ? parseCustomerApiKey(match[1]) : null;
+  if (!parsed || !match?.[1]) {
+    throw Object.assign(new Error("A valid customer API key is required"), {
+      statusCode: 401,
+      code: "API_KEY_REQUIRED",
+    });
+  }
+  return { rawKey: match[1], keyId: parsed.keyId, digest: digestCustomerApiKey(match[1]) };
+}
+
+/**
+ * Authenticate a customer API key under the same transaction as its business
+ * read/write and usage fact. The lock order is User -> API key -> Account ->
+ * Membership, so revocation and membership changes cannot race authorization.
+ */
+export async function lockCustomerApiKey(
+  request: FastifyRequest,
+  client: DatabaseClient,
+  config: Config,
+  requiredScope: CustomerApiKeyScope,
+): Promise<CustomerApiKeyPrincipal> {
+  const requestKey = customerApiKeyRequest(request, config);
+  const pointer = await client.query<{ user_id: string }>(
+    `SELECT user_id FROM public.customer_api_keys WHERE id = $1`,
+    [requestKey.keyId],
+  );
+  const pointerUserId = pointer.rows[0]?.user_id;
+  if (!pointerUserId) {
+    throw Object.assign(new Error("Customer API key is invalid or revoked"), {
+      statusCode: 401,
+      code: "API_KEY_INVALID",
+    });
+  }
+  const principal = await client.query<{
+    email: string;
+    email_verified_at: Date | null;
+    restricted_at: Date | null;
+    authorization_epoch: string;
+  }>(
+    `SELECT email::text, email_verified_at, restricted_at,
+            authorization_epoch::text
+     FROM public.users WHERE id = $1 FOR UPDATE`,
+    [pointerUserId],
+  );
+  const key = await client.query<{
+    id: string;
+    user_id: string;
+    client_account_id: string;
+    scopes: string[];
+    token_matches: boolean;
+  }>(
+    `SELECT id, user_id, client_account_id, scopes,
+            token_digest = $2 AS token_matches
+     FROM public.customer_api_keys
+     WHERE id = $1 AND user_id = $3
+     FOR UPDATE`,
+    [requestKey.keyId, requestKey.digest, pointerUserId],
+  );
+  const keyRow = key.rows[0];
+  const revocation = keyRow
+    ? await client.query(
+      `SELECT api_key_id FROM public.customer_api_key_revocations
+       WHERE api_key_id = $1`,
+      [keyRow.id],
+    )
+    : null;
+  const account = keyRow
+    ? await client.query<{ restricted_at: Date | null }>(
+      `SELECT restricted_at FROM public.client_accounts
+       WHERE id = $1 FOR UPDATE`,
+      [keyRow.client_account_id],
+    )
+    : null;
+  const membership = keyRow
+    ? await client.query<{
+      role: MembershipRole;
+      permissions: unknown;
+      removed_at: Date | null;
+      restricted_at: Date | null;
+    }>(
+      `SELECT role, permissions, removed_at, restricted_at
+       FROM public.client_memberships
+       WHERE user_id = $1 AND client_account_id = $2
+       FOR UPDATE`,
+      [pointerUserId, keyRow.client_account_id],
+    )
+    : null;
+  const user = principal.rows[0];
+  const accountRow = account?.rows[0];
+  const member = membership?.rows[0];
+  if (
+    !user || !user.email_verified_at || user.restricted_at || !keyRow ||
+    !keyRow.token_matches || revocation?.rows[0] || !accountRow ||
+    accountRow.restricted_at || !member || member.removed_at || member.restricted_at
+  ) {
+    throw Object.assign(new Error("Customer API key is invalid or revoked"), {
+      statusCode: 401,
+      code: "API_KEY_INVALID",
+    });
+  }
+  const scopes = canonicalCustomerApiKeyScopes(keyRow.scopes);
+  if (!scopes.includes(requiredScope)) {
+    throw Object.assign(new Error(`Customer API key scope ${requiredScope} is required`), {
+      statusCode: 403,
+      code: "API_KEY_SCOPE_REQUIRED",
+    });
+  }
+  const membershipPermissions = permissionArray(member.permissions);
+  assertApiKeyScopesAllowedForMembership(scopes, {
+    membershipRole: member.role,
+    membershipPermissions,
+  });
+  requestAuthorizationEpochs.set(request, user.authorization_epoch);
+  return {
+    apiKeyId: keyRow.id,
+    userId: keyRow.user_id,
+    email: user.email,
+    clientAccountId: keyRow.client_account_id,
+    scopes,
+    membershipRole: member.role,
+    membershipPermissions,
+    authorizationEpoch: user.authorization_epoch,
+  };
+}
+
+export async function recordCustomerApiKeyUsage(
+  client: DatabaseClient,
+  principal: CustomerApiKeyPrincipal,
+  method: "GET" | "POST",
+  capability: CustomerApiKeyScope,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO public.customer_api_key_usage_facts(
+       api_key_id, method, capability, result
+     ) VALUES ($1, $2, $3, 'authorized')`,
+    [principal.apiKeyId, method, capability],
+  );
 }
 
 export function expectedAccountContextVersion(request: FastifyRequest): string {
@@ -326,7 +544,7 @@ export async function lockSessionIdentityForMutation(
      WHERE id = $1
        AND user_id = $2
        AND revoked_at IS NULL
-       AND expires_at > pg_catalog.now()
+       AND expires_at > pg_catalog.clock_timestamp()
      FOR UPDATE`,
     [identity.sessionId, identity.userId],
   );
@@ -410,7 +628,7 @@ export async function lockSessionSetForMembershipMutation(
     user_id: string;
     active_client_account_id: string | null;
     account_context_version: string;
-    expires_at: Date;
+    unexpired: boolean;
     email_verified_at: Date | null;
     user_restricted_at: Date | null;
   }>(
@@ -419,7 +637,7 @@ export async function lockSessionSetForMembershipMutation(
        session_record.user_id,
        session_record.active_client_account_id,
        session_record.account_context_version::text,
-       session_record.expires_at,
+       session_record.expires_at > pg_catalog.clock_timestamp() AS unexpired,
        principal.email_verified_at,
        principal.restricted_at AS user_restricted_at
      FROM sessions session_record
@@ -433,7 +651,7 @@ export async function lockSessionSetForMembershipMutation(
   const session = sessionResult.rows.find(
     (row) => row.id === user.sessionId && row.user_id === user.userId,
   );
-  if (!session || session.expires_at.getTime() <= Date.now()) {
+  if (!session || !session.unexpired) {
     throw Object.assign(new Error("Session is invalid or expired"), { statusCode: 401 });
   }
   assertIdentityReadEligible({

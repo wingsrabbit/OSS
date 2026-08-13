@@ -1003,7 +1003,7 @@ export async function registerSupportOperationRoutes(
            id, access_token_digest, access_expires_at,
            department_revision_id, visitor_name, visitor_email,
            topic, subject, status, current_status_event_id
-         ) VALUES ($1, $2, now() + interval '30 days', $3, $4, $5,
+         ) VALUES ($1, $2, pg_catalog.clock_timestamp() + interval '30 days', $3, $4, $5,
                    $6, $7, 'awaiting_staff', $8)`,
         [
           inquiryId,
@@ -1062,7 +1062,7 @@ export async function registerSupportOperationRoutes(
          ON revision.id = inquiry.department_revision_id
        WHERE inquiry.id = $1
          AND inquiry.access_token_digest = $2
-         AND inquiry.access_expires_at > now()
+         AND inquiry.access_expires_at > pg_catalog.clock_timestamp()
          AND NOT EXISTS (
            SELECT 1 FROM presales_inquiry_access_revocations revocation
            WHERE revocation.inquiry_id = inquiry.id
@@ -1117,7 +1117,7 @@ export async function registerSupportOperationRoutes(
          FROM presales_inquiries
          WHERE id = $1
            AND access_token_digest = $2
-           AND access_expires_at > now()
+           AND access_expires_at > pg_catalog.clock_timestamp()
            AND NOT EXISTS (
              SELECT 1 FROM presales_inquiry_access_revocations revocation
              WHERE revocation.inquiry_id = presales_inquiries.id

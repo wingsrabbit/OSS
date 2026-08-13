@@ -47,6 +47,7 @@ const config: Config = {
     "synthetic-support-capability-secret-0000000000",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 91).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 92).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 93).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-support-payment-hook-00000000",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-support-provision-hook-00000",

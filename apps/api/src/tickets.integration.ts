@@ -51,6 +51,7 @@ const config: Config = {
     "synthetic-ticket-capability-secret-0000000000",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 61).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 62).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 63).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-ticket-payment-hook-000000000",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-ticket-provision-hook-0000000",

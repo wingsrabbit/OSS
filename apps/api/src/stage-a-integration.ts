@@ -10683,7 +10683,8 @@ await request(
 const activeReauthBeforeChargeback = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count
    FROM reauth_grants
-   WHERE user_id = $1 AND invalidated_at IS NULL AND expires_at > now()`,
+   WHERE user_id = $1 AND invalidated_at IS NULL
+     AND expires_at > pg_catalog.clock_timestamp()`,
   [chargebackMe.id],
 );
 assert.equal(activeReauthBeforeChargeback.rows[0]?.count, "1");
@@ -10886,7 +10887,8 @@ const chargebackEffects = await corePool.query<{
          AND source_id IN (SELECT id FROM add_funds_chargeback_effects
            WHERE add_funds_settlement_id = $1)) AS journals,
      (SELECT count(*)::text FROM reauth_grants
-       WHERE user_id = $3 AND invalidated_at IS NULL AND expires_at > now()) AS active_reauth,
+       WHERE user_id = $3 AND invalidated_at IS NULL
+         AND expires_at > pg_catalog.clock_timestamp()) AS active_reauth,
      (SELECT CASE
         WHEN allocation.allocated_minor = 0 THEN 'open'
         WHEN allocation.allocated_minor < invoice.total_minor THEN 'partially_paid'

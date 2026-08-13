@@ -46,6 +46,7 @@ const config: Config = {
     "synthetic-manual-receipt-capability-secret",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 41).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 42).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 43).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-manual-receipt-payment-hook",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-manual-receipt-provision-hook",

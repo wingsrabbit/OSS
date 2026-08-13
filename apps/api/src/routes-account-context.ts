@@ -17,6 +17,7 @@ import {
   requireSessionIdentity,
   requireUser,
   setAccountContextHeaders,
+  setAuthorizationEpochForRequest,
   type AuthenticatedUser,
   type MembershipRole,
 } from "./auth.js";
@@ -402,7 +403,7 @@ export async function registerAccountContextRoutes(
       `SELECT id, email, locale, role, permissions,
               CASE
                 WHEN accepted_at IS NOT NULL THEN 'accepted'
-                WHEN expires_at <= pg_catalog.now() THEN 'expired'
+                WHEN expires_at <= pg_catalog.clock_timestamp() THEN 'expired'
                 WHEN revoked_at IS NOT NULL THEN 'revoked'
                 ELSE 'pending'
               END AS status,
@@ -451,9 +452,6 @@ export async function registerAccountContextRoutes(
     const expectedVersion = expectedAccountContextVersion(request);
     const body = invitationSchema.parse(request.body);
     const token = createOpaqueToken();
-    const expiresAt = new Date(
-      Date.now() + config.VERIFICATION_TTL_MINUTES * 60_000,
-    );
     let outcome:
       | Readonly<{ kind: "created"; invitation: Record<string, unknown>; context: SessionContext }>
       | Readonly<{ kind: "existing_member" }>;
@@ -470,6 +468,12 @@ export async function registerAccountContextRoutes(
           role: body.role,
           permissions: body.permissions,
         });
+        const databaseClock = await client.query<{ expires_at: Date }>(
+          `SELECT pg_catalog.clock_timestamp() +
+                  pg_catalog.make_interval(mins => $1::integer) AS expires_at`,
+          [config.VERIFICATION_TTL_MINUTES],
+        );
+        const expiresAt = databaseClock.rows[0]!.expires_at;
         const existingMember = await client.query(
           `SELECT 1
            FROM client_memberships membership
@@ -487,7 +491,7 @@ export async function registerAccountContextRoutes(
              AND email = $2
              AND accepted_at IS NULL
              AND revoked_at IS NULL
-             AND expires_at <= pg_catalog.now()`,
+             AND expires_at <= pg_catalog.clock_timestamp()`,
           [context.clientAccountId, body.email],
         );
         const inserted = await client.query<{
@@ -692,7 +696,7 @@ export async function registerAccountContextRoutes(
            invitation.accepted_at,
            invitation.revoked_at,
            invitation.invited_by_user_id,
-           invitation.expires_at <= pg_catalog.now() AS expired
+           invitation.expires_at <= pg_catalog.clock_timestamp() AS expired
          FROM client_membership_invitations invitation
          WHERE invitation.id = $1
            AND invitation.token_digest = $2
@@ -940,6 +944,10 @@ export async function registerAccountContextRoutes(
         body.restricted === undefined
           ? Boolean(target.restricted_at)
           : body.restricted;
+      const authorizationChanged =
+        nextRole !== target.role ||
+        JSON.stringify(nextPermissions) !== JSON.stringify(stringPermissions(target.permissions)) ||
+        nextRestricted !== Boolean(target.restricted_at);
       assertGrantWithinCeiling(context, {
         role: nextRole,
         permissions: nextPermissions,
@@ -1009,6 +1017,13 @@ export async function registerAccountContextRoutes(
       );
       const row = updated.rows[0];
       if (!row) throw new Error("Unable to update Client Account member");
+      const epoch = authorizationChanged
+        ? await client.query<{ authorization_epoch: string }>(
+          `SELECT authorization_epoch::text
+           FROM users WHERE id = $1`,
+          [params.userId],
+        )
+        : null;
       return {
         member: {
           userId: params.userId,
@@ -1019,8 +1034,12 @@ export async function registerAccountContextRoutes(
         },
         ownerTransfer,
         context: await loadSessionContext(client, user.sessionId),
+        targetAuthorizationEpoch: epoch?.rows[0]?.authorization_epoch ?? null,
       };
     });
+    if (params.userId === user.userId && result.targetAuthorizationEpoch) {
+      setAuthorizationEpochForRequest(request, result.targetAuthorizationEpoch);
+    }
     applyContextHeaders(reply, result.context);
     return { member: result.member, ownerTransfer: result.ownerTransfer };
   });
@@ -1087,6 +1106,11 @@ export async function registerAccountContextRoutes(
          WHERE client_account_id = $1 AND user_id = $2`,
         [context.clientAccountId, params.userId],
       );
+      const epoch = await client.query<{ authorization_epoch: string }>(
+        `SELECT authorization_epoch::text
+         FROM users WHERE id = $1`,
+        [params.userId],
+      );
       await client.query(
         `INSERT INTO audit_events(
            actor_type, actor_id, action, target_type, target_id, metadata
@@ -1100,8 +1124,12 @@ export async function registerAccountContextRoutes(
       return {
         context: await loadSessionContext(client, user.sessionId),
         ownerTransfer,
+        targetAuthorizationEpoch: epoch.rows[0]?.authorization_epoch ?? null,
       };
     });
+    if (params.userId === user.userId && result.targetAuthorizationEpoch) {
+      setAuthorizationEpochForRequest(request, result.targetAuthorizationEpoch);
+    }
     applyContextHeaders(reply, result.context);
     return { removed: true, userId: params.userId, ownerTransfer: result.ownerTransfer };
   });

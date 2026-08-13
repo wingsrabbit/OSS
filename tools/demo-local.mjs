@@ -131,6 +131,7 @@ function createConfig() {
       provisioningWebhookSecret: secureToken(),
       paymentMethodTokenKey: secureToken(32),
       paymentMethodTokenLookupKey: secureToken(32),
+      identitySecretKey: secureToken(32),
     },
   };
   writePrivateJson(configFile, config);
@@ -372,6 +373,8 @@ function commonCoreEnvironment(config) {
     PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: "",
     PAYMENT_METHOD_TOKEN_LOOKUP_KEY: config.secrets.paymentMethodTokenLookupKey,
     PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: "1",
+    IDENTITY_SECRET_KEY: config.secrets.identitySecretKey,
+    IDENTITY_SECRET_KEY_VERSION: "1",
     PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: "",
     OSS_SCHEMA_ROLLBACK_BRIDGE: "disabled",
     MOCK_PAYMENT_WEBHOOK_SECRET: config.secrets.paymentWebhookSecret,

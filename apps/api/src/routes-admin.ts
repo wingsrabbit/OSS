@@ -132,7 +132,7 @@ export async function requireStaffActionLocked(
      WHERE user_id = $1
        AND session_id = $2
        AND invalidated_at IS NULL
-       AND expires_at > now()
+       AND expires_at > pg_catalog.clock_timestamp()
      ORDER BY created_at DESC, id DESC
      LIMIT 1
      FOR UPDATE`,
@@ -167,9 +167,9 @@ export async function requireRecentReauth(
      WHERE rg.user_id = $1
        AND rg.session_id = $2
        AND rg.invalidated_at IS NULL
-       AND rg.expires_at > now()
+       AND rg.expires_at > pg_catalog.clock_timestamp()
        AND s.revoked_at IS NULL
-       AND s.expires_at > now()
+       AND s.expires_at > pg_catalog.clock_timestamp()
      LIMIT 1`,
     [user.userId, user.sessionId],
   );
@@ -192,7 +192,7 @@ export async function requireRecentReauthLocked(
      WHERE user_id = $1
        AND session_id = $2
        AND invalidated_at IS NULL
-       AND expires_at > now()
+       AND expires_at > pg_catalog.clock_timestamp()
      ORDER BY created_at DESC, id DESC
      LIMIT 1
      FOR UPDATE`,

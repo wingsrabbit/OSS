@@ -18,6 +18,7 @@ import {
   fingerprintProviderTokenKey,
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
+import { createIdentitySecretKeyring } from "@opensales/core/identity-security";
 import {
   assertSchema023NativeSafe,
   SCHEMA_023_APPLICATION_GUARD,
@@ -47,6 +48,12 @@ import {
   recoverStaleServiceOperationJobs,
   type ServiceOperationJob,
 } from "./service-operations.js";
+import {
+  IdentityNotificationLeaseLostError,
+  persistUnexpectedIdentityNotificationFailure,
+  processIdentityNotificationJob,
+  recoverStaleIdentityNotificationJob,
+} from "./identity-notification-orchestration.js";
 
 const config = z
   .object({
@@ -60,6 +67,10 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
     MOCK_PROVIDER_PLATFORM_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
+    OSS_PUBLIC_URL: z.url(),
+    IDENTITY_SECRET_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    IDENTITY_SECRET_KEY_VERSION: z.coerce.number().int().positive().optional(),
+    IDENTITY_SECRET_PREVIOUS_KEYS: z.string().optional(),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
     OSS_SCHEMA_ROLLBACK_BRIDGE: z
       .enum(["disabled", "016-to-017"])
@@ -116,6 +127,23 @@ const serviceOperationRuntimeConfig = {
   // reconciliation budget. A lower deployment-wide budget remains respected.
   reconcileMaxAttempts: Math.min(config.RECONCILE_MAX_ATTEMPTS, 3),
   staleLockSeconds: config.JOB_LOCK_TIMEOUT_SECONDS,
+} as const;
+
+const identityNotificationRuntimeConfig = {
+  workerId: config.WORKER_ID,
+  providerUrl: config.MOCK_MAIL_PROVIDER_URL,
+  providerToken: config.MOCK_MAIL_PROVIDER_TOKEN,
+  publicUrl: config.OSS_PUBLIC_URL,
+  providerTimeoutMs: config.PROVIDER_TIMEOUT_MS,
+  retryDelaySeconds: config.NOTIFICATION_RETRY_BASE_DELAY_SECONDS,
+  maxDeliveryAttempts: Math.min(config.NOTIFICATION_MAX_ATTEMPTS, 3),
+  maxReconcileAttempts: config.RECONCILE_MAX_ATTEMPTS,
+  scenario: config.MOCK_MAIL_SCENARIO,
+  keyring: createIdentitySecretKeyring(
+    config.IDENTITY_SECRET_KEY_VERSION ?? 1,
+    config.IDENTITY_SECRET_KEY,
+    config.IDENTITY_SECRET_PREVIOUS_KEYS,
+  ),
 } as const;
 
 const paymentTokenEncryptionKeyring = createProviderTokenKeyring(
@@ -395,8 +423,20 @@ async function recoverStaleNotificationJob(candidate: StaleJob): Promise<boolean
   });
 }
 
+async function recoverStaleIdentityNotification(candidate: StaleJob): Promise<boolean> {
+  return recoverStaleIdentityNotificationJob(
+    pool,
+    candidate,
+    identityNotificationRuntimeConfig,
+    config.JOB_LOCK_TIMEOUT_SECONDS,
+  );
+}
+
 async function recoverOneStaleJob(candidate: StaleJob): Promise<boolean> {
   if (!isSchema016GenericRecoveryJobType(candidate.job_type)) return false;
+  if (candidate.job_type === "identity.notification.send") {
+    return recoverStaleIdentityNotification(candidate);
+  }
   if (candidate.job_type === "notification.send") {
     return recoverStaleNotificationJob(candidate);
   }
@@ -3822,7 +3862,7 @@ async function preflightRefund(
          WHERE id = $1
            AND user_id = $2
            AND revoked_at IS NULL
-           AND expires_at > pg_catalog.now()
+           AND expires_at > pg_catalog.clock_timestamp()
          FOR UPDATE`,
         [initial.requested_session_id, initial.requested_by_user_id],
       );
@@ -3839,8 +3879,8 @@ async function preflightRefund(
          WHERE user_id = $1
            AND session_id = $2
            AND invalidated_at IS NULL
-           AND expires_at > pg_catalog.now()
-           AND created_at >= pg_catalog.now() - interval '15 minutes'
+           AND expires_at > pg_catalog.clock_timestamp()
+           AND created_at >= pg_catalog.clock_timestamp() - interval '15 minutes'
          ORDER BY created_at DESC, id DESC
          LIMIT 1
          FOR UPDATE`,
@@ -7268,6 +7308,10 @@ async function sendNotification(job: Job): Promise<void> {
   await processNotificationDeliveryJob(pool, job, notificationRuntimeConfig);
 }
 
+async function sendIdentityNotification(job: Job): Promise<void> {
+  await processIdentityNotificationJob(pool, job, identityNotificationRuntimeConfig);
+}
+
 async function runScheduledBillingAutomation(job: Job): Promise<void> {
   const body = z
     .object({
@@ -7310,6 +7354,7 @@ async function processJob(job: Job): Promise<void> {
     return runScheduledBillingAutomation(job);
   }
   if (job.job_type === "notification.send") return sendNotification(job);
+  if (job.job_type === "identity.notification.send") return sendIdentityNotification(job);
   if (job.job_type === "refund.start") return startRefund(job);
   if (job.job_type === "refund.reconcile") return reconcileRefund(job);
   if (job.job_type === "payment.start") return startPayment(job);
@@ -7505,7 +7550,8 @@ let nextBillingScheduleAt = 0;
     if (
       error instanceof LostJobLeaseError ||
       error instanceof NotificationLeaseLostError ||
-      isServiceOperationLeaseLostError(error)
+      isServiceOperationLeaseLostError(error) ||
+      error instanceof IdentityNotificationLeaseLostError
     ) {
       console.warn("discarded stale worker result after durable job lease loss", {
         jobId: job.id,
@@ -7556,6 +7602,25 @@ let nextBillingScheduleAt = 0;
         if (isServiceOperationLeaseLostError(persistenceError)) continue;
         console.error(
           "failed to persist service operation failure; stale-job recovery will reconcile it",
+          { jobId: job.id },
+        );
+      }
+      continue;
+    }
+    if (job.job_type === "identity.notification.send") {
+      console.error("identity notification job failed closed without replaying a POST", {
+        jobId: job.id,
+      });
+      try {
+        await persistUnexpectedIdentityNotificationFailure(
+          pool,
+          job,
+          identityNotificationRuntimeConfig,
+        );
+      } catch (persistenceError) {
+        if (persistenceError instanceof IdentityNotificationLeaseLostError) continue;
+        console.error(
+          "failed to persist identity notification recovery state; stale-job recovery will reconcile it",
           { jobId: job.id },
         );
       }

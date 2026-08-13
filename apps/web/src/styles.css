@@ -816,6 +816,91 @@ select:focus {
   padding: 1.25rem;
 }
 
+.security-page {
+  display: grid;
+  gap: 1rem;
+  margin-block: 1.5rem;
+}
+
+.security-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.security-page form,
+.security-page fieldset {
+  display: grid;
+  gap: 0.7rem;
+  margin-block: 1rem;
+}
+
+.security-page label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.security-page .scope-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.security-page .scope-option input {
+  width: auto;
+}
+
+.security-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.security-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.security-list article {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.security-list article form {
+  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 1fr) auto;
+  margin: 0;
+}
+
+.one-time-secret {
+  display: grid;
+  gap: 0.6rem;
+  overflow-wrap: anywhere;
+  padding: 0.9rem;
+  border: 1px solid var(--warning, #c28b22);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--warning, #c28b22) 10%, transparent);
+}
+
+.one-time-secret code,
+.one-time-secret pre {
+  overflow: auto;
+  white-space: pre-wrap;
+  user-select: all;
+}
+
+@media (max-width: 800px) {
+  .security-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .security-list article form {
+    grid-template-columns: 1fr;
+  }
+}
+
 .account-context-switcher .inline-form {
   align-items: end;
 }

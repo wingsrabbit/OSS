@@ -24,8 +24,7 @@ if (!outputFile) {
   throw new Error("BOOTSTRAP_TOKEN_OUTPUT_FILE is required");
 }
 const token = createOpaqueToken();
-const expiresAt = new Date(Date.now() + 15 * 60_000);
-await transaction(pool, async (client) => {
+const expiresAt = await transaction(pool, async (client) => {
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
     "opensales:staff-bootstrap",
   ]);
@@ -36,11 +35,15 @@ await transaction(pool, async (client) => {
   await client.query(
     "UPDATE staff_bootstrap_tokens SET used_at = now() WHERE used_at IS NULL",
   );
-  await client.query(
+  const inserted = await client.query<{ expires_at: Date }>(
     `INSERT INTO staff_bootstrap_tokens(token_digest, expires_at)
-     VALUES ($1, $2)`,
-    [digestToken(token), expiresAt],
+     VALUES ($1, pg_catalog.clock_timestamp() + interval '15 minutes')
+     RETURNING expires_at`,
+    [digestToken(token)],
   );
+  const row = inserted.rows[0];
+  if (!row) throw new Error("Unable to create Staff bootstrap token");
+  return row.expires_at;
 });
 await pool.end();
 const handle = await open(outputFile, "wx", 0o600);

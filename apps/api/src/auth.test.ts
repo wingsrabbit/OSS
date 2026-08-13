@@ -21,6 +21,7 @@ function eligibleUser(
     membershipPermissions,
     membershipRestrictedAt: null,
     accountContextVersion: "1",
+    authorizationEpoch: "0",
   };
 }
 

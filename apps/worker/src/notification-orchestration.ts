@@ -373,7 +373,7 @@ async function lockRecipientForDispatch(
       invalidated_at: Date | null;
       eligible: boolean;
     }>(
-      `SELECT used_at, invalidated_at, expires_at > pg_catalog.now() AS eligible
+      `SELECT used_at, invalidated_at, expires_at > pg_catalog.clock_timestamp() AS eligible
        FROM public.email_verification_tokens
        WHERE user_id = $1
          AND ($2::uuid IS NULL OR id = $2::uuid)
@@ -450,7 +450,7 @@ async function lockRecipientForDispatch(
       eligible: boolean;
     }>(
       `SELECT email::text, locale, accepted_at, revoked_at,
-              expires_at > pg_catalog.now() AS eligible
+              expires_at > pg_catalog.clock_timestamp() AS eligible
        FROM public.client_membership_invitations
        WHERE id = $1
          AND client_account_id = $2
