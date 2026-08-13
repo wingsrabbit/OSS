@@ -61,6 +61,54 @@ function safeInteger(value: unknown, fallback: number, field: string): number {
   return candidate as number;
 }
 
+type ParsedDecimal = Readonly<{
+  value: number;
+  coefficient: bigint;
+  scale: number;
+}>;
+
+function parsedDecimal(value: unknown, fallback: number, field: string): ParsedDecimal {
+  const candidate = value === undefined ? fallback : value;
+  const text =
+    typeof candidate === "number"
+      ? Number.isFinite(candidate)
+        ? String(candidate)
+        : ""
+      : typeof candidate === "string"
+        ? candidate
+        : "";
+  const match = /^(-?)(\d+)(?:\.(\d{1,6}))?$/.exec(text);
+  if (!match) {
+    throw new CommercialValidationError(
+      `${field} must be a finite decimal with at most 6 decimal places`,
+    );
+  }
+  const fraction = match[3] ?? "";
+  const coefficient = BigInt(`${match[1] ?? ""}${match[2]}${fraction}`);
+  const numeric = Number(text);
+  if (!Number.isFinite(numeric) || Math.abs(numeric) > Number.MAX_SAFE_INTEGER) {
+    throw new CommercialValidationError(`${field} is outside the supported decimal range`);
+  }
+  return { value: numeric, coefficient, scale: fraction.length };
+}
+
+function scaledDecimal(value: ParsedDecimal, scale: number): bigint {
+  return value.coefficient * 10n ** BigInt(scale - value.scale);
+}
+
+function decimalStepAligned(
+  value: ParsedDecimal,
+  minimum: ParsedDecimal,
+  step: ParsedDecimal,
+): boolean {
+  const scale = Math.max(value.scale, minimum.scale, step.scale);
+  const stepCoefficient = scaledDecimal(step, scale);
+  return (
+    stepCoefficient > 0n &&
+    (scaledDecimal(value, scale) - scaledDecimal(minimum, scale)) % stepCoefficient === 0n
+  );
+}
+
 function nonnegativeMinor(value: unknown, field: string): bigint {
   if (value === undefined) return 0n;
   const candidate = safeInteger(value, 0, field);
@@ -132,19 +180,6 @@ function parseChoice(raw: unknown, field: string): ParsedChoice {
     recurringMinor: nonnegativeMinor(choice.recurringMinor, `${field}.recurringMinor`),
     capacityUnits: positiveCapacity(choice.capacityUnits, 0n, `${field}.capacityUnits`),
   };
-}
-
-function configuredInteger(value: CatalogConfigurationValue, field: string): number {
-  const candidate =
-    typeof value === "number"
-      ? value
-      : typeof value === "string" && /^-?\d+$/.test(value)
-        ? Number(value)
-        : Number.NaN;
-  if (!Number.isSafeInteger(candidate)) {
-    throw new CommercialValidationError(`${field} must be an integer`);
-  }
-  return candidate;
 }
 
 function dependencyOverrides(
@@ -223,8 +258,8 @@ export function validateCatalogOptionSchema(optionSchema: unknown): asserts opti
           rawOverride,
           `${code}.dependencies.${value} must be an object`,
         );
-        if (override.min !== undefined) safeInteger(override.min, 0, `${code}.dependencies.${value}.min`);
-        if (override.max !== undefined) safeInteger(override.max, 0, `${code}.dependencies.${value}.max`);
+        if (override.min !== undefined) parsedDecimal(override.min, 0, `${code}.dependencies.${value}.min`);
+        if (override.max !== undefined) parsedDecimal(override.max, 0, `${code}.dependencies.${value}.max`);
         if (override.required !== undefined && typeof override.required !== "boolean") {
           throw new CommercialValidationError(
             `${code}.dependencies.${value}.required must be boolean`,
@@ -244,10 +279,10 @@ export function validateCatalogOptionSchema(optionSchema: unknown): asserts opti
       }
       hasPrecedingSelection = true;
     } else if (type === "quantity") {
-      const minimum = safeInteger(option.min, 0, `${code}.min`);
-      const maximum = safeInteger(option.max, Number.MAX_SAFE_INTEGER, `${code}.max`);
-      const step = safeInteger(option.step, 1, `${code}.step`);
-      if (minimum > maximum || step <= 0) {
+      const minimum = parsedDecimal(option.min, 0, `${code}.min`);
+      const maximum = parsedDecimal(option.max, Number.MAX_SAFE_INTEGER, `${code}.max`);
+      const step = parsedDecimal(option.step, 1, `${code}.step`);
+      if (minimum.value > maximum.value || step.value <= 0) {
         throw new CommercialValidationError(`${code} has an invalid quantity range`);
       }
       nonnegativeMinor(option.oneTimeUnitMinor, `${code}.oneTimeUnitMinor`);
@@ -362,24 +397,24 @@ export function resolveCatalogConfiguration(
       }
       capacityUnits += choice.capacityUnits;
     } else if (type === "quantity") {
-      const quantity = configuredInteger(value, code);
-      const minimum = safeInteger(overrides.min ?? option.min, 0, `${code}.min`);
-      const maximum = safeInteger(
+      const quantity = parsedDecimal(value, 0, code);
+      const minimum = parsedDecimal(overrides.min ?? option.min, 0, `${code}.min`);
+      const maximum = parsedDecimal(
         overrides.max ?? option.max,
         Number.MAX_SAFE_INTEGER,
         `${code}.max`,
       );
-      const step = safeInteger(option.step, 1, `${code}.step`);
+      const step = parsedDecimal(option.step, 1, `${code}.step`);
       if (
-        step <= 0 ||
-        minimum > maximum ||
-        quantity < minimum ||
-        quantity > maximum ||
-        (quantity - minimum) % step !== 0
+        step.value <= 0 ||
+        minimum.value > maximum.value ||
+        quantity.value < minimum.value ||
+        quantity.value > maximum.value ||
+        !decimalStepAligned(quantity, minimum, step)
       ) {
         throw new CommercialValidationError(`${code} is outside its allowed quantity range`);
       }
-      snapshot[code] = quantity;
+      snapshot[code] = quantity.value;
       const oneTimeUnitMinor = nonnegativeMinor(
         option.oneTimeUnitMinor,
         `${code}.oneTimeUnitMinor`,
@@ -389,10 +424,15 @@ export function resolveCatalogConfiguration(
         `${code}.recurringUnitMinor`,
       );
       if (oneTimeUnitMinor > 0n || recurringUnitMinor > 0n) {
+        if (!Number.isSafeInteger(quantity.value)) {
+          throw new CommercialValidationError(
+            `${code} must be a whole number when it changes a price`,
+          );
+        }
         components.push({
           code,
           label: code,
-          quantity,
+          quantity: quantity.value,
           oneTimeMinor: oneTimeUnitMinor,
           recurringMinor: recurringUnitMinor,
         });
@@ -402,7 +442,14 @@ export function resolveCatalogConfiguration(
         0n,
         `${code}.capacityUnitsPerUnit`,
       );
-      capacityUnits += capacityUnitsPerUnit * BigInt(quantity);
+      if (capacityUnitsPerUnit > 0n) {
+        if (!Number.isSafeInteger(quantity.value)) {
+          throw new CommercialValidationError(
+            `${code} must be a whole number when it changes supply capacity`,
+          );
+        }
+        capacityUnits += capacityUnitsPerUnit * BigInt(quantity.value);
+      }
     } else {
       if (typeof value !== "string") {
         throw new CommercialValidationError(`${code} must be text`);

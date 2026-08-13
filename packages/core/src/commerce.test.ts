@@ -117,6 +117,38 @@ test("legacy dependency maps override Quantity minimum from the preceding Select
   );
 });
 
+test("fractional Quantity supports exact infrastructure units without fractional money", () => {
+  const colocation = [
+    { code: "space", type: "select", required: true, values: ["1U", "full_rack"] },
+    {
+      code: "power_kva",
+      type: "quantity",
+      required: true,
+      min: 0.5,
+      max: 20,
+      step: 0.5,
+      dependencies: { full_rack: { min: 4 } },
+    },
+  ];
+  assert.equal(
+    resolveCatalogConfiguration(colocation, { space: "1U", power_kva: 0.5 })
+      .configurationSnapshot.power_kva,
+    0.5,
+  );
+  assert.throws(
+    () => resolveCatalogConfiguration(colocation, { space: "1U", power_kva: 0.75 }),
+    /allowed quantity range/,
+  );
+  assert.throws(
+    () =>
+      resolveCatalogConfiguration(
+        [{ code: "fractional", type: "quantity", step: 0.5, recurringUnitMinor: 25 }],
+        { fractional: 1.5 },
+      ),
+    /whole number when it changes a price/,
+  );
+});
+
 test("fixed recurring Promotion is frozen into net renewal and initial totals", () => {
   const snapshot = buildCommercialPriceSnapshot({
     productId: "mock-vps",
