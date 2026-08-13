@@ -7,6 +7,7 @@ import {
 } from "./schema-016-017-rollback-compatibility.js";
 import { assertSchema018CatalogShape } from "./schema-017-018-native-compatibility.js";
 import {
+  EXPECTED_SCHEMA_019_HISTORY,
   assertSchema019CatalogDigest,
   schema019CatalogDigest,
   schema019CatalogFingerprintInput,
@@ -300,7 +301,7 @@ export async function assertSchema020NativeSafe(
     );
   }
   const schema017Shape = await schema017CatalogFingerprintInput(database, {
-    expectedMigrationHistory: EXPECTED_SCHEMA_020_HISTORY.slice(0, -1),
+    expectedMigrationHistory: EXPECTED_SCHEMA_019_HISTORY,
     allowSchema019RecordedOwnerInvariant: true,
   });
   const schema017Digest = schema017Shape.fingerprintInput

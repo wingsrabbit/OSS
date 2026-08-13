@@ -19,9 +19,9 @@ import {
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
 import {
-  assertSchema020NativeSafe,
-  SCHEMA_020_APPLICATION_GUARD,
-} from "@opensales/core/schema-019-020-native-compatibility";
+  assertSchema021NativeSafe,
+  SCHEMA_021_APPLICATION_GUARD,
+} from "@opensales/core/schema-020-021-native-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -107,7 +107,7 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
-const schemaCompatibilityGuardName = SCHEMA_020_APPLICATION_GUARD;
+const schemaCompatibilityGuardName = SCHEMA_021_APPLICATION_GUARD;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 
 async function releaseWorkerGuard(
@@ -7341,7 +7341,7 @@ try {
       query: async (text: string, values?: unknown[]) =>
         schemaCompatibilityGuard!.query(text, values),
     };
-    await assertSchema020NativeSafe(queryable);
+    await assertSchema021NativeSafe(queryable);
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {
     await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);

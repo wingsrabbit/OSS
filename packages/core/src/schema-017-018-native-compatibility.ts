@@ -73,6 +73,7 @@ async function installedSchemaVersion(
 
 export async function schema018CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
+  options: Readonly<{ allowSchema021SupportExtensions?: boolean }> = {},
 ): Promise<string | null> {
   const result = await database.query(
     `WITH catalog_items(item) AS (
@@ -95,6 +96,14 @@ export async function schema018CatalogFingerprintInput(
        FROM information_schema.columns actual
        WHERE actual.table_schema = 'public'
          AND actual.table_name IN ('support_tickets', 'support_ticket_messages')
+         AND NOT (
+           $1::boolean
+           AND actual.table_name = 'support_tickets'
+           AND actual.column_name IN (
+             'department_revision_id', 'priority', 'order_id',
+             'authorization_purpose', 'current_status_event_id'
+           )
+         )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'index', actual.schemaname,
                 actual.tablename, actual.indexname,
@@ -104,6 +113,14 @@ export async function schema018CatalogFingerprintInput(
          AND (
            actual.tablename IN ('support_tickets', 'support_ticket_messages')
            OR actual.indexname = 'services_id_client_account_key'
+         )
+         AND NOT (
+           $1::boolean
+           AND actual.tablename = 'support_ticket_messages'
+           AND actual.indexname IN (
+             'support_ticket_messages_id_ticket_key',
+             'support_ticket_messages_id_ticket_visibility_key'
+           )
          )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'constraint', relation.relname, actual.conname,
@@ -124,11 +141,41 @@ export async function schema018CatalogFingerprintInput(
              AND actual.conname = 'services_id_client_account_key'
            )
          )
+         AND NOT (
+           $1::boolean
+           AND (
+             (relation.relname = 'support_tickets' AND actual.conname IN (
+               'support_tickets_priority_check',
+               'support_tickets_authorization_purpose_check',
+               'support_tickets_authorization_reference_check',
+               'support_tickets_order_account_fkey',
+               'support_tickets_department_revision_fkey',
+               'support_tickets_current_status_event_fkey'
+             ))
+             OR (
+               relation.relname = 'support_tickets'
+               AND actual.conname IN (
+                 'support_tickets_current_state_guard',
+                 'support_tickets_current_status_event_id_not_null',
+                 'support_tickets_department_revision_id_not_null',
+                 'support_tickets_priority_not_null'
+               )
+             )
+             OR (
+               relation.relname = 'support_ticket_messages'
+               AND actual.conname IN (
+                 'support_ticket_messages_id_ticket_key',
+                 'support_ticket_messages_id_ticket_visibility_key'
+               )
+             )
+           )
+         )
      ), fingerprint(value) AS (
        SELECT pg_catalog.string_agg(item, E'\\n' ORDER BY item COLLATE "C")
        FROM catalog_items
      )
      SELECT value AS fingerprint_input FROM fingerprint`,
+    [options.allowSchema021SupportExtensions === true],
   );
   const value = result.rows[0] ? rowRecord(result.rows[0]).fingerprint_input : null;
   return typeof value === "string" ? value : null;
@@ -151,8 +198,9 @@ export function assertSchema018CatalogDigest(digest: string | null): void {
 
 export async function assertSchema018CatalogShape(
   database: RollbackPreflightQueryable,
+  options: Readonly<{ allowSchema021SupportExtensions?: boolean }> = {},
 ): Promise<void> {
-  const fingerprintInput = await schema018CatalogFingerprintInput(database);
+  const fingerprintInput = await schema018CatalogFingerprintInput(database, options);
   assertSchema018CatalogDigest(schema018CatalogDigest(fingerprintInput));
 }
 

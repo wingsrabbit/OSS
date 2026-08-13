@@ -21,7 +21,7 @@ export const SCHEMA_019_APPLICATION_GUARD =
 export const SCHEMA_019_CATALOG_DIGEST =
   "04b0a0250423c3e86759af716d838b573b861750372628866a8274c4575cc533" as const;
 
-const EXPECTED_SCHEMA_019_HISTORY = [
+export const EXPECTED_SCHEMA_019_HISTORY = [
   "001_stage_a",
   "002_staff_stage_a",
   "003_stage_a_financial_hardening",

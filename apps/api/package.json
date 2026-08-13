@@ -18,6 +18,7 @@
     "test:integration:payment-method-token-rotation": "node dist/payment-method-token-rotation.integration.js",
     "test:integration:manual-receipts": "node dist/manual-receipts.integration.js",
     "test:integration:tickets": "node dist/tickets.integration.js",
+    "test:integration:support-operations": "node dist/support-operations.integration.js",
     "test:integration:account-history": "node dist/account-history.integration.js",
     "test:integration:account-context": "node dist/account-context.integration.js",
     "test:integration:catalog-commerce": "node dist/catalog-commerce.integration.js",
