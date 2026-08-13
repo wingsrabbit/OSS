@@ -7,6 +7,7 @@ import {
   assertSchema020NativeSafe,
   SCHEMA_020,
   SCHEMA_020_CATALOG_DIGEST,
+  SCHEMA_020_WITH_022_EXTENSIONS_CATALOG_DIGEST,
   schema020CatalogFingerprintInput,
 } from "./schema-019-020-native-compatibility.js";
 
@@ -20,12 +21,15 @@ test("schema 020 catalog gate accepts only the reviewed PG18 digest", () => {
 
 test("schema 020 fingerprint covers immutable commercial and consent facts", async () => {
   let queryText = "";
+  let queryValues: readonly unknown[] | undefined;
   await schema020CatalogFingerprintInput({
-    query: async (text) => {
+    query: async (text, values) => {
       queryText = text;
+      queryValues = values;
       return { rows: [{ value: "reviewed" }] };
     },
   });
+  assert.deepEqual(queryValues, [false]);
   for (const name of [
     "catalog_product_revisions_immutable",
     "product_prices_revision_guard",
@@ -37,6 +41,36 @@ test("schema 020 fingerprint covers immutable commercial and consent facts", asy
     "marketing_consent_events_membership_guard",
     "orders_source_quote_immutable",
     "current_marketing_consents",
+  ]) {
+    assert.match(queryText, new RegExp(name));
+  }
+});
+
+test("schema 020 transfers only the reviewed commerce hardening objects to schema 022", async () => {
+  assert.match(SCHEMA_020_WITH_022_EXTENSIONS_CATALOG_DIGEST, /^[a-f0-9]{64}$/);
+  assert.notEqual(
+    SCHEMA_020_WITH_022_EXTENSIONS_CATALOG_DIGEST,
+    SCHEMA_020_CATALOG_DIGEST,
+  );
+  let queryText = "";
+  let queryValues: readonly unknown[] | undefined;
+  await schema020CatalogFingerprintInput(
+    {
+      query: async (text, values) => {
+        queryText = text;
+        queryValues = values;
+        return { rows: [{ value: "reviewed" }] };
+      },
+    },
+    { allowSchema022CommerceExtensions: true },
+  );
+  assert.deepEqual(queryValues, [true]);
+  for (const name of [
+    "promotions_validity_excl",
+    "product_supply_capacities_projection_invariant",
+    "supply_capacity_reservations_projection_invariant",
+    "supply_capacity_reservations_product_idx",
+    "opensales_validate_quote_terminal_fact",
   ]) {
     assert.match(queryText, new RegExp(name));
   }

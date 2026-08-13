@@ -5,6 +5,9 @@ import { randomBytes, randomUUID } from "node:crypto";
 import cookie from "@fastify/cookie";
 import Fastify from "fastify";
 import pg from "pg";
+import { assertSchema020CatalogShape } from "@opensales/core/schema-019-020-native-compatibility";
+import { assertSchema021CatalogShape } from "@opensales/core/schema-020-021-native-compatibility";
+import { assertSchema022CatalogShape } from "@opensales/core/schema-021-022-native-compatibility";
 import { digestToken } from "./auth.js";
 import type { FastifyError, FastifyReply, FastifyRequest } from "fastify";
 import type { Config } from "./config.js";
@@ -284,6 +287,41 @@ try {
     );
   });
   await runMigrations(pool);
+  const nativeQueryable = {
+    query: async (text: string, values?: unknown[]) => pool!.query(text, values),
+  };
+  await assertSchema020CatalogShape(nativeQueryable, {
+    allowSchema022CommerceExtensions: true,
+  });
+  await assertSchema021CatalogShape(nativeQueryable);
+  await assertSchema022CatalogShape(nativeQueryable);
+
+  const catalogTamperClient = await pool.connect();
+  try {
+    for (const statement of [
+      `CREATE OR REPLACE FUNCTION public.opensales_validate_supply_capacity_projection()
+       RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public
+       AS 'BEGIN RETURN NULL; END'`,
+      "DROP TRIGGER orders_release_supply_on_terminal ON public.orders",
+      "ALTER TABLE public.product_prices DROP CONSTRAINT product_prices_valid_interval_check",
+      "DROP INDEX public.supply_capacity_reservations_product_idx",
+    ]) {
+      await catalogTamperClient.query("BEGIN");
+      try {
+        await catalogTamperClient.query(statement);
+        await assert.rejects(
+          assertSchema022CatalogShape({
+            query: async (text, values) => catalogTamperClient.query(text, values),
+          }),
+          /Schema 022 is incomplete or counterfeit/,
+        );
+      } finally {
+        await catalogTamperClient.query("ROLLBACK");
+      }
+    }
+  } finally {
+    catalogTamperClient.release();
+  }
   const forwardUpgrade = await pool.query<{
     committed: string;
     releases: string;
@@ -1167,7 +1205,7 @@ try {
   });
 
   console.log(
-    "Catalog Commerce PostgreSQL 18 integration: PASS — saved Schema 020 forward upgrade, Staff definitions, immutable non-overlapping price and Promotion revisions, options, Promotion exhaustion, supply reservation/release projection, zero Order, Marketing Consent withdrawal, Quote wall-clock expiry/preview/accept/replay/void and idempotency isolation, tenant isolation, legal snapshots, and balanced sealed ledgers.",
+    "Catalog Commerce PostgreSQL 18 integration: PASS — saved Schema 020 forward upgrade, frozen Schema 020/021/022 projections and tamper rejection, Staff definitions, immutable non-overlapping price and Promotion revisions, options, Promotion exhaustion, supply reservation/release projection, zero Order, Marketing Consent withdrawal, Quote wall-clock expiry/preview/accept/replay/void and idempotency isolation, tenant isolation, legal snapshots, and balanced sealed ledgers.",
   );
 } finally {
   await app?.close().catch(() => undefined);

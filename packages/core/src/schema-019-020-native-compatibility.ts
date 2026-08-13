@@ -23,6 +23,11 @@ export const SCHEMA_020_APPLICATION_GUARD = "opensales:schema-020-application" a
 export const SCHEMA_020_CATALOG_DIGEST =
   "8334a80bee85bd2ffd31859319bdab334f62447f767c1e2cfc94fc051c2e2171" as const;
 
+// The reviewed Schema 020 projection after handing the six exact Schema 022
+// replacements/additions to the Schema 022 catalog gate.
+export const SCHEMA_020_WITH_022_EXTENSIONS_CATALOG_DIGEST =
+  "b2d1e3385a65cda79182c3e34b758b896bb7d844af90725365f3d69d9bbcafad" as const;
+
 export const EXPECTED_SCHEMA_020_HISTORY = [
   "001_stage_a",
   "002_staff_stage_a",
@@ -83,6 +88,7 @@ async function installedSchemaVersion(
 
 export async function schema020CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
+  options: Readonly<{ allowSchema022CommerceExtensions?: boolean }> = {},
 ): Promise<string | null> {
   const result = await database.query(
     `WITH catalog_items(item) AS (
@@ -172,6 +178,17 @@ export async function schema020CatalogFingerprintInput(
              'orders_source_quote_key'
            )
          )
+         AND NOT (
+           $1::boolean
+           AND (
+             (relation.relname = 'promotions'
+              AND actual.conname = 'promotions_validity_excl')
+             OR (relation.relname = 'product_supply_capacities'
+                 AND actual.conname = 'product_supply_capacities_projection_invariant')
+             OR (relation.relname = 'supply_capacity_reservations'
+                 AND actual.conname = 'supply_capacity_reservations_projection_invariant')
+           )
+         )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'index', actual.schemaname,
                 actual.tablename, actual.indexname,
@@ -189,6 +206,15 @@ export async function schema020CatalogFingerprintInput(
            'promotion_redemptions',
            'supply_capacity_reservations',
            'marketing_consent_events'
+         )
+         AND NOT (
+           $1::boolean
+           AND (
+             (actual.tablename = 'promotions'
+              AND actual.indexname = 'promotions_validity_excl')
+             OR (actual.tablename = 'supply_capacity_reservations'
+                 AND actual.indexname = 'supply_capacity_reservations_product_idx')
+           )
          )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'trigger', relation.relname, actual.tgname,
@@ -238,6 +264,10 @@ export async function schema020CatalogFingerprintInput(
            'opensales_guard_order_source_quote',
            'opensales_validate_marketing_consent_event'
          )
+         AND NOT (
+           $1::boolean
+           AND actual.proname = 'opensales_validate_quote_terminal_fact'
+         )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'view', 'current_marketing_consents',
                 pg_catalog.regexp_replace(
@@ -249,6 +279,7 @@ export async function schema020CatalogFingerprintInput(
        FROM catalog_items
      )
      SELECT value FROM fingerprint`,
+    [options.allowSchema022CommerceExtensions === true],
   );
   const value = result.rows[0] ? rowRecord(result.rows[0]).value : null;
   return typeof value === "string" ? value : null;
@@ -271,9 +302,20 @@ export function assertSchema020CatalogDigest(digest: string | null): void {
 
 export async function assertSchema020CatalogShape(
   database: RollbackPreflightQueryable,
+  options: Readonly<{ allowSchema022CommerceExtensions?: boolean }> = {},
 ): Promise<void> {
-  const fingerprintInput = await schema020CatalogFingerprintInput(database);
-  assertSchema020CatalogDigest(schema020CatalogDigest(fingerprintInput));
+  const fingerprintInput = await schema020CatalogFingerprintInput(database, options);
+  const digest = schema020CatalogDigest(fingerprintInput);
+  if (options.allowSchema022CommerceExtensions === true) {
+    if (digest !== SCHEMA_020_WITH_022_EXTENSIONS_CATALOG_DIGEST) {
+      throw new SchemaRollbackPreflightError(
+        `Schema 020 foundation under Schema 022 is incomplete or counterfeit: catalog digest ${String(digest)} does not match reviewed projection digest ${SCHEMA_020_WITH_022_EXTENSIONS_CATALOG_DIGEST}; do not start a schema-022 application.`,
+        SCHEMA_020,
+      );
+    }
+    return;
+  }
+  assertSchema020CatalogDigest(digest);
 }
 
 export async function assertSchema020NativeSafe(
