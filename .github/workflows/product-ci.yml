@@ -42,6 +42,9 @@ jobs:
       - name: Demo launcher lifecycle regressions
         run: node --test tools/demo-local.test.mjs
 
+      - name: Laboratory RC backup and restore-plan regressions
+        run: node --test tools/lab-backup.test.mjs
+
       - name: Install pinned dependencies
         shell: bash
         run: |
