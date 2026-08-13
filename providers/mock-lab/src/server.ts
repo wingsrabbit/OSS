@@ -553,11 +553,13 @@ app.addHook("onRequest", async (request, reply) => {
   }
 });
 
-await registerProviderPlatformRoutes(app, pool, {
-  publicBaseUrl:
-    config.MOCK_PROVIDER_PUBLIC_BASE_URL ??
-    `http://127.0.0.1:${config.PROVIDER_PORT}`,
-});
+if (config.MOCK_PROVIDER_PLATFORM_TOKEN) {
+  await registerProviderPlatformRoutes(app, pool, {
+    publicBaseUrl:
+      config.MOCK_PROVIDER_PUBLIC_BASE_URL ??
+      `http://127.0.0.1:${config.PROVIDER_PORT}`,
+  });
+}
 
 function releaseIncomingMailRequest(request: object): void {
   const release = incomingMailRequestReleases.get(request);

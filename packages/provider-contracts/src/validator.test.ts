@@ -122,6 +122,6 @@ test("result and event envelopes bind capability, operation, sequence, and versi
     eventType: "operation.succeeded",
     observedAt: now,
     result,
-  }), /must match the outer capability/);
+  }), /Invalid Provider event/);
   assert.throws(() => parseProviderOperationResult({ ...result, status: "failed" }), /Invalid Provider operation-result/);
 });

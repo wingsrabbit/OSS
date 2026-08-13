@@ -43,12 +43,38 @@ for (const capability of providerCapabilities) {
       ],
       requestBody: {
         required: true,
-        content: { "application/json": { schema: { $ref: "#/components/schemas/OperationRequest" } } },
+        content: {
+          "application/json": {
+            schema: {
+              allOf: [
+                { $ref: "#/components/schemas/OperationRequest" },
+                {
+                  type: "object",
+                  properties: { capability: { const: capability } },
+                  required: ["capability"],
+                },
+              ],
+            },
+          },
+        },
       },
       responses: {
         "202": {
           description: "Accepted Provider fact; status may require reconciliation.",
-          content: { "application/json": { schema: { $ref: "#/components/schemas/OperationResult" } } },
+          content: {
+            "application/json": {
+              schema: {
+                allOf: [
+                  { $ref: "#/components/schemas/OperationResult" },
+                  {
+                    type: "object",
+                    properties: { capability: { const: capability } },
+                    required: ["capability"],
+                  },
+                ],
+              },
+            },
+          },
         },
         "409": { description: "Idempotency key conflict" },
         "504": { description: "Outcome unknown; query the operation before another mutation" },
@@ -65,7 +91,20 @@ for (const capability of providerCapabilities) {
       responses: {
         "200": {
           description: "Current Provider fact",
-          content: { "application/json": { schema: { $ref: "#/components/schemas/OperationResult" } } },
+          content: {
+            "application/json": {
+              schema: {
+                allOf: [
+                  { $ref: "#/components/schemas/OperationResult" },
+                  {
+                    type: "object",
+                    properties: { capability: { const: capability } },
+                    required: ["capability"],
+                  },
+                ],
+              },
+            },
+          },
         },
         "404": { description: "Unknown operation" },
       },

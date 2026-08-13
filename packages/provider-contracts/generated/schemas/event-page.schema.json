@@ -3,6 +3,7 @@
   "$id": "https://schemas.opensales.system/provider/v1/event-page.schema.json",
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "title": "OpenSales System Provider Event Page v1",
+  "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Cursor page of external Provider fact events.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -18,6 +19,7 @@
         "$id": "https://schemas.opensales.system/provider/v1alpha1/event.schema.json",
         "$comment": "SPDX-License-Identifier: Apache-2.0",
         "title": "OpenSales System Provider Event v1alpha1",
+        "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. At-least-once external Provider fact event.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -82,6 +84,7 @@
             "$id": "https://schemas.opensales.system/provider/v1alpha1/operation-result.schema.json",
             "$comment": "SPDX-License-Identifier: Apache-2.0",
             "title": "OpenSales System Provider Operation Result v1alpha1",
+            "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. External result fact; Core retains business decision authority.",
             "oneOf": [
               {
                 "type": "object",
@@ -1325,7 +1328,1503 @@
               }
             ]
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "const": "payment"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "transportVersion",
+                    "contractVersion",
+                    "capability",
+                    "operationId",
+                    "status",
+                    "revision",
+                    "observedAt"
+                  ],
+                  "properties": {
+                    "transportVersion": {
+                      "const": "v1"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "capability": {
+                      "const": "payment"
+                    },
+                    "operationId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending",
+                        "succeeded",
+                        "failed",
+                        "unknown"
+                      ]
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalPaymentRef",
+                        "paymentState",
+                        "amountMinor",
+                        "currency"
+                      ],
+                      "properties": {
+                        "externalPaymentRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "paymentState": {
+                          "enum": [
+                            "authorized",
+                            "captured",
+                            "refunded",
+                            "declined"
+                          ]
+                        },
+                        "amountMinor": {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "currency": {
+                          "type": "string",
+                          "pattern": "^[A-Z]{3}$"
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 500
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "succeeded"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "output": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "externalPaymentRef",
+                              "paymentState",
+                              "amountMinor",
+                              "currency"
+                            ],
+                            "properties": {
+                              "externalPaymentRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "paymentState": {
+                                "enum": [
+                                  "authorized",
+                                  "captured",
+                                  "refunded",
+                                  "declined"
+                                ]
+                              },
+                              "amountMinor": {
+                                "type": "string",
+                                "pattern": "^(0|[1-9][0-9]*)$"
+                              },
+                              "currency": {
+                                "type": "string",
+                                "pattern": "^[A-Z]{3}$"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "output"
+                        ],
+                        "not": {
+                          "type": "object",
+                          "properties": {
+                            "error": {}
+                          },
+                          "required": [
+                            "error"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "failed"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "code",
+                              "message",
+                              "retryable"
+                            ],
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "retryable": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "const": "provisioning"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "transportVersion",
+                    "contractVersion",
+                    "capability",
+                    "operationId",
+                    "status",
+                    "revision",
+                    "observedAt"
+                  ],
+                  "properties": {
+                    "transportVersion": {
+                      "const": "v1"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "capability": {
+                      "const": "provisioning"
+                    },
+                    "operationId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending",
+                        "succeeded",
+                        "failed",
+                        "unknown"
+                      ]
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalResourceRef",
+                        "resourceState"
+                      ],
+                      "properties": {
+                        "externalResourceRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "resourceState": {
+                          "enum": [
+                            "pending",
+                            "ready",
+                            "stopped",
+                            "terminated"
+                          ]
+                        },
+                        "readyAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 500
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "succeeded"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "output": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "externalResourceRef",
+                              "resourceState"
+                            ],
+                            "properties": {
+                              "externalResourceRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "resourceState": {
+                                "enum": [
+                                  "pending",
+                                  "ready",
+                                  "stopped",
+                                  "terminated"
+                                ]
+                              },
+                              "readyAt": {
+                                "type": "string",
+                                "format": "date-time"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "output"
+                        ],
+                        "not": {
+                          "type": "object",
+                          "properties": {
+                            "error": {}
+                          },
+                          "required": [
+                            "error"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "failed"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "code",
+                              "message",
+                              "retryable"
+                            ],
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "retryable": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "const": "mail"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "transportVersion",
+                    "contractVersion",
+                    "capability",
+                    "operationId",
+                    "status",
+                    "revision",
+                    "observedAt"
+                  ],
+                  "properties": {
+                    "transportVersion": {
+                      "const": "v1"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "capability": {
+                      "const": "mail"
+                    },
+                    "operationId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending",
+                        "succeeded",
+                        "failed",
+                        "unknown"
+                      ]
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalDeliveryRef",
+                        "deliveryState"
+                      ],
+                      "properties": {
+                        "externalDeliveryRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "deliveryState": {
+                          "enum": [
+                            "delivered",
+                            "bounced",
+                            "failed"
+                          ]
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 500
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "succeeded"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "output": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "externalDeliveryRef",
+                              "deliveryState"
+                            ],
+                            "properties": {
+                              "externalDeliveryRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "deliveryState": {
+                                "enum": [
+                                  "delivered",
+                                  "bounced",
+                                  "failed"
+                                ]
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "output"
+                        ],
+                        "not": {
+                          "type": "object",
+                          "properties": {
+                            "error": {}
+                          },
+                          "required": [
+                            "error"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "failed"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "code",
+                              "message",
+                              "retryable"
+                            ],
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "retryable": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "const": "verification"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "transportVersion",
+                    "contractVersion",
+                    "capability",
+                    "operationId",
+                    "status",
+                    "revision",
+                    "observedAt"
+                  ],
+                  "properties": {
+                    "transportVersion": {
+                      "const": "v1"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "capability": {
+                      "const": "verification"
+                    },
+                    "operationId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending",
+                        "succeeded",
+                        "failed",
+                        "unknown"
+                      ]
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalEvidenceRef",
+                        "verdict",
+                        "assurance",
+                        "checked"
+                      ],
+                      "properties": {
+                        "externalEvidenceRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "verdict": {
+                          "enum": [
+                            "verified",
+                            "rejected",
+                            "manual_review"
+                          ]
+                        },
+                        "assurance": {
+                          "enum": [
+                            "low",
+                            "medium",
+                            "high"
+                          ]
+                        },
+                        "checked": {
+                          "type": "array",
+                          "minItems": 1,
+                          "uniqueItems": true,
+                          "items": {
+                            "enum": [
+                              "email_ownership",
+                              "identity",
+                              "business"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 500
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "succeeded"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "output": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "externalEvidenceRef",
+                              "verdict",
+                              "assurance",
+                              "checked"
+                            ],
+                            "properties": {
+                              "externalEvidenceRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "verdict": {
+                                "enum": [
+                                  "verified",
+                                  "rejected",
+                                  "manual_review"
+                                ]
+                              },
+                              "assurance": {
+                                "enum": [
+                                  "low",
+                                  "medium",
+                                  "high"
+                                ]
+                              },
+                              "checked": {
+                                "type": "array",
+                                "minItems": 1,
+                                "uniqueItems": true,
+                                "items": {
+                                  "enum": [
+                                    "email_ownership",
+                                    "identity",
+                                    "business"
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "output"
+                        ],
+                        "not": {
+                          "type": "object",
+                          "properties": {
+                            "error": {}
+                          },
+                          "required": [
+                            "error"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "failed"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "code",
+                              "message",
+                              "retryable"
+                            ],
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "retryable": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "const": "tax"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "transportVersion",
+                    "contractVersion",
+                    "capability",
+                    "operationId",
+                    "status",
+                    "revision",
+                    "observedAt"
+                  ],
+                  "properties": {
+                    "transportVersion": {
+                      "const": "v1"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "capability": {
+                      "const": "tax"
+                    },
+                    "operationId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending",
+                        "succeeded",
+                        "failed",
+                        "unknown"
+                      ]
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalQuoteRef",
+                        "currency",
+                        "totalTaxMinor",
+                        "lines"
+                      ],
+                      "properties": {
+                        "externalQuoteRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "currency": {
+                          "type": "string",
+                          "pattern": "^[A-Z]{3}$"
+                        },
+                        "totalTaxMinor": {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "lines": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "lineRef",
+                              "taxMinor",
+                              "rateBasisPoints"
+                            ],
+                            "properties": {
+                              "lineRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "taxMinor": {
+                                "type": "string",
+                                "pattern": "^(0|[1-9][0-9]*)$"
+                              },
+                              "rateBasisPoints": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 100000
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 500
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "succeeded"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "output": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "externalQuoteRef",
+                              "currency",
+                              "totalTaxMinor",
+                              "lines"
+                            ],
+                            "properties": {
+                              "externalQuoteRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "currency": {
+                                "type": "string",
+                                "pattern": "^[A-Z]{3}$"
+                              },
+                              "totalTaxMinor": {
+                                "type": "string",
+                                "pattern": "^(0|[1-9][0-9]*)$"
+                              },
+                              "lines": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "additionalProperties": false,
+                                  "required": [
+                                    "lineRef",
+                                    "taxMinor",
+                                    "rateBasisPoints"
+                                  ],
+                                  "properties": {
+                                    "lineRef": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 200
+                                    },
+                                    "taxMinor": {
+                                      "type": "string",
+                                      "pattern": "^(0|[1-9][0-9]*)$"
+                                    },
+                                    "rateBasisPoints": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 100000
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "output"
+                        ],
+                        "not": {
+                          "type": "object",
+                          "properties": {
+                            "error": {}
+                          },
+                          "required": [
+                            "error"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "failed"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "code",
+                              "message",
+                              "retryable"
+                            ],
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "retryable": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "capability": {
+                  "const": "anti_abuse_challenge"
+                }
+              },
+              "required": [
+                "capability"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "transportVersion",
+                    "contractVersion",
+                    "capability",
+                    "operationId",
+                    "status",
+                    "revision",
+                    "observedAt"
+                  ],
+                  "properties": {
+                    "transportVersion": {
+                      "const": "v1"
+                    },
+                    "contractVersion": {
+                      "const": "v1alpha1"
+                    },
+                    "capability": {
+                      "const": "anti_abuse_challenge"
+                    },
+                    "operationId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending",
+                        "succeeded",
+                        "failed",
+                        "unknown"
+                      ]
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "observedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "output": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "externalDecisionRef",
+                        "decision"
+                      ],
+                      "properties": {
+                        "externalDecisionRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "decision": {
+                          "enum": [
+                            "allow",
+                            "challenge",
+                            "deny"
+                          ]
+                        },
+                        "challengeRef": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 200
+                        },
+                        "challengeState": {
+                          "enum": [
+                            "pending",
+                            "satisfied",
+                            "failed"
+                          ]
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "message",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{1,79}$"
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 500
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "succeeded"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "output": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "externalDecisionRef",
+                              "decision"
+                            ],
+                            "properties": {
+                              "externalDecisionRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "decision": {
+                                "enum": [
+                                  "allow",
+                                  "challenge",
+                                  "deny"
+                                ]
+                              },
+                              "challengeRef": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200
+                              },
+                              "challengeState": {
+                                "enum": [
+                                  "pending",
+                                  "satisfied",
+                                  "failed"
+                                ]
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "output"
+                        ],
+                        "not": {
+                          "type": "object",
+                          "properties": {
+                            "error": {}
+                          },
+                          "required": [
+                            "error"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "status": {
+                            "const": "failed"
+                          }
+                        },
+                        "required": [
+                          "status"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "code",
+                              "message",
+                              "retryable"
+                            ],
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "retryable": {
+                                "type": "boolean"
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "error"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "eventType": {
+                  "const": "operation.pending"
+                }
+              },
+              "required": [
+                "eventType"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "const": "pending"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "eventType": {
+                  "const": "operation.succeeded"
+                }
+              },
+              "required": [
+                "eventType"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "eventType": {
+                  "const": "operation.failed"
+                }
+              },
+              "required": [
+                "eventType"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "const": "failed"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "eventType": {
+                  "const": "operation.unknown"
+                }
+              },
+              "required": [
+                "eventType"
+              ]
+            },
+            "then": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "const": "unknown"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            }
+          }
+        ]
       }
     },
     "nextCursor": {

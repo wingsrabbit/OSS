@@ -3,6 +3,7 @@
 import {
   PROVIDER_CONTRACT_VERSION,
   PROVIDER_TRANSPORT_VERSION,
+  capabilityMutationOperations,
   capabilityOperations,
   providerCapabilities,
   type ProviderCapability,
@@ -216,7 +217,7 @@ function operationRequestBranch(capability: ProviderCapability): JsonSchema {
       requestedAt: instant,
       intentRef: opaqueRef,
       capability: { const: capability },
-      action: { enum: capabilityOperations[capability] },
+      action: { enum: capabilityMutationOperations[capability] },
       input: inputSchemas[capability],
     },
   };
@@ -291,6 +292,7 @@ export const providerManifestSchema = {
   $id: "https://schemas.opensales.system/provider/v1/manifest.schema.json",
   $comment: "SPDX-License-Identifier: Apache-2.0",
   title: "OpenSales System Provider Manifest v1",
+  description: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Public Provider installation declaration.",
   type: "object",
   additionalProperties: false,
   required: [
@@ -364,8 +366,16 @@ export const providerManifestSchema = {
       additionalProperties: false,
       required: ["scopes", "dataFields", "secrets"],
       properties: {
-        scopes: { type: "array", uniqueItems: true, items: { type: "string" } },
-        dataFields: { type: "array", uniqueItems: true, items: { type: "string" } },
+        scopes: {
+          type: "array",
+          uniqueItems: true,
+          items: { type: "string", pattern: "^[a-z][a-z0-9_.-]{2,119}$" },
+        },
+        dataFields: {
+          type: "array",
+          uniqueItems: true,
+          items: { type: "string", pattern: "^[a-z][a-z0-9_.-]{2,119}$" },
+        },
         secrets: {
           type: "array",
           items: {
@@ -430,6 +440,7 @@ export const providerOperationRequestSchema = {
   $id: "https://schemas.opensales.system/provider/v1alpha1/operation-request.schema.json",
   $comment: "SPDX-License-Identifier: Apache-2.0",
   title: "OpenSales System Provider Operation Request v1alpha1",
+  description: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Idempotent Provider operation request.",
   oneOf: providerCapabilities.map(operationRequestBranch),
 } as const;
 
@@ -438,6 +449,7 @@ export const providerOperationResultSchema = {
   $id: "https://schemas.opensales.system/provider/v1alpha1/operation-result.schema.json",
   $comment: "SPDX-License-Identifier: Apache-2.0",
   title: "OpenSales System Provider Operation Result v1alpha1",
+  description: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. External result fact; Core retains business decision authority.",
   oneOf: providerCapabilities.map(operationResultBranch),
 } as const;
 
@@ -446,6 +458,7 @@ export const providerEventSchema = {
   $id: "https://schemas.opensales.system/provider/v1alpha1/event.schema.json",
   $comment: "SPDX-License-Identifier: Apache-2.0",
   title: "OpenSales System Provider Event v1alpha1",
+  description: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. At-least-once external Provider fact event.",
   type: "object",
   additionalProperties: false,
   required: [
@@ -474,6 +487,38 @@ export const providerEventSchema = {
     observedAt: instant,
     result: providerOperationResultSchema,
   },
+  allOf: [
+    ...providerCapabilities.map((capability) => ({
+      if: {
+        type: "object",
+        properties: { capability: { const: capability } },
+        required: ["capability"],
+      },
+      then: {
+        type: "object",
+        properties: { result: operationResultBranch(capability) },
+        required: ["result"],
+      },
+    })),
+    ...(["pending", "succeeded", "failed", "unknown"] as const).map((status) => ({
+      if: {
+        type: "object",
+        properties: { eventType: { const: `operation.${status}` } },
+        required: ["eventType"],
+      },
+      then: {
+        type: "object",
+        properties: {
+          result: {
+            type: "object",
+            properties: { status: { const: status } },
+            required: ["status"],
+          },
+        },
+        required: ["result"],
+      },
+    })),
+  ],
 } as const;
 
 export const providerEventPageSchema = {
@@ -481,6 +526,7 @@ export const providerEventPageSchema = {
   $id: "https://schemas.opensales.system/provider/v1/event-page.schema.json",
   $comment: "SPDX-License-Identifier: Apache-2.0",
   title: "OpenSales System Provider Event Page v1",
+  description: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Cursor page of external Provider fact events.",
   type: "object",
   additionalProperties: false,
   required: ["events", "nextCursor"],

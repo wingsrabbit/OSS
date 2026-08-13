@@ -58,7 +58,8 @@ export async function stableProviderOperationId(parts: {
 }): Promise<string> {
   const digest = await sha256(`opensales-provider-operation:v1\0${canonicalProviderJson(parts)}`);
   const bytes = digest.slice(0, 16);
-  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
+  // UUIDv8 explicitly permits application-defined SHA-256 name derivation.
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x80;
   bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
   const hex = bytesToHex(bytes);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
@@ -214,4 +215,231 @@ export function reduceProviderEvents(events: readonly ProviderEvent[]): Provider
     latest = event;
   }
   return { latest, accepted, ignoredDuplicateOrStale };
+}
+
+export type ProviderPermissionExpansionCategory =
+  | "identity"
+  | "endpoint"
+  | "contract_version"
+  | "capability"
+  | "operation"
+  | "event_subscription"
+  | "scope"
+  | "data_field"
+  | "secret"
+  | "concurrency_limit"
+  | "amount_limit"
+  | "resource_limit"
+  | "retention"
+  | "lifecycle";
+
+export interface ProviderPermissionExpansion {
+  category: ProviderPermissionExpansionCategory;
+  value: string;
+  reason: string;
+}
+
+export interface ProviderPermissionExpansionReview {
+  requiresFreshApproval: boolean;
+  expansions: ProviderPermissionExpansion[];
+}
+
+function additions(current: readonly string[], candidate: readonly string[]): string[] {
+  const installed = new Set(current);
+  return candidate.filter((value) => !installed.has(value));
+}
+
+function numericLimitExpanded(current: number | null, candidate: number | null): boolean {
+  return current !== null && (candidate === null || candidate > current);
+}
+
+function moneyLimitExpanded(current: string | null, candidate: string | null): boolean {
+  return current !== null && (candidate === null || BigInt(candidate) > BigInt(current));
+}
+
+export function reviewProviderPermissionExpansion(
+  installed: ProviderManifest,
+  candidate: ProviderManifest,
+): ProviderPermissionExpansionReview {
+  if (installed.providerId !== candidate.providerId) {
+    throw new Error("Cannot compare manifests from different Provider identities");
+  }
+  const expansions: ProviderPermissionExpansion[] = [];
+  const record = (
+    category: ProviderPermissionExpansionCategory,
+    value: string,
+    reason: string,
+  ) => expansions.push({ category, value, reason });
+
+  if (installed.endpointBaseUrl !== candidate.endpointBaseUrl) {
+    record("endpoint", candidate.endpointBaseUrl, "Provider endpoint identity changed");
+  }
+  if (
+    installed.publisher.name !== candidate.publisher.name ||
+    installed.publisher.website !== candidate.publisher.website ||
+    installed.license.identifier !== candidate.license.identifier ||
+    installed.license.url !== candidate.license.url
+  ) {
+    record("identity", candidate.publisher.name, "Provider publisher or license identity changed");
+  }
+  const installedCapabilities = new Map(
+    installed.capabilities.map((declaration) => [declaration.capability, declaration]),
+  );
+  for (const declaration of candidate.capabilities) {
+    const current = installedCapabilities.get(declaration.capability);
+    if (!current) {
+      record("capability", declaration.capability, "Provider requested a new capability");
+      continue;
+    }
+    if (current.contractVersion !== declaration.contractVersion) {
+      record(
+        "contract_version",
+        `${declaration.capability}:${declaration.contractVersion}`,
+        "Provider requested a different capability contract version",
+      );
+    }
+    for (const operation of additions(current.operations, declaration.operations)) {
+      record("operation", `${declaration.capability}:${operation}`, "Provider requested a new operation");
+    }
+    for (const subscription of additions(current.eventSubscriptions, declaration.eventSubscriptions)) {
+      record(
+        "event_subscription",
+        `${declaration.capability}:${subscription}`,
+        "Provider requested a new event subscription",
+      );
+    }
+  }
+  for (const scope of additions(installed.permissions.scopes, candidate.permissions.scopes)) {
+    record("scope", scope, "Provider requested a new API scope");
+  }
+  for (const field of additions(installed.permissions.dataFields, candidate.permissions.dataFields)) {
+    record("data_field", field, "Provider requested a new data field");
+  }
+  const installedSecrets = new Map(installed.permissions.secrets.map((secret) => [secret.name, secret]));
+  for (const secret of candidate.permissions.secrets) {
+    const current = installedSecrets.get(secret.name);
+    if (
+      !current ||
+      current.purpose !== secret.purpose ||
+      current.required !== secret.required ||
+      current.rotation !== secret.rotation
+    ) {
+      record("secret", secret.name, "Provider requested a new or changed injected Secret");
+    }
+  }
+  if (moneyLimitExpanded(installed.limits.maxAmountMinor, candidate.limits.maxAmountMinor)) {
+    record("amount_limit", candidate.limits.maxAmountMinor ?? "unlimited", "Provider amount limit increased");
+  }
+  if (candidate.limits.maxConcurrentOperations > installed.limits.maxConcurrentOperations) {
+    record(
+      "concurrency_limit",
+      String(candidate.limits.maxConcurrentOperations),
+      "Provider concurrency limit increased",
+    );
+  }
+  if (numericLimitExpanded(installed.limits.maxOwnedResources, candidate.limits.maxOwnedResources)) {
+    record("resource_limit", String(candidate.limits.maxOwnedResources ?? "unlimited"), "Provider resource limit increased");
+  }
+  for (const key of ["operationDays", "eventDays", "piiDays"] as const) {
+    if (candidate.retention[key] > installed.retention[key]) {
+      record("retention", `${key}:${candidate.retention[key]}`, "Provider retention period increased");
+    }
+  }
+  for (const key of [
+    "uninstallRequiresNoUnknownOperations",
+    "uninstallRequiresNoOwnedResources",
+    "uninstallRequiresNoPendingFunds",
+  ] as const) {
+    if (installed.lifecycle[key] && !candidate.lifecycle[key]) {
+      record("lifecycle", key, "Provider requested a weaker uninstall guard");
+    }
+  }
+  return { requiresFreshApproval: expansions.length > 0, expansions };
+}
+
+export interface ProviderInstallationReview {
+  identity: {
+    providerId: string;
+    displayName: string;
+    endpointBaseUrl: string;
+    publisher: string;
+    license: string;
+  };
+  versions: Array<{ capability: ProviderCapability; contractVersion: string }>;
+  capabilities: Array<{
+    capability: ProviderCapability;
+    operations: string[];
+    eventSubscriptions: string[];
+  }>;
+  scopes: string[];
+  dataFields: string[];
+  secrets: Array<{ name: string; purpose: string; required: boolean; rotation: string }>;
+  limits: ProviderManifest["limits"];
+  retention: ProviderManifest["retention"];
+  lifecycle: ProviderManifest["lifecycle"];
+}
+
+export function providerInstallationReview(manifest: ProviderManifest): ProviderInstallationReview {
+  return {
+    identity: {
+      providerId: manifest.providerId,
+      displayName: manifest.displayName,
+      endpointBaseUrl: manifest.endpointBaseUrl,
+      publisher: manifest.publisher.name,
+      license: manifest.license.identifier,
+    },
+    versions: manifest.capabilities.map(({ capability, contractVersion }) => ({
+      capability,
+      contractVersion,
+    })),
+    capabilities: manifest.capabilities.map(({ capability, operations, eventSubscriptions }) => ({
+      capability,
+      operations: [...operations],
+      eventSubscriptions: [...eventSubscriptions],
+    })),
+    scopes: [...manifest.permissions.scopes],
+    dataFields: [...manifest.permissions.dataFields],
+    secrets: manifest.permissions.secrets.map((secret) => ({ ...secret })),
+    limits: { ...manifest.limits },
+    retention: { ...manifest.retention },
+    lifecycle: { ...manifest.lifecycle },
+  };
+}
+
+export interface ProviderOwnershipFacts {
+  unknownOperations: number;
+  pendingFunds: number;
+  ownedActiveResources: number;
+}
+
+export interface ProviderUninstallDecision {
+  allowed: boolean;
+  blockers: Array<"unknown_operations" | "pending_funds" | "owned_active_resources">;
+  requiredNextStep: "uninstall" | "drain_reconcile_export_or_manual_takeover";
+}
+
+export function providerUninstallDecision(
+  manifest: ProviderManifest,
+  facts: ProviderOwnershipFacts,
+): ProviderUninstallDecision {
+  for (const [key, value] of Object.entries(facts)) {
+    if (!Number.isInteger(value) || value < 0) throw new RangeError(`${key} must be a non-negative integer`);
+  }
+  const blockers: ProviderUninstallDecision["blockers"] = [];
+  if (manifest.lifecycle.uninstallRequiresNoUnknownOperations && facts.unknownOperations > 0) {
+    blockers.push("unknown_operations");
+  }
+  if (manifest.lifecycle.uninstallRequiresNoPendingFunds && facts.pendingFunds > 0) {
+    blockers.push("pending_funds");
+  }
+  if (manifest.lifecycle.uninstallRequiresNoOwnedResources && facts.ownedActiveResources > 0) {
+    blockers.push("owned_active_resources");
+  }
+  return {
+    allowed: blockers.length === 0,
+    blockers,
+    requiredNextStep: blockers.length === 0
+      ? "uninstall"
+      : "drain_reconcile_export_or_manual_takeover",
+  };
 }

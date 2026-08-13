@@ -88,6 +88,7 @@ jobs:
       DATABASE_API_ROLE_PASSWORD: ci-only-api-database-password-000000000000
       DATABASE_WORKER_ROLE_PASSWORD: ci-only-worker-database-password-000000000
       PROVIDER_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/provider
+      PROVIDER_CONFORMANCE_DATABASE_NAME: provider
       OSS_ENV: test
       OSS_PUBLIC_URL: http://127.0.0.1:5173
       WEB_ORIGIN: http://127.0.0.1:5173
@@ -100,6 +101,7 @@ jobs:
       MOCK_PAYMENT_PROVIDER_TOKEN: ci-only-payment-token-00000000000000000
       MOCK_PROVISIONING_PROVIDER_TOKEN: ci-only-provision-token-000000000000000
       MOCK_MAIL_PROVIDER_TOKEN: ci-only-mail-token-00000000000000000000
+      MOCK_PROVIDER_PLATFORM_TOKEN: ci-only-provider-platform-token-00000000
       LAB_MAILBOX_TOKEN: ci-only-mailbox-token-000000000000000000
       PROVIDER_OPERATION_CAPABILITY_SECRET: ci-only-operation-capability-secret-000000
       PAYMENT_METHOD_TOKEN_KEY: FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU
@@ -157,6 +159,12 @@ jobs:
           await client.connect();
           await client.query('CREATE DATABASE provider');
           await client.end();"
+
+      - name: Run public Provider examples through HTTP-only conformance
+        run: pnpm --filter @opensales/provider-conformance test:examples
+
+      - name: Run six-capability Mock Provider reliability and restart conformance
+        run: pnpm --filter @opensales/provider-conformance test:mock-lab
 
       - name: Create isolated renewal lifecycle database
         shell: bash

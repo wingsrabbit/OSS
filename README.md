@@ -131,8 +131,12 @@ Provider credential. Laboratory deployment secrets belong outside Git.
 - `apps/worker`: PostgreSQL durable job worker and reconciliation flow.
 - `apps/web`: React/Vite customer interface with persistent Mock-only warning.
 - `packages/core`: exact-money pricing and monotonic state rules.
-- `providers/mock-lab`: out-of-process Mock Payment, Provisioning, and Mail
-  Provider with its own database.
+- `packages/provider-contracts` and `packages/provider-sdk-typescript`: public
+  Apache-2.0 schemas, validator, generated OpenAPI, and official SDK.
+- `providers/mock-lab`: out-of-process six-capability functional Mock Provider
+  with its own database.
+- `providers/example-sdk` and `providers/example-schema-only-tax`: official SDK
+  and independent public-schema-only Provider examples.
 - `compose.yaml`: isolated local laboratory topology.
 
 TermRat names and prices live only in the deployment seed
@@ -148,6 +152,10 @@ Core, Web, Worker, and core administration tools are licensed under
 `AGPL-3.0-or-later`. Provider contracts, SDK material, conformance assets, and
 Mock Providers use `Apache-2.0` as described in
 [LICENSES/README.md](LICENSES/README.md).
+
+Provider developers can start from the generated artifacts, both examples, and
+the HTTP-only functional conformance workflow in
+[docs/provider-development.md](docs/provider-development.md).
 
 Operators handling synthetic Add Funds losses should read
 [docs/operators/add-funds-chargebacks.md](docs/operators/add-funds-chargebacks.md).

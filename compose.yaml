@@ -111,6 +111,23 @@ services:
       retries: 20
     security_opt: ["no-new-privileges:true"]
 
+  provider-platform-db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: provider_platform
+      POSTGRES_USER: provider_platform
+      POSTGRES_PASSWORD: ${PROVIDER_PLATFORM_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-platform-db-data:/var/lib/postgresql
+    networks: [provider-platform-data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U provider_platform -d provider_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+
   seed:
     build:
       context: .
@@ -271,6 +288,20 @@ services:
         condition: service_healthy
     networks: [mail-data, mailbox-app]
 
+  provider-platform:
+    <<: *provider-base
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider_platform:${PROVIDER_PLATFORM_DATABASE_PASSWORD:?required}@provider-platform-db:5432/provider_platform
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
+      MOCK_PROVIDER_PUBLIC_BASE_URL: http://127.0.0.1:4105
+      CORE_CALLBACK_URL: http://127.0.0.1
+    depends_on:
+      provider-platform-db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4105:4000"
+    networks: [provider-platform-data, provider-platform-app]
+
   web:
     build:
       context: .
@@ -293,6 +324,7 @@ volumes:
   provider-payment-db-data:
   provider-provisioning-db-data:
   provider-mail-db-data:
+  provider-platform-db-data:
 
 networks:
   core-data:
@@ -303,6 +335,8 @@ networks:
     internal: true
   mail-data:
     internal: true
+  provider-platform-data:
+    internal: true
   core-app:
     internal: true
   payment-app:
@@ -312,6 +346,8 @@ networks:
   mail-app:
     internal: true
   mailbox-app:
+    internal: true
+  provider-platform-app:
     internal: true
   payment-callback:
     internal: true

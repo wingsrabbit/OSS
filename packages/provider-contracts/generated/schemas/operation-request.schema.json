@@ -3,6 +3,7 @@
   "$id": "https://schemas.opensales.system/provider/v1alpha1/operation-request.schema.json",
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "title": "OpenSales System Provider Operation Request v1alpha1",
+  "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Idempotent Provider operation request.",
   "oneOf": [
     {
       "type": "object",
@@ -44,8 +45,7 @@
           "enum": [
             "payment.authorize",
             "payment.capture",
-            "payment.refund",
-            "payment.reconcile"
+            "payment.refund"
           ]
         },
         "input": {
@@ -122,8 +122,7 @@
             "resource.reboot",
             "resource.change_password",
             "resource.change_plan",
-            "resource.terminate",
-            "resource.reconcile"
+            "resource.terminate"
           ]
         },
         "input": {
@@ -202,8 +201,7 @@
         },
         "action": {
           "enum": [
-            "mail.send",
-            "mail.reconcile"
+            "mail.send"
           ]
         },
         "input": {
@@ -285,8 +283,7 @@
         },
         "action": {
           "enum": [
-            "verification.evaluate",
-            "verification.reconcile"
+            "verification.evaluate"
           ]
         },
         "input": {
@@ -363,8 +360,7 @@
         },
         "action": {
           "enum": [
-            "tax.quote",
-            "tax.reconcile"
+            "tax.quote"
           ]
         },
         "input": {
@@ -461,8 +457,7 @@
         },
         "action": {
           "enum": [
-            "challenge.evaluate",
-            "challenge.reconcile"
+            "challenge.evaluate"
           ]
         },
         "input": {

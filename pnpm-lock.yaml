@@ -138,6 +138,22 @@ importers:
         specifier: 7.0.2
         version: 7.0.2
 
+  conformance/provider-platform:
+    dependencies:
+      '@opensales/provider-contracts':
+        specifier: workspace:*
+        version: link:../../packages/provider-contracts
+      '@opensales/provider-sdk-typescript':
+        specifier: workspace:*
+        version: link:../../packages/provider-sdk-typescript
+    devDependencies:
+      '@types/node':
+        specifier: 24.10.13
+        version: 24.10.13
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+
   packages/core:
     devDependencies:
       '@types/node':
@@ -165,6 +181,28 @@ importers:
       '@opensales/provider-contracts':
         specifier: workspace:*
         version: link:../provider-contracts
+    devDependencies:
+      '@types/node':
+        specifier: 24.10.13
+        version: 24.10.13
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+
+  providers/example-schema-only-tax:
+    dependencies:
+      ajv:
+        specifier: 8.20.0
+        version: 8.20.0
+
+  providers/example-sdk:
+    dependencies:
+      '@opensales/provider-contracts':
+        specifier: workspace:*
+        version: link:../../packages/provider-contracts
+      '@opensales/provider-sdk-typescript':
+        specifier: workspace:*
+        version: link:../../packages/provider-sdk-typescript
     devDependencies:
       '@types/node':
         specifier: 24.10.13

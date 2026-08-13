@@ -11,7 +11,12 @@ COPY apps/api/package.json apps/api/package.json
 COPY apps/worker/package.json apps/worker/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/core/package.json packages/core/package.json
+COPY packages/provider-contracts/package.json packages/provider-contracts/package.json
+COPY packages/provider-sdk-typescript/package.json packages/provider-sdk-typescript/package.json
 COPY providers/mock-lab/package.json providers/mock-lab/package.json
+COPY providers/example-sdk/package.json providers/example-sdk/package.json
+COPY providers/example-schema-only-tax/package.json providers/example-schema-only-tax/package.json
+COPY conformance/provider-platform/package.json conformance/provider-platform/package.json
 RUN pnpm install --frozen-lockfile --ignore-scripts
 COPY . .
 RUN pnpm -r --if-present build

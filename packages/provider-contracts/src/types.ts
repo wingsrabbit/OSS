@@ -35,13 +35,30 @@ export const capabilityOperations = {
   anti_abuse_challenge: ["challenge.evaluate", "challenge.reconcile"],
 } as const satisfies Record<ProviderCapability, readonly string[]>;
 
-export type PaymentAction = (typeof capabilityOperations.payment)[number];
-export type ProvisioningAction = (typeof capabilityOperations.provisioning)[number];
-export type MailAction = (typeof capabilityOperations.mail)[number];
-export type VerificationAction = (typeof capabilityOperations.verification)[number];
-export type TaxAction = (typeof capabilityOperations.tax)[number];
+export const capabilityMutationOperations = {
+  payment: ["payment.authorize", "payment.capture", "payment.refund"],
+  provisioning: [
+    "resource.create",
+    "resource.start",
+    "resource.stop",
+    "resource.reboot",
+    "resource.change_password",
+    "resource.change_plan",
+    "resource.terminate",
+  ],
+  mail: ["mail.send"],
+  verification: ["verification.evaluate"],
+  tax: ["tax.quote"],
+  anti_abuse_challenge: ["challenge.evaluate"],
+} as const satisfies Record<ProviderCapability, readonly string[]>;
+
+export type PaymentAction = (typeof capabilityMutationOperations.payment)[number];
+export type ProvisioningAction = (typeof capabilityMutationOperations.provisioning)[number];
+export type MailAction = (typeof capabilityMutationOperations.mail)[number];
+export type VerificationAction = (typeof capabilityMutationOperations.verification)[number];
+export type TaxAction = (typeof capabilityMutationOperations.tax)[number];
 export type AntiAbuseChallengeAction =
-  (typeof capabilityOperations.anti_abuse_challenge)[number];
+  (typeof capabilityMutationOperations.anti_abuse_challenge)[number];
 
 export interface ProviderOperationBase {
   transportVersion: ProviderTransportVersion;

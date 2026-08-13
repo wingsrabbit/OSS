@@ -3,6 +3,7 @@
   "$id": "https://schemas.opensales.system/provider/v1alpha1/operation-result.schema.json",
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "title": "OpenSales System Provider Operation Result v1alpha1",
+  "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. External result fact; Core retains business decision authority.",
   "oneOf": [
     {
       "type": "object",

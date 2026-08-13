@@ -3,6 +3,7 @@
   "$id": "https://schemas.opensales.system/provider/v1/manifest.schema.json",
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "title": "OpenSales System Provider Manifest v1",
+  "description": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY. Public Provider installation declaration.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -336,14 +337,16 @@
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
           }
         },
         "dataFields": {
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{2,119}$"
           }
         },
         "secrets": {

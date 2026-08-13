@@ -26,6 +26,7 @@
     "build": "tsc -p tsconfig.json",
     "docs": "tsc -p tsconfig.json && node scripts/generate.mjs",
     "docs:check": "tsc -p tsconfig.json && node scripts/generate.mjs --check",
+    "prepack": "npm run docs:check",
     "test": "node --test dist/**/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

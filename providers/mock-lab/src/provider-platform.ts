@@ -305,6 +305,10 @@ export async function registerProviderPlatformRoutes(
     let replayed = false;
     try {
       await client.query("BEGIN");
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`mock-contract-operation:${body.operationId}`],
+      );
       const existing = await client.query<StoredOperation>(
         `SELECT operation_id, capability, request_fingerprint, scenario,
                 result_json, final_result_json
@@ -416,6 +420,10 @@ export async function registerProviderPlatformRoutes(
     let result: ProviderOperationResult | undefined;
     try {
       await client.query("BEGIN");
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`mock-contract-operation:${params.operationId}`],
+      );
       const selected = await client.query<StoredOperation>(
         `SELECT operation_id, capability, request_fingerprint, scenario,
                 result_json, final_result_json

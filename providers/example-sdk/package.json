@@ -1,0 +1,22 @@
+{
+  "name": "@opensales/example-provider-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "node --test dist/**/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@opensales/provider-contracts": "workspace:*",
+    "@opensales/provider-sdk-typescript": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.13",
+    "typescript": "7.0.2"
+  },
+  "engines": { "node": "24.18.0" }
+}

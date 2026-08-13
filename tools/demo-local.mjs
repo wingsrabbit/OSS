@@ -456,6 +456,8 @@ function providerEnvironment(config, kind) {
 function assertDependenciesPresent() {
   const required = [
     "packages/core/node_modules/typescript/bin/tsc",
+    "packages/provider-contracts/node_modules/typescript/bin/tsc",
+    "packages/provider-sdk-typescript/node_modules/typescript/bin/tsc",
     "apps/api/node_modules/typescript/bin/tsc",
     "apps/worker/node_modules/typescript/bin/tsc",
     "providers/mock-lab/node_modules/typescript/bin/tsc",
@@ -473,12 +475,18 @@ function assertDependenciesPresent() {
 function buildWorkspace(node) {
   if (process.env.OSS_DEMO_SKIP_BUILD === "1") return;
   assertDependenciesPresent();
-  console.log("Building API, Worker, Web, Core, and Mock Provider with Node 24.18.0...");
+  console.log("Building API, Worker, Web, Core, public Provider packages, and Mock Provider with Node 24.18.0...");
   commandResult(node, [
     "packages/core/node_modules/typescript/bin/tsc",
     "-p",
     "packages/core/tsconfig.json",
   ]);
+  for (const [compiler, project] of [
+    ["packages/provider-contracts/node_modules/typescript/bin/tsc", "packages/provider-contracts/tsconfig.json"],
+    ["packages/provider-sdk-typescript/node_modules/typescript/bin/tsc", "packages/provider-sdk-typescript/tsconfig.json"],
+  ]) {
+    commandResult(node, [compiler, "-p", project]);
+  }
   for (const [compiler, project] of [
     ["apps/api/node_modules/typescript/bin/tsc", "apps/api/tsconfig.json"],
     ["apps/worker/node_modules/typescript/bin/tsc", "apps/worker/tsconfig.json"],
