@@ -288,6 +288,7 @@ function isPublicApiPath(pathname: string): boolean {
   return (
     pathname === "/api/v1/catalog" ||
     pathname.startsWith("/api/v1/legal/") ||
+    pathname === "/api/v1/content" ||
     pathname === "/api/v1/auth/register" ||
     pathname === "/api/v1/auth/invitation-registrations" ||
     pathname === "/api/v1/auth/verify-email" ||
@@ -300,7 +301,8 @@ function isPublicApiPath(pathname: string): boolean {
 function isAccountScopedPath(pathname: string): boolean {
   return (
     pathname.startsWith("/api/v1/account/") ||
-    pathname.startsWith("/api/v1/customer/") ||
+    (pathname.startsWith("/api/v1/customer/") &&
+      pathname !== "/api/v1/customer/content") ||
     pathname.startsWith("/api/v1/billing/") ||
     pathname === "/api/v1/orders" ||
     pathname.startsWith("/api/v1/orders/") ||

@@ -31,6 +31,9 @@ import {
   subscribeAccountContextInvalidation,
 } from "./api.js";
 import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
+import { ContentHub } from "./ContentHub.js";
+import { ContentOperationsPanel } from "./ContentOperationsPanel.js";
+import { LegalHub } from "./LegalHub.js";
 import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
 import { EmailChangePage, PasswordRecoveryPage, SecurityPanel } from "./SecurityPanel.js";
 import { TicketsPanel } from "./TicketsPanel.js";
@@ -119,7 +122,17 @@ type Product = {
   purchasable: boolean;
 };
 type Legal = {
-  documents: Record<"terms" | "aup" | "privacy", { version: string; title: string; body: string }>;
+  requestedLocale: Locale;
+  documents: Record<"terms" | "aup" | "privacy", {
+    id: string;
+    documentId: string;
+    locale: Locale;
+    fallback: boolean;
+    revision: string;
+    version: string;
+    title: string;
+    body: string;
+  }>;
 };
 type OrderDetail = {
   order: { id: string; status: string; price: { productName: string; billingCycle: string } };
@@ -1047,6 +1060,12 @@ export function App() {
   const canManageManualFulfillment =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("services.manual_fulfillment"));
+  const canReadContent =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("content.read"));
+  const canManageContent =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("content.manage"));
   const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
   const canViewAccount360 =
     eligibleStaff &&
@@ -1060,6 +1079,7 @@ export function App() {
     canManageRefunds ||
     canManageManualFulfillment ||
     canManageServiceOperations ||
+    canReadContent ||
     canViewAccount360 ||
     canUseFullAdminWorkspace;
   const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
@@ -1241,6 +1261,18 @@ export function App() {
     setNotice("");
     setError(message);
   }, [setError, setNotice]);
+  const contentNotice = useRef(showTicketNotice);
+  const contentError = useRef(showTicketError);
+  contentNotice.current = showTicketNotice;
+  contentError.current = showTicketError;
+  const showContentNotice = useCallback(
+    (message: string) => contentNotice.current(message),
+    [],
+  );
+  const showContentError = useCallback(
+    (message: string) => contentError.current(message),
+    [],
+  );
   const text = words[locale];
   const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const manualReceiptAmountsValid =
@@ -1510,6 +1542,7 @@ export function App() {
   }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   useEffect(() => {
+    setLegal(null);
     void Promise.all([
       api<{ products: Product[] }>(`/api/v1/catalog?locale=${locale}`).then((data) =>
         setProducts(data.products),
@@ -2550,6 +2583,11 @@ export function App() {
           configuration,
           termsVersion: legal.documents.terms.version,
           aupVersion: legal.documents.aup.version,
+          termsDocumentId: legal.documents.terms.documentId,
+          aupDocumentId: legal.documents.aup.documentId,
+          legalLocale: legal.requestedLocale,
+          termsLocale: legal.documents.terms.locale,
+          aupLocale: legal.documents.aup.locale,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
@@ -4885,6 +4923,42 @@ export function App() {
             </p>
           </section>
         )}
+
+        <ContentHub
+          active={route === "/"}
+          customer={false}
+          locale={locale}
+          onError={showContentError}
+        />
+
+        <ContentHub
+          active={
+            route === "/customer" &&
+            sessionResolved &&
+            me !== null &&
+            me.verification.email === "passed" &&
+            !me.restrictions.user
+          }
+          customer
+          locale={locale}
+          onError={showContentError}
+        />
+
+        <LegalHub
+          active={route === "/" || route === "/customer"}
+          locale={locale}
+          documents={legal?.documents ?? null}
+        />
+
+        <ContentOperationsPanel
+          active={route === "/admin" && sessionResolved && canReadContent}
+          locale={locale}
+          canRead={canReadContent}
+          canManage={canManageContent}
+          accessFingerprint={staffAccessFingerprint}
+          onNotice={showContentNotice}
+          onError={showContentError}
+        />
 
         {route === "/customer" &&
           me &&
@@ -7297,8 +7371,12 @@ export function App() {
                 Continue in customer workspace
               </button>
             ) : (
-              <button className="primary wide" disabled={!canCreateOrders} onClick={createOrder}>
-                {canCreateOrders ? text.buy : text.pending}
+              <button
+                className="primary wide"
+                disabled={!canCreateOrders || legal === null}
+                onClick={createOrder}
+              >
+                {canCreateOrders && legal !== null ? text.buy : text.pending}
               </button>
             )}
           </section>
