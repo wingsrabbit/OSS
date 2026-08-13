@@ -159,8 +159,8 @@ export async function lockCatalogOffer(
      FROM product_prices
      WHERE id = $1
        AND active
-       AND valid_from <= pg_catalog.transaction_timestamp()
-       AND (valid_until IS NULL OR valid_until > pg_catalog.transaction_timestamp())
+       AND valid_from <= pg_catalog.clock_timestamp()
+       AND (valid_until IS NULL OR valid_until > pg_catalog.clock_timestamp())
      FOR SHARE`,
     [input.priceId],
   );
@@ -276,8 +276,8 @@ export async function lockPromotion(
      FROM promotions
      WHERE code = $1
        AND active
-       AND valid_from <= pg_catalog.transaction_timestamp()
-       AND (valid_until IS NULL OR valid_until > pg_catalog.transaction_timestamp())
+       AND valid_from <= pg_catalog.clock_timestamp()
+       AND (valid_until IS NULL OR valid_until > pg_catalog.clock_timestamp())
      ORDER BY revision DESC, id DESC
      LIMIT 1`,
     [input.code.toUpperCase()],
@@ -306,8 +306,8 @@ export async function lockPromotion(
      FROM promotions
      WHERE id = $1
        AND active
-       AND valid_from <= pg_catalog.transaction_timestamp()
-       AND (valid_until IS NULL OR valid_until > pg_catalog.transaction_timestamp())
+       AND valid_from <= pg_catalog.clock_timestamp()
+       AND (valid_until IS NULL OR valid_until > pg_catalog.clock_timestamp())
      ${input.forUpdate ? "FOR UPDATE" : "FOR SHARE"}`,
     [id],
   );
@@ -343,12 +343,20 @@ export async function lockQuotedPromotion(
   client: DatabaseClient,
   input: Readonly<{
     promotionId: string;
-    snapshot: PromotionSnapshot;
+    snapshot: CommercialPriceSnapshot;
     productId: string;
     billingCycle: BillingCycle;
     currency: string;
   }>,
 ): Promise<LockedPromotion> {
+  const promotionSnapshot = input.snapshot.promotion;
+  if (!promotionSnapshot) {
+    throw commerceError(
+      "Quote Promotion snapshot is missing",
+      409,
+      "QUOTE_SNAPSHOT_INVALID",
+    );
+  }
   const result = await client.query<{
     id: string;
     code: string;
@@ -373,11 +381,11 @@ export async function lockQuotedPromotion(
   const promotion = result.rows[0];
   if (
     !promotion ||
-    promotion.id !== input.snapshot.id ||
-    promotion.code !== input.snapshot.code ||
-    promotion.revision !== input.snapshot.revision ||
-    promotion.discount_kind !== input.snapshot.discountKind ||
-    promotion.application_scope !== input.snapshot.applicationScope ||
+    promotion.id !== promotionSnapshot.id ||
+    promotion.code !== promotionSnapshot.code ||
+    promotion.revision !== promotionSnapshot.revision ||
+    promotion.discount_kind !== promotionSnapshot.discountKind ||
+    promotion.application_scope !== promotionSnapshot.applicationScope ||
     (promotion.product_id !== null && promotion.product_id !== input.productId) ||
     (promotion.billing_cycle !== null && promotion.billing_cycle !== input.billingCycle) ||
     (promotion.currency !== null && promotion.currency !== input.currency)
@@ -388,7 +396,7 @@ export async function lockQuotedPromotion(
       "QUOTE_SNAPSHOT_INVALID",
     );
   }
-  return {
+  const locked: LockedPromotion = {
     id: promotion.id,
     code: promotion.code,
     revision: promotion.revision,
@@ -405,6 +413,57 @@ export async function lockQuotedPromotion(
         ? null
         : BigInt(promotion.maximum_redemptions),
   };
+  const value =
+    locked.discountKind === "fixed"
+      ? String(locked.fixedAmountMinor)
+      : String(locked.percentageBasisPoints);
+  const discount = (amount: bigint): bigint => {
+    if (locked.discountKind === "fixed") {
+      if (locked.fixedAmountMinor === null || locked.fixedAmountMinor <= 0n) {
+        throw commerceError(
+          "Quote Promotion amount is invalid",
+          409,
+          "QUOTE_SNAPSHOT_INVALID",
+        );
+      }
+      return locked.fixedAmountMinor > amount ? amount : locked.fixedAmountMinor;
+    }
+    if (
+      locked.percentageBasisPoints === null ||
+      !Number.isSafeInteger(locked.percentageBasisPoints) ||
+      locked.percentageBasisPoints < 1 ||
+      locked.percentageBasisPoints > 10_000
+    ) {
+      throw commerceError(
+        "Quote Promotion percentage is invalid",
+        409,
+        "QUOTE_SNAPSHOT_INVALID",
+      );
+    }
+    return (amount * BigInt(locked.percentageBasisPoints)) / 10_000n;
+  };
+  const expectedOneTime =
+    locked.applicationScope === "one_time" || locked.applicationScope === "all"
+      ? discount(
+          input.snapshot.grossOneTimeSubtotalMinor + input.snapshot.grossSetupMinor,
+        )
+      : 0n;
+  const expectedRecurring =
+    locked.applicationScope === "recurring" || locked.applicationScope === "all"
+      ? discount(input.snapshot.grossRecurringSubtotalMinor)
+      : 0n;
+  if (
+    promotionSnapshot.value !== value ||
+    promotionSnapshot.oneTimeDiscountMinor !== expectedOneTime ||
+    promotionSnapshot.recurringDiscountMinor !== expectedRecurring
+  ) {
+    throw commerceError(
+      "Quote Promotion discount snapshot does not match its immutable definition",
+      409,
+      "QUOTE_SNAPSHOT_INVALID",
+    );
+  }
+  return locked;
 }
 
 function snapshotRecord(value: unknown, field: string): Record<string, unknown> {
@@ -526,7 +585,19 @@ export function parseCommercialSnapshot(value: unknown): CommercialPriceSnapshot
     ),
     promotion,
   };
+  const componentOneTime = snapshot.components.reduce(
+    (total, component) =>
+      total + component.oneTimeMinor * BigInt(component.quantity),
+    0n,
+  );
+  const componentRecurring = snapshot.components.reduce(
+    (total, component) =>
+      total + component.recurringMinor * BigInt(component.quantity),
+    0n,
+  );
   if (
+    snapshot.grossOneTimeSubtotalMinor !== componentOneTime ||
+    snapshot.grossRecurringSubtotalMinor !== componentRecurring ||
     snapshot.invoiceTotalMinor !==
       snapshot.oneTimeSubtotalMinor + snapshot.setupMinor + snapshot.recurringSubtotalMinor ||
     snapshot.grossInvoiceTotalMinor !==
@@ -535,6 +606,24 @@ export function parseCommercialSnapshot(value: unknown): CommercialPriceSnapshot
         snapshot.grossRecurringSubtotalMinor
   ) {
     throw commerceError("Quote price totals snapshot is invalid", 409, "QUOTE_SNAPSHOT_INVALID");
+  }
+  if (
+    promotion === null
+      ? snapshot.grossOneTimeSubtotalMinor !== snapshot.oneTimeSubtotalMinor ||
+        snapshot.grossSetupMinor !== snapshot.setupMinor ||
+        snapshot.grossRecurringSubtotalMinor !== snapshot.recurringSubtotalMinor
+      : snapshot.grossOneTimeSubtotalMinor + snapshot.grossSetupMinor -
+            snapshot.oneTimeSubtotalMinor -
+            snapshot.setupMinor !==
+          promotion.oneTimeDiscountMinor ||
+        snapshot.grossRecurringSubtotalMinor - snapshot.recurringSubtotalMinor !==
+          promotion.recurringDiscountMinor
+  ) {
+    throw commerceError(
+      "Quote Promotion totals snapshot is invalid",
+      409,
+      "QUOTE_SNAPSHOT_INVALID",
+    );
   }
   return snapshot;
 }

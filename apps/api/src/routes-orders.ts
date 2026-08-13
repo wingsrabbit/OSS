@@ -180,15 +180,22 @@ export async function registerOrderRoutes(
     assertEligible(user);
     assertCustomerCapability(user, "orders.create");
     const body = checkoutSchema.parse(request.body);
-    const fingerprint = requestFingerprint("orders.create:v1", {
+    const baseFingerprintInput = {
       priceId: body.priceId,
       configuration: body.configuration,
-      promotionCode: body.promotionCode,
       termsVersion: body.termsVersion,
       aupVersion: body.aupVersion,
-      marketingConsent: body.marketingConsent,
-      marketingConsentPolicyVersion: body.marketingConsentPolicyVersion ?? null,
-    });
+    };
+    const fingerprint =
+      body.promotionCode === null && !body.marketingConsent
+        ? requestFingerprint("orders.create:v1", baseFingerprintInput)
+        : requestFingerprint("orders.create:v2", {
+            ...baseFingerprintInput,
+            promotionCode: body.promotionCode,
+            marketingConsent: body.marketingConsent,
+            marketingConsentPolicyVersion:
+              body.marketingConsentPolicyVersion ?? null,
+          });
 
     const created = await transaction(pool, async (client) => {
       const context = await lockAccountContextForMutation(

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { randomUUID } from "node:crypto";
 import { LAB_BANNER, type BillingCycle, type FulfillmentMode } from "@opensales/core";
 import {
   buildCommercialPriceSnapshot,
@@ -395,7 +396,7 @@ const quoteSelect = `
          quote.currency, quote.one_time_minor::text, quote.setup_minor::text,
          quote.recurring_minor::text, quote.total_minor::text,
          quote.expires_at,
-         quote.expires_at > pg_catalog.transaction_timestamp() AS unexpired,
+         quote.expires_at > pg_catalog.clock_timestamp() AS unexpired,
          quote.created_at,
          void_fact.id AS void_id, void_fact.reason AS void_reason,
          void_fact.voided_at,
@@ -1421,7 +1422,7 @@ export async function registerCommerceRoutes(
         acceptance_id: string | null;
       }>(
         `SELECT quote.id, quote.request_fingerprint, quote.expires_at,
-                quote.expires_at > pg_catalog.transaction_timestamp() AS unexpired,
+                quote.expires_at > pg_catalog.clock_timestamp() AS unexpired,
                 void_fact.id AS void_id, acceptance.id AS acceptance_id
          FROM sales_quotes quote
          LEFT JOIN sales_quote_voids void_fact ON void_fact.quote_id = quote.id
@@ -1801,7 +1802,7 @@ export async function registerCommerceRoutes(
         }
         promotion = await lockQuotedPromotion(client, {
           promotionId: quote.promotion_id,
-          snapshot: snapshot.promotion,
+          snapshot,
           productId: quote.product_id,
           billingCycle: quote.billing_cycle,
           currency: quote.currency,
@@ -1980,7 +1981,7 @@ export async function registerCommerceRoutes(
         }
         promotion = await lockQuotedPromotion(client, {
           promotionId: quote.promotion_id,
-          snapshot: snapshot.promotion,
+          snapshot,
           productId: quote.product_id,
           billingCycle: quote.billing_cycle,
           currency: quote.currency,
@@ -2024,7 +2025,13 @@ export async function registerCommerceRoutes(
       const issued = await issueCommercialOrder(client, {
         clientAccountId: user.clientAccountId,
         userId: user.userId,
-        idempotencyKey: `quote:${params.quoteId}`,
+        // Customer Checkout keys and internal Quote fulfillment share the
+        // historical Orders uniqueness boundary. Use an unpredictable
+        // server-owned key so a customer cannot reserve the Quote's internal
+        // Order key before accepting it. Acceptance replay is governed by the
+        // immutable sales_quote_acceptances fact above, not this implementation
+        // key.
+        idempotencyKey: `quote-order:${randomUUID()}`,
         requestFingerprint: fingerprint,
         sourceQuoteId: params.quoteId,
         productId: quote.product_id,
@@ -2066,7 +2073,12 @@ export async function registerCommerceRoutes(
            quote_id, client_account_id, accepted_by_user_id,
            order_id, invoice_id, terms_document_id, aup_document_id,
            idempotency_key, request_fingerprint
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         )
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+         FROM sales_quotes quote
+         WHERE quote.id = $1
+           AND quote.client_account_id = $2
+           AND quote.expires_at > pg_catalog.clock_timestamp()
          RETURNING id`,
         [
           params.quoteId,
@@ -2081,7 +2093,13 @@ export async function registerCommerceRoutes(
         ],
       );
       const acceptanceId = acceptance.rows[0]?.id;
-      if (!acceptanceId) throw new Error("Unable to record Quote acceptance");
+      if (!acceptanceId) {
+        throw commerceRouteError(
+          "Quote expired before acceptance completed",
+          409,
+          "QUOTE_EXPIRED",
+        );
+      }
       if (body.marketingConsent) {
         await recordMarketingConsent(client, {
           clientAccountId: user.clientAccountId,
