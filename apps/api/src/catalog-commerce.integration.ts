@@ -332,6 +332,25 @@ try {
   });
   assert.equal(supply.statusCode, 200, supply.body);
 
+  const projectionClient = new pg.Client({ connectionString: databaseUrl.toString() });
+  await projectionClient.connect();
+  try {
+    await projectionClient.query("BEGIN");
+    await projectionClient.query(
+      `UPDATE product_supply_capacities
+       SET committed_units = 1
+       WHERE product_id = 'mock-capacity-service'`,
+    );
+    await assert.rejects(
+      projectionClient.query("COMMIT"),
+      /expected 0 from active Reservations/,
+      "direct SQL must not commit a drifted supply projection",
+    );
+  } finally {
+    await projectionClient.query("ROLLBACK").catch(() => undefined);
+    await projectionClient.end();
+  }
+
   const price = await app.inject({
     method: "POST",
     url: "/api/v1/admin/catalog/products/mock-capacity-service/prices",
@@ -364,6 +383,42 @@ try {
     },
   });
   assert.equal(promotion.statusCode, 201, promotion.body);
+
+  await assert.rejects(
+    pool.query(
+      `INSERT INTO product_prices(
+         product_id, catalog_product_revision_id, revision, currency,
+         billing_cycle, one_time_minor, setup_minor, recurring_minor,
+         active, valid_from
+       ) VALUES ($1, $2, 999999, 'USD', 'monthly', 0, 0, 101,
+                 false, pg_catalog.clock_timestamp() + interval '1 minute')`,
+      [productBody.productId, productBody.productRevisionId],
+    ),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "23P01");
+      return true;
+    },
+    "direct SQL must not create an overlapping active Product price interval",
+  );
+  await assert.rejects(
+    pool.query(
+      `INSERT INTO promotions(
+         code, revision, name, product_id, billing_cycle,
+         discount_kind, application_scope, percentage_basis_points,
+         active, valid_from, maximum_redemptions, created_by_staff_user_id
+       ) VALUES (
+         'LABFREE', 999999, 'Forbidden overlapping Promotion',
+         'mock-capacity-service', 'monthly', 'percentage', 'all', 10000,
+         false, pg_catalog.clock_timestamp() + interval '1 minute', 1, $1
+       )`,
+      [staff.userId],
+    ),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "23P01");
+      return true;
+    },
+    "direct SQL must not create an overlapping active Promotion interval",
+  );
 
   const preview = await app.inject({
     method: "POST",
@@ -496,6 +551,44 @@ try {
     headers: customerHeaders(winningIdentity),
   });
   assert.equal(json<{ granted: boolean }>(consentAfter).granted, false);
+
+  await pool.query(
+    `UPDATE orders
+     SET status = 'rejected', updated_at = pg_catalog.clock_timestamp(),
+         version = version + 1
+     WHERE id = $1`,
+    [winningOrder.orderId],
+  );
+  const releasedRejectedOrder = await pool.query<{
+    committed: string;
+    releases: string;
+    reason: string;
+  }>(
+    `SELECT
+       capacity.committed_units::text AS committed,
+       pg_catalog.count(release_fact.id)::text AS releases,
+       pg_catalog.min(release_fact.reason) AS reason
+     FROM product_supply_capacities capacity
+     LEFT JOIN supply_capacity_releases release_fact
+       ON release_fact.product_id = capacity.product_id
+     WHERE capacity.product_id = 'mock-capacity-service'
+     GROUP BY capacity.committed_units`,
+  );
+  assert.deepEqual(releasedRejectedOrder.rows[0], {
+    committed: "0",
+    releases: "1",
+    reason: "order_rejected",
+  });
+  await assert.rejects(
+    pool.query(
+      `UPDATE orders
+       SET status = 'waiting_payment', updated_at = pg_catalog.clock_timestamp(),
+           version = version + 1
+       WHERE id = $1`,
+      [winningOrder.orderId],
+    ),
+    /An Order that released tracked supply cannot leave its terminal state/,
+  );
 
   const revision = await app.inject({
     method: "POST",
@@ -633,6 +726,195 @@ try {
       .acceptance.invoiceTotalMinor,
     "1000",
   );
+
+  const expiryClient = new pg.Client({ connectionString: databaseUrl.toString() });
+  await expiryClient.connect();
+  try {
+    const expiryQuoteId = randomUUID();
+    const expiryOrderId = randomUUID();
+    const expiryInvoiceId = randomUUID();
+    await expiryClient.query("BEGIN");
+    await expiryClient.query(
+      `INSERT INTO sales_quotes(
+         id, client_account_id, created_by_staff_user_id,
+         product_id, catalog_product_revision_id, product_price_id,
+         product_name, fulfillment_mode, billing_cycle, configuration,
+         price_snapshot, promotion_id, promotion_snapshot, capacity_snapshot,
+         currency, one_time_minor, setup_minor, recurring_minor, total_minor,
+         expires_at, idempotency_key, request_fingerprint, created_at
+       )
+       SELECT
+         $1, client_account_id, created_by_staff_user_id,
+         product_id, catalog_product_revision_id, product_price_id,
+         product_name, fulfillment_mode, billing_cycle, configuration,
+         price_snapshot, promotion_id, promotion_snapshot, capacity_snapshot,
+         currency, one_time_minor, setup_minor, recurring_minor, total_minor,
+         pg_catalog.clock_timestamp() + interval '250 milliseconds',
+         $2, $3, pg_catalog.clock_timestamp()
+       FROM sales_quotes
+       WHERE id = $4`,
+      [
+        expiryQuoteId,
+        `expiry-clock-${randomUUID()}`,
+        `expiry-clock-fingerprint-${randomUUID()}`,
+        quoteId,
+      ],
+    );
+    await expiryClient.query(
+      `INSERT INTO orders(
+         id, client_account_id, submitted_by_user_id, status, currency,
+         price_snapshot, one_time_minor, setup_minor, recurring_minor,
+         total_minor, idempotency_key, request_fingerprint, source_quote_id
+       )
+       SELECT $1, quote.client_account_id, $2, 'awaiting_manual', quote.currency,
+              quote.price_snapshot, quote.one_time_minor, quote.setup_minor,
+              quote.recurring_minor, quote.total_minor, $3, $4, quote.id
+       FROM sales_quotes quote
+       WHERE quote.id = $5`,
+      [
+        expiryOrderId,
+        customerA.userId,
+        `expiry-order-${randomUUID()}`,
+        `expiry-order-fingerprint-${randomUUID()}`,
+        expiryQuoteId,
+      ],
+    );
+    await expiryClient.query(
+      `INSERT INTO invoices(id, client_account_id, order_id, currency, total_minor, due_at)
+       SELECT $1, client_account_id, id, currency, total_minor,
+              pg_catalog.clock_timestamp() + interval '7 days'
+       FROM orders
+       WHERE id = $2`,
+      [expiryInvoiceId, expiryOrderId],
+    );
+    await expiryClient.query("SELECT pg_catalog.pg_sleep(0.4)");
+    await assert.rejects(
+      expiryClient.query(
+        `INSERT INTO sales_quote_acceptances(
+           quote_id, client_account_id, accepted_by_user_id,
+           order_id, invoice_id, terms_document_id, aup_document_id,
+           idempotency_key, request_fingerprint
+         )
+         SELECT $1, $2, $3, $4, $5,
+                (SELECT id FROM legal_documents
+                 WHERE kind = 'terms' AND locale = 'en' AND version = 'commerce-v1'),
+                (SELECT id FROM legal_documents
+                 WHERE kind = 'aup' AND locale = 'en' AND version = 'commerce-v1'),
+                $6, $7`,
+        [
+          expiryQuoteId,
+          customerA.accountId,
+          customerA.userId,
+          expiryOrderId,
+          expiryInvoiceId,
+          `expiry-accept-${randomUUID()}`,
+          `expiry-accept-fingerprint-${randomUUID()}`,
+        ],
+      ),
+      /Expired Quotes cannot be accepted/,
+      "Quote expiry must use the wall clock, not the transaction start",
+    );
+  } finally {
+    await expiryClient.query("ROLLBACK").catch(() => undefined);
+    await expiryClient.end();
+  }
+
+  const currentPrice = await app.inject({
+    method: "POST",
+    url: "/api/v1/admin/catalog/products/mock-capacity-service/prices",
+    headers: staffHeaders(staff),
+    payload: {
+      billingCycle: "monthly",
+      currency: "USD",
+      oneTimeMinor: "0",
+      setupMinor: "0",
+      recurringMinor: "100",
+    },
+  });
+  assert.equal(currentPrice.statusCode, 201, currentPrice.body);
+  const currentPriceId = json<{ priceId: string }>(currentPrice).priceId;
+  const preemptingCheckout = await app.inject({
+    method: "POST",
+    url: "/api/v1/orders",
+    headers: customerHeaders(customerA),
+    payload: {
+      priceId: currentPriceId,
+      configuration: { units: 1 },
+      termsVersion: "commerce-v1",
+      aupVersion: "commerce-v1",
+      idempotencyKey: `quote:${quoteId}`,
+    },
+  });
+  assert.equal(preemptingCheckout.statusCode, 201, preemptingCheckout.body);
+  const preemptingOrder = json<{ orderId: string; serviceId: string }>(
+    preemptingCheckout,
+  );
+
+  await Promise.all([
+    pool.query(
+      `UPDATE orders
+       SET status = 'cancelled', updated_at = pg_catalog.clock_timestamp(),
+           version = version + 1
+       WHERE id = $1`,
+      [preemptingOrder.orderId],
+    ),
+    pool.query(
+      `UPDATE services
+       SET status = 'terminated', updated_at = pg_catalog.clock_timestamp(),
+           version = version + 1
+       WHERE id = $1`,
+      [preemptingOrder.serviceId],
+    ),
+  ]);
+  const racedRelease = await pool.query<{
+    committed: string;
+    releases: string;
+  }>(
+    `SELECT
+       capacity.committed_units::text AS committed,
+       pg_catalog.count(release_fact.id)::text AS releases
+     FROM product_supply_capacities capacity
+     LEFT JOIN supply_capacity_releases release_fact
+       ON release_fact.product_id = capacity.product_id
+     WHERE capacity.product_id = 'mock-capacity-service'
+     GROUP BY capacity.committed_units`,
+  );
+  assert.deepEqual(racedRelease.rows[0], { committed: "0", releases: "2" });
+  await assert.rejects(
+    pool.query(
+      `UPDATE services
+       SET status = 'active', updated_at = pg_catalog.clock_timestamp(),
+           version = version + 1
+       WHERE id = $1`,
+      [preemptingOrder.serviceId],
+    ),
+    /A Service that released tracked supply cannot leave terminated state/,
+  );
+  await pool.query(
+    `INSERT INTO supply_capacity_releases(
+       reservation_id, client_account_id, product_id, order_id, service_id, reason
+     )
+     SELECT reservation_id, client_account_id, product_id, order_id, service_id, reason
+     FROM supply_capacity_releases
+     WHERE order_id = $1
+     ON CONFLICT (reservation_id) DO NOTHING`,
+    [preemptingOrder.orderId],
+  );
+  const afterDuplicateRelease = await pool.query<{
+    committed: string;
+    releases: string;
+  }>(
+    `SELECT
+       capacity.committed_units::text AS committed,
+       pg_catalog.count(release_fact.id)::text AS releases
+     FROM product_supply_capacities capacity
+     LEFT JOIN supply_capacity_releases release_fact
+       ON release_fact.product_id = capacity.product_id
+     WHERE capacity.product_id = 'mock-capacity-service'
+     GROUP BY capacity.committed_units`,
+  );
+  assert.deepEqual(afterDuplicateRelease.rows[0], { committed: "0", releases: "2" });
+
   const acceptancePayload = {
     termsVersion: "commerce-v1",
     aupVersion: "commerce-v1",
@@ -768,7 +1050,7 @@ try {
   });
 
   console.log(
-    "Catalog Commerce PostgreSQL 18 integration: PASS — Staff definitions, immutable price revisions, options, Promotion exhaustion, supply reservations, zero Order, Marketing Consent withdrawal, Quote preview/accept/replay/void/expire, tenant isolation, legal snapshots, and balanced sealed ledgers.",
+    "Catalog Commerce PostgreSQL 18 integration: PASS — Staff definitions, immutable non-overlapping price and Promotion revisions, options, Promotion exhaustion, supply reservation/release projection, zero Order, Marketing Consent withdrawal, Quote wall-clock expiry/preview/accept/replay/void and idempotency isolation, tenant isolation, legal snapshots, and balanced sealed ledgers.",
   );
 } finally {
   await app?.close().catch(() => undefined);
