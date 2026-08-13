@@ -325,6 +325,50 @@ await transaction(pool, async (client) => {
     );
 
     await client.query(
+      `INSERT INTO catalog_product_revisions(
+         product_id, revision, group_id, names, descriptions, fulfillment_mode,
+         active, hidden, repeatable, option_schema
+       )
+       SELECT
+         current_product.id,
+         COALESCE((
+           SELECT pg_catalog.max(existing.revision) + 1
+           FROM catalog_product_revisions existing
+           WHERE existing.product_id = current_product.id
+         ), 1),
+         current_product.group_id,
+         current_product.names,
+         current_product.descriptions,
+         current_product.fulfillment_mode,
+         current_product.active,
+         current_product.hidden,
+         current_product.repeatable,
+         current_product.option_schema
+       FROM products current_product
+       WHERE current_product.id = $1
+         AND NOT EXISTS (
+           SELECT 1
+           FROM catalog_product_revisions latest
+           WHERE latest.id = (
+             SELECT candidate.id
+             FROM catalog_product_revisions candidate
+             WHERE candidate.product_id = current_product.id
+             ORDER BY candidate.revision DESC
+             LIMIT 1
+           )
+             AND latest.group_id = current_product.group_id
+             AND latest.names = current_product.names
+             AND latest.descriptions = current_product.descriptions
+             AND latest.fulfillment_mode = current_product.fulfillment_mode
+             AND latest.active = current_product.active
+             AND latest.hidden = current_product.hidden
+             AND latest.repeatable = current_product.repeatable
+             AND latest.option_schema = current_product.option_schema
+         )`,
+      [product.id],
+    );
+
+    await client.query(
       `INSERT INTO product_service_automation_policies(
          product_id, overdue_action, provider_installation_id,
          overdue_delay_mode, overdue_delay_value,
@@ -383,16 +427,77 @@ await transaction(pool, async (client) => {
           ];
 
     for (const [cycle, oneTime, setup, recurring] of prices) {
-      await client.query(
-        `INSERT INTO product_prices(
-           product_id, revision, currency, billing_cycle, one_time_minor, setup_minor, recurring_minor
-         ) VALUES ($1, 1, 'USD', $2, $3, $4, $5)
-         ON CONFLICT (product_id, revision, billing_cycle) DO UPDATE SET
-           one_time_minor = EXCLUDED.one_time_minor,
-           setup_minor = EXCLUDED.setup_minor,
-           recurring_minor = EXCLUDED.recurring_minor`,
-        [product.id, cycle, oneTime, setup, recurring],
+      const currentPrice = await client.query<{
+        id: string;
+        revision: number;
+        catalog_product_revision_id: string;
+        one_time_minor: string;
+        setup_minor: string;
+        recurring_minor: string;
+      }>(
+        `SELECT id, revision, catalog_product_revision_id,
+                one_time_minor::text, setup_minor::text, recurring_minor::text
+         FROM product_prices
+         WHERE product_id = $1 AND currency = 'USD' AND billing_cycle = $2
+           AND active
+           AND valid_from <= pg_catalog.transaction_timestamp()
+           AND (valid_until IS NULL OR valid_until > pg_catalog.transaction_timestamp())
+         ORDER BY revision DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [product.id, cycle],
       );
+      const catalogRevision = await client.query<{ id: string }>(
+        `SELECT id
+         FROM catalog_product_revisions
+         WHERE product_id = $1
+         ORDER BY revision DESC
+         LIMIT 1
+         FOR SHARE`,
+        [product.id],
+      );
+      const catalogRevisionId = catalogRevision.rows[0]?.id;
+      if (!catalogRevisionId) throw new Error(`Product ${product.id} has no Catalog revision`);
+      const previous = currentPrice.rows[0];
+      const unchanged =
+        previous?.catalog_product_revision_id === catalogRevisionId &&
+        previous.one_time_minor === String(oneTime) &&
+        previous.setup_minor === String(setup) &&
+        previous.recurring_minor === String(recurring);
+      if (!unchanged) {
+        if (previous) {
+          await client.query(
+            `UPDATE product_prices
+             SET active = false,
+                 valid_until = COALESCE(valid_until, pg_catalog.transaction_timestamp())
+             WHERE id = $1`,
+            [previous.id],
+          );
+        }
+        const latestRevision = await client.query<{ revision: number }>(
+          `SELECT revision
+           FROM product_prices
+           WHERE product_id = $1 AND billing_cycle = $2
+           ORDER BY revision DESC
+           LIMIT 1`,
+          [product.id, cycle],
+        );
+        await client.query(
+          `INSERT INTO product_prices(
+             product_id, catalog_product_revision_id, revision, currency,
+             billing_cycle, one_time_minor, setup_minor, recurring_minor
+           ) VALUES ($1, $2, $3, 'USD', $4, $5, $6, $7)`,
+          [
+            product.id,
+            catalogRevisionId,
+            (latestRevision.rows[0]?.revision ?? 0) + 1,
+            cycle,
+            oneTime,
+            setup,
+            recurring,
+          ],
+        );
+      }
     }
   }
 });
