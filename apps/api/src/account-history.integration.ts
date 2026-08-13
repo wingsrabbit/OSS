@@ -9,7 +9,12 @@ import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
 import type { Config } from "./config.js";
-import { assertSchemaCompatible, runMigrations, transaction } from "./database.js";
+import {
+  assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
+  runMigrations,
+  transaction,
+} from "./database.js";
 
 const adminDatabaseUrl = process.env.ADMIN_DATABASE_URL;
 if (!adminDatabaseUrl) {
@@ -117,7 +122,7 @@ try {
   const compatibility = await assertSchemaCompatible(pool);
   assert.equal(
     compatibility.installedSchemaVersion,
-    "019_stage_c_account_context_memberships_contacts",
+    REQUIRED_SCHEMA_VERSION,
   );
 
   const customer = await createFixture("Customer Alpha");

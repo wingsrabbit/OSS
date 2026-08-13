@@ -4,13 +4,14 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertSchema018NativeSafe } from "@opensales/core/schema-017-018-native-compatibility";
-import { assertSchema019NativeSafe } from "@opensales/core/schema-018-019-native-compatibility";
+import { assertSchema022NativeSafe } from "@opensales/core/schema-021-022-native-compatibility";
 import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken, passwordHash } from "./auth.js";
 import type { Config } from "./config.js";
 import {
   assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
   runMigrations,
   transaction,
   type DatabasePool,
@@ -2821,7 +2822,7 @@ try {
   const compatible = await assertSchemaCompatible(pool);
   assert.equal(
     compatible.installedSchemaVersion,
-    "019_stage_c_account_context_memberships_contacts",
+    REQUIRED_SCHEMA_VERSION,
   );
   await assert.rejects(
     assertSchemaCompatible(pool, { enable017RollbackBridge: true }),
@@ -2844,7 +2845,7 @@ try {
       await catalogDriftClient.query("BEGIN");
       await catalogDriftClient.query(`DROP INDEX ${index}`);
       await assert.rejects(
-        assertSchema019NativeSafe({
+        assertSchema022NativeSafe({
           query: async (text: string, values?: unknown[]) =>
             catalogDriftClient.query(text, values),
         }),
@@ -2884,7 +2885,7 @@ try {
       await immutableDriftClient.query("BEGIN");
       await immutableDriftClient.query(`DROP TRIGGER ${trigger} ON ${table}`);
       await assert.rejects(
-        assertSchema019NativeSafe({
+        assertSchema022NativeSafe({
           query: async (text: string, values?: unknown[]) =>
             immutableDriftClient.query(text, values),
         }),
@@ -2916,7 +2917,7 @@ try {
        EXECUTE FUNCTION public.schema_019_unreviewed_client_account_trigger()`,
     );
     await assert.rejects(
-      assertSchema019NativeSafe({
+      assertSchema022NativeSafe({
         query: async (text: string, values?: unknown[]) =>
           inheritedCatalogDriftClient.query(text, values),
       }),

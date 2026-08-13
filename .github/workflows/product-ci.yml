@@ -63,6 +63,9 @@ jobs:
       - name: Domain tests
         run: pnpm -r --if-present test
 
+      - name: Verify generated public Provider artifacts
+        run: pnpm --filter @opensales/provider-contracts docs:check
+
   product-integration:
     name: product-integration
     runs-on: ubuntu-24.04
@@ -218,6 +221,9 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/support_operations
         run: pnpm --filter @opensales/api test:integration:support-operations
+
+      - name: Run Catalog Commerce PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:catalog-commerce
 
       - name: Run account history PostgreSQL and API journey
         env:
