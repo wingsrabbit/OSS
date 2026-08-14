@@ -19,7 +19,7 @@ export const SCHEMA_019_APPLICATION_GUARD =
   "opensales:schema-019-application" as const;
 
 export const SCHEMA_019_CATALOG_DIGEST =
-  "04b0a0250423c3e86759af716d838b573b861750372628866a8274c4575cc533" as const;
+  "305ca08b13460b1691f695348c8615741877ac25232964acd3eaa8239a8b9df7" as const;
 
 export const EXPECTED_SCHEMA_019_HISTORY = [
   "001_stage_a",
