@@ -934,6 +934,16 @@ export async function registerServiceRoutes(
         if (!pointer) {
           throw requestError("Cancellation execution not found", 404, "CANCELLATION_NOT_FOUND");
         }
+        // Match every customer mutation's Account -> business-object lock
+        // order.  Platform Staff does not need a target Membership, but it
+        // must not hold the Service while waiting for its target Account.
+        const targetAccount = await client.query(
+          "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+          [pointer.client_account_id],
+        );
+        if (targetAccount.rowCount !== 1) {
+          throw requestError("Client account not found", 404, "CLIENT_ACCOUNT_NOT_FOUND");
+        }
         await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
           pointer.order_item_id,
         ]);
@@ -1105,6 +1115,25 @@ export async function registerServiceRoutes(
           ],
         );
         return { ...result, replayed: false };
+      }).catch((error: unknown) => {
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "P0001" &&
+          "message" in error &&
+          typeof error.message === "string" &&
+          error.message.includes(
+            "manual cancellation completion lacks current authority or eligible state",
+          )
+        ) {
+          throw requestError(
+            "Manual cancellation authority or target account state changed; refresh and retry",
+            409,
+            "MANUAL_COMPLETION_AUTHORITY_CHANGED",
+          );
+        }
+        throw error;
       });
       return reply.code(outcome.replayed ? 200 : 201).send(outcome);
     },
