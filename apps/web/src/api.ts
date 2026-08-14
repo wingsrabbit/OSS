@@ -292,7 +292,8 @@ function isPublicApiPath(pathname: string): boolean {
     pathname === "/api/v1/auth/invitation-registrations" ||
     pathname === "/api/v1/auth/verify-email" ||
     pathname === "/api/v1/auth/password-recovery/request" ||
-    pathname === "/api/v1/auth/password-recovery/complete"
+    pathname === "/api/v1/auth/password-recovery/complete" ||
+    pathname === "/api/v1/lab/identity-mailbox/password-recovery"
   );
 }
 

@@ -49,6 +49,7 @@ $$;
 CREATE TABLE public.password_reset_tokens (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id),
+  authorization_epoch bigint NOT NULL CHECK (authorization_epoch >= 0),
   token_digest bytea NOT NULL UNIQUE,
   expires_at timestamptz NOT NULL,
   used_at timestamptz,
@@ -70,9 +71,39 @@ CREATE UNIQUE INDEX password_reset_tokens_one_active
   ON public.password_reset_tokens(user_id)
   WHERE used_at IS NULL AND invalidated_at IS NULL;
 
+-- Mock-only mailbox possession. This long-lived opaque capability is issued
+-- only after a successful password-authenticated login and any configured
+-- second factor. It is
+-- deliberately independent from the Session cookie so an anonymous recovery
+-- request cannot mint permission to read somebody else's reset message.
+CREATE TABLE public.lab_identity_mailbox_capabilities (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id),
+  origin_session_id uuid NOT NULL REFERENCES public.sessions(id) ON DELETE RESTRICT,
+  recipient citext NOT NULL,
+  authorization_epoch bigint NOT NULL CHECK (authorization_epoch >= 0),
+  token_digest bytea NOT NULL UNIQUE,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  created_transaction_id bigint NOT NULL DEFAULT pg_catalog.txid_current(),
+  revoked_transaction_id bigint,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+  CHECK (pg_catalog.octet_length(token_digest) = 32),
+  CHECK (expires_at > created_at),
+  CHECK (revoked_at IS NULL OR revoked_at >= created_at),
+  CHECK ((revoked_at IS NULL) = (revoked_transaction_id IS NULL))
+);
+CREATE UNIQUE INDEX lab_identity_mailbox_capabilities_one_active
+  ON public.lab_identity_mailbox_capabilities(user_id)
+  WHERE revoked_at IS NULL;
+CREATE INDEX lab_identity_mailbox_capabilities_active_origin
+  ON public.lab_identity_mailbox_capabilities(origin_session_id)
+  WHERE revoked_at IS NULL;
+
 CREATE TABLE public.email_change_tokens (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id),
+  authorization_epoch bigint NOT NULL CHECK (authorization_epoch >= 0),
   requested_email citext NOT NULL,
   token_digest bytea NOT NULL UNIQUE,
   expires_at timestamptz NOT NULL,
@@ -234,6 +265,7 @@ CREATE TABLE public.totp_step_use_facts (
 CREATE TABLE public.login_challenges (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id),
+  authorization_epoch bigint NOT NULL CHECK (authorization_epoch >= 0),
   token_digest bytea NOT NULL UNIQUE,
   expires_at timestamptz NOT NULL,
   used_at timestamptz,
@@ -493,10 +525,11 @@ RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
 DECLARE
   principal_email public.citext;
   principal_locale text;
+  principal_authorization_epoch bigint;
   subject_is_valid boolean;
 BEGIN
-  SELECT principal.email, principal.locale
-  INTO principal_email, principal_locale
+  SELECT principal.email, principal.locale, principal.authorization_epoch
+  INTO principal_email, principal_locale, principal_authorization_epoch
   FROM public.users principal
   WHERE principal.id = NEW.user_id
   FOR SHARE NOWAIT;
@@ -506,6 +539,7 @@ BEGIN
 
   IF NEW.kind = 'password_recovery' THEN
     SELECT token.user_id = NEW.user_id
+       AND token.authorization_epoch = principal_authorization_epoch
        AND token.expires_at = NEW.expires_at
        AND token.expires_at > pg_catalog.clock_timestamp()
        AND token.used_at IS NULL
@@ -519,6 +553,7 @@ BEGIN
     END IF;
   ELSIF NEW.kind = 'email_change' THEN
     SELECT token.user_id = NEW.user_id
+       AND token.authorization_epoch = principal_authorization_epoch
        AND token.requested_email = NEW.recipient
        AND token.expires_at = NEW.expires_at
        AND token.expires_at > pg_catalog.clock_timestamp()
@@ -1067,6 +1102,46 @@ CREATE TRIGGER identity_password_change_events_insert_guard
 BEFORE INSERT ON public.identity_password_change_events FOR EACH ROW
 EXECUTE FUNCTION public.opensales_guard_password_change_event_insert();
 
+CREATE TABLE public.identity_email_change_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id),
+  old_email citext NOT NULL,
+  new_email citext NOT NULL,
+  transaction_id bigint NOT NULL DEFAULT pg_catalog.txid_current(),
+  occurred_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+  UNIQUE (user_id, transaction_id),
+  CHECK (old_email IS DISTINCT FROM new_email)
+);
+
+CREATE OR REPLACE FUNCTION public.opensales_record_email_change_event()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF NEW.email IS DISTINCT FROM OLD.email THEN
+    INSERT INTO public.identity_email_change_events(user_id, old_email, new_email)
+    VALUES (NEW.id, OLD.email, NEW.email);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER users_record_email_change_event
+AFTER UPDATE OF email ON public.users FOR EACH ROW
+WHEN (NEW.email IS DISTINCT FROM OLD.email)
+EXECUTE FUNCTION public.opensales_record_email_change_event();
+
+CREATE OR REPLACE FUNCTION public.opensales_guard_email_change_event_insert()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF pg_catalog.pg_trigger_depth() < 2
+     OR NEW.transaction_id IS DISTINCT FROM pg_catalog.txid_current() THEN
+    RAISE EXCEPTION 'email change events may only be emitted by the User email transition trigger';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER identity_email_change_events_insert_guard
+BEFORE INSERT ON public.identity_email_change_events FOR EACH ROW
+EXECUTE FUNCTION public.opensales_guard_email_change_event_insert();
+
 CREATE TABLE public.identity_action_facts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id),
@@ -1213,6 +1288,16 @@ BEGIN
     IF actual_count <> count_value THEN
       RAISE EXCEPTION 'password.recovered revokedApiKeyCount must match the exact current transaction projection';
     END IF;
+    IF EXISTS (
+      SELECT 1
+      FROM public.customer_api_keys api_key
+      LEFT JOIN public.customer_api_key_revocations revocation
+        ON revocation.api_key_id = api_key.id
+      WHERE api_key.user_id = NEW.user_id
+        AND revocation.api_key_id IS NULL
+    ) THEN
+      RAISE EXCEPTION 'password.recovered must revoke every active customer API key';
+    END IF;
   ELSIF NEW.action = 'email.change_requested' THEN
     IF NEW.actor_session_id IS NULL OR NEW.target_id IS NULL THEN
       RAISE EXCEPTION 'email.change_requested identity fact has an invalid shape';
@@ -1240,6 +1325,13 @@ BEGIN
         AND token.used_at IS NOT NULL
         AND token.terminal_transaction_id = pg_catalog.txid_current()
         AND principal.email = token.requested_email
+        AND EXISTS (
+          SELECT 1
+          FROM public.identity_email_change_events event
+          WHERE event.user_id = token.user_id
+            AND event.new_email = token.requested_email
+            AND event.transaction_id = pg_catalog.txid_current()
+        )
     ) INTO target_is_owned;
     IF NOT target_is_owned THEN
       RAISE EXCEPTION 'email.changed identity fact target must be the user email token';
@@ -1293,6 +1385,18 @@ BEGIN
     ) INTO target_is_owned;
     IF count_value < 1 OR NEW.metadata IS DISTINCT FROM exact_metadata OR NOT target_is_owned THEN
       RAISE EXCEPTION 'TOTP recovery-code regeneration fact must bind its exact current-transaction batch';
+    END IF;
+    IF EXISTS (
+      SELECT 1
+      FROM public.totp_recovery_code_batches batch
+      JOIN public.totp_recovery_codes code
+        ON code.credential_id = batch.credential_id
+      WHERE batch.id = NEW.target_id
+        AND code.batch_id <> batch.id
+        AND code.used_at IS NULL
+        AND code.invalidated_at IS NULL
+    ) THEN
+      RAISE EXCEPTION 'TOTP recovery-code regeneration must retire every prior active code';
     END IF;
   ELSIF NEW.action = 'session.revoked' THEN
     IF NEW.actor_session_id IS NULL OR NEW.target_id IS NULL
@@ -1407,6 +1511,9 @@ EXECUTE FUNCTION public.opensales_reject_identity_fact_mutation();
 CREATE TRIGGER identity_password_change_events_immutable BEFORE UPDATE OR DELETE
 ON public.identity_password_change_events FOR EACH ROW
 EXECUTE FUNCTION public.opensales_reject_identity_fact_mutation();
+CREATE TRIGGER identity_email_change_events_immutable BEFORE UPDATE OR DELETE
+ON public.identity_email_change_events FOR EACH ROW
+EXECUTE FUNCTION public.opensales_reject_identity_fact_mutation();
 
 CREATE OR REPLACE FUNCTION public.opensales_guard_totp_credential()
 RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
@@ -1459,6 +1566,11 @@ BEGIN
   END IF;
   IF NEW.id IS DISTINCT FROM OLD.id
      OR NEW.user_id IS DISTINCT FROM OLD.user_id
+     OR (TG_TABLE_NAME IN (
+           'login_challenges', 'password_reset_tokens', 'email_change_tokens'
+         )
+         AND (pg_catalog.to_jsonb(NEW) ->> 'authorization_epoch') IS DISTINCT FROM
+             (pg_catalog.to_jsonb(OLD) ->> 'authorization_epoch'))
      OR NEW.token_digest IS DISTINCT FROM OLD.token_digest
      OR NEW.created_transaction_id IS DISTINCT FROM OLD.created_transaction_id
      OR NEW.created_at IS DISTINCT FROM OLD.created_at
@@ -1502,6 +1614,78 @@ EXECUTE FUNCTION public.opensales_guard_identity_token_transition();
 CREATE TRIGGER login_challenges_transition_guard BEFORE UPDATE OR DELETE
 ON public.login_challenges FOR EACH ROW
 EXECUTE FUNCTION public.opensales_guard_identity_token_transition();
+
+CREATE OR REPLACE FUNCTION public.opensales_guard_lab_identity_mailbox_capability()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'laboratory mailbox capabilities are retained as immutable history';
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    PERFORM 1
+    FROM public.users principal
+    WHERE principal.id = NEW.user_id
+      AND principal.email = NEW.recipient
+      AND principal.authorization_epoch = NEW.authorization_epoch
+    FOR SHARE NOWAIT;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'laboratory mailbox capability must bind the current User email';
+    END IF;
+    PERFORM 1
+    FROM public.sessions origin
+    WHERE origin.id = NEW.origin_session_id
+      AND origin.user_id = NEW.user_id
+      AND origin.revoked_at IS NULL
+      AND origin.expires_at > pg_catalog.clock_timestamp()
+    FOR SHARE NOWAIT;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'laboratory mailbox capability must bind an active originating Session';
+    END IF;
+    IF NEW.revoked_at IS NOT NULL OR NEW.revoked_transaction_id IS NOT NULL THEN
+      RAISE EXCEPTION 'new laboratory mailbox capability must be active';
+    END IF;
+    NEW.created_transaction_id := pg_catalog.txid_current();
+    RETURN NEW;
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.user_id IS DISTINCT FROM OLD.user_id
+     OR NEW.origin_session_id IS DISTINCT FROM OLD.origin_session_id
+     OR NEW.recipient IS DISTINCT FROM OLD.recipient
+     OR NEW.authorization_epoch IS DISTINCT FROM OLD.authorization_epoch
+     OR NEW.token_digest IS DISTINCT FROM OLD.token_digest
+     OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+     OR NEW.created_transaction_id IS DISTINCT FROM OLD.created_transaction_id
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'laboratory mailbox capability identity and expiry are immutable';
+  END IF;
+  IF OLD.revoked_at IS NOT NULL THEN
+    RAISE EXCEPTION 'laboratory mailbox capability revocation is immutable';
+  END IF;
+  IF NEW.revoked_at IS NULL THEN
+    RAISE EXCEPTION 'laboratory mailbox capability update must revoke it';
+  END IF;
+  NEW.revoked_transaction_id := pg_catalog.txid_current();
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER lab_identity_mailbox_capabilities_guard BEFORE INSERT OR UPDATE OR DELETE
+ON public.lab_identity_mailbox_capabilities FOR EACH ROW
+EXECUTE FUNCTION public.opensales_guard_lab_identity_mailbox_capability();
+
+CREATE OR REPLACE FUNCTION public.opensales_revoke_lab_identity_mailbox_capability_for_session()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+  UPDATE public.lab_identity_mailbox_capabilities
+  SET revoked_at = pg_catalog.clock_timestamp()
+  WHERE origin_session_id = NEW.id AND revoked_at IS NULL;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER sessions_revoke_lab_identity_mailbox_capability
+AFTER UPDATE OF revoked_at ON public.sessions
+FOR EACH ROW
+WHEN (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL)
+EXECUTE FUNCTION public.opensales_revoke_lab_identity_mailbox_capability_for_session();
 
 CREATE OR REPLACE FUNCTION public.opensales_guard_totp_enrollment_transition()
 RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
@@ -1621,18 +1805,21 @@ BEGIN
      OR NEW.password_hash IS DISTINCT FROM OLD.password_hash
      OR NEW.email_verified_at IS DISTINCT FROM OLD.email_verified_at
      OR NEW.restricted_at IS DISTINCT FROM OLD.restricted_at THEN
-    -- Schema 019 owns the Session context bump for verification/restriction.
-    -- Only credential-only changes need the forward 024 Session bump here.
-    IF (NEW.email IS DISTINCT FROM OLD.email
-        OR NEW.password_hash IS DISTINCT FROM OLD.password_hash)
-       AND NEW.email_verified_at IS NOT DISTINCT FROM OLD.email_verified_at
-       AND NEW.restricted_at IS NOT DISTINCT FROM OLD.restricted_at THEN
+    -- Every identity eligibility or credential transition follows the shared
+    -- User -> Sessions -> reauthentication-grants order. Schema 019 may
+    -- subsequently re-lock the same Session rows for its context projection.
     PERFORM session_record.id
     FROM public.sessions session_record
     WHERE session_record.user_id = NEW.id
       AND session_record.revoked_at IS NULL
     ORDER BY session_record.id
     FOR UPDATE NOWAIT;
+    -- Schema 019 owns the Session context bump for verification/restriction.
+    -- Only credential-only changes need the forward 024 Session bump here.
+    IF (NEW.email IS DISTINCT FROM OLD.email
+        OR NEW.password_hash IS DISTINCT FROM OLD.password_hash)
+       AND NEW.email_verified_at IS NOT DISTINCT FROM OLD.email_verified_at
+       AND NEW.restricted_at IS NOT DISTINCT FROM OLD.restricted_at THEN
     UPDATE public.sessions session_record
     SET account_context_version = account_context_version + 1
     WHERE session_record.user_id = NEW.id
@@ -1660,6 +1847,32 @@ $$;
 CREATE TRIGGER users_authorization_epoch_monotonic
 BEFORE UPDATE OF authorization_epoch ON public.users FOR EACH ROW
 EXECUTE FUNCTION public.opensales_guard_authorization_epoch();
+
+CREATE OR REPLACE FUNCTION public.opensales_invalidate_reauth_on_authorization_epoch()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+  -- Authorization epoch is the single revocation boundary for credentials,
+  -- identity eligibility, TOTP, Membership and Staff authority. Keep every
+  -- current reauthentication grant on the same User -> Sessions -> grants
+  -- lock order regardless of which source advanced the epoch.
+  PERFORM session_record.id
+  FROM public.sessions session_record
+  WHERE session_record.user_id = NEW.id
+    AND session_record.revoked_at IS NULL
+  ORDER BY session_record.id
+  FOR UPDATE NOWAIT;
+  UPDATE public.reauth_grants grant_record
+  SET invalidated_at = pg_catalog.now()
+  WHERE grant_record.user_id = NEW.id
+    AND grant_record.invalidated_at IS NULL;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER users_authorization_epoch_invalidate_reauth
+AFTER UPDATE OF authorization_epoch ON public.users
+FOR EACH ROW
+WHEN (NEW.authorization_epoch IS DISTINCT FROM OLD.authorization_epoch)
+EXECUTE FUNCTION public.opensales_invalidate_reauth_on_authorization_epoch();
 
 CREATE OR REPLACE FUNCTION public.opensales_bump_membership_authorization_epoch()
 RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$

@@ -33,6 +33,11 @@ import {
 import { identitySecretKeyring, type Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { activeTotpCredential, verifyConfiguredFactorLocked } from "./identity-factor.js";
+import {
+  clearLabIdentityMailboxCapability,
+  rotateLabIdentityMailboxCapability,
+  setLabIdentityMailboxCapability,
+} from "./routes-auth.js";
 
 const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
 const passwordSchema = z.string().min(12).max(256);
@@ -89,12 +94,35 @@ type LockedIdentity = Readonly<{
   locale: "en" | "zh-CN";
   emailVerifiedAt: Date | null;
   restrictedAt: Date | null;
+  authorizationEpoch: string;
   currentSession: Readonly<{
     id: string;
     activeClientAccountId: string | null;
     accountContextVersion: string;
   }>;
 }>;
+
+function sessionInvalidError(): Error & { statusCode: number; code: string } {
+  return Object.assign(new Error("Session is invalid or expired"), {
+    statusCode: 401,
+    code: "SESSION_INVALID",
+  });
+}
+
+function emailUnavailableError(): Error & { statusCode: number; code: string } {
+  return Object.assign(new Error("The requested email is unavailable"), {
+    statusCode: 409,
+    code: "EMAIL_UNAVAILABLE",
+  });
+}
+
+function isUsersEmailUniqueViolation(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" &&
+      "code" in error && error.code === "23505" &&
+      "constraint" in error && error.constraint === "users_email_key",
+  );
+}
 
 async function lockIdentityAndSessions(
   client: DatabaseClient,
@@ -106,13 +134,15 @@ async function lockIdentityAndSessions(
     locale: "en" | "zh-CN";
     email_verified_at: Date | null;
     restricted_at: Date | null;
+    authorization_epoch: string;
   }>(
-    `SELECT password_hash, email::text, locale, email_verified_at, restricted_at
+    `SELECT password_hash, email::text, locale, email_verified_at, restricted_at,
+            authorization_epoch::text
      FROM public.users WHERE id = $1 FOR UPDATE`,
     [identity.userId],
   );
   const user = principal.rows[0];
-  if (!user) throw Object.assign(new Error("Session is invalid or expired"), { statusCode: 401 });
+  if (!user) throw sessionInvalidError();
   const sessions = await client.query<{
     id: string;
     active_client_account_id: string | null;
@@ -126,13 +156,14 @@ async function lockIdentityAndSessions(
     [identity.userId],
   );
   const current = sessions.rows.find((row) => row.id === identity.sessionId);
-  if (!current) throw Object.assign(new Error("Session is invalid or expired"), { statusCode: 401 });
+  if (!current) throw sessionInvalidError();
   return {
     passwordHash: user.password_hash,
     email: user.email,
     locale: user.locale,
     emailVerifiedAt: user.email_verified_at,
     restrictedAt: user.restricted_at,
+    authorizationEpoch: user.authorization_epoch,
     currentSession: {
       id: current.id,
       activeClientAccountId: current.active_client_account_id,
@@ -386,20 +417,51 @@ export async function registerIdentitySecurityRoutes(
         const locked = await client.query<{
           email: string;
           locale: "en" | "zh-CN";
+          restricted_at: Date | null;
+          authorization_epoch: string;
           expires_at: Date;
         }>(
-          `SELECT email::text, locale,
+          `SELECT email::text, locale, restricted_at,
+                  authorization_epoch::text,
                   pg_catalog.clock_timestamp() + interval '30 minutes' AS expires_at
            FROM users WHERE id = $1 FOR UPDATE`,
           [user.id],
         );
-        if (!locked.rows[0] || locked.rows[0].email !== user.email) return;
-        const expiresAt = locked.rows[0].expires_at;
+        const principal = locked.rows[0];
+        if (!principal || principal.email !== user.email || principal.restricted_at) return;
+        const expiresAt = principal.expires_at;
         await client.query(
           `SELECT id FROM sessions WHERE user_id = $1 AND revoked_at IS NULL
            ORDER BY id FOR UPDATE`,
           [user.id],
         );
+        const recent = await client.query(
+          `SELECT token.id
+           FROM password_reset_tokens token
+           LEFT JOIN identity_notification_outbox event
+             ON event.kind = 'password_recovery' AND event.subject_id = token.id
+           LEFT JOIN LATERAL (
+             SELECT operation.attempt_number, operation.status
+             FROM identity_notification_delivery_operations operation
+             WHERE operation.outbox_id = event.id
+             ORDER BY operation.attempt_number DESC
+             LIMIT 1
+           ) latest ON true
+           WHERE token.user_id = $1
+             AND token.authorization_epoch = $2
+             AND token.used_at IS NULL
+             AND token.invalidated_at IS NULL
+             AND token.expires_at > pg_catalog.clock_timestamp()
+             AND NOT (
+               latest.status = 'manual'
+               OR (latest.status = 'failed' AND latest.attempt_number = 3)
+             )
+           ORDER BY token.created_at DESC, token.id DESC
+           LIMIT 1
+           FOR UPDATE OF token`,
+          [user.id, principal.authorization_epoch],
+        );
+        if (recent.rows[0]) return;
         await client.query(
           `UPDATE password_reset_tokens
            SET invalidated_at = pg_catalog.now()
@@ -407,15 +469,16 @@ export async function registerIdentitySecurityRoutes(
           [user.id],
         );
         await client.query(
-          `INSERT INTO password_reset_tokens(id, user_id, token_digest, expires_at)
-           VALUES ($1, $2, $3, $4)`,
-          [tokenId, user.id, digestToken(token), expiresAt],
+          `INSERT INTO password_reset_tokens(
+             id, user_id, authorization_epoch, token_digest, expires_at
+           ) VALUES ($1, $2, $3, $4, $5)`,
+          [tokenId, user.id, principal.authorization_epoch, digestToken(token), expiresAt],
         );
         await enqueueIdentityNotification(client, config, {
           userId: user.id,
           kind: "password_recovery",
-          recipient: locked.rows[0].email,
-          locale: locked.rows[0].locale,
+          recipient: principal.email,
+          locale: principal.locale,
           subjectId: tokenId,
           url: passwordRecoveryUrl(config, token),
           expiresAt,
@@ -438,11 +501,16 @@ export async function registerIdentitySecurityRoutes(
     const tokenPointer = pointer.rows[0];
     if (!tokenPointer) return reply.code(400).send({ error: "Recovery token is invalid" });
     const completed = await transaction(pool, async (client) => {
-      const user = await client.query<{ restricted_at: Date | null }>(
-        `SELECT restricted_at FROM users WHERE id = $1 FOR UPDATE`,
+      const user = await client.query<{
+        restricted_at: Date | null;
+        authorization_epoch: string;
+      }>(
+        `SELECT restricted_at, authorization_epoch::text
+         FROM users WHERE id = $1 FOR UPDATE`,
         [tokenPointer.user_id],
       );
-      if (!user.rows[0] || user.rows[0].restricted_at) return false;
+      const principal = user.rows[0];
+      if (!principal || principal.restricted_at) return false;
       await client.query(
         `SELECT id FROM sessions WHERE user_id = $1 AND revoked_at IS NULL
          ORDER BY id FOR UPDATE`,
@@ -452,10 +520,16 @@ export async function registerIdentitySecurityRoutes(
       const token = await client.query<{ id: string }>(
         `SELECT id FROM password_reset_tokens
          WHERE id = $1 AND user_id = $2 AND token_digest = $3
+           AND authorization_epoch = $4
            AND used_at IS NULL AND invalidated_at IS NULL
            AND expires_at > pg_catalog.clock_timestamp()
          FOR UPDATE`,
-        [tokenPointer.id, tokenPointer.user_id, digestToken(body.token)],
+        [
+          tokenPointer.id,
+          tokenPointer.user_id,
+          digestToken(body.token),
+          principal.authorization_epoch,
+        ],
       );
       if (!token.rows[0]) return false;
       const apiKeys = await client.query<{ id: string }>(
@@ -522,6 +596,7 @@ export async function registerIdentitySecurityRoutes(
     });
     if (!completed) return reply.code(410).send({ error: "Recovery token is expired" });
     reply.clearCookie(config.SESSION_COOKIE_NAME, { path: "/" });
+    clearLabIdentityMailboxCapability(reply);
     return reply.code(200).send({ sessionEnded: true });
   });
 
@@ -572,7 +647,7 @@ export async function registerIdentitySecurityRoutes(
     assertIdentityReadEligible(identity);
     const body = passwordChangeSchema.parse(request.body);
     const encodedPassword = await passwordHash(body.newPassword);
-    await transaction(pool, async (client) => {
+    const mailboxCapability = await transaction(pool, async (client) => {
       const locked = await lockIdentityAndSessions(client, identity);
       assertLockedIdentityEligible(locked);
       await confirmPasswordAndConfiguredFactor(
@@ -600,7 +675,15 @@ export async function registerIdentitySecurityRoutes(
          VALUES ($1, $2, 'password.changed', $3)`,
         [identity.userId, identity.sessionId, passwordEvent.rows[0].id],
       );
+      return rotateLabIdentityMailboxCapability(
+        client,
+        identity.userId,
+        locked.email,
+        identity.sessionId,
+        config.LAB_MAILBOX_ENABLED,
+      );
     });
+    setLabIdentityMailboxCapability(reply, config, mailboxCapability);
     await refreshIdentityHeaders(pool, request, reply, identity.userId, identity.sessionId);
     return reply.code(204).send();
   });
@@ -628,10 +711,7 @@ export async function registerIdentitySecurityRoutes(
         [body.requestedEmail, identity.userId],
       );
       if (existing.rows[0]) {
-        throw Object.assign(new Error("The requested email is unavailable"), {
-          statusCode: 409,
-          code: "EMAIL_UNAVAILABLE",
-        });
+        throw emailUnavailableError();
       }
       await client.query(
         `UPDATE email_change_tokens SET invalidated_at = pg_catalog.now()
@@ -644,9 +724,16 @@ export async function registerIdentitySecurityRoutes(
       const expiresAt = databaseClock.rows[0]!.expires_at;
       await client.query(
         `INSERT INTO email_change_tokens(
-           id, user_id, requested_email, token_digest, expires_at
-         ) VALUES ($1, $2, $3, $4, $5)`,
-        [tokenId, identity.userId, body.requestedEmail, digestToken(token), expiresAt],
+           id, user_id, authorization_epoch, requested_email, token_digest, expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          tokenId,
+          identity.userId,
+          locked.authorizationEpoch,
+          body.requestedEmail,
+          digestToken(token),
+          expiresAt,
+        ],
       );
       await enqueueIdentityNotification(client, config, {
         userId: identity.userId,
@@ -669,62 +756,101 @@ export async function registerIdentitySecurityRoutes(
     return reply.code(202).send({ expiresAt: expiresAt.toISOString() });
   });
 
+  app.post("/api/v1/security/email-change/inspect", async (request, reply) => {
+    const identity = await requireSessionIdentity(request, pool, config);
+    assertIdentityReadEligible(identity);
+    const body = tokenCompleteSchema.parse(request.body);
+    const requestedEmail = await transaction(pool, async (client) => {
+      const locked = await lockIdentityAndSessions(client, identity);
+      assertLockedIdentityEligible(locked);
+      const token = await client.query<{ requested_email: string }>(
+        `SELECT requested_email::text
+         FROM email_change_tokens
+         WHERE user_id = $1 AND token_digest = $2
+           AND authorization_epoch = $3
+           AND used_at IS NULL AND invalidated_at IS NULL
+           AND expires_at > pg_catalog.clock_timestamp()
+         FOR SHARE`,
+        [identity.userId, digestToken(body.token), locked.authorizationEpoch],
+      );
+      return token.rows[0]?.requested_email ?? null;
+    });
+    if (!requestedEmail) {
+      return reply.code(410).send({ error: "Email change token is expired" });
+    }
+    return {
+      warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+      requestedEmail,
+    };
+  });
+
   app.post("/api/v1/security/email-change/complete", async (request, reply) => {
     const identity = await requireSessionIdentity(request, pool, config);
     assertIdentityReadEligible(identity);
     const body = tokenCompleteSchema.parse(request.body);
-    const changed = await transaction(pool, async (client) => {
-      const locked = await lockIdentityAndSessions(client, identity);
-      assertLockedIdentityEligible(locked);
-      await activeTotpCredential(client, identity.userId);
-      const token = await client.query<{
-        id: string;
-        requested_email: string;
-      }>(
-        `SELECT id, requested_email::text
-         FROM email_change_tokens
-         WHERE user_id = $1 AND token_digest = $2
-           AND used_at IS NULL AND invalidated_at IS NULL
-           AND expires_at > pg_catalog.clock_timestamp()
-         FOR UPDATE`,
-        [identity.userId, digestToken(body.token)],
-      );
-      const row = token.rows[0];
-      if (!row) return false;
-      const conflict = await client.query(
-        `SELECT 1 FROM users WHERE email = $1 AND id <> $2`,
-        [row.requested_email, identity.userId],
-      );
-      if (conflict.rows[0]) {
-        throw Object.assign(new Error("The requested email is unavailable"), {
-          statusCode: 409,
-          code: "EMAIL_UNAVAILABLE",
-        });
-      }
-      await client.query(
-        `UPDATE email_change_tokens SET used_at = pg_catalog.now() WHERE id = $1`,
-        [row.id],
-      );
-      await client.query(
-        `UPDATE users SET email = $2, email_verified_at = pg_catalog.now(),
-                          updated_at = pg_catalog.now()
-         WHERE id = $1`,
-        [identity.userId, row.requested_email],
-      );
-      await client.query(
-        `UPDATE sessions SET revoked_at = pg_catalog.now()
-         WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`,
-        [identity.userId, identity.sessionId],
-      );
-      await client.query(
-        `INSERT INTO identity_action_facts(
-           user_id, actor_session_id, action, target_id
-         ) VALUES ($1, $2, 'email.changed', $3)`,
-        [identity.userId, identity.sessionId, row.id],
-      );
-      return true;
-    });
-    if (!changed) return reply.code(410).send({ error: "Email change token is expired" });
+    let outcome: Readonly<{ mailboxCapability: string | null }> | null;
+    try {
+      outcome = await transaction(pool, async (client) => {
+        const locked = await lockIdentityAndSessions(client, identity);
+        assertLockedIdentityEligible(locked);
+        await activeTotpCredential(client, identity.userId);
+        const token = await client.query<{
+          id: string;
+          requested_email: string;
+        }>(
+          `SELECT id, requested_email::text
+           FROM email_change_tokens
+           WHERE user_id = $1 AND token_digest = $2
+             AND authorization_epoch = $3
+             AND used_at IS NULL AND invalidated_at IS NULL
+             AND expires_at > pg_catalog.clock_timestamp()
+           FOR UPDATE`,
+          [identity.userId, digestToken(body.token), locked.authorizationEpoch],
+        );
+        const row = token.rows[0];
+        if (!row) return null;
+        const conflict = await client.query(
+          `SELECT 1 FROM users WHERE email = $1 AND id <> $2`,
+          [row.requested_email, identity.userId],
+        );
+        if (conflict.rows[0]) throw emailUnavailableError();
+        await client.query(
+          `UPDATE email_change_tokens SET used_at = pg_catalog.now() WHERE id = $1`,
+          [row.id],
+        );
+        await client.query(
+          `UPDATE users SET email = $2, email_verified_at = pg_catalog.now(),
+                            updated_at = pg_catalog.now()
+           WHERE id = $1`,
+          [identity.userId, row.requested_email],
+        );
+        await client.query(
+          `UPDATE sessions SET revoked_at = pg_catalog.now()
+           WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`,
+          [identity.userId, identity.sessionId],
+        );
+        await client.query(
+          `INSERT INTO identity_action_facts(
+             user_id, actor_session_id, action, target_id
+           ) VALUES ($1, $2, 'email.changed', $3)`,
+          [identity.userId, identity.sessionId, row.id],
+        );
+        return {
+          mailboxCapability: await rotateLabIdentityMailboxCapability(
+            client,
+            identity.userId,
+            row.requested_email,
+            identity.sessionId,
+            config.LAB_MAILBOX_ENABLED,
+          ),
+        };
+      });
+    } catch (error) {
+      if (isUsersEmailUniqueViolation(error)) throw emailUnavailableError();
+      throw error;
+    }
+    if (!outcome) return reply.code(410).send({ error: "Email change token is expired" });
+    setLabIdentityMailboxCapability(reply, config, outcome.mailboxCapability);
     await refreshIdentityHeaders(pool, request, reply, identity.userId, identity.sessionId);
     return reply.code(204).send();
   });
@@ -879,7 +1005,16 @@ export async function registerIdentitySecurityRoutes(
          ) VALUES ($1, $2, 'totp.enabled', $3)`,
         [identity.userId, identity.sessionId, credentialId],
       );
-      return "enabled_now" as const;
+      return {
+        kind: "enabled_now" as const,
+        mailboxCapability: await rotateLabIdentityMailboxCapability(
+          client,
+          identity.userId,
+          locked.email,
+          identity.sessionId,
+          config.LAB_MAILBOX_ENABLED,
+        ),
+      };
     });
     if (outcome === "expired") return reply.code(410).send({ error: "TOTP enrollment expired" });
     if (outcome === "invalid") return reply.code(401).send({ error: "TOTP code is invalid" });
@@ -889,6 +1024,7 @@ export async function registerIdentitySecurityRoutes(
         code: "SECRET_ALREADY_ISSUED",
       });
     }
+    setLabIdentityMailboxCapability(reply, config, outcome.mailboxCapability);
     await refreshIdentityHeaders(pool, request, reply, identity.userId, identity.sessionId);
     return reply.code(201).send({ recoveryCodes, displayOnce: true });
   });
@@ -924,9 +1060,18 @@ export async function registerIdentitySecurityRoutes(
          ) VALUES ($1, $2, 'totp.disabled', $3)`,
         [identity.userId, identity.sessionId, credential.id],
       );
-      return true;
+      return {
+        mailboxCapability: await rotateLabIdentityMailboxCapability(
+          client,
+          identity.userId,
+          locked.email,
+          identity.sessionId,
+          config.LAB_MAILBOX_ENABLED,
+        ),
+      };
     });
     if (!disabled) return reply.code(401).send({ error: "Password or factor confirmation failed" });
+    setLabIdentityMailboxCapability(reply, config, disabled.mailboxCapability);
     await refreshIdentityHeaders(pool, request, reply, identity.userId, identity.sessionId);
     return reply.code(204).send();
   });
@@ -945,7 +1090,11 @@ export async function registerIdentitySecurityRoutes(
       const factor = await verifyConfiguredFactorLocked(
         client, config, identity.userId, body.factorCode, "reauth", { credential, required: true },
       );
-      if (!factor || factor === "password") return false;
+      // Recovery-code rotation must retain a known authentication path even
+      // if the one-time response is lost after commit. Require the live TOTP
+      // factor here; a recovery code remains available for login/reauth but
+      // cannot be consumed while simultaneously replacing every known code.
+      if (factor !== "totp") return false;
       await client.query(
         `UPDATE totp_recovery_codes SET invalidated_at = pg_catalog.now()
          WHERE credential_id = $1 AND used_at IS NULL AND invalidated_at IS NULL`,
@@ -975,9 +1124,18 @@ export async function registerIdentitySecurityRoutes(
          )`,
         [identity.userId, identity.sessionId, recoveryBatchId, recoveryCodes.length],
       );
-      return true;
+      return {
+        mailboxCapability: await rotateLabIdentityMailboxCapability(
+          client,
+          identity.userId,
+          locked.email,
+          identity.sessionId,
+          config.LAB_MAILBOX_ENABLED,
+        ),
+      };
     });
     if (!regenerated) return reply.code(401).send({ error: "Password or factor confirmation failed" });
+    setLabIdentityMailboxCapability(reply, config, regenerated.mailboxCapability);
     await refreshIdentityHeaders(pool, request, reply, identity.userId, identity.sessionId);
     return reply.code(201).send({ recoveryCodes, displayOnce: true });
   });
@@ -1184,16 +1342,29 @@ export async function registerIdentitySecurityRoutes(
     const params = sessionParamsSchema.parse(request.params);
     const revoked = await transaction(pool, async (client) => {
       await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [identity.userId]);
-      const sessions = await client.query<{ id: string }>(
-        `SELECT id FROM sessions WHERE user_id = $1 ORDER BY id FOR UPDATE`,
+      const sessions = await client.query<{
+        id: string;
+        revoked_at: Date | null;
+        actor_active: boolean;
+      }>(
+        `SELECT id, revoked_at,
+                revoked_at IS NULL AND expires_at > pg_catalog.clock_timestamp()
+                  AS actor_active
+         FROM sessions WHERE user_id = $1 ORDER BY id FOR UPDATE`,
         [identity.userId],
       );
-      if (!sessions.rows.some((row) => row.id === params.sessionId)) return false;
-      await client.query(
+      const actor = sessions.rows.find((row) => row.id === identity.sessionId);
+      if (!actor?.actor_active) throw sessionInvalidError();
+      const target = sessions.rows.find((row) => row.id === params.sessionId);
+      if (!target) return false;
+      if (target.revoked_at !== null) return true;
+      const changed = await client.query(
         `UPDATE sessions SET revoked_at = pg_catalog.now()
-         WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
+         WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+         RETURNING id`,
         [params.sessionId, identity.userId],
       );
+      if (changed.rowCount !== 1) return true;
       await client.query(
         `INSERT INTO identity_action_facts(
            user_id, actor_session_id, action, target_id
@@ -1205,6 +1376,7 @@ export async function registerIdentitySecurityRoutes(
     if (!revoked) return reply.code(404).send({ error: "Session not found" });
     if (params.sessionId === identity.sessionId) {
       reply.clearCookie(config.SESSION_COOKIE_NAME, { path: "/" });
+      clearLabIdentityMailboxCapability(reply);
       return reply.code(200).send({ sessionEnded: true });
     }
     return reply.code(204).send();
@@ -1215,10 +1387,16 @@ export async function registerIdentitySecurityRoutes(
     assertIdentityReadEligible(identity);
     const count = await transaction(pool, async (client) => {
       await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [identity.userId]);
-      await client.query(
-        `SELECT id FROM sessions WHERE user_id = $1 ORDER BY id FOR UPDATE`,
+      const sessions = await client.query<{ id: string }>(
+        `SELECT id FROM sessions
+         WHERE user_id = $1 AND revoked_at IS NULL
+           AND expires_at > pg_catalog.clock_timestamp()
+         ORDER BY id FOR UPDATE`,
         [identity.userId],
       );
+      if (!sessions.rows.some((row) => row.id === identity.sessionId)) {
+        throw sessionInvalidError();
+      }
       const result = await client.query(
         `UPDATE sessions SET revoked_at = pg_catalog.now()
          WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL RETURNING id`,
@@ -1241,10 +1419,16 @@ export async function registerIdentitySecurityRoutes(
     assertIdentityReadEligible(identity);
     const count = await transaction(pool, async (client) => {
       await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [identity.userId]);
-      await client.query(
-        `SELECT id FROM sessions WHERE user_id = $1 ORDER BY id FOR UPDATE`,
+      const sessions = await client.query<{ id: string }>(
+        `SELECT id FROM sessions
+         WHERE user_id = $1 AND revoked_at IS NULL
+           AND expires_at > pg_catalog.clock_timestamp()
+         ORDER BY id FOR UPDATE`,
         [identity.userId],
       );
+      if (!sessions.rows.some((row) => row.id === identity.sessionId)) {
+        throw sessionInvalidError();
+      }
       const result = await client.query(
         `UPDATE sessions SET revoked_at = pg_catalog.now()
          WHERE user_id = $1 AND revoked_at IS NULL RETURNING id`,
@@ -1260,6 +1444,7 @@ export async function registerIdentitySecurityRoutes(
       return result.rowCount ?? 0;
     });
     reply.clearCookie(config.SESSION_COOKIE_NAME, { path: "/" });
+    clearLabIdentityMailboxCapability(reply);
     return reply.send({ revokedCount: count, sessionEnded: true });
   });
 }

@@ -15,6 +15,9 @@ type MockIdentityState = {
   loginRequests: number;
   challengeCompletions: number;
   sessionEndRequests: string[];
+  recoveryMailboxReads?: number;
+  emailChangeInspections?: number;
+  emailChangeInspectGate?: Promise<void>;
 };
 
 function identityHeaders(state: MockIdentityState): Record<string, string> {
@@ -142,8 +145,33 @@ async function installIdentityApi(
       await route.fulfill({ json: { sessionEnded: true } });
       return;
     }
+    if (path === "/api/v1/auth/password-recovery/request") {
+      await route.fulfill({ status: 202, json: { status: "pending" } });
+      return;
+    }
+    if (path === "/api/v1/lab/identity-mailbox/password-recovery") {
+      state.recoveryMailboxReads = (state.recoveryMailboxReads ?? 0) + 1;
+      const origin = new URL(request.url()).origin;
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          status: "delivered",
+          actionUrl: `${origin}/password-recovery#token=${"R".repeat(43)}`,
+        },
+      });
+      return;
+    }
     if (!state.authenticated) {
       await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+      return;
+    }
+    if (path === "/api/v1/security/email-change/inspect") {
+      state.emailChangeInspections = (state.emailChangeInspections ?? 0) + 1;
+      await state.emailChangeInspectGate;
+      await fulfillSessionJson(route, state, {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        requestedEmail: "new-identity-mailbox@example.invalid",
+      });
       return;
     }
     if (path === "/api/v1/customer/business-history") {
@@ -420,4 +448,67 @@ test("password recovery completion removes a signed-in customer workspace in bot
   await expect(customer.getByRole("heading", { name: "Sign in to open the customer workspace" })).toBeVisible();
   await expect(customer.getByText(email, { exact: true })).toHaveCount(0);
   expect(state.sessionEndRequests).toEqual(["POST /api/v1/auth/password-recovery/complete"]);
+});
+
+test("an anonymous user can retrieve the exact Mock Mail recovery link through the public wrapper", async ({
+  context,
+}) => {
+  const state: MockIdentityState = {
+    authenticated: false,
+    authorizationEpoch: "61",
+    contextVersion: "71",
+    loginMode: "normal",
+    loginRequests: 0,
+    challengeCompletions: 0,
+    sessionEndRequests: [],
+  };
+  await installIdentityApi(context, state);
+  const page = await context.newPage();
+  await page.goto("/password-recovery");
+  await page.getByLabel("Email").fill(email);
+  await page.getByRole("button", { name: "Send recovery link" }).click();
+  await expect(page.getByTestId("password-recovery-mailbox")).toContainText(
+    "Waiting for Mock Mail delivery.",
+  );
+  await page.getByRole("button", { name: "Refresh recovery mailbox" }).click();
+  const action = page.getByRole("link", { name: "Open the one-time recovery link" });
+  await expect(action).toBeVisible();
+  await action.click();
+  await expect(page).not.toHaveURL(/token=/);
+  await expect(page.getByRole("heading", { name: "Set a new password" })).toBeVisible();
+  expect(state.recoveryMailboxReads).toBe(1);
+});
+
+test("email change preserves the fragment through login and cannot confirm before the exact target is inspected", async ({
+  context,
+}) => {
+  let releaseInspection!: () => void;
+  const inspectionGate = new Promise<void>((resolve) => { releaseInspection = resolve; });
+  const state: MockIdentityState = {
+    authenticated: false,
+    authorizationEpoch: "81",
+    contextVersion: "91",
+    loginMode: "normal",
+    loginRequests: 0,
+    challengeCompletions: 0,
+    sessionEndRequests: [],
+    emailChangeInspectGate: inspectionGate,
+  };
+  await installIdentityApi(context, state);
+  const page = await context.newPage();
+  await page.goto(`/email-change#token=${"E".repeat(43)}`);
+  await expect(page).not.toHaveURL(/token=/);
+  await page.getByLabel("Current sign-in email").fill(email);
+  await page.getByLabel("Password").fill("Synthetic-browser-password-024!");
+  await page.getByRole("button", { name: "Sign in and continue" }).click();
+
+  const target = page.getByTestId("email-change-target");
+  await expect(target).toContainText("Verifying the link…");
+  const confirm = page.getByRole("button", { name: "Confirm email change" });
+  await expect(confirm).toBeDisabled();
+  releaseInspection();
+  await expect(target).toContainText("new-identity-mailbox@example.invalid");
+  await expect(confirm).toBeEnabled();
+  expect(state.loginRequests).toBe(1);
+  expect(state.emailChangeInspections).toBe(1);
 });

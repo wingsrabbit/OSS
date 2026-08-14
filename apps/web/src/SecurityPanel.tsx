@@ -436,6 +436,10 @@ export function PasswordRecoveryPage(props: Readonly<{
   const zh = props.locale === "zh-CN";
   const [token, setToken] = useState<string | null>(() => fragmentToken());
   const [pending, setPending] = useState(false);
+  const [delivery, setDelivery] = useState<{
+    status: "pending" | "delivered";
+    actionUrl?: string;
+  } | null>(null);
   useEffect(() => {
     if (window.location.hash) {
       window.history.replaceState({}, "", window.location.pathname);
@@ -458,6 +462,7 @@ export function PasswordRecoveryPage(props: Readonly<{
     void request.then(() => {
       form.reset();
       setToken(null);
+      if (!token) setDelivery({ status: "pending" });
       props.onNotice(token
         ? zh ? "密码已重置，所有会话与客户 API Key 均已撤销。" : "Password reset; all sessions and customer API keys were revoked."
         : zh ? "如该身份符合条件，Mock Mail 将收到恢复链接。" : "If eligible, the identity will receive a Mock Mail recovery link.");
@@ -473,12 +478,43 @@ export function PasswordRecoveryPage(props: Readonly<{
         : <label>{zh ? "邮箱" : "Email"}<input name="email" type="email" required /></label>}
       <button className="primary" disabled={pending}>{token ? (zh ? "重置密码" : "Reset password") : (zh ? "发送恢复链接" : "Send recovery link")}</button>
     </form>
+    {!token && delivery && <div className="mock-message" data-testid="password-recovery-mailbox">
+      <strong>{zh ? "实验室恢复邮箱" : "Laboratory recovery mailbox"}</strong>
+      <span>{delivery.status === "delivered"
+        ? (zh ? "恢复链接已送达。" : "The recovery link was delivered.")
+        : (zh ? "正在等待 Mock Mail 投递。" : "Waiting for Mock Mail delivery.")}</span>
+      {delivery.actionUrl && <a
+        href={delivery.actionUrl}
+        onClick={(event) => {
+          const parsed = new URL(delivery.actionUrl!, window.location.origin);
+          const values = new URLSearchParams(parsed.hash.slice(1)).getAll("token");
+          if (
+            parsed.origin !== window.location.origin ||
+            parsed.pathname !== "/password-recovery" ||
+            parsed.search !== "" || values.length !== 1 ||
+            !/^[A-Za-z0-9_-]{43}$/.test(values[0] ?? "")
+          ) return;
+          event.preventDefault();
+          setToken(values[0]!);
+          window.history.replaceState({}, "", window.location.pathname);
+        }}
+      >{zh ? "打开一次性恢复链接" : "Open the one-time recovery link"}</a>}
+      <button disabled={pending} onClick={() => {
+        setPending(true);
+        void api<{ status: "pending" | "delivered"; actionUrl?: string }>(
+          "/api/v1/lab/identity-mailbox/password-recovery",
+        ).then(setDelivery)
+          .catch((caught: unknown) => props.onError(caught instanceof Error ? caught.message : "Recovery mailbox failed"))
+          .finally(() => setPending(false));
+      }}>{zh ? "刷新恢复邮箱" : "Refresh recovery mailbox"}</button>
+    </div>}
   </section>;
 }
 
 export function EmailChangePage(props: Readonly<{
   authenticated: boolean;
   locale: Locale;
+  onLogin?: (event: FormEvent<HTMLFormElement>) => void;
   onCompleted: () => Promise<void>;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
@@ -486,9 +522,37 @@ export function EmailChangePage(props: Readonly<{
   const zh = props.locale === "zh-CN";
   const [token, setToken] = useState<string | null>(() => fragmentToken());
   const [pending, setPending] = useState(false);
+  const [intent, setIntent] = useState<{
+    status: "pending" | "delivered";
+    requestedEmail?: string;
+    actionUrl?: string;
+  } | null>(null);
+  const [inspectedToken, setInspectedToken] = useState<string | null>(null);
   useEffect(() => {
     if (window.location.hash) window.history.replaceState({}, "", window.location.pathname);
   }, []);
+  useEffect(() => {
+    setInspectedToken(null);
+    if (!props.authenticated || !token) return;
+    let active = true;
+    void api<{ requestedEmail: string }>("/api/v1/security/email-change/inspect", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    }).then((result) => {
+      if (!active) return;
+      setIntent((current) => ({
+        status: current?.status ?? "pending",
+        requestedEmail: result.requestedEmail,
+        ...(current?.actionUrl ? { actionUrl: current.actionUrl } : {}),
+      }));
+      setInspectedToken(token);
+    }).catch((caught: unknown) => {
+      if (active) {
+        props.onError(caught instanceof Error ? caught.message : "Email change inspection failed");
+      }
+    });
+    return () => { active = false; };
+  }, [props.authenticated, token]);
   const complete = () => {
     if (!token) return;
     setPending(true);
@@ -509,6 +573,51 @@ export function EmailChangePage(props: Readonly<{
       ? (zh ? "请先使用原身份登录，再打开此 fragment 链接完成确认。" : "Sign in as the existing identity before completing this fragment link.")
       : token ? (zh ? "确认后，新邮箱立即成为已验证登录邮箱。" : "After confirmation, the new address immediately becomes the verified sign-in email.")
         : (zh ? "链接缺失或已从当前页面消费。" : "The link is missing or was already consumed in this page.")}</p>
-    <button className="primary" disabled={!props.authenticated || !token || pending} onClick={complete}>{zh ? "确认邮箱变更" : "Confirm email change"}</button>
+    {props.authenticated && token && <div className="mock-message" data-testid="email-change-target">
+      <strong>{zh ? "将要使用的新邮箱" : "New email address"}</strong>
+      <span>{inspectedToken === token && intent?.requestedEmail
+        ? intent.requestedEmail
+        : (zh ? "正在验证链接…" : "Verifying the link…")}</span>
+    </div>}
+    {!props.authenticated && props.onLogin && <form onSubmit={props.onLogin} data-testid="email-change-login">
+      <label>{zh ? "当前登录邮箱" : "Current sign-in email"}<input name="email" type="email" required /></label>
+      <label>{zh ? "密码" : "Password"}<input name="password" type="password" required /></label>
+      <button className="primary" disabled={pending}>{zh ? "登录后继续" : "Sign in and continue"}</button>
+    </form>}
+    {props.authenticated && !token && <div className="mock-message" data-testid="email-change-mailbox">
+      <strong>{zh ? "待确认邮箱" : "Pending email address"}</strong>
+      <span>{intent?.requestedEmail ?? (zh ? "尚未找到待确认地址" : "No pending address found")}</span>
+      {intent?.actionUrl && <a
+        href={intent.actionUrl}
+        onClick={(event) => {
+          event.preventDefault();
+          const parsed = new URL(intent.actionUrl!, window.location.origin);
+          const values = new URLSearchParams(parsed.hash.slice(1)).getAll("token");
+          if (parsed.origin === window.location.origin && values.length === 1) {
+            setToken(values[0]!);
+            window.history.replaceState({}, "", window.location.pathname);
+          }
+        }}
+      >{zh ? "打开邮箱确认链接" : "Open the email confirmation link"}</a>}
+      <button disabled={pending} onClick={() => {
+        setPending(true);
+        void api<{
+          status: "pending" | "delivered";
+          requestedEmail?: string;
+          actionUrl?: string;
+        }>("/api/v1/lab/identity-mailbox/email-change")
+          .then(setIntent)
+          .catch((caught: unknown) => props.onError(caught instanceof Error ? caught.message : "Email mailbox failed"))
+          .finally(() => setPending(false));
+      }}>{zh ? "读取新邮箱的 Mock Mail" : "Read the new-address Mock Mail"}</button>
+    </div>}
+    <button
+      className="primary"
+      disabled={
+        !props.authenticated || !token || pending || inspectedToken !== token ||
+        !intent?.requestedEmail
+      }
+      onClick={complete}
+    >{zh ? "确认邮箱变更" : "Confirm email change"}</button>
   </section>;
 }

@@ -205,6 +205,11 @@ async function createBundle(input: Readonly<{
        VALUES ($1, $2, 'synthetic-not-a-password', 'en', pg_catalog.now())`,
       [userId, email],
     );
+    const principal = await client.query<{ authorization_epoch: string }>(
+      `SELECT authorization_epoch::text FROM users WHERE id = $1`,
+      [userId],
+    );
+    const authorizationEpoch = principal.rows[0]!.authorization_epoch;
     const clock = await client.query<{ expires_at: Date }>(
       `SELECT pg_catalog.clock_timestamp() + interval '30 minutes' AS expires_at`,
     );
@@ -213,16 +218,16 @@ async function createBundle(input: Readonly<{
     if (input.kind === "password_recovery") {
       await client.query(
         `INSERT INTO password_reset_tokens(
-           id, user_id, token_digest, expires_at
-         ) VALUES ($1, $2, $3, $4)`,
-        [subjectId, userId, digest, expiresAt],
+           id, user_id, authorization_epoch, token_digest, expires_at
+         ) VALUES ($1, $2, $3, $4, $5)`,
+        [subjectId, userId, authorizationEpoch, digest, expiresAt],
       );
     } else {
       await client.query(
         `INSERT INTO email_change_tokens(
-           id, user_id, requested_email, token_digest, expires_at
-         ) VALUES ($1, $2, $3, $4, $5)`,
-        [subjectId, userId, recipient, digest, expiresAt],
+           id, user_id, authorization_epoch, requested_email, token_digest, expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [subjectId, userId, authorizationEpoch, recipient, digest, expiresAt],
       );
     }
     const path = input.kind === "password_recovery" ? "/password-recovery" : "/email-change";

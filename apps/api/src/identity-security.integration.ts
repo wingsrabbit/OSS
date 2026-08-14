@@ -46,7 +46,7 @@ const config: Config = {
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-identity-security-payment-secret",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-identity-security-provisioning-secret",
-  LAB_MAILBOX_ENABLED: false,
+  LAB_MAILBOX_ENABLED: true,
 };
 
 type Customer = Readonly<{
@@ -60,10 +60,25 @@ function json<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
 }
 
-function cookie(response: Readonly<{ headers: Record<string, unknown> }>): string {
+function namedCookie(
+  response: Readonly<{ headers: Record<string, unknown> }>,
+  name: string,
+): string {
   const value = response.headers["set-cookie"];
-  assert.ok(value, "response must issue a Session cookie");
-  return String(value).split(";", 1)[0]!;
+  assert.ok(value, `response must issue the ${name} cookie`);
+  const serialized = Array.isArray(value) ? value.join(", ") : String(value);
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = serialized.match(new RegExp(`(?:^|,\\s*)(${escaped}=[^;,\\s]+)`));
+  assert.ok(match?.[1], `response must issue the ${name} cookie`);
+  return match[1];
+}
+
+function cookie(response: Readonly<{ headers: Record<string, unknown> }>): string {
+  return namedCookie(response, config.SESSION_COOKIE_NAME);
+}
+
+function mailboxCookie(response: Readonly<{ headers: Record<string, unknown> }>): string {
+  return namedCookie(response, "oss_lab_identity_mailbox");
 }
 
 function base32Decode(secret: string): Buffer {
@@ -100,7 +115,7 @@ function totpCode(secret: string, timeMs: number): string {
   return String(binary % 1_000_000).padStart(6, "0");
 }
 
-async function createCustomer(label: string): Promise<Customer> {
+async function createCustomer(label: string, emailVerified = true): Promise<Customer> {
   if (!pool) throw new Error("Database is unavailable");
   const userId = randomUUID();
   const accountId = randomUUID();
@@ -110,8 +125,11 @@ async function createCustomer(label: string): Promise<Customer> {
   await transaction(pool, async (client) => {
     await client.query(
       `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
-       VALUES ($1, $2, $3, 'en', pg_catalog.now())`,
-      [userId, email, encoded],
+       VALUES (
+         $1, $2, $3, 'en',
+         CASE WHEN $4::boolean THEN pg_catalog.now() ELSE NULL END
+       )`,
+      [userId, email, encoded, emailVerified],
     );
     await client.query(
       `INSERT INTO client_accounts(id, name, owner_user_id)
@@ -129,6 +147,7 @@ async function createCustomer(label: string): Promise<Customer> {
 
 async function login(customer: Customer): Promise<Readonly<{
   cookie: string;
+  mailboxCookie: string;
   epoch: string;
   contextVersion: string;
 }>> {
@@ -142,6 +161,7 @@ async function login(customer: Customer): Promise<Readonly<{
   assert.match(String(response.headers["x-oss-authorization-epoch"]), /^\d+$/);
   return {
     cookie: cookie(response),
+    mailboxCookie: mailboxCookie(response),
     epoch: String(response.headers["x-oss-authorization-epoch"]),
     contextVersion: String(response.headers["x-oss-account-context-version"]),
   };
@@ -155,6 +175,55 @@ function sessionHeaders(session: Readonly<{ cookie: string; contextVersion: stri
     cookie: session.cookie,
     "x-oss-account-context-version": session.contextVersion,
   };
+}
+
+function rawCookieValue(serialized: string): string {
+  const separator = serialized.indexOf("=");
+  assert.ok(separator > 0, "cookie must contain a name and value");
+  return serialized.slice(separator + 1);
+}
+
+async function assertMailboxCapability(
+  session: Readonly<{
+    cookie: string;
+    mailboxCookie: string;
+    epoch: string;
+  }>,
+  expectedEmail: string,
+): Promise<string> {
+  if (!pool) throw new Error("Database is unavailable");
+  const rawCapability = rawCookieValue(session.mailboxCookie);
+  const separator = rawCapability.indexOf(".");
+  assert.ok(separator > 0, "mailbox capability must contain an id and secret");
+  const capabilityId = rawCapability.slice(0, separator);
+  const capabilitySecret = rawCapability.slice(separator + 1);
+  const sessionToken = rawCookieValue(session.cookie);
+  const result = await pool.query<{
+    recipient: string;
+    authorization_epoch: string;
+    origin_session_id: string;
+    current_session_id: string;
+    revoked_at: Date | null;
+  }>(
+    `SELECT capability.recipient::text,
+            capability.authorization_epoch::text,
+            capability.origin_session_id,
+            origin.id AS current_session_id,
+            capability.revoked_at
+     FROM lab_identity_mailbox_capabilities capability
+     JOIN sessions origin
+       ON origin.id = capability.origin_session_id
+      AND origin.token_digest = $3
+     WHERE capability.id = $1 AND capability.token_digest = $2`,
+    [capabilityId, digestToken(capabilitySecret), digestToken(sessionToken)],
+  );
+  const row = result.rows[0];
+  assert.ok(row, "mailbox capability must bind the current Session secret");
+  assert.equal(row.recipient, expectedEmail);
+  assert.equal(row.authorization_epoch, session.epoch);
+  assert.equal(row.origin_session_id, row.current_session_id);
+  assert.equal(row.revoked_at, null);
+  return capabilityId;
 }
 
 async function notificationToken(kind: "password_recovery" | "email_change"): Promise<{
@@ -220,8 +289,98 @@ try {
 
   const primary = await createCustomer("primary");
   const other = await createCustomer("other");
+  const registration = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/register",
+    payload: {
+      email: `registration-${databaseName}@example.invalid`,
+      password: "Synthetic-registration-password-024!",
+      clientName: "Synthetic registration account",
+      locale: "en",
+    },
+  });
+  assert.equal(registration.statusCode, 201, registration.body);
+  assert.doesNotMatch(
+    String(registration.headers["set-cookie"] ?? ""),
+    /oss_lab_identity_mailbox=/,
+    "registration alone must not prove possession of the recovery mailbox",
+  );
+
+  const verificationCustomer = await createCustomer("verification", false);
+  const verificationSession = await login(verificationCustomer);
+  const unverifiedCapabilityId = await assertMailboxCapability(
+    verificationSession,
+    verificationCustomer.email,
+  );
+  const verificationToken = randomBytes(32).toString("base64url");
+  await pool.query(
+    `INSERT INTO email_verification_tokens(user_id, token_digest, expires_at)
+     VALUES ($1, $2, pg_catalog.clock_timestamp() + interval '30 minutes')`,
+    [verificationCustomer.userId, digestToken(verificationToken)],
+  );
+  const verification = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/verify-email",
+    headers: {
+      cookie: `${verificationSession.cookie}; ${verificationSession.mailboxCookie}`,
+    },
+    payload: { token: verificationToken },
+  });
+  assert.equal(verification.statusCode, 200, verification.body);
+  assert.equal(json<{ status: string }>(verification).status, "verified");
+  const verifiedEpoch = await pool.query<{ authorization_epoch: string }>(
+    `SELECT authorization_epoch::text FROM users WHERE id = $1`,
+    [verificationCustomer.userId],
+  );
+  const verifiedSession = {
+    ...verificationSession,
+    mailboxCookie: mailboxCookie(verification),
+    epoch: verifiedEpoch.rows[0]!.authorization_epoch,
+  };
+  const verifiedCapabilityId = await assertMailboxCapability(
+    verifiedSession,
+    verificationCustomer.email,
+  );
+  assert.notEqual(verifiedCapabilityId, unverifiedCapabilityId);
+  const retiredUnverifiedCapability = await pool.query<{ revoked: boolean }>(
+    `SELECT revoked_at IS NOT NULL AS revoked
+     FROM lab_identity_mailbox_capabilities WHERE id = $1`,
+    [unverifiedCapabilityId],
+  );
+  assert.equal(retiredUnverifiedCapability.rows[0]?.revoked, true);
+
   let session = await login(primary);
   assert.match(session.epoch, /^\d+$/);
+  const initialMailboxCapabilityId = await assertMailboxCapability(session, primary.email);
+  const verificationOrigin = await pool.query<{ id: string }>(
+    `SELECT id FROM sessions WHERE token_digest = $1`,
+    [digestToken(rawCookieValue(verificationSession.cookie))],
+  );
+  await expectDatabaseReject(
+    `INSERT INTO lab_identity_mailbox_capabilities(
+       user_id, origin_session_id, recipient, authorization_epoch,
+       token_digest, expires_at
+     ) VALUES (
+       $1, $2, $3, $4, $5,
+       pg_catalog.clock_timestamp() + interval '30 days'
+     )`,
+    [
+      primary.userId,
+      verificationOrigin.rows[0]!.id,
+      primary.email,
+      session.epoch,
+      randomBytes(32),
+    ],
+  );
+  await expectDatabaseReject(
+    `UPDATE lab_identity_mailbox_capabilities
+     SET recipient = $2 WHERE id = $1`,
+    [initialMailboxCapabilityId, `forged-${databaseName}@example.invalid`],
+  );
+  await expectDatabaseReject(
+    `DELETE FROM lab_identity_mailbox_capabilities WHERE id = $1`,
+    [initialMailboxCapabilityId],
+  );
 
   const bearerOnCookieRoute = await app.inject({
     method: "GET",
@@ -331,9 +490,18 @@ try {
   assert.notEqual(confirm.headers["x-oss-authorization-epoch"], session.epoch);
   session = {
     ...session,
+    mailboxCookie: mailboxCookie(confirm),
     epoch: String(confirm.headers["x-oss-authorization-epoch"]),
     contextVersion: String(confirm.headers["x-oss-account-context-version"]),
   };
+  const enabledMailboxCapabilityId = await assertMailboxCapability(session, primary.email);
+  assert.notEqual(enabledMailboxCapabilityId, initialMailboxCapabilityId);
+  const retiredInitialMailbox = await pool.query<{ revoked: boolean }>(
+    `SELECT revoked_at IS NOT NULL AS revoked
+     FROM lab_identity_mailbox_capabilities WHERE id = $1`,
+    [initialMailboxCapabilityId],
+  );
+  assert.equal(retiredInitialMailbox.rows[0]?.revoked, true);
 
   const challengeLogin = await app.inject({
     method: "POST",
@@ -358,9 +526,11 @@ try {
   assert.match(String(completeChallenge.headers["x-oss-authorization-epoch"]), /^\d+$/);
   let mfaSession = {
     cookie: cookie(completeChallenge),
+    mailboxCookie: mailboxCookie(completeChallenge),
     epoch: String(completeChallenge.headers["x-oss-authorization-epoch"]),
     contextVersion: String(completeChallenge.headers["x-oss-account-context-version"]),
   };
+  await assertMailboxCapability(mfaSession, primary.email);
 
   const replayLogin = await app.inject({
     method: "POST",
@@ -409,9 +579,11 @@ try {
   assert.equal(finishEmail.statusCode, 204, finishEmail.body);
   mfaSession = {
     ...mfaSession,
+    mailboxCookie: mailboxCookie(finishEmail),
     epoch: String(finishEmail.headers["x-oss-authorization-epoch"]),
     contextVersion: String(finishEmail.headers["x-oss-account-context-version"]),
   };
+  await assertMailboxCapability(mfaSession, `changed-${databaseName}@example.invalid`);
 
   const disableTotp = await app.inject({
     method: "POST",
@@ -422,9 +594,11 @@ try {
   assert.equal(disableTotp.statusCode, 204, disableTotp.body);
   mfaSession = {
     ...mfaSession,
+    mailboxCookie: mailboxCookie(disableTotp),
     epoch: String(disableTotp.headers["x-oss-authorization-epoch"]),
     contextVersion: String(disableTotp.headers["x-oss-account-context-version"]),
   };
+  await assertMailboxCapability(mfaSession, `changed-${databaseName}@example.invalid`);
   const reenrollment = await app.inject({
     method: "POST",
     url: "/api/v1/security/totp/enroll",
@@ -448,6 +622,13 @@ try {
     },
   });
   assert.equal(reenable.statusCode, 201, reenable.body);
+  mfaSession = {
+    ...mfaSession,
+    mailboxCookie: mailboxCookie(reenable),
+    epoch: String(reenable.headers["x-oss-authorization-epoch"]),
+    contextVersion: String(reenable.headers["x-oss-account-context-version"]),
+  };
+  await assertMailboxCapability(mfaSession, `changed-${databaseName}@example.invalid`);
   const credentialHistory = await pool.query<{ total: string; active: string }>(
     `SELECT pg_catalog.count(*)::text AS total,
             pg_catalog.count(*) FILTER (WHERE disabled_at IS NULL)::text AS active
@@ -703,9 +884,11 @@ try {
   assert.equal(recoveryComplete.statusCode, 200, recoveryComplete.body);
   assert.equal(json<{ sessionEnded: boolean }>(recoveryComplete).sessionEnded, true);
   assert.match(String(recoveryComplete.headers["set-cookie"]), /Max-Age=0|Expires=/i);
+  assert.match(String(recoveryComplete.headers["set-cookie"]), /oss_lab_identity_mailbox=/i);
   const revoked = await pool.query<{
     active_sessions: string;
     active_keys: string;
+    active_mailbox_capabilities: string;
   }>(
     `SELECT
        (SELECT pg_catalog.count(*)::text FROM sessions
@@ -714,10 +897,18 @@ try {
         FROM customer_api_keys api_key
         LEFT JOIN customer_api_key_revocations revocation
           ON revocation.api_key_id = api_key.id
-        WHERE api_key.user_id = $1 AND revocation.api_key_id IS NULL) AS active_keys`,
+        WHERE api_key.user_id = $1 AND revocation.api_key_id IS NULL) AS active_keys,
+       (SELECT pg_catalog.count(*)::text
+        FROM lab_identity_mailbox_capabilities capability
+        WHERE capability.user_id = $1 AND capability.revoked_at IS NULL)
+         AS active_mailbox_capabilities`,
     [primary.userId],
   );
-  assert.deepEqual(revoked.rows[0], { active_sessions: "0", active_keys: "0" });
+  assert.deepEqual(revoked.rows[0], {
+    active_sessions: "0",
+    active_keys: "0",
+    active_mailbox_capabilities: "0",
+  });
   const revokedKeyUse = await app.inject({
     method: "GET",
     url: "/api/v1/customer-api/account",
@@ -732,6 +923,7 @@ try {
   });
   assert.equal(terminateCurrent.statusCode, 200, terminateCurrent.body);
   assert.equal(json<{ sessionEnded: boolean }>(terminateCurrent).sessionEnded, true);
+  assert.match(String(terminateCurrent.headers["set-cookie"]), /oss_lab_identity_mailbox=.*Max-Age=0/i);
   const terminatedOtherSession = await pool.query<{ id: string }>(
     `SELECT id FROM sessions WHERE user_id = $1 AND revoked_at IS NOT NULL
      ORDER BY revoked_at DESC, id DESC LIMIT 1`,

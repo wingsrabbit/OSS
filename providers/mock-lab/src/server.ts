@@ -127,6 +127,7 @@ const mailDeliveryStatusSchema = z.enum(["delivered", "bounced", "failed"]);
 
 const mailboxQuerySchema = z.object({
   recipient: z.email(),
+  operationId: z.uuid().optional(),
 });
 
 function requestFingerprint(scope: string, body: unknown): string {
@@ -1768,9 +1769,10 @@ app.post("/v1/mailbox/query", async (request) => {
     `SELECT operation_id, template, locale, subject, body, status, delivered_at
      FROM mock_mail_messages
      WHERE recipient = $1
+       AND ($2::uuid IS NULL OR operation_id = $2)
      ORDER BY delivered_at DESC
      LIMIT 20`,
-    [query.recipient],
+    [query.recipient, query.operationId ?? null],
   );
   return result.rows.map((message) => ({
     id: message.operation_id,

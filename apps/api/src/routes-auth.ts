@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import {
   assertIdentityReadEligible,
@@ -19,7 +19,7 @@ import {
   type SessionIdentity,
 } from "./auth.js";
 import type { Config } from "./config.js";
-import { transaction, type DatabasePool } from "./database.js";
+import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import {
   collectionPage,
   decodeKeysetCursor,
@@ -82,6 +82,11 @@ const labMailboxMessageSchema = z
     deliveredAt: z.iso.datetime(),
   })
   .strict();
+
+const LAB_IDENTITY_MAILBOX_COOKIE = "oss_lab_identity_mailbox";
+const labIdentityMailboxCapabilitySchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/i,
+);
 
 type AccountContextItem = Readonly<{
   clientAccountId: string;
@@ -221,6 +226,229 @@ function sessionCookieOptions(config: Config) {
   };
 }
 
+function labIdentityMailboxCookieOptions(config: Config) {
+  return {
+    httpOnly: true,
+    secure: config.OSS_ENV === "laboratory",
+    sameSite: "strict" as const,
+    path: "/",
+    maxAge: 30 * 24 * 60 * 60,
+  };
+}
+
+export async function rotateLabIdentityMailboxCapability(
+  client: DatabaseClient,
+  userId: string,
+  recipient: string,
+  originSessionId: string,
+  enabled: boolean,
+): Promise<string | null> {
+  if (!enabled) return null;
+  await client.query(
+    `UPDATE lab_identity_mailbox_capabilities
+     SET revoked_at = pg_catalog.clock_timestamp()
+     WHERE user_id = $1 AND revoked_at IS NULL`,
+    [userId],
+  );
+  const secret = createOpaqueToken();
+  const inserted = await client.query<{ id: string }>(
+    `INSERT INTO lab_identity_mailbox_capabilities(
+       user_id, origin_session_id, recipient, authorization_epoch,
+       token_digest, expires_at
+     )
+     SELECT principal.id, origin.id, principal.email,
+            principal.authorization_epoch, $4,
+            pg_catalog.clock_timestamp() + interval '30 days'
+     FROM users principal
+     JOIN sessions origin
+       ON origin.id = $3 AND origin.user_id = principal.id
+      AND origin.revoked_at IS NULL
+      AND origin.expires_at > pg_catalog.clock_timestamp()
+     WHERE principal.id = $1 AND principal.email = $2
+     RETURNING id`,
+    [userId, recipient, originSessionId, digestToken(secret)],
+  );
+  const id = inserted.rows[0]?.id;
+  if (!id) return null;
+  return `${id}.${secret}`;
+}
+
+export function setLabIdentityMailboxCapability(
+  reply: FastifyReply,
+  config: Config,
+  capability: string | null,
+): void {
+  if (capability) {
+    reply.setCookie(
+      LAB_IDENTITY_MAILBOX_COOKIE,
+      capability,
+      labIdentityMailboxCookieOptions(config),
+    );
+  }
+}
+
+export function clearLabIdentityMailboxCapability(reply: FastifyReply): void {
+  reply.clearCookie(LAB_IDENTITY_MAILBOX_COOKIE, { path: "/" });
+}
+
+type LabIdentityMessagePointer = Readonly<{
+  capabilityId: string;
+  recipient: string;
+  outboxId: string;
+  subjectId: string;
+  providerOperationId: string;
+  tokenDigest: Buffer;
+}>;
+
+type IdentityMessagePointer = Readonly<{
+  recipient: string;
+  outboxId: string;
+  subjectId: string;
+  providerOperationId: string;
+  tokenDigest: Buffer;
+}>;
+
+async function passwordRecoveryMailboxPointer(
+  pool: DatabasePool,
+  rawCapability: string,
+): Promise<LabIdentityMessagePointer | null> {
+  const parsed = labIdentityMailboxCapabilitySchema.safeParse(rawCapability);
+  if (!parsed.success) return null;
+  const separator = parsed.data.indexOf(".");
+  const capabilityId = parsed.data.slice(0, separator).toLowerCase();
+  const secret = parsed.data.slice(separator + 1);
+  const result = await pool.query<{
+    capability_id: string;
+    recipient: string;
+    outbox_id: string;
+    subject_id: string;
+    provider_operation_id: string;
+    token_digest: Buffer;
+  }>(
+    `SELECT capability.id AS capability_id, capability.recipient::text,
+            event.id AS outbox_id, event.subject_id,
+            operation.provider_operation_id, token.token_digest
+     FROM lab_identity_mailbox_capabilities capability
+     JOIN users principal ON principal.id = capability.user_id
+       AND principal.email = capability.recipient
+       AND principal.authorization_epoch = capability.authorization_epoch
+     JOIN password_reset_tokens token
+       ON token.user_id = capability.user_id
+      AND token.authorization_epoch = principal.authorization_epoch
+      AND token.used_at IS NULL AND token.invalidated_at IS NULL
+      AND token.expires_at > pg_catalog.clock_timestamp()
+     JOIN identity_notification_outbox event
+       ON event.kind = 'password_recovery'
+      AND event.subject_id = token.id
+      AND event.user_id = capability.user_id
+      AND event.recipient = capability.recipient
+     JOIN identity_notification_delivery_operations operation
+       ON operation.outbox_id = event.id
+     JOIN identity_notification_delivery_facts fact
+       ON fact.outbox_id = operation.outbox_id
+      AND fact.attempt_number = operation.attempt_number
+      AND fact.provider_operation_id = operation.provider_operation_id
+      AND fact.status = 'delivered'
+     WHERE capability.id = $1
+       AND capability.token_digest = $2
+       AND capability.revoked_at IS NULL
+       AND capability.expires_at > pg_catalog.clock_timestamp()
+     ORDER BY operation.attempt_number DESC, fact.recorded_at DESC
+     LIMIT 1`,
+    [capabilityId, digestToken(secret)],
+  );
+  const row = result.rows[0];
+  return row
+    ? {
+        capabilityId: row.capability_id,
+        recipient: row.recipient,
+        outboxId: row.outbox_id,
+        subjectId: row.subject_id,
+        providerOperationId: row.provider_operation_id,
+        tokenDigest: row.token_digest,
+      }
+    : null;
+}
+
+async function emailChangeMailboxPointer(
+  pool: DatabasePool,
+  userId: string,
+): Promise<IdentityMessagePointer | null> {
+  const result = await pool.query<{
+    recipient: string;
+    outbox_id: string;
+    subject_id: string;
+    provider_operation_id: string;
+    token_digest: Buffer;
+  }>(
+    `SELECT token.requested_email::text AS recipient,
+            event.id AS outbox_id, event.subject_id,
+            operation.provider_operation_id, token.token_digest
+     FROM users principal
+     JOIN email_change_tokens token
+       ON token.user_id = principal.id
+      AND token.authorization_epoch = principal.authorization_epoch
+      AND token.used_at IS NULL AND token.invalidated_at IS NULL
+      AND token.expires_at > pg_catalog.clock_timestamp()
+     JOIN identity_notification_outbox event
+       ON event.kind = 'email_change'
+      AND event.subject_id = token.id
+      AND event.user_id = principal.id
+      AND event.recipient = token.requested_email
+     JOIN identity_notification_delivery_operations operation
+       ON operation.outbox_id = event.id
+     JOIN identity_notification_delivery_facts fact
+       ON fact.outbox_id = operation.outbox_id
+      AND fact.attempt_number = operation.attempt_number
+      AND fact.provider_operation_id = operation.provider_operation_id
+      AND fact.status = 'delivered'
+     WHERE principal.id = $1
+     ORDER BY operation.attempt_number DESC, fact.recorded_at DESC
+     LIMIT 1`,
+    [userId],
+  );
+  const row = result.rows[0];
+  return row
+    ? {
+        recipient: row.recipient,
+        outboxId: row.outbox_id,
+        subjectId: row.subject_id,
+        providerOperationId: row.provider_operation_id,
+        tokenDigest: row.token_digest,
+      }
+    : null;
+}
+
+function exactIdentityLink(
+  message: z.infer<typeof labMailboxMessageSchema>,
+  input: Readonly<{
+    providerOperationId: string;
+    template: "password-recovery-v1" | "email-change-v1";
+    path: "/password-recovery" | "/email-change";
+    tokenDigest: Buffer;
+    publicOrigin: string;
+  }>,
+): string | null {
+  if (message.id !== input.providerOperationId || message.template !== input.template) {
+    return null;
+  }
+  const candidates = message.body.match(/https?:\/\/[^\s]+/g) ?? [];
+  const exact = candidates.filter((candidate) => {
+    try {
+      const url = new URL(candidate);
+      const tokens = new URLSearchParams(url.hash.slice(1)).getAll("token");
+      return url.origin === input.publicOrigin &&
+        url.pathname === input.path && url.search === "" && tokens.length === 1 &&
+        url.hash === `#token=${tokens[0]}` &&
+        /^[A-Za-z0-9_-]{43}$/.test(tokens[0] ?? "") &&
+        digestToken(tokens[0]!).equals(input.tokenDigest);
+    } catch {
+      return false;
+    }
+  });
+  return exact.length === 1 ? exact[0]! : null;
+}
+
 export async function registerAuthRoutes(
   app: FastifyInstance,
   pool: DatabasePool,
@@ -288,10 +516,15 @@ export async function registerAuthRoutes(
             locale: body.locale,
           },
         });
-        return { userId, clientAccountId, expiresAt: verification.expires_at };
+        return {
+          userId,
+          clientAccountId,
+          expiresAt: verification.expires_at,
+        };
       });
       return reply.code(201).send({
-        ...user,
+        userId: user.userId,
+        clientAccountId: user.clientAccountId,
         verification: {
           status: "pending",
           expiresAt: user.expiresAt.toISOString(),
@@ -474,20 +707,25 @@ export async function registerAuthRoutes(
       // one serialized decision.
       const lockedPrincipal = await client.query<{
         password_hash: string;
+        email_matches: boolean;
         email_verified_at: Date | null;
         user_restricted_at: Date | null;
         authorization_epoch: string;
       }>(
-        `SELECT password_hash, email_verified_at,
+        `SELECT password_hash, email = $2 AS email_matches, email_verified_at,
                 restricted_at AS user_restricted_at,
                 authorization_epoch::text
          FROM users
          WHERE id = $1
          FOR UPDATE`,
-        [user.id],
+        [user.id, body.email],
       );
       const principal = lockedPrincipal.rows[0];
-      if (!principal || principal.password_hash !== user.password_hash) {
+      if (
+        !principal ||
+        principal.email_matches !== true ||
+        principal.password_hash !== user.password_hash
+      ) {
         throw Object.assign(new Error("Invalid email or password"), { statusCode: 401 });
       }
       await client.query(
@@ -505,16 +743,19 @@ export async function registerAuthRoutes(
           [user.id],
         );
         const challenge = await client.query<{ id: string }>(
-          `INSERT INTO login_challenges(user_id, token_digest, expires_at)
-           VALUES ($1, $2, pg_catalog.clock_timestamp() + interval '5 minutes')
+          `INSERT INTO login_challenges(
+             user_id, authorization_epoch, token_digest, expires_at
+           )
+           VALUES ($1, $2, $3, pg_catalog.clock_timestamp() + interval '5 minutes')
            RETURNING id`,
-          [user.id, digestToken(challengeToken)],
+          [user.id, principal.authorization_epoch, digestToken(challengeToken)],
         );
         const challengeId = challenge.rows[0]?.id;
         if (!challengeId) throw new Error("Unable to create login challenge");
         return { kind: "challenge" as const, challengeId };
       }
       const sessionResult = await client.query<{
+        id: string;
         active_client_account_id: string | null;
         account_context_version: string;
         expires_at: Date;
@@ -549,7 +790,7 @@ export async function registerAuthRoutes(
            ELSE 0
          END
        FROM active_memberships
-       RETURNING active_client_account_id, account_context_version::text,
+       RETURNING id, active_client_account_id, account_context_version::text,
                  expires_at`,
         [user.id, digestToken(sessionToken), config.SESSION_TTL_HOURS],
       );
@@ -561,6 +802,13 @@ export async function registerAuthRoutes(
         identityEligible:
           Boolean(principal.email_verified_at) && !principal.user_restricted_at,
         authorizationEpoch: principal.authorization_epoch,
+        mailboxCapability: await rotateLabIdentityMailboxCapability(
+          client,
+          user.id,
+          body.email,
+          context.id,
+          config.LAB_MAILBOX_ENABLED,
+        ),
       };
     });
     if (loginOutcome.kind === "challenge") {
@@ -574,6 +822,7 @@ export async function registerAuthRoutes(
       });
     }
     reply.setCookie(config.SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(config));
+    setLabIdentityMailboxCapability(reply, config, loginOutcome.mailboxCapability);
     const context = loginOutcome.context;
     setAccountContextHeaders(reply, {
       clientAccountId: loginOutcome.identityEligible
@@ -631,7 +880,7 @@ export async function registerAuthRoutes(
          FROM users WHERE id = $1 FOR UPDATE`,
         [pointerUserId],
       );
-      if (!principal.rows[0] || principal.rows[0].restricted_at) return null;
+      if (!principal.rows[0]) return null;
       await client.query(
         `SELECT id FROM sessions
          WHERE user_id = $1 AND revoked_at IS NULL
@@ -643,10 +892,16 @@ export async function registerAuthRoutes(
       const challenge = await client.query<{ id: string }>(
         `SELECT id FROM login_challenges
          WHERE id = $1 AND user_id = $2 AND token_digest = $3
+           AND authorization_epoch = $4::bigint
            AND used_at IS NULL AND invalidated_at IS NULL
            AND expires_at > pg_catalog.clock_timestamp()
          FOR UPDATE`,
-        [body.challengeId, pointerUserId, digestToken(body.challengeToken)],
+        [
+          body.challengeId,
+          pointerUserId,
+          digestToken(body.challengeToken),
+          principal.rows[0].authorization_epoch,
+        ],
       );
       if (!challenge.rows[0]) return null;
       const factorMethod = await verifyConfiguredFactorLocked(
@@ -665,6 +920,7 @@ export async function registerAuthRoutes(
         [body.challengeId, factorMethod],
       );
       const sessionResult = await client.query<{
+        id: string;
         active_client_account_id: string | null;
         account_context_version: string;
         expires_at: Date;
@@ -690,20 +946,34 @@ export async function registerAuthRoutes(
                 CASE WHEN membership_count = 1 AND unrestricted_membership_count = 1
                   THEN 1 ELSE 0 END
          FROM active_memberships
-         RETURNING active_client_account_id, account_context_version::text,
+         RETURNING id, active_client_account_id, account_context_version::text,
                    expires_at`,
         [pointerUserId, digestToken(sessionToken), config.SESSION_TTL_HOURS],
       );
       return {
         context: sessionResult.rows[0]!,
-        identityEligible: Boolean(principal.rows[0].email_verified_at),
+        identityEligible:
+          Boolean(principal.rows[0].email_verified_at) && !principal.rows[0].restricted_at,
         authorizationEpoch: principal.rows[0].authorization_epoch,
+        mailboxCapability: await rotateLabIdentityMailboxCapability(
+          client,
+          pointerUserId,
+          (
+            await client.query<{ email: string }>(
+              `SELECT email::text FROM users WHERE id = $1`,
+              [pointerUserId],
+            )
+          ).rows[0]!.email,
+          sessionResult.rows[0]!.id,
+          config.LAB_MAILBOX_ENABLED,
+        ),
       };
     });
     if (!outcome) {
       return reply.code(401).send({ error: "Login challenge is invalid or expired" });
     }
     reply.setCookie(config.SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(config));
+    setLabIdentityMailboxCapability(reply, config, outcome.mailboxCapability);
     setAccountContextHeaders(reply, {
       clientAccountId: outcome.identityEligible
         ? outcome.context.active_client_account_id
@@ -772,6 +1042,7 @@ export async function registerAuthRoutes(
       }
     }
     reply.clearCookie(config.SESSION_COOKIE_NAME, { path: "/" });
+    clearLabIdentityMailboxCapability(reply);
     return reply.code(204).send();
   });
 
@@ -1064,6 +1335,18 @@ export async function registerAuthRoutes(
 
   app.post("/api/v1/auth/verify-email", async (request, reply) => {
     const body = verificationSchema.parse(request.body);
+    const rawSessionToken = request.cookies[config.SESSION_COOKIE_NAME];
+    const browserSession = rawSessionToken
+      ? (
+          await pool.query<{ id: string; user_id: string }>(
+            `SELECT id, user_id
+             FROM sessions
+             WHERE token_digest = $1 AND revoked_at IS NULL
+               AND expires_at > pg_catalog.clock_timestamp()`,
+            [digestToken(rawSessionToken)],
+          )
+        ).rows[0] ?? null
+      : null;
     const result = await transaction(pool, async (client) => {
       const tokenDigest = digestToken(body.token);
       const pointerResult = await client.query<{ id: string; user_id: string }>(
@@ -1075,8 +1358,11 @@ export async function registerAuthRoutes(
       );
       const pointer = pointerResult.rows[0];
       if (!pointer) return { status: "invalid" as const };
-      const principalResult = await client.query<{ email_verified_at: Date | null }>(
-        `SELECT email_verified_at
+      const principalResult = await client.query<{
+        email: string;
+        email_verified_at: Date | null;
+      }>(
+        `SELECT email::text, email_verified_at
          FROM users
          WHERE id = $1
          FOR UPDATE`,
@@ -1086,7 +1372,7 @@ export async function registerAuthRoutes(
       // version.  Finish the universal User -> Sessions prefix before locking
       // the verification token so a concurrent Session mutation fails closed
       // instead of introducing a Token <-> Session lock inversion.
-      await client.query(
+      const lockedSessions = await client.query<{ id: string }>(
         `SELECT id
          FROM sessions
          WHERE user_id = $1
@@ -1128,11 +1414,27 @@ export async function registerAuthRoutes(
          VALUES ('user', $1, 'email.verified', 'user', $1)`,
         [token.user_id],
       );
-      return { status: "verified" as const };
+      const canRefreshMailbox = browserSession?.user_id === token.user_id &&
+        lockedSessions.rows.some((session) => session.id === browserSession.id);
+      return {
+        status: "verified" as const,
+        mailboxCapability: canRefreshMailbox
+          ? await rotateLabIdentityMailboxCapability(
+              client,
+              token.user_id,
+              principalResult.rows[0]!.email,
+              browserSession.id,
+              config.LAB_MAILBOX_ENABLED,
+            )
+          : null,
+      };
     });
     if (result.status === "invalid") return reply.code(400).send(result);
     if (result.status === "expired") return reply.code(410).send(result);
-    return result;
+    if (result.status === "verified") {
+      setLabIdentityMailboxCapability(reply, config, result.mailboxCapability);
+    }
+    return { status: result.status };
   });
 
   app.post("/api/v1/auth/resend-verification", async (request, reply) => {
@@ -1258,12 +1560,190 @@ export async function registerAuthRoutes(
       throw Object.assign(new Error("Mock Mail Provider is unavailable"), { statusCode: 503 });
     }
     const providerMessages = z.array(labMailboxMessageSchema).parse(await response.json());
+    const currentIdentity = await requireSessionIdentity(request, pool, config);
+    if (
+      currentIdentity.userId !== identity.userId ||
+      currentIdentity.sessionId !== identity.sessionId ||
+      currentIdentity.email !== identity.email ||
+      currentIdentity.authorizationEpoch !== identity.authorizationEpoch ||
+      currentIdentity.userRestrictedAt
+    ) {
+      throw Object.assign(new Error("Session is invalid or expired"), { statusCode: 401 });
+    }
+    const sessionSafeTemplates = new Set([
+      "email-verification",
+      "email-change-v1",
+      "membership-invitation-v1",
+      "renewal-renewal-created-v1",
+      "renewal-pre-due-v1",
+      "renewal-overdue-first-v1",
+      "support-ticket-reply-v1",
+      "service-cancellation-scheduled-v1",
+    ]);
+    const sessionSafeMessages = providerMessages.filter((message) =>
+      sessionSafeTemplates.has(message.template)
+    );
     const messages = identity.emailVerifiedAt
-      ? providerMessages
-      : providerMessages.filter((message) => message.template === "email-verification");
+      ? sessionSafeMessages
+      : sessionSafeMessages.filter((message) => message.template === "email-verification");
     return {
       warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
       messages,
+    };
+  });
+
+  app.get("/api/v1/lab/identity-mailbox/password-recovery", async (request, reply) => {
+    if (!config.LAB_MAILBOX_ENABLED) {
+      return reply.code(404).send({ error: "Laboratory mailbox access is disabled" });
+    }
+    const rawCapability = request.cookies[LAB_IDENTITY_MAILBOX_COOKIE] ?? "";
+    const pointer = await passwordRecoveryMailboxPointer(pool, rawCapability);
+    if (!pointer) {
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        status: "pending",
+      };
+    }
+    const response = await fetch(new URL("/v1/mailbox/query", config.MOCK_MAILBOX_URL), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.LAB_MAILBOX_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        recipient: pointer.recipient,
+        operationId: pointer.providerOperationId,
+      }),
+      signal: AbortSignal.timeout(5_000),
+      redirect: "error",
+    });
+    if (!response.ok) {
+      throw Object.assign(new Error("Mock Mail Provider is unavailable"), { statusCode: 503 });
+    }
+    const messages = z.array(labMailboxMessageSchema).parse(await response.json());
+    const message = messages.find((candidate) =>
+      candidate.id === pointer.providerOperationId && candidate.status === "delivered"
+    );
+    const actionUrl = message
+      ? exactIdentityLink(message, {
+          providerOperationId: pointer.providerOperationId,
+          template: "password-recovery-v1",
+          path: "/password-recovery",
+          tokenDigest: pointer.tokenDigest,
+          publicOrigin: new URL(config.OSS_PUBLIC_URL).origin,
+        })
+      : null;
+    const current = await passwordRecoveryMailboxPointer(pool, rawCapability);
+    if (
+      !actionUrl || !message || !current ||
+      current.capabilityId !== pointer.capabilityId ||
+      current.outboxId !== pointer.outboxId ||
+      current.subjectId !== pointer.subjectId ||
+      current.providerOperationId !== pointer.providerOperationId
+    ) {
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        status: "pending",
+      };
+    }
+    return {
+      warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+      status: "delivered",
+      message: {
+        id: message.id,
+        subject: message.subject,
+        status: message.status,
+        deliveredAt: message.deliveredAt,
+      },
+      actionUrl,
+    };
+  });
+
+  app.get("/api/v1/lab/identity-mailbox/email-change", async (request, reply) => {
+    if (!config.LAB_MAILBOX_ENABLED) {
+      return reply.code(404).send({ error: "Laboratory mailbox access is disabled" });
+    }
+    const identity = await requireSessionIdentity(request, pool, config);
+    assertIdentityReadEligible(identity);
+    const pointer = await emailChangeMailboxPointer(pool, identity.userId);
+    if (!pointer) {
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        status: "pending",
+      };
+    }
+    const response = await fetch(new URL("/v1/mailbox/query", config.MOCK_MAILBOX_URL), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.LAB_MAILBOX_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        recipient: pointer.recipient,
+        operationId: pointer.providerOperationId,
+      }),
+      signal: AbortSignal.timeout(5_000),
+      redirect: "error",
+    });
+    if (!response.ok) {
+      throw Object.assign(new Error("Mock Mail Provider is unavailable"), { statusCode: 503 });
+    }
+    const messages = z.array(labMailboxMessageSchema).parse(await response.json());
+    const message = messages.find((candidate) =>
+      candidate.id === pointer.providerOperationId && candidate.status === "delivered"
+    );
+    const actionUrl = message
+      ? exactIdentityLink(message, {
+          providerOperationId: pointer.providerOperationId,
+          template: "email-change-v1",
+          path: "/email-change",
+          tokenDigest: pointer.tokenDigest,
+          publicOrigin: new URL(config.OSS_PUBLIC_URL).origin,
+        })
+      : null;
+    const currentIdentity = await requireSessionIdentity(request, pool, config);
+    if (
+      currentIdentity.userId !== identity.userId ||
+      currentIdentity.sessionId !== identity.sessionId ||
+      currentIdentity.email !== identity.email ||
+      currentIdentity.authorizationEpoch !== identity.authorizationEpoch
+    ) {
+      throw Object.assign(new Error("Session is invalid or expired"), {
+        statusCode: 401,
+        code: "SESSION_INVALID",
+      });
+    }
+    assertIdentityReadEligible(currentIdentity);
+    const current = await emailChangeMailboxPointer(pool, identity.userId);
+    if (
+      !current ||
+      current.outboxId !== pointer.outboxId ||
+      current.subjectId !== pointer.subjectId ||
+      current.providerOperationId !== pointer.providerOperationId
+    ) {
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        status: "pending",
+      };
+    }
+    if (!message || !actionUrl) {
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        status: "pending",
+        requestedEmail: current.recipient,
+      };
+    }
+    return {
+      warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+      status: "delivered",
+      requestedEmail: current.recipient,
+      message: {
+        id: message.id,
+        subject: message.subject,
+        status: message.status,
+        deliveredAt: message.deliveredAt,
+      },
+      actionUrl,
     };
   });
 }

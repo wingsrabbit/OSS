@@ -4428,6 +4428,7 @@ export function App() {
               me && me.verification.email === "passed" && !me.restrictions.user,
             )}
             locale={locale}
+            onLogin={login}
             onCompleted={async () => { await refreshMe(); }}
             onNotice={showTicketNotice}
             onError={showTicketError}
@@ -4515,6 +4516,13 @@ export function App() {
                   <button className="primary" type="submit">
                     {text.login}
                   </button>
+                  <a
+                    className="route-action"
+                    href="/password-recovery"
+                    onClick={(event) => followRouteLink(event, "/password-recovery")}
+                  >
+                    {locale === "zh-CN" ? "忘记密码？" : "Forgot password?"}
+                  </a>
                 </form>
               </div>
             </div>
@@ -4646,6 +4654,13 @@ export function App() {
                   <button className="primary" type="submit">
                     {text.login}
                   </button>
+                  <a
+                    className="route-action"
+                    href="/password-recovery"
+                    onClick={(event) => followRouteLink(event, "/password-recovery")}
+                  >
+                    {locale === "zh-CN" ? "忘记密码？" : "Forgot password?"}
+                  </a>
                 </form>
               </div>
             )}
@@ -4751,6 +4766,13 @@ export function App() {
                   <input name="password" type="password" placeholder="Staff password" required />
                 </label>
                 <button className="primary" type="submit">Sign in to Staff workspace</button>
+                <a
+                  className="route-action"
+                  href="/password-recovery"
+                  onClick={(event) => followRouteLink(event, "/password-recovery")}
+                >
+                  Forgot password?
+                </a>
               </form>
             )}
             <a className="route-action" href="/" onClick={(event) => followRouteLink(event, "/")}>

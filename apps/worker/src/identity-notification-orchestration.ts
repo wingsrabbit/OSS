@@ -167,8 +167,9 @@ async function lockBundle(
     email: string;
     locale: "en" | "zh-CN";
     restricted_at: Date | null;
+    authorization_epoch: string;
   }>(
-    `SELECT email::text, locale, restricted_at
+    `SELECT email::text, locale, restricted_at, authorization_epoch::text
      FROM public.users WHERE id = $1 FOR SHARE NOWAIT`,
     [pointer.user_id],
   );
@@ -184,8 +185,10 @@ async function lockBundle(
       invalidated_at: Date | null;
       unexpired: boolean;
       token_digest: Buffer;
+      authorization_epoch: string;
     }>(
       `SELECT user_id, expires_at, used_at, invalidated_at, token_digest,
+              authorization_epoch::text,
               expires_at > pg_catalog.clock_timestamp() AS unexpired
        FROM public.password_reset_tokens
        WHERE id = $1
@@ -195,6 +198,7 @@ async function lockBundle(
     const subject = token.rows[0];
     subjectExact = Boolean(
       subject && subject.user_id === pointer.user_id &&
+      subject.authorization_epoch === user?.authorization_epoch &&
       subject.expires_at.getTime() === pointer.expires_at.getTime(),
     );
     subjectActive = Boolean(
@@ -210,9 +214,10 @@ async function lockBundle(
       invalidated_at: Date | null;
       unexpired: boolean;
       token_digest: Buffer;
+      authorization_epoch: string;
     }>(
       `SELECT user_id, requested_email::text, expires_at, used_at, invalidated_at,
-              token_digest,
+              token_digest, authorization_epoch::text,
               expires_at > pg_catalog.clock_timestamp() AS unexpired
        FROM public.email_change_tokens
        WHERE id = $1
@@ -222,6 +227,7 @@ async function lockBundle(
     const subject = token.rows[0];
     subjectExact = Boolean(
       subject && subject.user_id === pointer.user_id &&
+      subject.authorization_epoch === user?.authorization_epoch &&
       subject.requested_email === pointer.recipient &&
       subject.expires_at.getTime() === pointer.expires_at.getTime(),
     );
