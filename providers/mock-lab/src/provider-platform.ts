@@ -63,6 +63,7 @@ interface StoredEvent {
 
 export interface ProviderPlatformConfig {
   publicBaseUrl: string;
+  authoritativeProvisioningResources?: boolean;
 }
 
 function succeededOutput(request: ProviderOperationRequest): ProviderOperationOutput {
@@ -283,6 +284,14 @@ export async function registerProviderPlatformRoutes(
     );
     CREATE INDEX IF NOT EXISTS mock_contract_events_operation_order_idx
       ON mock_contract_events (operation_id, response_order, event_row_id);
+    CREATE TABLE IF NOT EXISTS mock_contract_resource_states (
+      external_resource_ref text PRIMARY KEY,
+      resource_state text NOT NULL CHECK (resource_state IN ('ready', 'stopped', 'terminated')),
+      revision integer NOT NULL CHECK (revision > 0),
+      last_action text NOT NULL,
+      last_operation_id uuid NOT NULL UNIQUE REFERENCES mock_contract_operations(operation_id),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
 
   const manifest = createMockProviderManifest(config.publicBaseUrl);
@@ -337,6 +346,58 @@ export async function registerProviderPlatformRoutes(
         operation = repeated.rows[0];
         replayed = true;
       } else {
+        let authoritativeResource:
+          | {
+              service_id: string;
+              external_resource_id: string;
+              resource_state: "active" | "suspended" | "terminated";
+              power_state: "running" | "stopped" | "terminated";
+              desired_power_state: "running" | "stopped" | "terminated";
+            }
+          | undefined;
+        if (
+          config.authoritativeProvisioningResources === true &&
+          body.capability === "provisioning" &&
+          ["resource.start", "resource.stop", "resource.reboot"].includes(body.action)
+        ) {
+          const input: ProvisioningInput = body.input;
+          if (!input.externalResourceRef) {
+            await client.query("ROLLBACK");
+            return reply.code(400).send({ error: "daily resource operation requires externalResourceRef" });
+          }
+          const resource = await client.query<{
+            service_id: string;
+            external_resource_id: string;
+            resource_state: "active" | "suspended" | "terminated";
+            power_state: "running" | "stopped" | "terminated";
+            desired_power_state: "running" | "stopped" | "terminated";
+          }>(
+            `SELECT service_id::text, external_resource_id, resource_state,
+                    power_state, desired_power_state
+             FROM mock_resource_operations
+             WHERE service_id::text = $1
+               AND external_resource_id = $2
+               AND status = 'succeeded'
+             FOR UPDATE`,
+            [input.serviceRef, input.externalResourceRef],
+          );
+          authoritativeResource = resource.rows[0];
+          if (!authoritativeResource) {
+            await client.query("ROLLBACK");
+            return reply.code(404).send({ error: "authoritative Mock resource not found" });
+          }
+          const eligible = authoritativeResource.resource_state === "active" && (
+            body.action === "resource.start"
+              ? authoritativeResource.power_state === "stopped"
+              : authoritativeResource.power_state === "running"
+          );
+          if (!eligible) {
+            await client.query("ROLLBACK");
+            return reply.code(409).send({
+              error: `resource is ${authoritativeResource.resource_state}/${authoritativeResource.power_state}; ${body.action} is not allowed`,
+            });
+          }
+        }
         const observedAt = new Date().toISOString();
         const finalResult = createMockProviderOperationResult(
           body,
@@ -367,6 +428,53 @@ export async function registerProviderPlatformRoutes(
         );
         operation = inserted.rows[0];
         if (!operation) throw new Error("Mock Provider operation insert returned no row");
+
+        if (
+          authoritativeResource &&
+          finalResult.status === "succeeded"
+        ) {
+          await client.query(
+            `UPDATE mock_resource_operations
+             SET power_state = $3,
+                 desired_power_state = $3
+             WHERE service_id::text = $1
+               AND external_resource_id = $2`,
+            [
+              authoritativeResource.service_id,
+              authoritativeResource.external_resource_id,
+              body.action === "resource.stop" ? "stopped" : "running",
+            ],
+          );
+        } else if (
+          config.authoritativeProvisioningResources !== true &&
+          body.capability === "provisioning" &&
+          finalResult.status === "succeeded" &&
+          [
+            "resource.create",
+            "resource.start",
+            "resource.stop",
+            "resource.reboot",
+            "resource.terminate",
+          ].includes(body.action)
+        ) {
+          const output = finalResult.output as {
+            externalResourceRef: string;
+            resourceState: "ready" | "stopped" | "terminated";
+          };
+          await client.query(
+            `INSERT INTO mock_contract_resource_states(
+               external_resource_ref, resource_state, revision,
+               last_action, last_operation_id
+             ) VALUES ($1, $2, 1, $3, $4)
+             ON CONFLICT (external_resource_ref) DO UPDATE
+               SET resource_state = EXCLUDED.resource_state,
+                   revision = mock_contract_resource_states.revision + 1,
+                   last_action = EXCLUDED.last_action,
+                   last_operation_id = EXCLUDED.last_operation_id,
+                   updated_at = now()`,
+            [output.externalResourceRef, output.resourceState, body.action, body.operationId],
+          );
+        }
 
         const finalEvent = providerEvent(manifest.providerId, finalResult, finalResult.revision);
         const events: ProviderEvent[] = scenario === "out_of_order"

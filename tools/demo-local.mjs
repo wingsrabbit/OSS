@@ -106,7 +106,14 @@ function readJson(path, fallback) {
 function createConfig() {
   ensureRuntimeDirectories();
   const existing = readJson(configFile, null);
-  if (existing) return existing;
+  if (existing) {
+    if (!existing.secrets?.providerPlatformToken) {
+      existing.secrets ??= {};
+      existing.secrets.providerPlatformToken = secureToken();
+      writePrivateJson(configFile, existing);
+    }
+    return existing;
+  }
   const config = {
     warning: LAB_WARNING,
     createdAt: new Date().toISOString(),
@@ -116,6 +123,7 @@ function createConfig() {
       workerDatabasePassword: secureToken(),
       paymentProviderToken: secureToken(),
       provisioningProviderToken: secureToken(),
+      providerPlatformToken: secureToken(),
       mailProviderToken: secureToken(),
       mailboxToken: secureToken(),
       providerOperationCapabilitySecret: secureToken(),
@@ -397,9 +405,11 @@ function workerEnvironment(config) {
     DATABASE_RUNTIME_ROLE: "oss_worker",
     MOCK_PAYMENT_PROVIDER_URL: `http://127.0.0.1:${config.ports.payment}`,
     MOCK_PROVISIONING_PROVIDER_URL: `http://127.0.0.1:${config.ports.provisioning}`,
+    MOCK_PROVIDER_PLATFORM_URL: `http://127.0.0.1:${config.ports.provisioning}`,
     MOCK_MAIL_PROVIDER_URL: `http://127.0.0.1:${config.ports.mail}`,
     MOCK_PAYMENT_PROVIDER_TOKEN: config.secrets.paymentProviderToken,
     MOCK_PROVISIONING_PROVIDER_TOKEN: config.secrets.provisioningProviderToken,
+    MOCK_PROVIDER_PLATFORM_TOKEN: config.secrets.providerPlatformToken,
     MOCK_MAIL_PROVIDER_TOKEN: config.secrets.mailProviderToken,
     PROVIDER_OPERATION_CAPABILITY_SECRET: config.secrets.providerOperationCapabilitySecret,
     PAYMENT_METHOD_TOKEN_KEY: config.secrets.paymentMethodTokenKey,
@@ -411,6 +421,7 @@ function workerEnvironment(config) {
     CORE_INTERNAL_URL: `http://127.0.0.1:${config.ports.api}`,
     MOCK_PROVISION_SCENARIO: "success",
     MOCK_RESOURCE_ACTION_SCENARIO: "success",
+    MOCK_SERVICE_OPERATION_SCENARIO: "normal",
   };
 }
 
@@ -434,6 +445,8 @@ function providerEnvironment(config, kind) {
       PROVIDER_PORT: String(config.ports.provisioning),
       PROVIDER_DATABASE_URL: postgresUrl(config, "provisioning_provider"),
       MOCK_PROVISIONING_PROVIDER_TOKEN: config.secrets.provisioningProviderToken,
+      MOCK_PROVIDER_PLATFORM_TOKEN: config.secrets.providerPlatformToken,
+      MOCK_PROVIDER_PUBLIC_BASE_URL: `http://127.0.0.1:${config.ports.provisioning}`,
       MOCK_PROVISIONING_WEBHOOK_SECRET: config.secrets.provisioningWebhookSecret,
     };
   }

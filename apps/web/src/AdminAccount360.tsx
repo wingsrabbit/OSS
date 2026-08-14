@@ -3,6 +3,7 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
 import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
+import { ServiceOperationsPanel } from "./ServiceOperationsPanel.js";
 import type {
   CancellationHistory,
   CreditHistory,
@@ -215,6 +216,7 @@ export function AdminAccount360({
   const canReadOrders = permissionSetHas(permissions, "orders.read");
   const canReadBilling = permissionSetHas(permissions, "billing.read");
   const canReadServices = permissionSetHas(permissions, "services.read");
+  const canManageServiceOperations = permissionSetHas(permissions, "services.operations_manage");
   const canReadTickets = permissionSetHas(permissions, "support.tickets.manage");
   const canReadContacts = permissionSetHas(permissions, "accounts.contacts.read");
   const canReadNotificationHistory = permissionSetHas(permissions, "accounts.notification.read");
@@ -633,6 +635,14 @@ export function AdminAccount360({
                         <span>{service.billingCycle} · {when(service.termStart)} → {when(service.termEnd)}</span>
                         <span>Order {service.orderId} · {service.invoiceIds.length} invoice(s)</span>
                         <span className="mono">{service.id}</span>
+                        <ServiceOperationsPanel
+                          endpoint={`/api/v1/admin/client-accounts/${data.account.id}/services/${service.id}/operations`}
+                          canManage={canManageServiceOperations}
+                          locale={locale}
+                          staff
+                          onNotice={onNotice}
+                          onError={onError}
+                        />
                       </details>
                     ))}
                   </div>

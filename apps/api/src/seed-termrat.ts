@@ -264,7 +264,7 @@ await transaction(pool, async (client) => {
        provider_installation_id, provider_type, enabled, capabilities
      ) VALUES (
        'mock-provisioning-v1', 'provisioning', true,
-       '["resource_create","resource_reconcile","resource_suspend","resource_resume","resource_terminate"]'::jsonb
+       '["resource_create","resource_reconcile","resource_suspend","resource_resume","resource_terminate","resource.start","resource.stop","resource.reboot"]'::jsonb
      )
      ON CONFLICT (provider_installation_id) DO UPDATE SET
        provider_type = EXCLUDED.provider_type,

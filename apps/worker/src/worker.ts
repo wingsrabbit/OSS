@@ -19,9 +19,9 @@ import {
   fingerprintProviderTokenKeyMaterial,
 } from "@opensales/core/provider-token-vault";
 import {
-  assertSchema022NativeSafe,
-  SCHEMA_022_APPLICATION_GUARD,
-} from "@opensales/core/schema-021-022-native-compatibility";
+  assertSchema023NativeSafe,
+  SCHEMA_023_APPLICATION_GUARD,
+} from "@opensales/core/schema-022-023-native-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -39,6 +39,14 @@ import {
   processNotificationDeliveryJob,
   recoverStaleNotificationDeliveryJob,
 } from "./notification-orchestration.js";
+import {
+  isServiceOperationLeaseLostError,
+  persistUnexpectedServiceOperationFailure,
+  processServiceOperationReconcile,
+  processServiceOperationStart,
+  recoverStaleServiceOperationJobs,
+  type ServiceOperationJob,
+} from "./service-operations.js";
 
 const config = z
   .object({
@@ -46,9 +54,11 @@ const config = z
     DATABASE_RUNTIME_ROLE: z.string().regex(/^[a-z][a-z0-9_]{0,62}$/),
     MOCK_PAYMENT_PROVIDER_URL: z.url(),
     MOCK_PROVISIONING_PROVIDER_URL: z.url(),
+    MOCK_PROVIDER_PLATFORM_URL: z.url(),
     MOCK_MAIL_PROVIDER_URL: z.url(),
     MOCK_PAYMENT_PROVIDER_TOKEN: z.string().min(32),
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32),
+    MOCK_PROVIDER_PLATFORM_TOKEN: z.string().min(32),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32),
     PROVIDER_OPERATION_CAPABILITY_SECRET: z.string().min(32),
     OSS_SCHEMA_ROLLBACK_BRIDGE: z
@@ -79,6 +89,9 @@ const config = z
     MOCK_RESOURCE_ACTION_SCENARIO: z
       .enum(["success", "failed", "timeout_success", "duplicate_out_of_order"])
       .default("success"),
+    MOCK_SERVICE_OPERATION_SCENARIO: z
+      .enum(["normal", "failure", "duplicate", "out_of_order", "timeout", "restart"])
+      .default("normal"),
   })
   .parse(process.env);
 
@@ -90,6 +103,19 @@ const notificationRuntimeConfig = {
   maxAttempts: config.NOTIFICATION_MAX_ATTEMPTS,
   retryBaseDelaySeconds: config.NOTIFICATION_RETRY_BASE_DELAY_SECONDS,
   scenario: config.MOCK_MAIL_SCENARIO,
+} as const;
+
+const serviceOperationRuntimeConfig = {
+  workerId: config.WORKER_ID,
+  providerUrl: config.MOCK_PROVIDER_PLATFORM_URL,
+  providerToken: config.MOCK_PROVIDER_PLATFORM_TOKEN,
+  providerTimeoutMs: config.PROVIDER_TIMEOUT_MS,
+  scenario: config.MOCK_SERVICE_OPERATION_SCENARIO,
+  reconcileBaseDelaySeconds: config.RECONCILE_BASE_DELAY_SECONDS,
+  // Schema 023 freezes three actual GET attempts as the bounded daily-operation
+  // reconciliation budget. A lower deployment-wide budget remains respected.
+  reconcileMaxAttempts: Math.min(config.RECONCILE_MAX_ATTEMPTS, 3),
+  staleLockSeconds: config.JOB_LOCK_TIMEOUT_SECONDS,
 } as const;
 
 const paymentTokenEncryptionKeyring = createProviderTokenKeyring(
@@ -107,7 +133,7 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
-const schemaCompatibilityGuardName = SCHEMA_022_APPLICATION_GUARD;
+const schemaCompatibilityGuardName = SCHEMA_023_APPLICATION_GUARD;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 
 async function releaseWorkerGuard(
@@ -7302,6 +7328,12 @@ async function processJob(job: Job): Promise<void> {
   }
   if (job.job_type === "service.cancellation.due") return startCancellation(job);
   if (job.job_type === "service.cancellation.reconcile") return reconcileCancellation(job);
+  if (job.job_type === "service.operation.start") {
+    return processServiceOperationStart(pool, job as ServiceOperationJob, serviceOperationRuntimeConfig);
+  }
+  if (job.job_type === "service.operation.reconcile") {
+    return processServiceOperationReconcile(pool, job as ServiceOperationJob, serviceOperationRuntimeConfig);
+  }
   throw new Error(`Unsupported job type: ${job.job_type}`);
 }
 
@@ -7318,7 +7350,7 @@ let cleanupFailure: unknown;
 try {
   if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
     throw new Error(
-      "Schema 022 Worker refuses the legacy 016-to-017 rollback bridge; use the matching historical worker binary or migrate forward",
+      "Schema 023 Worker refuses the legacy 016-to-017 rollback bridge; use the matching historical worker binary or migrate forward",
     );
   }
   await assertRuntimeDatabaseRoleSafe(
@@ -7341,7 +7373,7 @@ try {
       query: async (text: string, values?: unknown[]) =>
         schemaCompatibilityGuard!.query(text, values),
     };
-    await assertSchema022NativeSafe(queryable);
+    await assertSchema023NativeSafe(queryable);
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {
     await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
@@ -7441,7 +7473,8 @@ let nextBillingScheduleAt = 0;
         (await recoverStaleJobs()) +
         (await recoverStaleRefundJobs()) +
         (await recoverStaleServiceActionJobs()) +
-        (await recoverStaleCancellationJobs());
+        (await recoverStaleCancellationJobs()) +
+        (await recoverStaleServiceOperationJobs(pool, serviceOperationRuntimeConfig));
       if (recovered > 0) {
         console.warn("recovered stale durable jobs", { count: recovered });
       }
@@ -7469,7 +7502,11 @@ let nextBillingScheduleAt = 0;
   try {
     await processJob(job);
   } catch (error) {
-    if (error instanceof LostJobLeaseError || error instanceof NotificationLeaseLostError) {
+    if (
+      error instanceof LostJobLeaseError ||
+      error instanceof NotificationLeaseLostError ||
+      isServiceOperationLeaseLostError(error)
+    ) {
       console.warn("discarded stale worker result after durable job lease loss", {
         jobId: job.id,
         jobType: job.job_type,
@@ -7494,6 +7531,31 @@ let nextBillingScheduleAt = 0;
         }
         console.error(
           "failed to persist notification failure; stale-job recovery will reconcile it",
+          { jobId: job.id },
+        );
+      }
+      continue;
+    }
+    if (
+      job.job_type === "service.operation.start" ||
+      job.job_type === "service.operation.reconcile"
+    ) {
+      console.error("service operation job entered its safe failure reconciler", {
+        jobId: job.id,
+        jobType: job.job_type,
+        error: error instanceof Error ? error.message : "unknown",
+      });
+      try {
+        await persistUnexpectedServiceOperationFailure(
+          pool,
+          job as ServiceOperationJob,
+          serviceOperationRuntimeConfig,
+          error,
+        );
+      } catch (persistenceError) {
+        if (isServiceOperationLeaseLostError(persistenceError)) continue;
+        console.error(
+          "failed to persist service operation failure; stale-job recovery will reconcile it",
           { jobId: job.id },
         );
       }

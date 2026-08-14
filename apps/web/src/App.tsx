@@ -20,6 +20,7 @@ import {
   type AdminAccountAction,
 } from "./AdminAccount360.js";
 import { AccountAccessPanel } from "./AccountAccessPanel.js";
+import { AdminServiceOperationsQueue } from "./AdminServiceOperationsQueue.js";
 import { AccountContextSwitcher, type MembershipRole } from "./AccountContextSwitcher.js";
 import {
   ApiError,
@@ -1040,11 +1041,15 @@ export function App() {
   const canViewAccount360 =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("accounts.view"));
+  const canManageServiceOperations =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("services.operations_manage"));
   const canOpenAdminWorkspace =
     canManageStaffTickets ||
     canManageManualReceipts ||
     canManageRefunds ||
     canManageManualFulfillment ||
+    canManageServiceOperations ||
     canViewAccount360 ||
     canUseFullAdminWorkspace;
   const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
@@ -2428,6 +2433,7 @@ export function App() {
           viewerPermissions.has("billing.manual_receipt_manage") ||
           viewerPermissions.has("billing.refund_manage") ||
           viewerPermissions.has("services.manual_fulfillment") ||
+          viewerPermissions.has("services.operations_manage") ||
           viewerPermissions.has("support.tickets.manage"));
       const target = route === "/"
         ? viewerCanOpenAdmin ? "/admin" : "/customer"
@@ -4627,6 +4633,7 @@ export function App() {
             key={`${me.id}:${me.clientAccountId}:${me.accountContextVersion}`}
             active={route === "/customer"}
             canReadHistory={canReadCustomerHistory}
+            canManageServices={canManageServices}
             clientAccountId={me.clientAccountId}
             locale={locale}
             onNotice={showTicketNotice}
@@ -4676,6 +4683,15 @@ export function App() {
             onRefreshAccess={async () => { await refreshMe(); }}
             onNotice={showTicketNotice}
             onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canManageServiceOperations && (
+          <AdminServiceOperationsQueue
+            active={route === "/admin"}
+            locale={locale}
+            onNotice={setNotice}
+            onError={setError}
           />
         )}
 

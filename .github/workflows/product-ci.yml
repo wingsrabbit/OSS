@@ -100,6 +100,7 @@ jobs:
       WEB_ORIGIN: http://127.0.0.1:5173
       MOCK_PAYMENT_PROVIDER_URL: http://127.0.0.1:4000
       MOCK_PROVISIONING_PROVIDER_URL: http://127.0.0.1:4000
+      MOCK_PROVIDER_PLATFORM_URL: http://127.0.0.1:4000
       MOCK_MAIL_PROVIDER_URL: http://127.0.0.1:4000
       MOCK_MAILBOX_URL: http://127.0.0.1:4000
       CORE_INTERNAL_URL: http://127.0.0.1:3000
@@ -451,8 +452,10 @@ jobs:
             node apps/worker/dist/worker.js > worker.log 2>&1 &
           echo "$!" > worker.pid
           for attempt in $(seq 1 60); do
+            read -r worker_pid < worker.pid
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
-               curl --fail --silent http://127.0.0.1:4000/health/ready >/dev/null; then
+               curl --fail --silent http://127.0.0.1:4000/health/ready >/dev/null &&
+               kill -0 "${worker_pid}" 2>/dev/null; then
               exit 0
             fi
             sleep 1
@@ -465,18 +468,62 @@ jobs:
           EXPECT_RESOURCE_ACTION_SCENARIO: timeout_success
         run: pnpm --filter @opensales/api test:integration:stage-a
 
+      - name: Stop Worker for deterministic Service operation fault phases
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r worker_pid < worker.pid
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            kill "${worker_pid}"
+            for attempt in $(seq 1 30); do
+              if ! kill -0 "${worker_pid}" 2>/dev/null; then
+                break
+              fi
+              sleep 0.2
+            done
+          fi
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            echo "Worker process did not stop cleanly"
+            exit 1
+          fi
+
+      - name: Run Schema 023 and full Service operations PostgreSQL journey
+        shell: bash
+        env:
+          SERVICE_OPERATION_STATE_FILE: ${{ runner.temp }}/service-operation-revoked.json
+          SERVICE_OPERATION_WORKER_DATABASE_URL: postgresql://oss_worker:${{ env.DATABASE_WORKER_ROLE_PASSWORD }}@127.0.0.1:5432/oss
+        run: |
+          set -euo pipefail
+          for phase in schema normal timeout failure cancellation; do
+            SERVICE_OPERATION_INTEGRATION_PHASE="${phase}" \
+              pnpm --filter @opensales/api test:integration:service-operations
+          done
+          SERVICE_OPERATION_INTEGRATION_PHASE=prepare-revoked \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_INTEGRATION_PHASE=verify-revoked \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_INTEGRATION_PHASE=mismatch \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_INTEGRATION_PHASE=reconcile-budget \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_STATE_FILE="${RUNNER_TEMP}/service-operation-browser.json" \
+            SERVICE_OPERATION_INTEGRATION_PHASE=prepare-browser \
+            pnpm --filter @opensales/api test:integration:service-operations
+
       - name: Restart Worker for isolated browser journey
         shell: bash
         run: |
           set -euo pipefail
           read -r worker_pid < worker.pid
-          kill "${worker_pid}"
-          for attempt in $(seq 1 30); do
-            if ! kill -0 "${worker_pid}" 2>/dev/null; then
-              break
-            fi
-            sleep 0.2
-          done
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            kill "${worker_pid}"
+            for attempt in $(seq 1 30); do
+              if ! kill -0 "${worker_pid}" 2>/dev/null; then
+                break
+              fi
+              sleep 0.2
+            done
+          fi
           if kill -0 "${worker_pid}" 2>/dev/null; then
             echo "Worker process did not stop cleanly"
             exit 1
@@ -485,6 +532,12 @@ jobs:
             DATABASE_RUNTIME_ROLE=oss_worker node apps/worker/dist/worker.js \
             > worker-browser.log 2>&1 &
           echo "$!" > worker.pid
+          sleep 2
+          read -r worker_pid < worker.pid
+          if ! kill -0 "${worker_pid}" 2>/dev/null; then
+            tail -n 100 worker-browser.log
+            exit 1
+          fi
 
       - name: Install pinned Chromium runtime
         run: pnpm --filter @opensales/e2e exec playwright install --with-deps chromium
@@ -536,6 +589,10 @@ jobs:
 
       - name: Run browser Stage A journey
         shell: bash
+        env:
+          OSS_E2E_SERVICE_OPERATION_STATE_FILE: ${{ runner.temp }}/service-operation-browser.json
+          OSS_E2E_SELF_PUMP_SERVICE_OPERATIONS: "1"
+          SERVICE_OPERATION_WORKER_DATABASE_URL: postgresql://oss_worker:${{ env.DATABASE_WORKER_ROLE_PASSWORD }}@127.0.0.1:5432/oss
         run: |
           set +e
           pnpm --filter @opensales/e2e test:e2e

@@ -10,7 +10,7 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema022ApplicationGuard,
+  holdSchema023ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -37,6 +37,7 @@ import { registerProviderEventRoutes } from "./routes-provider-events.js";
 import { registerRefundRoutes } from "./routes-refunds.js";
 import { registerRenewalRoutes } from "./routes-renewals.js";
 import { registerServiceRoutes } from "./routes-services.js";
+import { registerServiceOperationRoutes } from "./routes-service-operations.js";
 import { registerTicketRoutes } from "./routes-tickets.js";
 import { registerSupportOperationRoutes } from "./routes-support-operations.js";
 
@@ -95,10 +96,10 @@ export async function buildApp(
   try {
     if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
       throw new Error(
-        "Schema 022 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
+        "Schema 023 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
       );
     }
-    releaseSchemaRollbackGuard = await holdSchema022ApplicationGuard(pool);
+    releaseSchemaRollbackGuard = await holdSchema023ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
@@ -229,6 +230,7 @@ export async function buildApp(
   await registerRefundRoutes(app, pool, config);
   await registerRenewalRoutes(app, pool, config);
   await registerServiceRoutes(app, pool, config);
+  await registerServiceOperationRoutes(app, pool, config);
   await registerTicketRoutes(app, pool, config);
   await registerSupportOperationRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);

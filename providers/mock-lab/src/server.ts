@@ -358,10 +358,35 @@ await pool.query(`
   ALTER TABLE mock_resource_operations
     ADD COLUMN IF NOT EXISTS resource_state text NOT NULL DEFAULT 'active';
   ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS power_state text NOT NULL DEFAULT 'running';
+  ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS desired_power_state text NOT NULL DEFAULT 'running';
+  ALTER TABLE mock_resource_operations
     DROP CONSTRAINT IF EXISTS mock_resource_operations_resource_state_check;
   ALTER TABLE mock_resource_operations
     ADD CONSTRAINT mock_resource_operations_resource_state_check
     CHECK (resource_state IN ('active', 'suspended', 'terminated'));
+  ALTER TABLE mock_resource_operations
+    DROP CONSTRAINT IF EXISTS mock_resource_operations_power_state_check;
+  ALTER TABLE mock_resource_operations
+    ADD CONSTRAINT mock_resource_operations_power_state_check
+    CHECK (power_state IN ('running', 'stopped', 'terminated'));
+  ALTER TABLE mock_resource_operations
+    DROP CONSTRAINT IF EXISTS mock_resource_operations_desired_power_state_check;
+  ALTER TABLE mock_resource_operations
+    ADD CONSTRAINT mock_resource_operations_desired_power_state_check
+    CHECK (desired_power_state IN ('running', 'stopped', 'terminated'));
+  UPDATE mock_resource_operations
+  SET power_state = CASE resource_state
+    WHEN 'suspended' THEN 'stopped'
+    WHEN 'terminated' THEN 'terminated'
+    ELSE power_state
+  END;
+  UPDATE mock_resource_operations
+  SET desired_power_state = CASE resource_state
+    WHEN 'terminated' THEN 'terminated'
+    ELSE desired_power_state
+  END;
   UPDATE mock_resource_operations
   SET callback_capability = repeat('A', 43)
   WHERE callback_capability IS NULL;
@@ -558,6 +583,7 @@ if (config.MOCK_PROVIDER_PLATFORM_TOKEN) {
     publicBaseUrl:
       config.MOCK_PROVIDER_PUBLIC_BASE_URL ??
       `http://127.0.0.1:${config.PROVIDER_PORT}`,
+    authoritativeProvisioningResources: Boolean(config.MOCK_PROVISIONING_PROVIDER_TOKEN),
   });
 }
 
@@ -1519,7 +1545,16 @@ app.post("/v1/resource-actions", async (request, reply) => {
       if (status === "succeeded") {
         await client.query(
           `UPDATE mock_resource_operations
-           SET resource_state = $3
+           SET resource_state = $3,
+               power_state = CASE $3
+                 WHEN 'suspended' THEN 'stopped'
+                 WHEN 'active' THEN desired_power_state
+                 ELSE 'terminated'
+               END,
+               desired_power_state = CASE
+                 WHEN $3 = 'terminated' THEN 'terminated'
+                 ELSE desired_power_state
+               END
            WHERE service_id = $1 AND external_resource_id = $2`,
           [
             body.serviceId,

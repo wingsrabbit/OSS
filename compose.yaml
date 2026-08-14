@@ -197,12 +197,15 @@ services:
       CORE_INTERNAL_URL: http://api:3000
       MOCK_PAYMENT_PROVIDER_URL: http://provider-payment:4000
       MOCK_PROVISIONING_PROVIDER_URL: http://provider-provisioning:4000
+      MOCK_PROVIDER_PLATFORM_URL: http://provider-provisioning:4000
       MOCK_MAIL_PROVIDER_URL: http://provider-mail:4000
       MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
       MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
       MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
       MOCK_PROVISION_SCENARIO: ${MOCK_PROVISION_SCENARIO:-success}
       MOCK_RESOURCE_ACTION_SCENARIO: ${MOCK_RESOURCE_ACTION_SCENARIO:-success}
+      MOCK_SERVICE_OPERATION_SCENARIO: ${MOCK_SERVICE_OPERATION_SCENARIO:-normal}
     depends_on:
       api:
         condition: service_healthy
@@ -259,6 +262,8 @@ services:
     environment:
       PROVIDER_DATABASE_URL: postgresql://provisioning_provider:${PROVISIONING_PROVIDER_DATABASE_PASSWORD:?required}@provider-provisioning-db:5432/provisioning_provider
       MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
+      MOCK_PROVIDER_PUBLIC_BASE_URL: http://provider-provisioning:4000
       MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
       CORE_CALLBACK_URL: http://callback-gateway:8081
     depends_on:

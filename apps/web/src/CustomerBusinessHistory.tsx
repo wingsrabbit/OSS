@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "./api.js";
+import { ServiceOperationsPanel } from "./ServiceOperationsPanel.js";
 
 export type Locale = "en" | "zh-CN";
 
@@ -207,6 +208,7 @@ function Empty({ children }: { children: string }) {
 export function CustomerBusinessHistory({
   active,
   canReadHistory,
+  canManageServices,
   clientAccountId,
   locale,
   onNotice,
@@ -214,6 +216,7 @@ export function CustomerBusinessHistory({
 }: {
   active: boolean;
   canReadHistory: boolean;
+  canManageServices: boolean;
   clientAccountId: string | null;
   locale: Locale;
   onNotice: (message: string) => void;
@@ -586,6 +589,13 @@ export function CustomerBusinessHistory({
                 {serviceDetail.trace.cancellationRequestId && <span className="mono">Cancellation · {serviceDetail.trace.cancellationRequestId}</span>}
                 {serviceDetail.tickets.map((ticket) => <span key={ticket.id}>Ticket · {ticket.subject} · <span className="mono">{ticket.id}</span></span>)}
               </div>
+              <ServiceOperationsPanel
+                endpoint={`/api/v1/services/${serviceDetail.service.id}/operations`}
+                canManage={canManageServices}
+                locale={locale}
+                onNotice={onNotice}
+                onError={onError}
+              />
             </>
           )}
         </article>

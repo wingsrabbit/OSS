@@ -106,6 +106,9 @@ importers:
       '@opensales/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@opensales/provider-contracts':
+        specifier: workspace:*
+        version: link:../../packages/provider-contracts
       pg:
         specifier: 8.22.0
         version: 8.22.0
@@ -134,6 +137,12 @@ importers:
       '@types/node':
         specifier: 24.10.13
         version: 24.10.13
+      '@types/pg':
+        specifier: 8.20.0
+        version: 8.20.0
+      pg:
+        specifier: 8.22.0
+        version: 8.22.0
       typescript:
         specifier: 7.0.2
         version: 7.0.2

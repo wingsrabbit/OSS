@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@opensales/core": "workspace:*",
+    "@opensales/provider-contracts": "workspace:*",
     "pg": "8.22.0",
     "zod": "4.4.3"
   },
