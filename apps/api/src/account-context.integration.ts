@@ -2265,6 +2265,9 @@ try {
 
   const supportNotificationTicketId = randomUUID();
   const otherSupportNotificationTicketId = randomUUID();
+  const supportNotificationStatusEventId = randomUUID();
+  const otherSupportNotificationStatusEventId = randomUUID();
+  const supportNotificationStaffUserId = randomUUID();
   const publicSupportMessageId = randomUUID();
   const internalSupportMessageId = randomUUID();
   const crossTicketSupportMessageId = randomUUID();
@@ -2273,17 +2276,63 @@ try {
   const supportSubject = "Schema 019 notification message binding";
   const publicSupportBody = "Exact public Staff reply for notification evidence";
   await pool.query(
-    `INSERT INTO support_tickets(
-       id, client_account_id, created_by_user_id, subject
-     ) VALUES ($1, $3, $4, $5), ($2, $3, $4, 'Other notification Ticket')`,
+    `INSERT INTO users(id, email, password_hash, email_verified_at)
+     VALUES ($1, $2, 'synthetic-not-a-password', pg_catalog.now())`,
     [
-      supportNotificationTicketId,
-      otherSupportNotificationTicketId,
-      ownerAccountId,
-      owner.userId,
-      supportSubject,
+      supportNotificationStaffUserId,
+      `support-notification-staff-${databaseName}@example.invalid`,
     ],
   );
+  await pool.query(
+    `INSERT INTO staff_members(user_id, roles, permissions)
+     VALUES ($1, ARRAY['Support'], '["support.tickets.manage"]'::jsonb)`,
+    [supportNotificationStaffUserId],
+  );
+  await transaction(pool, async (client) => {
+    const department = await client.query<{ current_revision_id: string }>(
+      `SELECT current_revision_id
+       FROM support_departments
+       WHERE code = 'general-support'
+       FOR SHARE`,
+    );
+    const departmentRevisionId = department.rows[0]?.current_revision_id;
+    assert.ok(departmentRevisionId, "Schema 021 must retain the default Support revision");
+    await client.query(
+      `INSERT INTO support_ticket_status_events(
+         id, ticket_id, previous_status, status,
+         actor_type, actor_user_id, reason
+       ) VALUES
+         ($1, $3, NULL, 'awaiting_staff', 'customer', $5,
+          'Customer created the notification fixture ticket'),
+         ($2, $4, NULL, 'awaiting_staff', 'customer', $5,
+          'Customer created the second notification fixture ticket')`,
+      [
+        supportNotificationStatusEventId,
+        otherSupportNotificationStatusEventId,
+        supportNotificationTicketId,
+        otherSupportNotificationTicketId,
+        owner.userId,
+      ],
+    );
+    await client.query(
+      `INSERT INTO support_tickets(
+         id, client_account_id, created_by_user_id, subject,
+         department_revision_id, priority, current_status_event_id
+       ) VALUES
+         ($1, $3, $4, $5, $6, 'normal', $7),
+         ($2, $3, $4, 'Other notification Ticket', $6, 'normal', $8)`,
+      [
+        supportNotificationTicketId,
+        otherSupportNotificationTicketId,
+        ownerAccountId,
+        owner.userId,
+        supportSubject,
+        departmentRevisionId,
+        supportNotificationStatusEventId,
+        otherSupportNotificationStatusEventId,
+      ],
+    );
+  });
   await pool.query(
     `INSERT INTO support_ticket_messages(
        id, ticket_id, author_user_id, author_type, visibility, body
@@ -2298,7 +2347,7 @@ try {
       internalSupportMessageId,
       crossTicketSupportMessageId,
       supportNotificationTicketId,
-      owner.userId,
+      supportNotificationStaffUserId,
       publicSupportBody,
       otherSupportNotificationTicketId,
       rewrittenSupportMessageId,
@@ -2890,7 +2939,7 @@ try {
           query: async (text: string, values?: unknown[]) =>
             immutableDriftClient.query(text, values),
         }),
-        /Schema (017|019) is incomplete or counterfeit/,
+        /Schema (017 foundation|019) is incomplete or counterfeit/,
       );
       await immutableDriftClient.query("ROLLBACK");
     } catch (error) {
@@ -2922,7 +2971,7 @@ try {
         query: async (text: string, values?: unknown[]) =>
           inheritedCatalogDriftClient.query(text, values),
       }),
-      /Schema 017 is incomplete or counterfeit/,
+      /Schema 017 foundation is incomplete or counterfeit/,
     );
     await inheritedCatalogDriftClient.query("ROLLBACK");
   } catch (error) {
@@ -3245,7 +3294,7 @@ try {
   assert.equal(loginContexts.statusCode, 200, loginContexts.body);
   assert.equal(
     json<{ items: unknown[] }>(loginContexts).items.length,
-    2,
+    multi.accountIds.length + 1,
   );
   const loginContextSelection = await app.inject({
     method: "PUT",
@@ -3392,7 +3441,7 @@ try {
       },
     });
     await waitForBlockedQuery("WHERE id = ANY($1::uuid[])");
-    await pool.query(
+    await staleHeaderBlocker.query(
       `UPDATE client_memberships
        SET restricted_at = pg_catalog.now(), updated_at = pg_catalog.now()
        WHERE client_account_id = $1 AND user_id = $2`,
@@ -3595,6 +3644,7 @@ try {
     [secondAccountId, directSwitchRaceMember.userId],
   );
   const membershipFirst = await pool.connect();
+  const membershipFirstSwitch = await pool.connect();
   try {
     await membershipFirst.query("BEGIN");
     await membershipFirst.query(
@@ -3603,9 +3653,11 @@ try {
        WHERE client_account_id = $1 AND user_id = $2`,
       [secondAccountId, directSwitchRaceMember.userId],
     );
+    await membershipFirstSwitch.query("BEGIN");
+    await membershipFirstSwitch.query("SET LOCAL lock_timeout = '250ms'");
     await expectPgCode(
       () =>
-        pool!.query(
+        membershipFirstSwitch.query(
           `UPDATE sessions
            SET active_client_account_id = $2, account_context_version = 2
            WHERE id = $1`,
@@ -3613,12 +3665,15 @@ try {
         ),
       "55P03",
     );
+    await membershipFirstSwitch.query("ROLLBACK");
     await membershipFirst.query("COMMIT");
   } catch (error) {
     await membershipFirst.query("ROLLBACK").catch(() => undefined);
+    await membershipFirstSwitch.query("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
     membershipFirst.release();
+    membershipFirstSwitch.release();
   }
   const membershipFirstContext = await pool.query<{
     active_client_account_id: string | null;
@@ -3640,6 +3695,7 @@ try {
     [secondAccountId, directSwitchRaceMember.userId],
   );
   const sessionFirst = await pool.connect();
+  const sessionFirstRestriction = await pool.connect();
   try {
     await sessionFirst.query("BEGIN");
     await sessionFirst.query(
@@ -3648,20 +3704,33 @@ try {
        WHERE id = $1`,
       [directSwitchRaceMember.sessionId, secondAccountId],
     );
-    const restriction = pool.query(
+    await sessionFirstRestriction.query("BEGIN");
+    await sessionFirstRestriction.query("SET LOCAL lock_timeout = '250ms'");
+    await expectPgCode(
+      () =>
+        sessionFirstRestriction.query(
+          `UPDATE client_memberships
+           SET restricted_at = pg_catalog.now(), updated_at = pg_catalog.now()
+           WHERE client_account_id = $1 AND user_id = $2`,
+          [secondAccountId, directSwitchRaceMember.userId],
+        ),
+      "55P03",
+    );
+    await sessionFirstRestriction.query("ROLLBACK");
+    await sessionFirst.query("COMMIT");
+    await pool.query(
       `UPDATE client_memberships
        SET restricted_at = pg_catalog.now(), updated_at = pg_catalog.now()
        WHERE client_account_id = $1 AND user_id = $2`,
       [secondAccountId, directSwitchRaceMember.userId],
     );
-    await waitForBlockedQuery("SET restricted_at = pg_catalog.now()");
-    await sessionFirst.query("COMMIT");
-    await restriction;
   } catch (error) {
     await sessionFirst.query("ROLLBACK").catch(() => undefined);
+    await sessionFirstRestriction.query("ROLLBACK").catch(() => undefined);
     throw error;
   } finally {
     sessionFirst.release();
+    sessionFirstRestriction.release();
   }
   const sessionFirstContext = await pool.query<{
     active_client_account_id: string | null;
@@ -3873,9 +3942,10 @@ try {
 
   const capabilityGroupId = `capability-group-${databaseName}`;
   const capabilityProductId = `capability-product-${databaseName}`;
+  const capabilityProductRevisionId = randomUUID();
   const capabilityPriceId = randomUUID();
-  const capabilityTermsVersion = `capability-terms-${databaseName}`;
-  const capabilityAupVersion = `capability-aup-${databaseName}`;
+  const capabilityTermsVersion = `ct-${randomUUID()}`;
+  const capabilityAupVersion = `ca-${randomUUID()}`;
   await pool.query(
     `INSERT INTO product_groups(id, sort_order, names)
      VALUES ($1, 9001, '{"en":"Capability Matrix"}'::jsonb)`,
@@ -3893,11 +3963,22 @@ try {
     [capabilityProductId, capabilityGroupId],
   );
   await pool.query(
+    `INSERT INTO catalog_product_revisions(
+       id, product_id, revision, group_id, names, descriptions,
+       fulfillment_mode, active, hidden, repeatable, option_schema
+     ) VALUES (
+       $1, $2, 1, $3, '{"en":"Capability Service"}'::jsonb,
+       '{"en":"Synthetic role and explicit permission matrix"}'::jsonb,
+       'manual', true, false, true, '[]'::jsonb
+     )`,
+    [capabilityProductRevisionId, capabilityProductId, capabilityGroupId],
+  );
+  await pool.query(
     `INSERT INTO product_prices(
-       id, product_id, revision, currency, billing_cycle,
+       id, product_id, catalog_product_revision_id, revision, currency, billing_cycle,
        one_time_minor, setup_minor, recurring_minor
-     ) VALUES ($1, $2, 1, 'USD', 'monthly', 0, 0, 100)`,
-    [capabilityPriceId, capabilityProductId],
+     ) VALUES ($1, $2, $3, 1, 'USD', 'monthly', 0, 0, 100)`,
+    [capabilityPriceId, capabilityProductId, capabilityProductRevisionId],
   );
   await pool.query(
     `INSERT INTO product_service_automation_policies(
@@ -3994,7 +4075,18 @@ try {
     label: string,
   ): Promise<string> => {
     const item = await pool!.query<{ id: string }>(
-      `SELECT id FROM order_items WHERE order_id = $1 ORDER BY id LIMIT 1`,
+      `INSERT INTO order_items(
+         order_id, client_account_id, product_id, product_name,
+         fulfillment_mode, billing_cycle, configuration, price_snapshot
+       )
+       SELECT
+         item.order_id, item.client_account_id, item.product_id, item.product_name,
+         item.fulfillment_mode, item.billing_cycle, item.configuration, item.price_snapshot
+       FROM order_items item
+       WHERE item.order_id = $1
+       ORDER BY item.id
+       LIMIT 1
+       RETURNING id`,
       [orderId],
     );
     const itemId = item.rows[0]?.id;
@@ -5051,6 +5143,14 @@ try {
   });
   assert.equal(invalidPermissionArray.statusCode, 400, invalidPermissionArray.body);
 
+  const ownerInvitationReauth = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/reauth",
+    headers: { cookie: ownerCookie },
+    payload: { password: loginPassword },
+  });
+  assert.equal(ownerInvitationReauth.statusCode, 200, ownerInvitationReauth.body);
+
   const invite = await app.inject({
     method: "POST",
     url: "/api/v1/account/membership-invitations",
@@ -5415,7 +5515,7 @@ try {
     true,
   );
 
-  const lastOwner = await app.inject({
+  const primaryOwnerRestriction = await app.inject({
     method: "PATCH",
     url: `/api/v1/account/members/${owner.userId}`,
     headers: {
@@ -5424,8 +5524,15 @@ try {
     },
     payload: { restricted: true },
   });
-  assert.equal(lastOwner.statusCode, 409, lastOwner.body);
-  assert.equal(json<{ code: string }>(lastOwner).code, "LAST_OWNER_REQUIRED");
+  assert.equal(
+    primaryOwnerRestriction.statusCode,
+    409,
+    primaryOwnerRestriction.body,
+  );
+  assert.equal(
+    json<{ code: string }>(primaryOwnerRestriction).code,
+    "PRIMARY_OWNER_TRANSFER_REQUIRED",
+  );
 
   const removedTarget = await app.inject({
     method: "DELETE",
@@ -5986,13 +6093,16 @@ try {
       [ownerAccountId, writeSkewOwnerUserId],
     );
     await ownerRestrictionWriter.query("BEGIN");
-    await ownerRestrictionWriter.query(
-      `UPDATE client_memberships
-       SET restricted_at = pg_catalog.now(), updated_at = pg_catalog.now()
-       WHERE client_account_id = $1 AND user_id = $2`,
-      [ownerAccountId, writeSkewOwnerUserId],
+    await expectPgCode(
+      () =>
+        ownerRestrictionWriter.query(
+          `UPDATE client_memberships
+           SET restricted_at = pg_catalog.now(), updated_at = pg_catalog.now()
+           WHERE client_account_id = $1 AND user_id = $2`,
+          [ownerAccountId, writeSkewOwnerUserId],
+        ),
+      "55P03",
     );
-    await expectPgCode(() => ownerRestrictionWriter.query("COMMIT"), "55P03");
     await ownerRestrictionWriter.query("ROLLBACK").catch(() => undefined);
     await ownerPointerWriter.query("COMMIT");
   } catch (error) {
