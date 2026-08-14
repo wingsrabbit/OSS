@@ -239,6 +239,9 @@ jobs:
       - name: Verify Schema 019 native catalog freeze through the latest schema
         run: pnpm --filter @opensales/api test:integration:schema-019-native
 
+      - name: Verify Schema 025 native history, foundation, and catalog freeze
+        run: pnpm --filter @opensales/api test:integration:schema-025-native
+
       - name: Run Content Operations PostgreSQL and API journey
         run: pnpm --filter @opensales/api test:integration:content-operations
 

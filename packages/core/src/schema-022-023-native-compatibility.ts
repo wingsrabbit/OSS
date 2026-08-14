@@ -268,6 +268,33 @@ export async function assertSchema023NativeSafe(
       SCHEMA_023,
     );
   }
+  await assertSchema023FoundationCatalogShape(database);
+  if (allowSchema024IdentityExtensions) {
+    return {
+      installedSchemaVersion: "024_stage_c_identity_security",
+      applicationSchemaVersion: SCHEMA_023,
+      mode: "native-foundation",
+      safe: true,
+      blockers: [],
+    };
+  }
+  return {
+    installedSchemaVersion: SCHEMA_023,
+    applicationSchemaVersion: SCHEMA_023,
+    mode: "native",
+    safe: true,
+    blockers: [],
+  };
+}
+
+/**
+ * Revalidates the complete Schema 023-and-earlier catalog foundation without
+ * relaxing Schema 023's exact migration-history gate. Forward schemas call
+ * this only after independently proving their own exact installed history.
+ */
+export async function assertSchema023FoundationCatalogShape(
+  database: RollbackPreflightQueryable,
+): Promise<void> {
   const schema017Shape = await schema017CatalogFingerprintInput(database, {
     expectedMigrationHistory: EXPECTED_SCHEMA_019_HISTORY,
     allowSchema019RecordedOwnerInvariant: true,
@@ -292,20 +319,4 @@ export async function assertSchema023NativeSafe(
   await assertSchema021CatalogShape(database);
   await assertSchema022CatalogShape(database);
   await assertSchema023CatalogShape(database);
-  if (allowSchema024IdentityExtensions) {
-    return {
-      installedSchemaVersion: "024_stage_c_identity_security",
-      applicationSchemaVersion: SCHEMA_023,
-      mode: "native-foundation",
-      safe: true,
-      blockers: [],
-    };
-  }
-  return {
-    installedSchemaVersion: SCHEMA_023,
-    applicationSchemaVersion: SCHEMA_023,
-    mode: "native",
-    safe: true,
-    blockers: [],
-  };
 }

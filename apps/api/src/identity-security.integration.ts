@@ -18,6 +18,7 @@ import { buildApp } from "./app.js";
 import { digestToken, passwordHash } from "./auth.js";
 import { identitySecretKeyring, type Config } from "./config.js";
 import {
+  assertSchemaCompatible,
   holdSchema024ApplicationGuard,
   runMigrations,
   transaction,
@@ -347,7 +348,8 @@ try {
   } finally {
     await releaseSchema024Guard();
   }
-  await runMigrations(pool, { throughVersion: "024_stage_c_identity_security" });
+  await runMigrations(pool);
+  await assertSchemaCompatible(pool);
   ({ app } = await buildApp(config, pool));
 
   const primary = await createCustomer("primary");

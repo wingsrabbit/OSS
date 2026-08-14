@@ -30,7 +30,7 @@ try {
   assert.equal(original.rows[0]?.version, "014_stage_b_cycle_end_cancellation");
   await assert.rejects(
     assertSchemaCompatible(pool),
-    /incompatible.*024_stage_c_identity_security/i,
+    /incompatible.*025_stage_c_content_operations/i,
   );
 
   const native = await assert014RollbackBridgeSafe(database, {
