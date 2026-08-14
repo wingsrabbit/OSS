@@ -67,3 +67,17 @@ test("schema 023 rejects a schema 022 database before catalog reads", async () =
   );
   assert.equal(calls, 1);
 });
+
+test("schema 023 rejects schema 024 unless its exact forward projection is requested", async () => {
+  let calls = 0;
+  await assert.rejects(
+    assertSchema023NativeSafe({
+      query: async () => {
+        calls += 1;
+        return { rows: [{ version: "024_stage_c_identity_security" }] };
+      },
+    }),
+    /024_stage_c_identity_security.*023_stage_c_service_operations/,
+  );
+  assert.equal(calls, 1);
+});

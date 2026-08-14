@@ -43,6 +43,18 @@ export type Schema023NativePreflightReport = Readonly<{
   blockers: readonly [];
 }>;
 
+export type Schema023IdentityForwardExtensionPreflightReport = Readonly<{
+  installedSchemaVersion: "024_stage_c_identity_security";
+  applicationSchemaVersion: typeof SCHEMA_023;
+  mode: "native-foundation";
+  safe: true;
+  blockers: readonly [];
+}>;
+
+export type Schema023NativePreflightOptions = Readonly<{
+  allowSchema024IdentityExtensions?: boolean;
+}>;
+
 function rowRecord(row: unknown): Record<string, unknown> {
   if (!row || typeof row !== "object" || Array.isArray(row)) {
     throw new Error("Schema 023 preflight returned an invalid database row");
@@ -203,9 +215,25 @@ export async function assertSchema023CatalogShape(
   );
 }
 
+export function assertSchema023NativeSafe(
+  database: RollbackPreflightQueryable,
+): Promise<Schema023NativePreflightReport>;
+export function assertSchema023NativeSafe(
+  database: RollbackPreflightQueryable,
+  input: Readonly<{ allowSchema024IdentityExtensions: true }>,
+): Promise<Schema023IdentityForwardExtensionPreflightReport>;
 export async function assertSchema023NativeSafe(
   database: RollbackPreflightQueryable,
-): Promise<Schema023NativePreflightReport> {
+  input: Schema023NativePreflightOptions = {},
+): Promise<Schema023NativePreflightReport | Schema023IdentityForwardExtensionPreflightReport> {
+  const allowSchema024IdentityExtensions =
+    input.allowSchema024IdentityExtensions === true;
+  const expectedInstalled = allowSchema024IdentityExtensions
+    ? "024_stage_c_identity_security"
+    : SCHEMA_023;
+  const expectedHistory = allowSchema024IdentityExtensions
+    ? [...EXPECTED_SCHEMA_023_HISTORY, "024_stage_c_identity_security"]
+    : [...EXPECTED_SCHEMA_023_HISTORY];
   let installed: string | null;
   try {
     const result = await database.query(
@@ -220,11 +248,11 @@ export async function assertSchema023NativeSafe(
     if (code !== "42P01") throw error;
     installed = null;
   }
-  if (installed !== SCHEMA_023) {
+  if (installed !== expectedInstalled) {
     throw new SchemaRollbackPreflightError(
       installed === null
-        ? `Database schema is missing; application schema ${SCHEMA_023} requires a forward migration.`
-        : `Database schema ${installed} is incompatible with application schema ${SCHEMA_023}; run the dedicated forward migration and never run a down migration.`,
+        ? `Database schema is missing; application schema ${expectedInstalled} requires a forward migration.`
+        : `Database schema ${installed} is incompatible with application schema ${expectedInstalled}; run the dedicated forward migration and never run a down migration.`,
       installed,
     );
   }
@@ -232,7 +260,7 @@ export async function assertSchema023NativeSafe(
     `SELECT pg_catalog.array_agg(version ORDER BY version COLLATE "C") = $1::text[]
        AS history_exact
      FROM public.schema_migrations`,
-    [[...EXPECTED_SCHEMA_023_HISTORY]],
+    [expectedHistory],
   );
   if (rowRecord(history.rows[0]).history_exact !== true) {
     throw new SchemaRollbackPreflightError(
@@ -264,6 +292,15 @@ export async function assertSchema023NativeSafe(
   await assertSchema021CatalogShape(database);
   await assertSchema022CatalogShape(database);
   await assertSchema023CatalogShape(database);
+  if (allowSchema024IdentityExtensions) {
+    return {
+      installedSchemaVersion: "024_stage_c_identity_security",
+      applicationSchemaVersion: SCHEMA_023,
+      mode: "native-foundation",
+      safe: true,
+      blockers: [],
+    };
+  }
   return {
     installedSchemaVersion: SCHEMA_023,
     applicationSchemaVersion: SCHEMA_023,

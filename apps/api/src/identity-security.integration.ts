@@ -7,10 +7,22 @@ import {
   decryptIdentitySecret,
   type CustomerApiKeyScope,
 } from "@opensales/core/identity-security";
+import { assertSchema023NativeSafe } from "@opensales/core/schema-022-023-native-compatibility";
+import {
+  SCHEMA_024_CATALOG_DIGEST,
+  assertSchema024NativeSafe,
+  schema024CatalogDigest,
+  schema024CatalogFingerprintInput,
+} from "@opensales/core/schema-023-024-native-compatibility";
 import { buildApp } from "./app.js";
 import { digestToken, passwordHash } from "./auth.js";
 import { identitySecretKeyring, type Config } from "./config.js";
-import { runMigrations, transaction, type DatabasePool } from "./database.js";
+import {
+  holdSchema024ApplicationGuard,
+  runMigrations,
+  transaction,
+  type DatabasePool,
+} from "./database.js";
 
 const adminDatabaseUrl = process.env.ADMIN_DATABASE_URL;
 if (!adminDatabaseUrl) {
@@ -284,6 +296,57 @@ try {
     statement_timeout: 20_000,
     application_name: "opensales-identity-security-integration",
   });
+  await runMigrations(pool, { throughVersion: "023_stage_c_service_operations" });
+  await assertSchema023NativeSafe(pool);
+  await runMigrations(pool, { throughVersion: "024_stage_c_identity_security" });
+  await assertSchema024NativeSafe(pool);
+  assert.equal(
+    schema024CatalogDigest(await schema024CatalogFingerprintInput(pool)),
+    SCHEMA_024_CATALOG_DIGEST,
+  );
+
+  const tamperClient = await pool.connect();
+  try {
+    for (const statement of [
+      "ALTER TABLE public.users ALTER COLUMN authorization_epoch DROP NOT NULL",
+      "ALTER TABLE public.sessions DROP CONSTRAINT sessions_revoked_transaction_check",
+      "ALTER TABLE public.reauth_grants ALTER COLUMN factor_method DROP NOT NULL",
+      "ALTER TABLE public.identity_notification_delivery_operations DISABLE TRIGGER identity_notification_delivery_operations_guard",
+      "ALTER TABLE public.durable_jobs DISABLE TRIGGER identity_notification_durable_job_guard",
+      "ALTER TABLE public.identity_notification_outbox DISABLE TRIGGER identity_notification_outbox_bundle_guard",
+      "ALTER TABLE public.totp_recovery_code_batches DISABLE TRIGGER totp_recovery_code_batch_projection_guard",
+      "ALTER TABLE public.identity_action_facts DISABLE TRIGGER identity_action_facts_insert_guard",
+      "ALTER TABLE public.audit_events DISABLE TRIGGER audit_events_immutable",
+      "ALTER FUNCTION public.opensales_guard_identity_action_fact_insert() SECURITY DEFINER",
+      "DROP INDEX public.identity_action_facts_transaction_once",
+    ]) {
+      await tamperClient.query("BEGIN");
+      try {
+        await tamperClient.query(statement);
+        await assert.rejects(
+          assertSchema024NativeSafe({
+            query: async (text: string, values?: unknown[]) =>
+              tamperClient.query(text, values),
+          }),
+          /Schema 024 is incomplete or counterfeit/,
+        );
+      } finally {
+        await tamperClient.query("ROLLBACK");
+      }
+    }
+  } finally {
+    tamperClient.release();
+  }
+  await assertSchema024NativeSafe(pool);
+  const releaseSchema024Guard = await holdSchema024ApplicationGuard(pool);
+  try {
+    await assert.rejects(
+      runMigrations(pool, { throughVersion: "024_stage_c_identity_security" }),
+      /running schema-024 API or Worker/,
+    );
+  } finally {
+    await releaseSchema024Guard();
+  }
   await runMigrations(pool, { throughVersion: "024_stage_c_identity_security" });
   ({ app } = await buildApp(config, pool));
 

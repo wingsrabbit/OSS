@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertSchema018NativeSafe } from "@opensales/core/schema-017-018-native-compatibility";
-import { assertSchema023NativeSafe } from "@opensales/core/schema-022-023-native-compatibility";
+import { assertSchema024NativeSafe } from "@opensales/core/schema-023-024-native-compatibility";
 import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken, passwordHash } from "./auth.js";
@@ -2846,7 +2846,7 @@ try {
       await catalogDriftClient.query("BEGIN");
       await catalogDriftClient.query(`DROP INDEX ${index}`);
       await assert.rejects(
-        assertSchema023NativeSafe({
+        assertSchema024NativeSafe({
           query: async (text: string, values?: unknown[]) =>
             catalogDriftClient.query(text, values),
         }),
@@ -2886,7 +2886,7 @@ try {
       await immutableDriftClient.query("BEGIN");
       await immutableDriftClient.query(`DROP TRIGGER ${trigger} ON ${table}`);
       await assert.rejects(
-        assertSchema023NativeSafe({
+        assertSchema024NativeSafe({
           query: async (text: string, values?: unknown[]) =>
             immutableDriftClient.query(text, values),
         }),
@@ -2918,7 +2918,7 @@ try {
        EXECUTE FUNCTION public.schema_019_unreviewed_client_account_trigger()`,
     );
     await assert.rejects(
-      assertSchema023NativeSafe({
+      assertSchema024NativeSafe({
         query: async (text: string, values?: unknown[]) =>
           inheritedCatalogDriftClient.query(text, values),
       }),

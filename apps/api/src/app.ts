@@ -10,7 +10,7 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema023ApplicationGuard,
+  holdSchema024ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -126,10 +126,10 @@ export async function buildApp(
   try {
     if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
       throw new Error(
-        "Schema 023 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
+        "Schema 024 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
       );
     }
-    releaseSchemaRollbackGuard = await holdSchema023ApplicationGuard(pool);
+    releaseSchemaRollbackGuard = await holdSchema024ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
