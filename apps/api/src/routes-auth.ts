@@ -1249,12 +1249,16 @@ export async function registerAuthRoutes(
         [identity.userId, identity.sessionId],
       );
       const inserted = await client.query<{ expires_at: Date }>(
-        `INSERT INTO reauth_grants(user_id, session_id, expires_at, factor_method)
-         VALUES (
-           $1, $2,
-           pg_catalog.clock_timestamp() + interval '15 minutes',
-           $3
+        `WITH grant_time AS (
+           SELECT pg_catalog.clock_timestamp() AS created_at
          )
+         INSERT INTO reauth_grants(
+           user_id, session_id, created_at, expires_at, factor_method
+         )
+         SELECT
+           $1, $2, grant_time.created_at,
+           grant_time.created_at + interval '15 minutes', $3
+         FROM grant_time
          RETURNING expires_at`,
         [identity.userId, identity.sessionId, factorMethod],
       );
