@@ -103,13 +103,25 @@ function readJson(path, fallback) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+export function upgradeExistingDemoConfig(config, tokenFactory = secureToken) {
+  let changed = false;
+  config.secrets ??= {};
+  if (!config.secrets.providerPlatformToken) {
+    config.secrets.providerPlatformToken = tokenFactory();
+    changed = true;
+  }
+  if (!config.secrets.identitySecretKey) {
+    config.secrets.identitySecretKey = tokenFactory(32);
+    changed = true;
+  }
+  return changed;
+}
+
 function createConfig() {
   ensureRuntimeDirectories();
   const existing = readJson(configFile, null);
   if (existing) {
-    if (!existing.secrets?.providerPlatformToken) {
-      existing.secrets ??= {};
-      existing.secrets.providerPlatformToken = secureToken();
+    if (upgradeExistingDemoConfig(existing)) {
       writePrivateJson(configFile, existing);
     }
     return existing;
@@ -397,7 +409,7 @@ function apiEnvironment(config) {
   };
 }
 
-function workerEnvironment(config) {
+export function workerEnvironment(config) {
   return {
     DATABASE_URL: postgresUrl(
       config,
@@ -414,6 +426,9 @@ function workerEnvironment(config) {
     MOCK_PROVISIONING_PROVIDER_TOKEN: config.secrets.provisioningProviderToken,
     MOCK_PROVIDER_PLATFORM_TOKEN: config.secrets.providerPlatformToken,
     MOCK_MAIL_PROVIDER_TOKEN: config.secrets.mailProviderToken,
+    OSS_PUBLIC_URL: `http://127.0.0.1:${config.ports.web}`,
+    IDENTITY_SECRET_KEY: config.secrets.identitySecretKey,
+    IDENTITY_SECRET_KEY_VERSION: "1",
     PROVIDER_OPERATION_CAPABILITY_SECRET: config.secrets.providerOperationCapabilitySecret,
     PAYMENT_METHOD_TOKEN_KEY: config.secrets.paymentMethodTokenKey,
     PAYMENT_METHOD_TOKEN_KEY_VERSION: "1",

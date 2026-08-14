@@ -29,7 +29,9 @@ import {
   releaseAdvisoryFileLock,
   releaseLifecycleLockOwner,
   repositoryRevision,
+  upgradeExistingDemoConfig,
   verifyStoredProcessIdentity,
+  workerEnvironment,
 } from "./demo-local.mjs";
 import {
   assertSeparatedDemoRoles,
@@ -107,6 +109,52 @@ async function stopTestPid(pid) {
   }
   assert.equal(pidExists(pid), false, `test PID ${pid} did not stop`);
 }
+
+test("legacy Demo config gains independent identity and Provider platform secrets exactly once", () => {
+  const config = { secrets: {} };
+  const generated = [];
+  const tokenFactory = (bytes) => {
+    generated.push(bytes ?? null);
+    return bytes === 32 ? "synthetic-identity-key" : "synthetic-platform-token";
+  };
+  assert.equal(upgradeExistingDemoConfig(config, tokenFactory), true);
+  assert.deepEqual(generated, [null, 32]);
+  assert.equal(config.secrets.providerPlatformToken, "synthetic-platform-token");
+  assert.equal(config.secrets.identitySecretKey, "synthetic-identity-key");
+  assert.equal(upgradeExistingDemoConfig(config, tokenFactory), false);
+  assert.deepEqual(generated, [null, 32], "an upgraded config must not rotate either secret");
+});
+
+test("Demo Worker receives the public identity origin and encrypted-secret key", () => {
+  const environment = workerEnvironment({
+    ports: {
+      api: 30_001,
+      web: 51_731,
+      payment: 40_001,
+      provisioning: 40_002,
+      mail: 40_003,
+    },
+    secrets: {
+      workerDatabasePassword: "synthetic-worker-db-password",
+      paymentProviderToken: "synthetic-payment-provider-token",
+      provisioningProviderToken: "synthetic-provisioning-provider-token",
+      providerPlatformToken: "synthetic-provider-platform-token",
+      mailProviderToken: "synthetic-mail-provider-token",
+      identitySecretKey: "synthetic-identity-secret-key",
+      providerOperationCapabilitySecret: "synthetic-operation-capability-secret",
+      paymentMethodTokenKey: "synthetic-payment-method-key",
+      paymentWebhookSecret: "synthetic-payment-webhook-secret",
+      provisioningWebhookSecret: "synthetic-provisioning-webhook-secret",
+    },
+  });
+  assert.equal(environment.OSS_PUBLIC_URL, "http://127.0.0.1:51731");
+  assert.equal(environment.IDENTITY_SECRET_KEY, "synthetic-identity-secret-key");
+  assert.equal(environment.IDENTITY_SECRET_KEY_VERSION, "1");
+  assert.equal(
+    environment.MOCK_PROVIDER_PLATFORM_TOKEN,
+    "synthetic-provider-platform-token",
+  );
+});
 
 test("advisory lock keeps one stable semaphore inode across success and failure", () => {
   const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-inode-"));
