@@ -1483,7 +1483,7 @@ function prepareDatabases(config, pgBin, node) {
     DATABASE_API_ROLE_PASSWORD: config.secrets.apiDatabasePassword,
     DATABASE_WORKER_ROLE_PASSWORD: config.secrets.workerDatabasePassword,
   };
-  console.log("Applying the latest native schema (018) and synthetic catalog seed...");
+  console.log("Applying the latest native schema and synthetic catalog seed...");
   commandResult(node, ["apps/api/dist/migrate.js"], { env: migrationEnvironment });
   commandResult(node, ["apps/api/dist/seed-termrat.js"], { env: apiEnvironment(config) });
 }
