@@ -28,7 +28,10 @@ export function LegalHub({
 }>) {
   if (!active) return null;
   return (
-    <section className="catalog legal-hub" aria-label="Published legal documents">
+    <section
+      className="catalog legal-hub"
+      aria-label={locale === "zh-CN" ? "已发布法律文本" : "Published legal documents"}
+    >
       <p className="eyebrow">
         {locale === "zh-CN" ? "已发布法律版本" : "Published legal versions"}
       </p>
@@ -47,7 +50,13 @@ export function LegalHub({
                 key={kind}
               >
                 <div>
-                  <span className="mode">{kind === "aup" ? "AUP" : kind}</span>
+                  <span className="mode">
+                    {kind === "aup"
+                      ? "AUP"
+                      : locale === "zh-CN"
+                        ? kind === "terms" ? "条款" : "隐私说明"
+                        : kind}
+                  </span>
                   <h3>{document.title}</h3>
                   <p>{document.body}</p>
                 </div>

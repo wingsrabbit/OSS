@@ -102,6 +102,26 @@ function parseStaffPermissions(value: unknown): ReadonlySet<string> {
   return new Set(value);
 }
 
+const ADMIN_ENTRY_PERMISSIONS = [
+  "accounts.view",
+  "billing.manual_receipt_manage",
+  "billing.refund_manage",
+  "content.read",
+  "services.manual_fulfillment",
+  "services.operations_manage",
+  "support.tickets.manage",
+] as const;
+
+function viewerCanOpenAdminWorkspace(viewer: Me | null): boolean {
+  if (
+    viewer?.verification.email !== "passed" ||
+    viewer.restrictions.user ||
+    !viewer.staff
+  ) return false;
+  const permissions = parseStaffPermissions(viewer.staff.permissions);
+  return permissions.has("*") || ADMIN_ENTRY_PERMISSIONS.some((permission) => permissions.has(permission));
+}
+
 type Price = {
   id: string;
   currency: string;
@@ -1073,15 +1093,7 @@ export function App() {
   const canManageServiceOperations =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("services.operations_manage"));
-  const canOpenAdminWorkspace =
-    canManageStaffTickets ||
-    canManageManualReceipts ||
-    canManageRefunds ||
-    canManageManualFulfillment ||
-    canManageServiceOperations ||
-    canReadContent ||
-    canViewAccount360 ||
-    canUseFullAdminWorkspace;
+  const canOpenAdminWorkspace = viewerCanOpenAdminWorkspace(me);
   const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
   const canManageManualReceiptsRoute = route === "/admin" && canManageManualReceipts;
   const canManageRefundsRoute = route === "/admin" && canManageRefunds;
@@ -1410,6 +1422,7 @@ export function App() {
         return meRef.current;
       }
       setMe(viewer);
+      setLocale(viewer.locale);
       setSessionResolved(true);
       return viewer;
     } catch (caught) {
@@ -1422,6 +1435,30 @@ export function App() {
       return null;
     }
   }, []);
+
+  const toggleLocale = useCallback(async (): Promise<void> => {
+    const previous = locale;
+    const next: Locale = previous === "en" ? "zh-CN" : "en";
+    setLocale(next);
+    if (meRef.current === null) return;
+    try {
+      const persisted = await api<{ locale: Locale }>("/api/v1/auth/locale", {
+        method: "PUT",
+        body: JSON.stringify({ locale: next }),
+      });
+      setLocale(persisted.locale);
+      setMe((viewer) => viewer ? { ...viewer, locale: persisted.locale } : viewer);
+    } catch (caught) {
+      setLocale(previous);
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : previous === "zh-CN"
+            ? "无法保存语言偏好"
+            : "Unable to save the language preference",
+      );
+    }
+  }, [locale, setError]);
 
   useEffect(() => subscribeAccountContextInvalidation(() => {
     meRequestGeneration.current += 1;
@@ -1542,15 +1579,26 @@ export function App() {
   }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   useEffect(() => {
+    let current = true;
+    setProducts([]);
     setLegal(null);
-    void Promise.all([
-      api<{ products: Product[] }>(`/api/v1/catalog?locale=${locale}`).then((data) =>
-        setProducts(data.products),
-      ),
-      api<Legal>(`/api/v1/legal/current?locale=${locale}`).then(setLegal),
-    ]).catch((caught: unknown) =>
-      setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
-    );
+    void api<{ products: Product[] }>(`/api/v1/catalog?locale=${locale}`).then((catalog) => {
+      if (!current) return;
+      setProducts(catalog.products);
+    }).catch((caught: unknown) => {
+      if (!current) return;
+      setError(caught instanceof Error ? caught.message : "Unable to load the laboratory");
+    });
+    void api<Legal>(`/api/v1/legal/current?locale=${locale}`).then((legal) => {
+      if (!current) return;
+      setLegal(legal);
+    }).catch((caught: unknown) => {
+      if (!current) return;
+      setError(caught instanceof Error ? caught.message : "Unable to load the laboratory");
+    });
+    return () => {
+      current = false;
+    };
   }, [locale, setError]);
 
   useEffect(() => {
@@ -1593,6 +1641,8 @@ export function App() {
 
   useLayoutEffect(() => {
     adminAccessGeneration.current += 1;
+    const previousPrincipal = previousStaffPrincipalFingerprint.current;
+    const hadResolvedPrincipal = previousPrincipal.split("\u0001", 1)[0] !== "";
     const accessChanged =
       previousStaffAccessFingerprint.current !== staffAccessFingerprint;
     const principalChanged =
@@ -1605,8 +1655,10 @@ export function App() {
     manualReceiptRequestGeneration.current += 1;
     adminOperationContextRef.current = null;
     setAdminOperationContext(null);
-    setNoticeRaw("");
-    setErrorRaw("");
+    if (hadResolvedPrincipal) {
+      setNoticeRaw("");
+      setErrorRaw("");
+    }
     setManualItems([]);
     setAdminRenewals([]);
     setAdminCancellations([]);
@@ -2479,25 +2531,14 @@ export function App() {
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
       const viewer = await refreshMe();
-      const viewerPermissions = parseStaffPermissions(viewer?.staff?.permissions);
-      const viewerCanOpenAdmin =
-        viewer?.verification.email === "passed" &&
-        viewer.restrictions.user === false &&
-        viewer.staff !== null &&
-        viewer.staff !== undefined &&
-        (viewerPermissions.has("*") ||
-          viewerPermissions.has("accounts.view") ||
-          viewerPermissions.has("billing.manual_receipt_manage") ||
-          viewerPermissions.has("billing.refund_manage") ||
-          viewerPermissions.has("services.manual_fulfillment") ||
-          viewerPermissions.has("services.operations_manage") ||
-          viewerPermissions.has("support.tickets.manage"));
+      const resolvedLocale = viewer?.locale ?? locale;
+      const viewerCanOpenAdmin = viewerCanOpenAdminWorkspace(viewer);
       const target = route === "/"
         ? viewerCanOpenAdmin ? "/admin" : "/customer"
         : route;
       if (membershipInvitationToken) {
         setSessionResolved(true);
-        setNoticeRaw(locale === "zh-CN" ? "已登录，正在检查成员邀请…" : "Signed in. Checking the membership invitation…");
+        setNoticeRaw(resolvedLocale === "zh-CN" ? "已登录，正在检查成员邀请…" : "Signed in. Checking the membership invitation…");
         return;
       }
       const staysOnResolvedRoute = route === target;
@@ -2505,8 +2546,8 @@ export function App() {
       if (staysOnResolvedRoute) setSessionResolved(true);
       setNoticeRaw(
         requiresAccountContext
-          ? locale === "zh-CN" ? "已登录。请选择当前客户账户后继续。" : "Signed in. Select an active Client Account to continue."
-          : locale === "zh-CN" ? "已登录。" : "Signed in.",
+          ? resolvedLocale === "zh-CN" ? "已登录。请选择当前客户账户后继续。" : "Signed in. Select an active Client Account to continue."
+          : resolvedLocale === "zh-CN" ? "已登录。" : "Signed in.",
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
@@ -2538,9 +2579,9 @@ export function App() {
       }
       setLoginChallenge(null);
       const viewer = await refreshMe();
-      const permissions = parseStaffPermissions(viewer?.staff?.permissions);
+      const resolvedLocale = viewer?.locale ?? locale;
       const target = route === "/"
-        ? viewer?.staff && (permissions.has("*") || permissions.size > 0)
+        ? viewerCanOpenAdminWorkspace(viewer)
           ? "/admin"
           : "/customer"
         : route;
@@ -2548,8 +2589,8 @@ export function App() {
       openRoute(target);
       if (staysOnResolvedRoute) setSessionResolved(true);
       setNoticeRaw(requiresAccountContext
-        ? locale === "zh-CN" ? "已登录。请选择当前客户账户。" : "Signed in. Select an active Client Account."
-        : locale === "zh-CN" ? "双因素登录成功。" : "Two-factor sign-in completed.");
+        ? resolvedLocale === "zh-CN" ? "已登录。请选择当前客户账户。" : "Signed in. Select an active Client Account."
+        : resolvedLocale === "zh-CN" ? "双因素登录成功。" : "Two-factor sign-in completed.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Login challenge failed");
     }
@@ -4367,7 +4408,7 @@ export function App() {
           </a>
         </nav>
         <div className="header-actions">
-          <button onClick={() => setLocale(locale === "en" ? "zh-CN" : "en")}>
+          <button onClick={() => void toggleLocale()}>
             {locale === "en" ? "简体中文" : "English"}
           </button>
           <span className={route === "/" ? "pill" : me?.eligible ? "pill good" : "pill"}>

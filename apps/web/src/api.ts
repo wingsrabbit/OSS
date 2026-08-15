@@ -277,10 +277,12 @@ export function hardResetSession(): void {
 function isProtectedApiPath(path: string): boolean {
   const pathname = new URL(path, window.location.origin).pathname;
   return (
-    pathname.startsWith("/api/v1/") &&
-    !pathname.startsWith("/api/v1/auth/") &&
-    pathname !== "/api/v1/catalog" &&
-    !pathname.startsWith("/api/v1/legal/")
+    pathname === "/api/v1/auth/locale" ||
+    (pathname.startsWith("/api/v1/") &&
+      !pathname.startsWith("/api/v1/auth/") &&
+      pathname !== "/api/v1/catalog" &&
+      pathname !== "/api/v1/content" &&
+      !pathname.startsWith("/api/v1/legal/"))
   );
 }
 
@@ -496,7 +498,10 @@ async function request<T>(
       replaceSessionContext(transitionId!);
     }
 
-    const sessionAbsent = transition !== "login" && responseMeansSessionAbsent(response, body);
+    const sessionAbsent =
+      transition !== "login" &&
+      !isPublicApiPath(pathname) &&
+      responseMeansSessionAbsent(response, body);
     if (sessionAbsent) {
       clearAccountContext();
     }

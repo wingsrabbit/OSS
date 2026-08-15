@@ -22,6 +22,23 @@ export type ContentItem = Readonly<{
   publishedAt: string;
 }>;
 
+function contentKindLabel(kind: ContentItem["kind"], locale: Locale): string {
+  if (locale === "en") return kind.replaceAll("_", " ");
+  if (kind === "announcement") return "公告";
+  if (kind === "knowledge_base") return "知识库";
+  return "网络状态";
+}
+
+function statusLevelLabel(status: string, locale: Locale): string {
+  if (locale === "en") return status.replaceAll("_", " ");
+  if (status === "operational") return "运行正常";
+  if (status === "maintenance") return "维护中";
+  if (status === "degraded") return "服务降级";
+  if (status === "resolved") return "已恢复";
+  if (status === "information") return "信息";
+  return status.replaceAll("_", " ");
+}
+
 export function ContentHub({
   locale,
   customer,
@@ -62,7 +79,12 @@ export function ContentHub({
 
   if (!active) return null;
   return (
-    <section className="catalog content-hub" aria-label={customer ? "Customer content" : "Public content"}>
+    <section
+      className="catalog content-hub"
+      aria-label={customer
+        ? locale === "zh-CN" ? "客户内容" : "Customer content"
+        : locale === "zh-CN" ? "公开内容" : "Public content"}
+    >
       <p className="eyebrow">
         {customer
           ? locale === "zh-CN" ? "客户内容中心" : "Customer content hub"
@@ -77,10 +99,10 @@ export function ContentHub({
         {items.map((item) => (
           <article className="product-card content-card" key={item.entryId} data-testid={`content-${item.slug}`}>
             <div>
-              <span className="mode">{item.kind.replaceAll("_", " ")}</span>
+              <span className="mode">{contentKindLabel(item.kind, locale)}</span>
               {item.kind === "network_status" && (
                 <span className={`pill ${item.statusLevel === "operational" ? "good" : ""}`}>
-                  {item.statusLevel}
+                  {statusLevelLabel(item.statusLevel, locale)}
                 </span>
               )}
               <h3>{item.title}</h3>

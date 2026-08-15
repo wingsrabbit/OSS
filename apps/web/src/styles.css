@@ -577,6 +577,10 @@ select:focus {
   line-height: 1.55;
 }
 
+.revision-body {
+  white-space: pre-wrap;
+}
+
 .mode {
   padding: 0.3rem 0.5rem;
   border-radius: 0.35rem;

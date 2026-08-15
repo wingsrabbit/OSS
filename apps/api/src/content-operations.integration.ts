@@ -9,6 +9,7 @@ import { digestToken } from "./auth.js";
 import { loadLegalDocuments } from "./commerce-service.js";
 import type { Config } from "./config.js";
 import { runMigrations, transaction, type DatabasePool } from "./database.js";
+import { registerAuthRoutes } from "./routes-auth.js";
 import { registerContentRoutes } from "./routes-content.js";
 
 const adminDatabaseUrl = process.env.ADMIN_DATABASE_URL;
@@ -125,6 +126,7 @@ try {
       ...(code ? { code } : {}),
     });
   });
+  await registerAuthRoutes(app, pool, config);
   await registerContentRoutes(app, pool, config);
   await app.ready();
   try {
@@ -134,6 +136,41 @@ try {
     const readerHeaders = {
       cookie: `${config.SESSION_COOKIE_NAME}=${readingStaff.token}`,
     };
+
+    const persistedLocale = await app.inject({
+      method: "PUT",
+      url: "/api/v1/auth/locale",
+      headers: managerHeaders,
+      payload: { locale: "zh-CN" },
+    });
+    assert.equal(persistedLocale.statusCode, 200, persistedLocale.body);
+    assert.deepEqual(json(persistedLocale), { locale: "zh-CN" });
+    const persistedViewer = await app.inject({
+      method: "GET",
+      url: "/api/v1/auth/me",
+      headers: managerHeaders,
+    });
+    assert.equal(persistedViewer.statusCode, 200, persistedViewer.body);
+    assert.equal(json<{ locale: string }>(persistedViewer).locale, "zh-CN");
+    const persistedLocaleFacts = await pool.query<{
+      locale: string;
+      audit_count: string;
+    }>(
+      `SELECT principal.locale,
+              (SELECT pg_catalog.count(*)::text
+               FROM audit_events event
+               WHERE event.actor_id = principal.id::text
+                 AND event.action = 'user.locale.updated'
+                 AND event.metadata = '{"oldLocale":"en","newLocale":"zh-CN"}'::jsonb)
+                AS audit_count
+       FROM users principal
+       WHERE principal.id = $1`,
+      [managingStaff.userId],
+    );
+    assert.deepEqual(persistedLocaleFacts.rows[0], {
+      locale: "zh-CN",
+      audit_count: "1",
+    });
 
     const publicContent = await app.inject({
       method: "GET",

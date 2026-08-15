@@ -5,10 +5,11 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 type MockViewer = {
   id: string;
   email: string;
-  locale: "en";
+  locale: "en" | "zh-CN";
   clientAccountId: string;
   membershipRole: string;
   accountContextVersion: string;
+  authorizationEpoch: string;
   context: {
     clientAccountId: string;
     name: string;
@@ -54,6 +55,7 @@ function mockViewer({
     clientAccountId,
     membershipRole: "owner",
     accountContextVersion: "1",
+    authorizationEpoch: "1",
     context: {
       clientAccountId,
       name: "Synthetic route account",
@@ -81,6 +83,7 @@ function withViewerSessionContext(route: Route, viewer: MockViewer | null): Rout
             headers: {
               "X-OSS-Account-Context-Version": viewer.accountContextVersion,
               "X-OSS-Client-Account-Id": viewer.clientAccountId,
+              "X-OSS-Authorization-Epoch": viewer.authorizationEpoch,
               ...(response.headers ?? {}),
             },
           });
@@ -123,6 +126,7 @@ async function installMockApi(
           headers: {
             "X-OSS-Account-Context-Version": viewer.accountContextVersion,
             "X-OSS-Client-Account-Id": viewer.clientAccountId,
+            "X-OSS-Authorization-Epoch": viewer.authorizationEpoch,
           },
           json: viewer,
         });
@@ -136,6 +140,7 @@ async function installMockApi(
         headers: {
           "X-OSS-Account-Context-Version": viewer.accountContextVersion,
           "X-OSS-Client-Account-Id": viewer.clientAccountId,
+          "X-OSS-Authorization-Epoch": viewer.authorizationEpoch,
         },
         json: {
           activeClientAccountId: viewer.clientAccountId,
@@ -207,6 +212,54 @@ async function installMockApi(
     if (path === "/api/v1/legal/current") {
       const document = { version: "mock-v1", title: "Mock terms", body: "Synthetic only." };
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+      return;
+    }
+    if (path === "/api/v1/content" || path === "/api/v1/customer/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (request.method() === "GET" && path === "/api/v1/admin/service-operations") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          items: [],
+        },
+      });
+      return;
+    }
+    if (request.method() === "GET" && path === "/api/v1/admin/content") {
+      await route.fulfill({
+        json: {
+          entries: [],
+          revisions: [],
+          legalDocuments: [],
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === "GET" &&
+      (
+        /^\/api\/v1\/services\/[0-9a-f-]+\/operations$/u.test(path) ||
+        /^\/api\/v1\/admin\/client-accounts\/[0-9a-f-]+\/services\/[0-9a-f-]+\/operations$/u.test(path)
+      )
+    ) {
+      const serviceId = path.split("/").at(-2) ?? "";
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          service: {
+            id: serviceId,
+            productName: "Synthetic route service",
+            status: "active",
+            version: 1,
+            resourceState: null,
+            resourceRevision: 0,
+            availableActions: [],
+          },
+          items: [],
+        },
+      });
       return;
     }
     if (path === "/api/v1/orders") {
@@ -432,6 +485,7 @@ test("customer and Staff sessions stay separated and can switch accounts through
           headers: {
             "X-OSS-Account-Context-Version": nextViewer.accountContextVersion,
             "X-OSS-Client-Account-Id": nextViewer.clientAccountId,
+            "X-OSS-Authorization-Epoch": nextViewer.authorizationEpoch,
           },
           json: { requiresAccountContext: false },
         });
@@ -509,13 +563,13 @@ test("public Home stays session-neutral for a signed-in wildcard Staff account",
   await expect(page.getByRole("button", { name: "Register", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
   expect(new Set(requests)).toEqual(
-    new Set(["/api/v1/catalog", "/api/v1/legal/current"]),
+    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content"]),
   );
   const requestCountBeforeLocaleChange = requests.length;
   await page.getByRole("button", { name: "简体中文" }).click();
   await expect.poll(() => requests.length).toBeGreaterThan(requestCountBeforeLocaleChange);
   expect(new Set(requests)).toEqual(
-    new Set(["/api/v1/catalog", "/api/v1/legal/current"]),
+    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content"]),
   );
 });
 
@@ -586,6 +640,56 @@ test("catalog query 401 stays on public Home without a hard-reload loop", async 
     catalogRequests.every((url) => new URL(url).searchParams.get("locale") === "en"),
   ).toBe(true);
   await expect(page).toHaveURL(/\/$/);
+});
+
+test("public Content query 401 stays on Home without a hard reload", async ({ page }) => {
+  await installMockApi(page, null, {
+    unauthorizedPath: "/api/v1/content",
+    unauthorizedError: "Synthetic Content unavailable",
+  });
+  const documents: string[] = [];
+  const contentRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.resourceType() === "document") documents.push(url.pathname);
+    if (url.pathname === "/api/v1/content") contentRequests.push(url.toString());
+  });
+
+  await page.goto("/");
+  await expect(page.locator(".notice.error")).toContainText("Synthetic Content unavailable");
+  await page.waitForTimeout(250);
+  expect(documents).toEqual(["/"]);
+  expect(contentRequests.length).toBeGreaterThan(0);
+  expect(
+    contentRequests.every((url) => new URL(url).searchParams.get("locale") === "en"),
+  ).toBe(true);
+  await expect(page).toHaveURL(/\/$/);
+});
+
+test("an expired locale mutation hard-resets the authenticated workspace", async ({ page }) => {
+  const activeViewer = mockViewer({ email: "expired-locale-session@example.invalid" });
+  await installMockApi(page, activeViewer, {
+    intercept: async (path, route) => {
+      if (path !== "/api/v1/auth/locale" || route.request().method() !== "PUT") return false;
+      await route.fulfill({
+        status: 401,
+        json: { error: "Session is invalid or expired" },
+      });
+      return true;
+    },
+  });
+
+  await page.goto("/customer");
+  await expect(page.getByRole("banner").getByText(activeViewer.email, { exact: true })).toBeVisible();
+  const rootDocument = page.waitForRequest(
+    (request) => request.resourceType() === "document" && new URL(request.url()).pathname === "/",
+  );
+  await page.getByRole("button", { name: "简体中文" }).click();
+  await rootDocument;
+
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByText(activeViewer.email)).toHaveCount(0);
+  await expect(page.getByTestId("customer-business-history")).toHaveCount(0);
 });
 
 test("restricted wildcard Staff mounts no Admin capability or Admin fetch", async ({ page }) => {

@@ -71,6 +71,10 @@ const accountContextSchema = z.object({
   clientAccountId: z.uuid().transform((value) => value.toLowerCase()),
 });
 
+const localePreferenceSchema = z
+  .object({ locale: z.enum(["en", "zh-CN"]) })
+  .strict();
+
 const labMailboxMessageSchema = z
   .object({
     id: z.uuid(),
@@ -1105,6 +1109,42 @@ export async function registerAuthRoutes(
         !active?.restrictions.clientAccount,
       staff: staff ? { roles: staff.roles, permissions: staff.permissions } : null,
     };
+  });
+
+  app.put("/api/v1/auth/locale", async (request) => {
+    const identity = await requireSessionIdentity(request, pool, config);
+    const body = localePreferenceSchema.parse(request.body);
+    const locale = await transaction(pool, async (client) => {
+      await lockSessionIdentityForMutation(client, identity);
+      const currentResult = await client.query<{ locale: "en" | "zh-CN" }>(
+        `SELECT locale
+         FROM users
+         WHERE id = $1`,
+        [identity.userId],
+      );
+      const current = currentResult.rows[0];
+      if (!current) {
+        throw Object.assign(new Error("Session is invalid or expired"), { statusCode: 401 });
+      }
+      if (current.locale === body.locale) return current.locale;
+      await client.query(
+        `UPDATE users
+         SET locale = $2
+         WHERE id = $1`,
+        [identity.userId, body.locale],
+      );
+      await client.query(
+        `INSERT INTO audit_events(
+           actor_type, actor_id, action, target_type, target_id, metadata
+         ) VALUES ('user', $1, 'user.locale.updated', 'user', $1, $2::jsonb)`,
+        [
+          identity.userId,
+          JSON.stringify({ oldLocale: current.locale, newLocale: body.locale }),
+        ],
+      );
+      return body.locale;
+    });
+    return { locale };
   });
 
   app.get("/api/v1/auth/account-contexts", async (request, reply) => {

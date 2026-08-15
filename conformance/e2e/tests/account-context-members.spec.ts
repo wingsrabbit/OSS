@@ -12,6 +12,7 @@ const invitationId = "00000000-0000-4000-8000-000000001906";
 const occurredAt = "2026-08-10T00:00:00.123456Z";
 const contextVersionHeader = "X-OSS-Account-Context-Version";
 const contextIdHeader = "X-OSS-Client-Account-Id";
+const authorizationEpochHeader = "X-OSS-Authorization-Epoch";
 
 type Role = "owner" | "billing" | "technical" | "viewer";
 type AccountContext = {
@@ -56,8 +57,10 @@ function derivedCapabilities(context: Pick<AccountContext, "role" | "permissions
 
 type MockState = {
   authenticated: boolean;
+  locale: "en" | "zh-CN";
   activeId: string | null;
   version: string;
+  authorizationEpoch: string;
   userRestricted: boolean;
   clientRestricted: boolean;
   role: Role | null;
@@ -76,9 +79,12 @@ type SeenRequest = {
   body: unknown;
 };
 
-function headers(state: Pick<MockState, "activeId" | "version">): Record<string, string> {
+function headers(
+  state: Pick<MockState, "activeId" | "version" | "authorizationEpoch">,
+): Record<string, string> {
   return {
     [contextVersionHeader]: state.version,
+    [authorizationEpochHeader]: state.authorizationEpoch,
     ...(state.activeId ? { [contextIdHeader]: state.activeId } : {}),
   };
 }
@@ -99,10 +105,11 @@ function viewer(state: MockState) {
   return {
     id: viewerId,
     email: "context-owner@example.invalid",
-    locale: "en",
+    locale: state.locale,
     clientAccountId: context?.clientAccountId ?? null,
     membershipRole: context?.role ?? null,
     accountContextVersion: state.version,
+    authorizationEpoch: state.authorizationEpoch,
     context: context
       ? {
           clientAccountId: context.clientAccountId,
@@ -259,6 +266,31 @@ function requestBody(request: Request): unknown {
   }
 }
 
+function withAuthorizationEpoch(route: Route, authorizationEpoch = "1"): Route {
+  return new Proxy(route, {
+    get(target, property, receiver) {
+      if (property === "fulfill") {
+        return (options: Parameters<Route["fulfill"]>[0]) => {
+          const response = options ?? {};
+          const responseHeaders = response.headers ?? {};
+          const lowerHeaderNames = new Set(Object.keys(responseHeaders).map((name) => name.toLowerCase()));
+          const hasSessionContext =
+            lowerHeaderNames.has(contextVersionHeader.toLowerCase()) ||
+            lowerHeaderNames.has(contextIdHeader.toLowerCase());
+          return target.fulfill({
+            ...response,
+            headers: hasSessionContext && !lowerHeaderNames.has(authorizationEpochHeader.toLowerCase())
+              ? { ...responseHeaders, [authorizationEpochHeader]: authorizationEpoch }
+              : responseHeaders,
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 async function installMockApi(
   pageInstance: Page,
   state: MockState,
@@ -268,7 +300,8 @@ async function installMockApi(
   } = {},
 ): Promise<SeenRequest[]> {
   const seen: SeenRequest[] = [];
-  await pageInstance.route("**/api/v1/**", async (route) => {
+  await pageInstance.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute, state.authorizationEpoch);
     const request = route.request();
     const url = new URL(request.url());
     const fact: SeenRequest = {
@@ -286,6 +319,10 @@ async function installMockApi(
     } else if (url.pathname === "/api/v1/legal/current") {
       const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+    } else if (url.pathname === "/api/v1/customer/content") {
+      await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
     } else if (url.pathname === "/api/v1/auth/me") {
       if (!state.authenticated) {
         await route.fulfill({ status: 401, json: { error: "Authentication required" } });
@@ -334,6 +371,19 @@ async function installMockApi(
       await route.fulfill({ headers: authenticatedHeaders, json: page(state.contacts) });
     } else if (url.pathname === "/api/v1/auth/reauth") {
       await route.fulfill({ headers: authenticatedHeaders, json: { expiresAt: "2026-08-10T00:15:00.000Z", fixedWindowMinutes: 15 } });
+    } else if (url.pathname === "/api/v1/auth/locale" && request.method() === "PUT") {
+      const body = requestBody(request) as { locale?: unknown };
+      if (body.locale !== "en" && body.locale !== "zh-CN") {
+        await route.fulfill({ status: 400, headers: authenticatedHeaders, json: { error: "Invalid locale" } });
+      } else {
+        state.locale = body.locale;
+        await route.fulfill({ headers: authenticatedHeaders, json: { locale: state.locale } });
+      }
+    } else if (url.pathname === "/api/v1/admin/content" && request.method() === "GET") {
+      await route.fulfill({
+        headers: authenticatedHeaders,
+        json: { entries: [], revisions: [], legalDocuments: [] },
+      });
     } else {
       await route.fulfill({ status: 501, json: { error: `Unexpected mock API request: ${request.method()} ${url.pathname}` } });
       throw new Error(`Unexpected mock API request: ${request.method()} ${url.pathname}`);
@@ -345,8 +395,10 @@ async function installMockApi(
 function baseState(overrides: Partial<MockState> = {}): MockState {
   return {
     authenticated: true,
+    locale: "en",
     activeId: accountA,
     version: "1",
+    authorizationEpoch: "1",
     userRestricted: false,
     clientRestricted: false,
     role: "owner",
@@ -552,8 +604,13 @@ test("a mutation holds the shared session lock until its response is captured, t
   const mutationSeen = new Promise<void>((resolve) => { mutationStarted = resolve; });
   let mutationCalls = 0;
   let loginCalls = 0;
-  await browserPage.route("**/api/v1/**", async (route) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -605,7 +662,7 @@ test("a mutation holds the shared session lock until its response is captured, t
   expect(outcome).toEqual({
     mutation: { committed: true },
     login: "ACCOUNT_CONTEXT_REQUIRED",
-    snapshot: { clientAccountId: null, version: "0", generation: expect.any(Number) },
+    snapshot: { clientAccountId: null, version: "0", authorizationEpoch: "1", generation: expect.any(Number) },
   });
   expect(mutationCalls).toBe(1);
   expect(loginCalls).toBe(1);
@@ -617,8 +674,13 @@ test("login holds the exclusive lock and a queued mutation uses the new same-ver
   const loginGate = new Promise<void>((resolve) => { releaseLogin = resolve; });
   const loginSeen = new Promise<void>((resolve) => { loginStarted = resolve; });
   let mutationCalls = 0;
-  await browserPage.route("**/api/v1/**", async (route) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -667,7 +729,7 @@ test("login holds the exclusive lock and a queued mutation uses the new same-ver
   expect(outcome).toEqual({
     login: { expiresAt: occurredAt },
     mutation: { account: accountB },
-    snapshot: { clientAccountId: accountB, version: "1", generation: expect.any(Number) },
+    snapshot: { clientAccountId: accountB, version: "1", authorizationEpoch: "1", generation: expect.any(Number) },
   });
   expect(mutationCalls).toBe(1);
 });
@@ -678,8 +740,13 @@ test("logout waits exclusively for an in-flight shared read and clears context o
   const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
   const readSeen = new Promise<void>((resolve) => { readStarted = resolve; });
   let logoutCalls = 0;
-  await browserPage.route("**/api/v1/**", async (route) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -731,14 +798,19 @@ test("logout waits exclusively for an in-flight shared read and clears context o
   expect(outcome).toEqual({
     read: { captured: true },
     logoutReturnedNoBody: true,
-    snapshot: { clientAccountId: null, version: null, generation: expect.any(Number) },
+    snapshot: { clientAccountId: null, version: null, authorizationEpoch: null, generation: expect.any(Number) },
   });
   expect(logoutCalls).toBe(1);
 });
 
 test("an incorrect reauthentication password preserves a valid session context", async ({ page: browserPage }) => {
-  await browserPage.route("**/api/v1/**", async (route) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -768,16 +840,67 @@ test("an incorrect reauthentication password preserves a valid session context",
   });
   expect(outcome).toEqual({
     status: 401,
-    snapshot: { clientAccountId: accountA, version: "7", generation: expect.any(Number) },
+    snapshot: { clientAccountId: accountA, version: "7", authorizationEpoch: "1", generation: expect.any(Number) },
   });
+});
+
+test("a public Content 401 never clears an established session context", async ({ page: browserPage }) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/catalog") {
+      await route.fulfill({ json: { products: [] } });
+    } else if (url.pathname === "/api/v1/legal/current") {
+      const document = { version: "mock-v1", title: "Mock", body: "Synthetic only." };
+      await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
+    } else if (url.pathname === "/api/v1/content") {
+      if (url.searchParams.get("probe") === "session-boundary") {
+        await route.fulfill({ status: 401, json: { error: "Synthetic public Content unavailable" } });
+      } else {
+        await route.fulfill({ json: { items: [] } });
+      }
+    } else if (url.pathname === "/api/v1/test/seed") {
+      await route.fulfill({
+        headers: { [contextVersionHeader]: "9", [contextIdHeader]: accountA },
+        json: { seeded: true },
+      });
+    } else {
+      await route.fulfill({ status: 401, json: { error: "Authentication required" } });
+    }
+  });
+  await browserPage.goto("/");
+  const outcome = await browserPage.evaluate(async () => {
+    const modulePath = "/src/api.ts";
+    const client = await import(modulePath);
+    await client.api("/api/v1/test/seed");
+    const status = await client
+      .api("/api/v1/content?probe=session-boundary")
+      .catch((error: { status?: number }) => error.status);
+    return { status, snapshot: client.getAccountContextSnapshot() };
+  });
+  expect(outcome).toEqual({
+    status: 401,
+    snapshot: {
+      clientAccountId: accountA,
+      version: "9",
+      authorizationEpoch: "1",
+      generation: expect.any(Number),
+    },
+  });
+  await expect(browserPage).toHaveURL(/\/$/u);
 });
 
 test("invalid or missing protected response context is recovered once and mutations are never replayed", async ({ page: browserPage }) => {
   let reads = 0;
   let mutations = 0;
   let meReads = 0;
-  await browserPage.route("**/api/v1/**", async (route) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -820,7 +943,7 @@ test("invalid or missing protected response context is recovered once and mutati
     read: { authoritative: true },
     mutationCode: "SESSION_CONTEXT_INVALID",
     invalidations: ["SESSION_CHANGED", "SESSION_CONTEXT_INVALID"],
-    snapshot: { clientAccountId: accountB, version: "2", generation: expect.any(Number) },
+    snapshot: { clientAccountId: accountB, version: "2", authorizationEpoch: "1", generation: expect.any(Number) },
   });
   expect({ reads, mutations, meReads }).toEqual({ reads: 2, mutations: 1, meReads: 2 });
 });
@@ -831,8 +954,13 @@ test("a cross-tab A to B ordinary response never enters the old workspace and a 
   let reads = 0;
   let mutations = 0;
   let meReads = 0;
-  await context.route("**/api/v1/**", async (route) => {
+  await context.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -904,11 +1032,11 @@ test("a cross-tab A to B ordinary response never enters the old workspace and a 
   expect(await browserPage.evaluate(() => {
     const client = (globalThis as Record<string, any>).ossTestClient;
     return client.getAccountContextSnapshot();
-  })).toEqual({ clientAccountId: accountB, version: "2", generation: expect.any(Number) });
+  })).toEqual({ clientAccountId: accountB, version: "2", authorizationEpoch: "1", generation: expect.any(Number) });
   expect(await peerPage.evaluate(() => {
     const client = (globalThis as Record<string, any>).ossTestClient;
     return client.getAccountContextSnapshot();
-  })).toEqual({ clientAccountId: null, version: null, generation: expect.any(Number) });
+  })).toEqual({ clientAccountId: null, version: null, authorizationEpoch: null, generation: expect.any(Number) });
 
   const mutationCode = await browserPage.evaluate(async () => {
     const client = (globalThis as Record<string, any>).ossTestClient;
@@ -924,8 +1052,13 @@ test("a cross-tab A to B ordinary response never enters the old workspace and a 
 test("a rotated login cookie with bad context headers clears old state and uses only authoritative recovery", async ({ page: browserPage }) => {
   let loginCalls = 0;
   let meReads = 0;
-  await browserPage.route("**/api/v1/**", async (route) => {
+  await browserPage.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -959,9 +1092,9 @@ test("a rotated login cookie with bad context headers clears old state and uses 
   });
   expect(outcome).toEqual({
     first: { expiresAt: occurredAt },
-    recovered: { clientAccountId: accountB, version: "1", generation: expect.any(Number) },
+    recovered: { clientAccountId: accountB, version: "1", authorizationEpoch: "1", generation: expect.any(Number) },
     secondCode: "SESSION_CONTEXT_INVALID",
-    final: { clientAccountId: null, version: null, generation: expect.any(Number) },
+    final: { clientAccountId: null, version: null, authorizationEpoch: null, generation: expect.any(Number) },
   });
   expect(loginCalls).toBe(2);
   expect(meReads).toBeGreaterThanOrEqual(2);
@@ -969,8 +1102,13 @@ test("a rotated login cookie with bad context headers clears old state and uses 
 
 test("a tab that closes after broadcasting begin cannot permanently block safe reads", async ({ page: browserPage, context }) => {
   let crashReadCalls = 0;
-  await context.route("**/api/v1/**", async (route) => {
+  await context.route("**/api/v1/**", async (rawRoute) => {
+    const route = withAuthorizationEpoch(rawRoute);
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
     } else if (url.pathname === "/api/v1/legal/current") {
@@ -1259,7 +1397,7 @@ test("a Billing to Viewer authorization epoch change unmounts old writes before 
 
   // A server-side membership change keeps the same account but advances the
   // authorization epoch and removes Billing writes.
-  state.version = "2";
+  state.authorizationEpoch = "2";
   state.role = "viewer";
   state.contexts[0] = { ...state.contexts[0]!, role: "viewer" };
   authorizationDowngraded = true;
@@ -1268,7 +1406,8 @@ test("a Billing to Viewer authorization epoch change unmounts old writes before 
     .click();
   await recoveryMeStarted;
 
-  // The v2 read body is discarded and the v1 Billing workspace is cleared
+  // The epoch-2 read body is discarded while the context version remains 1,
+  // and the epoch-1 Billing workspace is cleared
   // synchronously, before either authoritative Me request can complete.
   await expect(createTicket).toHaveCount(0);
   await expect(browserPage.getByTestId("customer-business-history")).toHaveCount(0);

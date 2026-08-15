@@ -21,6 +21,7 @@ function withStaffSessionContext(route: Route): Route {
             ...response,
             headers: {
               "X-OSS-Account-Context-Version": "0",
+              "X-OSS-Authorization-Epoch": "1",
               ...(response.headers ?? {}),
             },
           });
@@ -80,6 +81,7 @@ function viewer(permissions: string[]) {
     clientAccountId: null,
     membershipRole: null,
     accountContextVersion: "0",
+    authorizationEpoch: "1",
     context: null,
     verification: { email: "passed" },
     restrictions: { user: false, clientAccount: false },
@@ -457,7 +459,11 @@ const refundReadPaths = [
 ];
 
 function expectedMethods(path: string): ReadonlySet<string> | null {
-  if (path === "/api/v1/catalog" || path === "/api/v1/legal/current") {
+  if (
+    path === "/api/v1/catalog" ||
+    path === "/api/v1/legal/current" ||
+    path === "/api/v1/content"
+  ) {
     return new Set(["GET"]);
   }
   if (path === "/api/v1/auth/me") return new Set(["GET"]);
@@ -631,7 +637,11 @@ function requestContractError(fact: RequestFact): string | null {
     return `unexpected method ${fact.method}; expected ${[...methods].join(" or ")}`;
   }
   const params = new URLSearchParams(fact.query);
-  if (fact.path === "/api/v1/catalog" || fact.path === "/api/v1/legal/current") {
+  if (
+    fact.path === "/api/v1/catalog" ||
+    fact.path === "/api/v1/legal/current" ||
+    fact.path === "/api/v1/content"
+  ) {
     if (
       [...params.keys()].length !== 1 ||
       !["en", "zh-CN"].includes(params.get("locale") ?? "")
@@ -645,6 +655,11 @@ function requestContractError(fact: RequestFact): string | null {
       params.get("limit") !== "20" ||
       (params.has("cursor") && !params.get("cursor"))
     ) return "invalid Client Account search query contract";
+  } else if (fact.path === "/api/v1/admin/service-operations") {
+    const keys = [...params.keys()];
+    if (keys.length !== 1 || keys[0] !== "status" || params.get("status") !== "unresolved") {
+      return "expected the unresolved Service Operations queue query";
+    }
   } else if (fact.query !== "") {
     return `unexpected query string ${fact.query}`;
   }
@@ -695,7 +710,10 @@ async function installApi(
     if (interceptor && await interceptor(path, route)) return;
     if (path === "/api/v1/auth/me") {
       await route.fulfill({
-        headers: { "X-OSS-Account-Context-Version": "0" },
+        headers: {
+          "X-OSS-Account-Context-Version": "0",
+          "X-OSS-Authorization-Epoch": "1",
+        },
         json: viewer(permissions),
       });
       return;
@@ -703,7 +721,10 @@ async function installApi(
     if (path === "/api/v1/auth/login") {
       await route.fulfill({
         status: 409,
-        headers: { "X-OSS-Account-Context-Version": "0" },
+        headers: {
+          "X-OSS-Account-Context-Version": "0",
+          "X-OSS-Authorization-Epoch": "1",
+        },
         json: {
           error: "Select a Client Account for customer work",
           code: "ACCOUNT_CONTEXT_REQUIRED",
@@ -731,6 +752,20 @@ async function installApi(
       const document = { version: "mock-v1", title: "Mock terms", body: "Synthetic only." };
       await route.fulfill({
         json: { documents: { terms: document, aup: document, privacy: document } },
+      });
+      return;
+    }
+    if (path === "/api/v1/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (path === "/api/v1/admin/content") {
+      await route.fulfill({ json: { entries: [], revisions: [], legalDocuments: [] } });
+      return;
+    }
+    if (path === "/api/v1/admin/service-operations") {
+      await route.fulfill({
+        json: { warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", items: [] },
       });
       return;
     }
