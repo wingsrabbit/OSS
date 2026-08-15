@@ -44,18 +44,21 @@ import {
   SCHEMA_024_APPLICATION_GUARD,
 } from "@opensales/core/schema-023-024-native-compatibility";
 import {
-  assertSchema025NativeSafe,
-  SCHEMA_025,
   SCHEMA_025_APPLICATION_GUARD,
-  type Schema025NativePreflightReport,
 } from "@opensales/core/schema-024-025-native-compatibility";
+import {
+  assertSchema026NativeSafe,
+  SCHEMA_026,
+  SCHEMA_026_APPLICATION_GUARD,
+  type Schema026NativePreflightReport,
+} from "@opensales/core/schema-025-026-native-compatibility";
 import pg from "pg";
 import { paymentMethodTokenKeyrings, type Config } from "./config.js";
 
 const { Pool } = pg;
 export type DatabasePool = pg.Pool;
 export type DatabaseClient = pg.PoolClient;
-export const REQUIRED_SCHEMA_VERSION = SCHEMA_025;
+export const REQUIRED_SCHEMA_VERSION = SCHEMA_026;
 const TOKEN_REGISTRY_EXTENSION_GUARD =
   "opensales:payment-method-token-registry-extension";
 
@@ -392,6 +395,30 @@ export async function holdSchema025ApplicationGuard(
   };
 }
 
+export async function holdSchema026ApplicationGuard(
+  pool: DatabasePool,
+): Promise<() => Promise<void>> {
+  const client = await pool.connect();
+  let held = false;
+  try {
+    await client.query("SET lock_timeout = '15s'");
+    await client.query(
+      "SELECT pg_catalog.pg_advisory_lock_shared(pg_catalog.hashtextextended($1, 0))",
+      [SCHEMA_026_APPLICATION_GUARD],
+    );
+    await client.query("RESET lock_timeout");
+    held = true;
+  } catch (error) {
+    client.release(error instanceof Error ? error : true);
+    throw error;
+  }
+  return async () => {
+    if (!held) return;
+    held = false;
+    await releaseGuardClient(client, SCHEMA_026_APPLICATION_GUARD);
+  };
+}
+
 export async function tryLockPaymentMethodTokenRegistryExtension(
   client: DatabaseClient,
 ): Promise<boolean> {
@@ -419,6 +446,7 @@ export async function runMigrations(
   let schema023ApplicationLockHeld = false;
   let schema024ApplicationLockHeld = false;
   let schema025ApplicationLockHeld = false;
+  let schema026ApplicationLockHeld = false;
   let failed = false;
   let failure: unknown;
   try {
@@ -540,6 +568,16 @@ export async function runMigrations(
       );
     }
     schema025ApplicationLockHeld = true;
+    const schema026ApplicationGuard = await client.query<{ locked: boolean }>(
+      "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended($1, 0)) AS locked",
+      [SCHEMA_026_APPLICATION_GUARD],
+    );
+    if (schema026ApplicationGuard.rows[0]?.locked !== true) {
+      throw new Error(
+        "Schema migration is blocked by a running schema-026 API or Worker; stop every application process before migrating",
+      );
+    }
+    schema026ApplicationLockHeld = true;
     await client.query(
       "CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     );
@@ -600,6 +638,12 @@ export async function runMigrations(
       discardClient = true;
     }
   };
+  if (schema026ApplicationLockHeld) {
+    await unlock(
+      "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
+      [SCHEMA_026_APPLICATION_GUARD],
+    );
+  }
   if (schema025ApplicationLockHeld) {
     await unlock(
       "SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0)) AS unlocked",
@@ -805,17 +849,17 @@ export async function configureRuntimeDatabaseRoles(
 export async function assertSchemaCompatible(
   pool: DatabasePool,
   input: Readonly<{ enable017RollbackBridge?: boolean }> = {},
-): Promise<Schema025NativePreflightReport> {
+): Promise<Schema026NativePreflightReport> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await client.query("SET LOCAL search_path TO pg_catalog, public");
     if (input.enable017RollbackBridge === true) {
       throw new Error(
-        "Schema 025 application startup refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
+        "Schema 026 application startup refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
       );
     }
-    const report = await assertSchema025NativeSafe(
+    const report = await assertSchema026NativeSafe(
       { query: async (text: string, values?: unknown[]) => client.query(text, values) },
     );
     await client.query("COMMIT");

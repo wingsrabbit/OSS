@@ -242,6 +242,12 @@ jobs:
       - name: Verify Schema 025 native history, foundation, and catalog freeze
         run: pnpm --filter @opensales/api test:integration:schema-025-native
 
+      - name: Verify Schema 026 native history, authority bindings, and application gate
+        run: pnpm --filter @opensales/api test:integration:schema-026-native
+
+      - name: Run Service cancellation authority PostgreSQL 18 and API journey
+        run: pnpm --filter @opensales/api test:integration:service-cancellation-authority
+
       - name: Run Content Operations PostgreSQL and API journey
         run: pnpm --filter @opensales/api test:integration:content-operations
 

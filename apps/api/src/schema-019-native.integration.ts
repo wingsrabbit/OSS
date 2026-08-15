@@ -9,6 +9,7 @@ import {
 import pg from "pg";
 import {
   assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
   runMigrations,
   type DatabasePool,
 } from "./database.js";
@@ -86,6 +87,7 @@ try {
     await runMigrations(pool);
     const report = await assertSchemaCompatible(pool);
     assert.equal(report.safe, true);
+    assert.equal(report.installedSchemaVersion, REQUIRED_SCHEMA_VERSION);
   });
 
   console.log(

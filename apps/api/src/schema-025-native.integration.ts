@@ -128,8 +128,10 @@ try {
        FROM public.schema_migrations`,
     );
     assert.deepEqual(history.rows[0]?.versions, [...EXPECTED_SCHEMA_025_HISTORY]);
-    const startup = await assertSchemaCompatible(pool);
-    assert.equal(startup.installedSchemaVersion, SCHEMA_025);
+    await assert.rejects(
+      assertSchemaCompatible(pool),
+      /025_stage_c_content_operations.*026_stage_c_service_cancellation_authority/,
+    );
 
     for (const statement of [
       "ALTER TABLE public.legal_documents ALTER COLUMN revision DROP NOT NULL",
