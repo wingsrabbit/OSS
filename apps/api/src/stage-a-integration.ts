@@ -3861,11 +3861,11 @@ try {
 
     await releasePaymentStart(sharedWorkerCommand.paymentAttemptId);
     await waitFor(
-      "three callback types to wait at User while the Worker waits at the account payment-settings fence",
+      "three callback types and the Worker to wait at the shared User row",
       async () => {
         const result = await corePool.query<{
           callbacks_waiting: string;
-          worker_fence_waiting: string;
+          worker_user_waiting: string;
         }>(
           `SELECT
              (SELECT count(*)::text
@@ -3880,14 +3880,14 @@ try {
                WHERE application_name = 'opensales-worker'
                  AND state = 'active'
                  AND wait_event_type = 'Lock'
-                 AND query ILIKE '%SELECT pg_advisory_xact_lock(hashtextextended($1, 0))%')
-               AS worker_fence_waiting`,
+                 AND query ILIKE '%SELECT id FROM users%FOR UPDATE%')
+               AS worker_user_waiting`,
         );
         return result.rows[0];
       },
       (waiting) =>
         BigInt(waiting?.callbacks_waiting ?? "0") >= 3n &&
-        BigInt(waiting?.worker_fence_waiting ?? "0") >= 1n,
+        BigInt(waiting?.worker_user_waiting ?? "0") >= 1n,
     );
 
     const accountProbe = await corePool.connect();
