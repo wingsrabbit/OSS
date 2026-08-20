@@ -10774,6 +10774,22 @@ const activeReauthBeforeChargeback = await corePool.query<{ count: string }>(
 );
 assert.equal(activeReauthBeforeChargeback.rows[0]?.count, "1");
 
+const chargebackAnchorOwnerUserId = randomUUID();
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [chargebackAnchorOwnerUserId, `chargeback-owner-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+   VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+  [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
+);
+
 const chargebackQuote = await createAddFundsQuote("5000", "card");
 const chargebackAddFunds = await startAddFunds(chargebackQuote.quoteId, "success");
 const chargebackAddFundsSettled = await waitForAddFunds(
@@ -10899,6 +10915,16 @@ await corePool.query(
    SET removed_at = NULL
    WHERE user_id = $1 AND client_account_id = $2`,
   [chargebackMe.id, chargebackMe.clientAccountId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [chargebackMe.clientAccountId, chargebackMe.id],
+);
+await corePool.query(
+  `UPDATE client_memberships
+   SET role = 'viewer', permissions = '[]'::jsonb
+   WHERE client_account_id = $1 AND user_id = $2`,
+  [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
 );
 await refreshAccountContext(chargebackMe.clientAccountId);
 const customerChargebackStatus = await waitFor(
