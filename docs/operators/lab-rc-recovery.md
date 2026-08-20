@@ -2,14 +2,14 @@
 
 > **NOT FOR PRODUCTION — MOCK PROVIDERS ONLY**
 
-This runbook covers release-candidate backup evidence and a deliberately non-executing blank-restore
-plan for the disposable OpenSales System laboratory. It supports the `TestA` Core/Staging profile,
-the `TestB` Provider Lab profile, a combined five-database `local` fixture profile, and the four-
-database `DemoLocal` launcher topology. It does not authorize a
+This runbook covers release-candidate backup evidence, a non-executing restore plan, and a guarded
+blank-only `DemoLocal` restore executor for the disposable OpenSales System laboratory. It supports
+the `TestA` Core/Staging profile, the `TestB` Provider Lab profile, a combined five-database `local`
+fixture profile, and the four-database `DemoLocal` launcher topology. It does not authorize a
 production deployment, remote-host access, DNS changes, vulnerability scanning, or destructive
 recovery against a populated database.
 
-The first recovery slice has three commands:
+The current recovery slice has four commands:
 
 - `create` makes encrypted logical PostgreSQL 18 dumps and encrypts the configuration/credential
   bundle supplied on stdin. It records an exact clean Git commit, schema history or Provider table
@@ -19,10 +19,13 @@ The first recovery slice has three commands:
   the decrypted configuration stream and never creates a plaintext verification artifact.
 - `restore-plan` verifies the archive and writes a gate file. It does not connect to PostgreSQL,
   decrypt configuration to disk, run `pg_restore`, start an application, or resume side effects.
+- `restore-demo-local` deep-verifies a `DemoLocal` archive, refuses nonblank or overlapping
+  PostgreSQL 18 targets, restores the four physical databases in manifest order, and records an
+  atomic resumable journal. It does not create/drop databases, restore configuration, migrate,
+  start applications, or resume side effects.
 
-An operator must not claim recovery acceptance from `restore-plan`. A later reviewed slice may add
-an executing blank-restore command with the same gates. Until then, use the generated plan as the
-required ordered checklist and record a real exercise separately.
+An operator must not claim recovery acceptance from `restore-plan`, or from a restore that has not
+also completed the native-integrity, reconciliation, and application checks below.
 
 ## What is protected
 
