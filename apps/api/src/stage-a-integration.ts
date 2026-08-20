@@ -1834,19 +1834,31 @@ try {
     occurredAt: forgedProvisionPaymentRecord.provider_occurred_at.toISOString(),
   });
   await waitFor(
-    "manual provision reconcile and duplicate payment callback to share Invoice root",
+    "manual provision reconcile and duplicate payment callback to follow the canonical identity-to-Invoice order",
     async () => {
-      const result = await corePool.query<{ waiting: string }>(
-        `SELECT count(*)::text AS waiting
+      const result = await corePool.query<{
+        worker_waiting: string;
+        callback_waiting: string;
+      }>(
+        `SELECT
+           count(*) FILTER (
+             WHERE application_name = 'opensales-worker'
+               AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'
+           )::text AS worker_waiting,
+           count(*) FILTER (
+             WHERE application_name = 'opensales-api'
+               AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'
+           )::text AS callback_waiting
          FROM pg_stat_activity
-         WHERE application_name IN ('opensales-api', 'opensales-worker')
-           AND state = 'active'
-           AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+         WHERE state = 'active' AND wait_event_type = 'Lock'`,
       );
-      return result.rows[0]?.waiting ?? "0";
+      return {
+        workerWaiting: result.rows[0]?.worker_waiting ?? "0",
+        callbackWaiting: result.rows[0]?.callback_waiting ?? "0",
+      };
     },
-    (waiting) => BigInt(waiting) >= 2n,
+    (waiting) =>
+      BigInt(waiting.workerWaiting) >= 1n && BigInt(waiting.callbackWaiting) >= 1n,
   );
   await forgedProvisionInvoiceGate.query("COMMIT");
   forgedProvisionInvoiceGateOpen = false;
