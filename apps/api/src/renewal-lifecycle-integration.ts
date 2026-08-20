@@ -3432,10 +3432,6 @@ async function provePaymentSettingsDecisionConflicts(pool: pg.Pool): Promise<voi
         true,
         "real HTTP replacement must be observed waiting on the held Service row",
       );
-      await serviceGate.query(
-        "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
-        [owner.clientAccountId],
-      );
       await serviceGate.query("COMMIT");
       replaced = await replacementPromise;
     } catch (error) {
@@ -3744,7 +3740,8 @@ async function proveScheduledBillingDay(pool: pg.Pool): Promise<{ runId: string 
 
 const pool = new pg.Pool({
   connectionString: databaseUrl,
-  max: 4,
+  // Schema guard + three barriers + HTTP handler + lock observer.
+  max: 6,
   connectionTimeoutMillis: 5_000,
 });
 await runMigrations(pool);
@@ -3760,6 +3757,7 @@ try {
   const fixtureNamespace = randomUUID();
   const productGroupId = `renewal-integration-group-${fixtureNamespace}`;
   const productId = `renewal-integration-product-${fixtureNamespace}`;
+  const catalogProductRevisionId = randomUUID();
   await client.query(
     `INSERT INTO product_groups(id, sort_order, names)
      VALUES ($1, 9999, '{"en":"Renewal Integration"}'::jsonb)`,
@@ -3777,11 +3775,22 @@ try {
     [productId, productGroupId],
   );
   await client.query(
+    `INSERT INTO catalog_product_revisions(
+       id, product_id, revision, group_id, names, descriptions,
+       fulfillment_mode, active, hidden, repeatable, option_schema
+     ) VALUES (
+       $1, $2, 1, $3, '{"en":"Current Catalog Product"}'::jsonb,
+       '{"en":"Synthetic integration product"}'::jsonb,
+       'automatic', true, false, false, '[]'::jsonb
+     )`,
+    [catalogProductRevisionId, productId, productGroupId],
+  );
+  await client.query(
     `INSERT INTO product_prices(
-       product_id, revision, currency, billing_cycle,
+       product_id, catalog_product_revision_id, revision, currency, billing_cycle,
        one_time_minor, setup_minor, recurring_minor, valid_from
-     ) VALUES ($1, 99, 'USD', 'monthly', 0, 0, 9999, $2)`,
-    [productId, TERM_START],
+     ) VALUES ($1, $2, 99, 'USD', 'monthly', 0, 0, 9999, $3)`,
+    [productId, catalogProductRevisionId, TERM_START],
   );
 
   const mainAccount = await createFixtureAccount(client, "main");
@@ -4503,7 +4512,7 @@ try {
         pendingMethodRemoval: "409 without revoking active authorization",
         pendingWithdrawal: "bounded generation, exact replay and ABA conflict enforced",
         confirmedReplacementAndRevoke: "fresh decision generation required",
-        lockOrder: "real HTTP waited on Service while Service-first transaction locked Account; no deadlock",
+        lockOrder: "real HTTP waited on Service; the Service-only blocker introduced no reverse lock",
         futureProviderTime: "query-only reconciliation retained the running Worker lease",
         terminalCallback: "completed the released manual reconciliation job",
         lateSuccessAfterActionRequired:
