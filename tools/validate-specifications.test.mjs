@@ -4719,12 +4719,7 @@ test("a later Gate subject must descend from the predecessor Gate report", () =>
     ]);
     hasIssue(issues, "Gate G1 subject must descend from the G0 report commit");
   } finally {
-    rmSync(temporaryRoot, {
-      recursive: true,
-      force: true,
-      maxRetries: 5,
-      retryDelay: 25,
-    });
+    rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });
 
@@ -4759,6 +4754,11 @@ test("later commits cannot retroactively supply missing Gate artifacts", () => {
     ]);
     hasIssue(issues, "repository evidence was not a regular file in report commit");
   } finally {
-    rmSync(temporaryRoot, { recursive: true, force: true });
+    rmSync(temporaryRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25,
+    });
   }
 });
