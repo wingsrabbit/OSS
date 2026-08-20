@@ -535,13 +535,16 @@ async function rawCoreRequest(
   };
 }
 
-async function refreshAccountContext(expectedClientAccountId: string): Promise<void> {
+async function refreshAccountContext(
+  expectedClientAccountId: string,
+  expectedEligible = true,
+): Promise<void> {
   const current = await request<{
     eligible: boolean;
     clientAccountId: string | null;
   }>("/api/v1/auth/me");
   if (current.clientAccountId === expectedClientAccountId) {
-    assert.equal(current.eligible, true);
+    assert.equal(current.eligible, expectedEligible);
     return;
   }
   assert.equal(current.clientAccountId, null);
@@ -10940,7 +10943,7 @@ await corePool.query(
    WHERE client_account_id = $1 AND user_id = $2`,
   [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
 );
-await refreshAccountContext(chargebackMe.clientAccountId);
+await refreshAccountContext(chargebackMe.clientAccountId, false);
 const customerChargebackStatus = await waitFor(
   "settled Add Funds Chargeback customer status",
   () => request<ChargebackStatus>("/api/v1/billing/chargeback-status"),
