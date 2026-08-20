@@ -225,7 +225,7 @@ async function assertTicketCreateReplay(
      LEFT JOIN audit_events audit
        ON audit.action = 'support.ticket_created'
       AND audit.target_type = 'support_ticket'
-      AND audit.target_id = ticket.id
+      AND audit.target_id = ticket.id::text
      WHERE ticket.id = $1`,
     [input.ticketId],
   );

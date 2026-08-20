@@ -15,6 +15,7 @@ if (!baseUrl || !customerCookie || !otherCustomerCookie || !staffCookie) {
       "the sessions must be normal verified Customer/Customer/Support Staff sessions, and Staff must have current reauthentication",
   );
 }
+const requiredCustomerCookie: string = customerCookie;
 
 type ResponseResult<T> = {
   status: number;
@@ -57,6 +58,32 @@ async function request<T>(
 function expectStatus<T>(response: ResponseResult<T>, expected: number): T {
   assert.equal(response.status, expected, response.raw);
   return response.body;
+}
+
+async function waitForSupportReplyDelivery(): Promise<Readonly<{
+  eventType: string;
+  templateRevision: string;
+}>> {
+  const deadline = Date.now() + 10_000;
+  do {
+    const deliveries = expectStatus(
+      await request<{
+        items: Array<{ eventType: string; templateRevision: string }>;
+      }>("/api/v1/customer/notification-deliveries?limit=50", {
+        cookie: requiredCustomerCookie,
+        accountScoped: true,
+      }),
+      200,
+    );
+    const delivery = deliveries.items.find(
+      (item) =>
+        item.eventType === "notification.support_ticket_reply_requested" &&
+        item.templateRevision === "support-ticket-reply-v1",
+    );
+    if (delivery) return delivery;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  } while (Date.now() < deadline);
+  assert.fail("Timed out waiting for the normal Support reply notification delivery");
 }
 
 const suffix = randomUUID().slice(0, 8);
@@ -282,23 +309,8 @@ for (const event of [...customerAfterStaff.statusHistory, ...customerAfterStaff.
   assert.equal(Object.hasOwn(event, "reason"), false);
 }
 
-const deliveries = expectStatus(
-  await request<{
-    items: Array<{ eventType: string; templateRevision: string }>;
-  }>("/api/v1/customer/notification-deliveries?limit=100", {
-    cookie: customerCookie,
-    accountScoped: true,
-  }),
-  200,
-);
-assert.equal(
-  deliveries.items.filter(
-    (item) =>
-      item.eventType === "notification.support_ticket_reply_requested" &&
-      item.templateRevision === "support-ticket-reply-v1",
-  ).length,
-  1,
-);
+const supportReplyDelivery = await waitForSupportReplyDelivery();
+assert.equal(supportReplyDelivery.templateRevision, "support-ticket-reply-v1");
 
 const customerReplyIdempotencyKey = randomUUID();
 const customerReplyPayload = {

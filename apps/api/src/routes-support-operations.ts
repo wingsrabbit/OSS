@@ -732,7 +732,7 @@ export async function registerSupportOperationRoutes(
              LEFT JOIN audit_events audit
                ON audit.action = 'support.department_revised'
               AND audit.target_type = 'support_department'
-              AND audit.target_id = revision.department_id
+              AND audit.target_id = revision.department_id::text
               AND audit.metadata->>'revisionId' = revision.id::text
              WHERE revision.id = $1`,
             [revisionId],
@@ -1457,7 +1457,7 @@ export async function registerSupportOperationRoutes(
            LEFT JOIN audit_events audit
              ON audit.action = 'support.presales_created'
             AND audit.target_type = 'presales_inquiry'
-            AND audit.target_id = inquiry.id
+            AND audit.target_id = inquiry.id::text
            WHERE inquiry.id = $1`,
           [inquiryId],
         );

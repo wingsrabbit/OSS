@@ -65,14 +65,22 @@ function outputFor(request: ProviderOperationRequest): ProviderOperationOutput {
     case "payment":
       return {
         externalPaymentRef: `example-payment-${request.operationId}`,
-        paymentState: request.action === "payment.refund" ? "refunded" : "captured",
+        paymentState: request.action === "payment.refund"
+          ? "refunded"
+          : request.action === "payment.authorize"
+            ? "authorized"
+            : "captured",
         amountMinor: request.input.amountMinor,
         currency: request.input.currency,
       };
     case "provisioning":
       return {
         externalResourceRef: request.input.externalResourceRef ?? `example-resource-${request.operationId}`,
-        resourceState: request.action === "resource.terminate" ? "terminated" : "ready",
+        resourceState: request.action === "resource.terminate"
+          ? "terminated"
+          : request.action === "resource.stop"
+            ? "stopped"
+            : "ready",
         ...(request.action === "resource.terminate" ? {} : { readyAt: new Date().toISOString() }),
       };
     case "mail":
