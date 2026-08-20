@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import { addBillingCycle, type BillingCycle } from "@opensales/core";
+import {
+  addBillingCycle,
+  hasCustomerMembershipCapability,
+  staffFulfillmentActionForBinding,
+  type BillingCycle,
+  type CustomerMembershipRole,
+  type FulfillmentMode,
+} from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
@@ -19,6 +26,188 @@ import { recordInitialServicePeriod } from "./renewal-lifecycle.js";
 const manualCompletionSchema = z.object({
   reason: z.string().trim().min(10).max(1_000),
 });
+
+const MOCK_PROVISIONING_INSTALLATION_ID = "mock-provisioning-v1";
+const REQUIRED_PROVISIONING_CAPABILITIES = [
+  "resource_create",
+  "resource_reconcile",
+] as const;
+
+type StableProvisioningQueue = Readonly<{
+  providerOperationId: string;
+  jobId: string;
+  providerOperationStatus: string;
+  jobStatus: string;
+}>;
+
+function fulfillmentConflict(message: string, code: string): Error {
+  return Object.assign(new Error(message), { statusCode: 409, code });
+}
+
+function exactStringList(value: unknown): readonly string[] | null {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string")
+    ? value
+    : null;
+}
+
+async function requireProvisioningApprovalBinding(
+  client: DatabaseClient,
+  serviceId: string,
+): Promise<void> {
+  const result = await client.query<{
+    binding_configured: boolean;
+    binding_provider_installation_id: string | null;
+    binding_product_policy_version: number | null;
+    binding_capability_snapshot: unknown;
+    provider_type: string | null;
+    provider_enabled: boolean | null;
+    current_provider_capabilities: unknown;
+  }>(
+    `SELECT
+       (binding.service_id IS NOT NULL) AS binding_configured,
+       binding.provider_installation_id AS binding_provider_installation_id,
+       binding.product_policy_version AS binding_product_policy_version,
+       binding.capability_snapshot AS binding_capability_snapshot,
+       provider.provider_type,
+       provider.enabled AS provider_enabled,
+       provider.capabilities AS current_provider_capabilities
+     FROM services service
+     LEFT JOIN service_provider_bindings binding ON binding.service_id = service.id
+     LEFT JOIN provider_installation_capabilities provider
+       ON provider.provider_installation_id = binding.provider_installation_id
+     WHERE service.id = $1`,
+    [serviceId],
+  );
+  const policy = result.rows[0];
+  const snapshotCapabilities = exactStringList(policy?.binding_capability_snapshot);
+  const currentCapabilities = exactStringList(policy?.current_provider_capabilities);
+  const available =
+    policy?.binding_configured === true &&
+    policy?.binding_provider_installation_id === MOCK_PROVISIONING_INSTALLATION_ID &&
+    policy.binding_product_policy_version !== null &&
+    policy.provider_type === "provisioning" &&
+    policy.provider_enabled === true &&
+    snapshotCapabilities !== null &&
+    currentCapabilities !== null &&
+    REQUIRED_PROVISIONING_CAPABILITIES.every(
+      (capability) =>
+        snapshotCapabilities.includes(capability) && currentCapabilities.includes(capability),
+    );
+  if (!available) {
+    throw fulfillmentConflict(
+      "Provider provisioning approval is unavailable because the saved binding or required current Mock Provider capabilities are missing",
+      "PROVISIONING_POLICY_UNAVAILABLE",
+    );
+  }
+}
+
+function assertProvisioningJobPayload(
+  payload: unknown,
+  serviceId: string,
+  providerOperationId: string,
+): void {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload) ||
+    (payload as Record<string, unknown>).serviceId !== serviceId ||
+    (payload as Record<string, unknown>).providerOperationId !== providerOperationId
+  ) {
+    throw fulfillmentConflict(
+      "The saved provisioning queue does not match this Service",
+      "PROVISIONING_QUEUE_CONFLICT",
+    );
+  }
+}
+
+async function loadStableProvisioningQueue(
+  client: DatabaseClient,
+  serviceId: string,
+): Promise<StableProvisioningQueue | null> {
+  const stableKey = `service:${serviceId}`;
+  const operationResult = await client.query<{
+    id: string;
+    subject_type: string;
+    subject_id: string;
+    status: string;
+  }>(
+    `SELECT id, subject_type, subject_id, status
+     FROM provider_operations
+     WHERE provider_installation_id = $1
+       AND kind = 'resource_create'
+       AND stable_key = $2`,
+    [MOCK_PROVISIONING_INSTALLATION_ID, stableKey],
+  );
+  const operation = operationResult.rows[0];
+  const jobResult = await client.query<{ id: string; payload: unknown; status: string }>(
+    `SELECT id, payload, status
+     FROM durable_jobs
+     WHERE job_type = 'provision.start' AND unique_key = $1`,
+    [stableKey],
+  );
+  const job = jobResult.rows[0];
+  if (!operation && !job) return null;
+  if (
+    !operation ||
+    !job ||
+    operation.subject_type !== "service" ||
+    operation.subject_id !== serviceId
+  ) {
+    throw fulfillmentConflict(
+      "The saved provisioning queue is incomplete or belongs to another Service",
+      "PROVISIONING_QUEUE_CONFLICT",
+    );
+  }
+  assertProvisioningJobPayload(job.payload, serviceId, operation.id);
+  return {
+    providerOperationId: operation.id,
+    jobId: job.id,
+    providerOperationStatus: operation.status,
+    jobStatus: job.status,
+  };
+}
+
+async function createStableProvisioningQueue(
+  client: DatabaseClient,
+  serviceId: string,
+): Promise<StableProvisioningQueue> {
+  const existing = await loadStableProvisioningQueue(client, serviceId);
+  if (existing) {
+    throw fulfillmentConflict(
+      "This Service already has a provisioning queue but no matching Staff approval",
+      "PROVISIONING_QUEUE_CONFLICT",
+    );
+  }
+  const stableKey = `service:${serviceId}`;
+  const operationResult = await client.query<{ id: string; status: string }>(
+    `INSERT INTO provider_operations(
+       provider_installation_id, kind, subject_type, subject_id, stable_key, status
+     ) VALUES ($1, 'resource_create', 'service', $2, $3, 'queued')
+     ON CONFLICT (provider_installation_id, kind, stable_key) DO UPDATE
+       SET updated_at = provider_operations.updated_at
+     RETURNING id, status`,
+    [MOCK_PROVISIONING_INSTALLATION_ID, serviceId, stableKey],
+  );
+  const operation = operationResult.rows[0];
+  if (!operation) throw new Error("Unable to create provisioning operation");
+  const jobResult = await client.query<{ id: string; payload: unknown; status: string }>(
+    `INSERT INTO durable_jobs(job_type, unique_key, payload)
+     VALUES ('provision.start', $1, $2)
+     ON CONFLICT (job_type, unique_key) DO UPDATE
+       SET updated_at = durable_jobs.updated_at
+     RETURNING id, payload, status`,
+    [stableKey, { serviceId, providerOperationId: operation.id }],
+  );
+  const job = jobResult.rows[0];
+  if (!job) throw new Error("Unable to create provisioning job");
+  assertProvisioningJobPayload(job.payload, serviceId, operation.id);
+  return {
+    providerOperationId: operation.id,
+    jobId: job.id,
+    providerOperationStatus: operation.status,
+    jobStatus: job.status,
+  };
+}
 
 const creditAdjustmentSchema = z.object({
   direction: z.enum(["increase", "decrease"]),
@@ -1620,27 +1809,36 @@ export async function registerAdminRoutes(
       order_id: string;
       client_account_id: string;
       product_name: string;
+      fulfillment_mode: FulfillmentMode;
       billing_cycle: string;
       client_account_name: string;
       paid_minor: string;
       total_minor: string;
       submitted_at: Date;
+      binding_configured: boolean;
+      binding_provider_installation_id: string | null;
+      binding_product_policy_version: number | null;
     }>(
       `SELECT
          s.id AS service_id,
          o.id AS order_id,
          o.client_account_id,
          oi.product_name,
+         oi.fulfillment_mode,
          oi.billing_cycle,
          ca.name AS client_account_name,
          COALESCE(alloc.allocated_minor, 0)::text AS paid_minor,
          i.total_minor,
-         o.submitted_at
+         o.submitted_at,
+         (binding.service_id IS NOT NULL) AS binding_configured,
+         binding.provider_installation_id AS binding_provider_installation_id,
+         binding.product_policy_version AS binding_product_policy_version
        FROM orders o
        JOIN client_accounts ca ON ca.id = o.client_account_id
        JOIN order_items oi ON oi.order_id = o.id
        JOIN services s ON s.order_item_id = oi.id
        JOIN invoices i ON i.order_id = o.id
+       LEFT JOIN service_provider_bindings binding ON binding.service_id = s.id
        LEFT JOIN invoice_allocation_totals alloc ON alloc.invoice_id = i.id
        WHERE o.status = 'awaiting_manual'
        ORDER BY o.submitted_at`,
@@ -1652,6 +1850,21 @@ export async function registerAdminRoutes(
         orderId: row.order_id,
         clientAccountId: row.client_account_id,
         productName: row.product_name,
+        fulfillmentMode: row.fulfillment_mode,
+        action: staffFulfillmentActionForBinding({
+          fulfillmentMode: row.fulfillment_mode,
+          invoiceTotalMinor: BigInt(row.total_minor),
+          bindingConfigured: row.binding_configured,
+          providerInstallationId: row.binding_provider_installation_id,
+        }),
+        fulfillmentExecutionMode:
+          row.fulfillment_mode === "manual" || row.fulfillment_mode === "quote"
+            ? "manual"
+            : row.binding_configured
+              ? (row.binding_provider_installation_id === null ? "manual" : "provider")
+              : "unconfigured",
+        providerInstallationId: row.binding_provider_installation_id,
+        bindingPolicyVersion: row.binding_product_policy_version,
         billingCycle: row.billing_cycle,
         clientAccountName: row.client_account_name,
         paidMinor: row.paid_minor,
@@ -1723,21 +1936,29 @@ export async function registerAdminRoutes(
       const serviceResult = await client.query<{
         service_id: string;
         service_status: string;
+        activated_at: Date | null;
         billing_cycle: BillingCycle;
         order_id: string;
         order_status: string;
-        fulfillment_mode: string;
+        fulfillment_mode: FulfillmentMode;
         invoice_id: string;
         invoice_total_minor: string;
         submitted_by_user_id: string;
         email_verified_at: Date | null;
         user_restricted_at: Date | null;
         account_restricted_at: Date | null;
+        membership_role: CustomerMembershipRole;
+        membership_permissions: unknown;
+        membership_restricted_at: Date | null;
         removed_at: Date | null;
+        binding_configured: boolean;
+        binding_provider_installation_id: string | null;
+        binding_product_policy_version: number | null;
       }>(
         `SELECT
            s.id AS service_id,
            s.status AS service_status,
+           s.activated_at,
            s.billing_cycle,
            o.id AS order_id,
            o.status AS order_status,
@@ -1748,7 +1969,13 @@ export async function registerAdminRoutes(
            customer.email_verified_at,
            customer.restricted_at AS user_restricted_at,
            ca.restricted_at AS account_restricted_at,
-           cm.removed_at
+           cm.role AS membership_role,
+           cm.permissions AS membership_permissions,
+           cm.restricted_at AS membership_restricted_at,
+           cm.removed_at,
+           (binding.service_id IS NOT NULL) AS binding_configured,
+           binding.provider_installation_id AS binding_provider_installation_id,
+           binding.product_policy_version AS binding_product_policy_version
          FROM services s
          JOIN order_items oi ON oi.id = s.order_item_id
          JOIN orders o ON o.id = oi.order_id
@@ -1758,20 +1985,44 @@ export async function registerAdminRoutes(
          JOIN client_memberships cm
            ON cm.client_account_id = o.client_account_id
           AND cm.user_id = o.submitted_by_user_id
+         LEFT JOIN service_provider_bindings binding ON binding.service_id = s.id
          WHERE s.id = $1`,
         [params.serviceId],
       );
       const service = serviceResult.rows[0];
       if (!service) throw Object.assign(new Error("Service not found"), { statusCode: 404 });
-      if (!["manual", "review"].includes(service.fulfillment_mode)) {
-        throw Object.assign(new Error("This service is not eligible for manual fulfillment"), {
-          statusCode: 409,
-        });
+      const invoiceTotalMinor = BigInt(service.invoice_total_minor);
+      const action = staffFulfillmentActionForBinding({
+        fulfillmentMode: service.fulfillment_mode,
+        invoiceTotalMinor,
+        bindingConfigured: service.binding_configured,
+        providerInstallationId: service.binding_provider_installation_id,
+      });
+      if (!action) {
+        throw fulfillmentConflict(
+          "This automatic paid Service does not require a Staff fulfillment action",
+          "FULFILLMENT_ACTION_NOT_REQUIRED",
+        );
       }
-      if (service.order_status !== "awaiting_manual" || service.service_status !== "pending") {
-        throw Object.assign(new Error("Service is not waiting for manual fulfillment"), {
-          statusCode: 409,
-        });
+      const freshAction =
+        service.order_status === "awaiting_manual" && service.service_status === "pending";
+      const providerApprovalReplay =
+        action === "approve_provider_provisioning" &&
+        !freshAction &&
+        ["accepted", "fulfilling", "completed", "on_hold"].includes(service.order_status) &&
+        [
+          "pending",
+          "provisioning",
+          "confirming",
+          "provision_failed",
+          "provisioned_hold",
+          "active",
+        ].includes(service.service_status);
+      if (!freshAction && !providerApprovalReplay) {
+        throw fulfillmentConflict(
+          "Service is not waiting for this Staff fulfillment action",
+          "FULFILLMENT_STATE_CONFLICT",
+        );
       }
       const allocationResult = await client.query<{ allocated_minor: string }>(
         `SELECT allocated_minor::text
@@ -1781,19 +2032,77 @@ export async function registerAdminRoutes(
       );
       if (
         BigInt(allocationResult.rows[0]?.allocated_minor ?? "0") <
-        BigInt(service.invoice_total_minor)
+        invoiceTotalMinor
       ) {
-        throw Object.assign(new Error("Invoice is not fully paid"), { statusCode: 409 });
+        throw fulfillmentConflict(
+          "Invoice is not fully paid; Staff fulfillment cannot continue",
+          "INVOICE_NOT_FULLY_PAID",
+        );
       }
+      if (providerApprovalReplay) {
+        const queue = await loadStableProvisioningQueue(client, service.service_id);
+        if (!queue) {
+          throw fulfillmentConflict(
+            "The saved Staff approval has no matching provisioning operation and job",
+            "PROVISIONING_QUEUE_CONFLICT",
+          );
+        }
+        const approval = await client.query(
+          `SELECT id
+           FROM audit_events
+           WHERE action = 'service.provider_provisioning_approved'
+             AND target_type = 'service'
+             AND target_id = $1
+             AND metadata @> $2::jsonb
+           LIMIT 1`,
+          [
+            service.service_id,
+            JSON.stringify({
+              providerOperationId: queue.providerOperationId,
+              jobId: queue.jobId,
+            }),
+          ],
+        );
+        if (approval.rowCount !== 1) {
+          throw fulfillmentConflict(
+            "The saved provisioning queue has no matching Staff approval fact",
+            "PROVISIONING_APPROVAL_MISSING",
+          );
+        }
+        return {
+          serviceId: service.service_id,
+          status: service.service_status,
+          orderStatus: service.order_status,
+          activatedAt: service.activated_at?.toISOString() ?? null,
+          fulfillment: "provider_queued" as const,
+          providerOperationId: queue.providerOperationId,
+          jobId: queue.jobId,
+          providerOperationStatus: queue.providerOperationStatus,
+          jobStatus: queue.jobStatus,
+          replayed: true,
+        };
+      }
+      const membershipPermissions = exactStringList(service.membership_permissions) ?? [];
       const eligible =
         Boolean(service.email_verified_at) &&
         !service.user_restricted_at &&
         !service.account_restricted_at &&
-        !service.removed_at;
+        !service.membership_restricted_at &&
+        !service.removed_at &&
+        hasCustomerMembershipCapability(
+          {
+            role: service.membership_role,
+            permissions: membershipPermissions,
+          },
+          "orders.create",
+        );
       if (!eligible) {
-        await client.query("UPDATE orders SET status = 'on_hold', updated_at = now() WHERE id = $1", [
-          service.order_id,
-        ]);
+        await client.query(
+          `UPDATE orders
+           SET status = 'on_hold', updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'awaiting_manual'`,
+          [service.order_id],
+        );
         await client.query(
           `INSERT INTO audit_events(
              actor_type, actor_id, action, target_type, target_id, reason
@@ -1804,6 +2113,72 @@ export async function registerAdminRoutes(
           serviceId: service.service_id,
           status: "on_hold" as const,
           activatedAt: null,
+        };
+      }
+      if (action === "approve_provider_provisioning") {
+        await requireProvisioningApprovalBinding(client, service.service_id);
+        const queue = await createStableProvisioningQueue(client, service.service_id);
+        const accepted = await client.query(
+          `UPDATE orders
+           SET status = 'accepted', updated_at = now(), version = version + 1
+           WHERE id = $1 AND status = 'awaiting_manual'
+           RETURNING id`,
+          [service.order_id],
+        );
+        if (accepted.rowCount !== 1) {
+          throw fulfillmentConflict(
+            "Order state changed while Staff approved Provider provisioning",
+            "FULFILLMENT_STATE_CONFLICT",
+          );
+        }
+        await client.query(
+          `INSERT INTO audit_events(
+             actor_type, actor_id, action, target_type, target_id, reason, metadata
+           ) VALUES (
+             'staff', $1, 'service.provider_provisioning_approved',
+             'service', $2, $3, $4
+           )`,
+          [
+            user.userId,
+            service.service_id,
+            body.reason,
+            {
+              orderId: service.order_id,
+              fulfillmentMode: service.fulfillment_mode,
+              bindingPolicyVersion: service.binding_product_policy_version,
+              providerInstallationId: service.binding_provider_installation_id,
+              zeroAmount: invoiceTotalMinor === 0n,
+              providerOperationId: queue.providerOperationId,
+              jobId: queue.jobId,
+            },
+          ],
+        );
+        await client.query(
+          `INSERT INTO outbox(event_type, unique_key, payload)
+           VALUES ('service.provisioning_approved', $1, $2)
+           ON CONFLICT (event_type, unique_key) DO NOTHING`,
+          [
+            `service:${service.service_id}`,
+            {
+              serviceId: service.service_id,
+              orderId: service.order_id,
+              providerOperationId: queue.providerOperationId,
+              jobId: queue.jobId,
+              fulfillmentMode: service.fulfillment_mode,
+            },
+          ],
+        );
+        return {
+          serviceId: service.service_id,
+          status: "pending" as const,
+          orderStatus: "accepted" as const,
+          activatedAt: null,
+          fulfillment: "provider_queued" as const,
+          providerOperationId: queue.providerOperationId,
+          jobId: queue.jobId,
+          providerOperationStatus: queue.providerOperationStatus,
+          jobStatus: queue.jobStatus,
+          replayed: false,
         };
       }
       const readyAt = new Date();
@@ -1852,7 +2227,13 @@ export async function registerAdminRoutes(
           user.userId,
           service.service_id,
           body.reason,
-          { orderId: service.order_id, readyAt: readyAt.toISOString() },
+          {
+            orderId: service.order_id,
+            readyAt: readyAt.toISOString(),
+            fulfillmentMode: service.fulfillment_mode,
+            fulfillmentExecutionMode: "manual",
+            bindingPolicyVersion: service.binding_product_policy_version,
+          },
         ],
       );
       await client.query(
@@ -1870,7 +2251,14 @@ export async function registerAdminRoutes(
           },
         ],
       );
-      return { serviceId: service.service_id, status: "active", activatedAt: readyAt.toISOString() };
+      return {
+        serviceId: service.service_id,
+        status: "active" as const,
+        orderStatus: "completed" as const,
+        activatedAt: readyAt.toISOString(),
+        fulfillment: "manual_ready" as const,
+        replayed: false,
+      };
     });
     if (result.status === "on_hold") {
       return reply

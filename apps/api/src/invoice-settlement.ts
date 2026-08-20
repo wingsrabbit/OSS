@@ -2,6 +2,7 @@
 
 import {
   hasCustomerMembershipCapability,
+  paidOrderRequiresStaffFulfillmentReview,
   type CustomerMembershipRole,
 } from "@opensales/core";
 import type { DatabaseClient } from "./database.js";
@@ -178,6 +179,8 @@ export async function advancePaidInvoice(
     membership_permissions: unknown;
     membership_restricted_at: Date | null;
     removed_at: Date | null;
+    binding_configured: boolean;
+    binding_provider_installation_id: string | null;
   }>(
     `SELECT
        o.id, o.status, oi.fulfillment_mode, s.id AS service_id,
@@ -186,7 +189,9 @@ export async function advancePaidInvoice(
        cm.role AS membership_role,
        cm.permissions AS membership_permissions,
        cm.restricted_at AS membership_restricted_at,
-       cm.removed_at
+       cm.removed_at,
+       (binding.service_id IS NOT NULL) AS binding_configured,
+       binding.provider_installation_id AS binding_provider_installation_id
      FROM orders o
      JOIN order_items oi ON oi.order_id = o.id
      JOIN services s ON s.order_item_id = oi.id
@@ -195,6 +200,7 @@ export async function advancePaidInvoice(
      JOIN client_memberships cm
        ON cm.client_account_id = o.client_account_id
       AND cm.user_id = o.submitted_by_user_id
+     LEFT JOIN service_provider_bindings binding ON binding.service_id = s.id
      WHERE o.id = $1`,
     [invoice.order_id],
   );
@@ -245,9 +251,15 @@ export async function advancePaidInvoice(
   }
 
   if (
-    order.fulfillment_mode === "manual" ||
-    order.fulfillment_mode === "review" ||
-    order.fulfillment_mode === "quote"
+    (
+      order.binding_configured &&
+      order.binding_provider_installation_id === null &&
+      (order.fulfillment_mode === "automatic" || order.fulfillment_mode === "review")
+    ) ||
+    paidOrderRequiresStaffFulfillmentReview(
+      order.fulfillment_mode,
+      BigInt(invoice.total_minor),
+    )
   ) {
     await client.query(
       `UPDATE orders
@@ -267,6 +279,15 @@ export async function advancePaidInvoice(
   );
   if (accepted.rowCount !== 1) {
     return { invoiceStatus: "paid", orderStatus: order.status };
+  }
+  if (
+    !order.binding_configured ||
+    order.binding_provider_installation_id !== "mock-provisioning-v1"
+  ) {
+    throw Object.assign(
+      new Error("Paid automatic fulfillment has no Provider binding snapshot"),
+      { statusCode: 409, code: "PROVISIONING_BINDING_UNAVAILABLE" },
+    );
   }
   const operationResult = await client.query<{ id: string }>(
     `INSERT INTO provider_operations(

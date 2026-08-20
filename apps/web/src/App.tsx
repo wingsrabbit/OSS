@@ -20,8 +20,15 @@ import {
   type AdminAccountAction,
 } from "./AdminAccount360.js";
 import { AccountAccessPanel } from "./AccountAccessPanel.js";
+import { AdminCommercePanel } from "./AdminCommercePanel.js";
 import { AdminServiceOperationsQueue } from "./AdminServiceOperationsQueue.js";
 import { AccountContextSwitcher, type MembershipRole } from "./AccountContextSwitcher.js";
+import {
+  CatalogCheckoutPanel,
+  type CatalogCheckoutOrderPayload,
+  type CatalogPrice as Price,
+  type CatalogProduct as Product,
+} from "./CatalogCheckoutPanel.js";
 import {
   ApiError,
   ObsoleteSessionResponseError,
@@ -31,6 +38,10 @@ import {
   subscribeAccountContextInvalidation,
 } from "./api.js";
 import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
+import {
+  CustomerQuotePanel,
+  MarketingConsentPanel,
+} from "./CustomerQuotePanel.js";
 import { ContentHub } from "./ContentHub.js";
 import { ContentOperationsPanel } from "./ContentOperationsPanel.js";
 import { LegalHub } from "./LegalHub.js";
@@ -106,7 +117,15 @@ const ADMIN_ENTRY_PERMISSIONS = [
   "accounts.view",
   "billing.manual_receipt_manage",
   "billing.refund_manage",
+  "catalog.manage",
+  "catalog.pricing.manage",
+  "catalog.promotions.manage",
+  "catalog.promotions.read",
+  "catalog.read",
+  "catalog.supply.manage",
   "content.read",
+  "quotes.manage",
+  "quotes.read",
   "services.manual_fulfillment",
   "services.operations_manage",
   "support.tickets.manage",
@@ -122,25 +141,6 @@ function viewerCanOpenAdminWorkspace(viewer: Me | null): boolean {
   return permissions.has("*") || ADMIN_ENTRY_PERMISSIONS.some((permission) => permissions.has(permission));
 }
 
-type Price = {
-  id: string;
-  currency: string;
-  billingCycle: string;
-  oneTimeMinor: string;
-  setupMinor: string;
-  recurringMinor: string;
-};
-type Product = {
-  id: string;
-  groupId: string;
-  groupName: string;
-  name: string;
-  description: string;
-  fulfillmentMode: "automatic" | "review" | "manual" | "quote";
-  optionSchema: Array<Record<string, unknown>>;
-  prices: Price[];
-  purchasable: boolean;
-};
 type Legal = {
   requestedLocale: Locale;
   documents: Record<"terms" | "aup" | "privacy", {
@@ -213,6 +213,10 @@ type ManualItem = {
   paidMinor: string;
   totalMinor: string;
   submittedAt: string;
+  action?: "approve_provider_provisioning" | "confirm_manual_ready" | null;
+  fulfillmentExecutionMode?: "manual" | "provider" | "unconfigured";
+  providerInstallationId?: string | null;
+  bindingPolicyVersion?: number | null;
 };
 type AdminOperationContext = {
   action: AdminAccountAction;
@@ -905,7 +909,6 @@ export function App() {
   const [adminChargebackHolds, setAdminChargebackHolds] = useState<
     AddFundsChargebackHold[]
   >([]);
-  const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
   const [adminOperationContext, setAdminOperationContext] =
@@ -1060,11 +1063,33 @@ export function App() {
     canUseCustomerSupport && accountPermissionGranted("support.tickets.write");
   const canCreateOrders =
     me?.eligible === true && accountPermissionGranted("orders.create");
+  const canReadCustomerQuotes =
+    canReadCustomerAccount && accountPermissionGranted("account.history.read");
+  const canReadMarketingConsent = canReadCustomerQuotes;
+  const canWithdrawMarketingConsent =
+    me?.eligible === true && accountPermissionGranted("account.history.read");
+  const customerCommerceAccessFingerprint = [
+    me?.id ?? "",
+    me?.clientAccountId ?? "",
+    me?.accountContextVersion ?? "",
+    me?.context?.version ?? "",
+    [...accountCapabilities].sort().join("\u0000"),
+  ].join("\u0001");
   const canWriteBilling =
     me?.eligible === true && accountPermissionGranted("billing.write");
   const canManageServices =
     me?.eligible === true && accountPermissionGranted("services.manage");
   const eligibleStaff = staffIdentityEligible && staffMembershipActive;
+  const staffPermissionGranted = (permission: string) =>
+    eligibleStaff && (staffPermissions.has("*") || staffPermissions.has(permission));
+  const canReadCatalog = staffPermissionGranted("catalog.read");
+  const canManageCatalog = staffPermissionGranted("catalog.manage");
+  const canManageCatalogPricing = staffPermissionGranted("catalog.pricing.manage");
+  const canManageCatalogSupply = staffPermissionGranted("catalog.supply.manage");
+  const canReadPromotions = staffPermissionGranted("catalog.promotions.read");
+  const canManagePromotions = staffPermissionGranted("catalog.promotions.manage");
+  const canReadQuotes = staffPermissionGranted("quotes.read");
+  const canManageQuotes = staffPermissionGranted("quotes.manage");
   const canManageStaffTickets =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
@@ -1167,7 +1192,6 @@ export function App() {
     setAdminChargebacks([]);
     setAdminUnclaimedChargebacks([]);
     setAdminChargebackHolds([]);
-    setQuantity(1);
     setMail([]);
     setManualItems([]);
     adminOperationContextRef.current = null;
@@ -2611,31 +2635,24 @@ export function App() {
     }
   }
 
-  async function createOrder() {
-    if (!selected || !legal || !canCreateOrders) return;
+  async function createOrder(payload: CatalogCheckoutOrderPayload): Promise<boolean> {
+    if (!selected || !legal || !canCreateOrders) return false;
     setError("");
     try {
-      const configuration =
-        selected.product.id === "gsl-inbound" ? { bandwidth_units: quantity } : {};
       const created = await api<{ orderId: string }>("/api/v1/orders", {
         method: "POST",
         body: JSON.stringify({
-          priceId: selected.price.id,
-          configuration,
-          termsVersion: legal.documents.terms.version,
-          aupVersion: legal.documents.aup.version,
-          termsDocumentId: legal.documents.terms.documentId,
-          aupDocumentId: legal.documents.aup.documentId,
-          legalLocale: legal.requestedLocale,
-          termsLocale: legal.documents.terms.locale,
-          aupLocale: legal.documents.aup.locale,
+          ...payload,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
       setOrder(await api<OrderDetail>(`/api/v1/orders/${created.orderId}`));
       setSelected(null);
+      return true;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Checkout failed");
+      const error = caught instanceof Error ? caught : new Error("Checkout failed");
+      setError(error.message);
+      throw error;
     }
   }
 
@@ -3524,10 +3541,12 @@ export function App() {
         !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
       setAdminPassword("");
-      await api(`/api/v1/admin/services/${item.serviceId}/complete-manual`, {
+      const outcome = await api<{ fulfillment?: "provider_queued" | "manual_ready" }>(
+        `/api/v1/admin/services/${item.serviceId}/complete-manual`, {
         method: "POST",
         body: JSON.stringify({ reason: manualReason }),
-      });
+        },
+      );
       if (
         !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
@@ -3537,7 +3556,11 @@ export function App() {
       if (
         !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
       ) return;
-      setNotice("Manual service marked Ready for Service with an audited activation time.");
+      setNotice(
+        outcome.fulfillment === "provider_queued"
+          ? "The saved Provider binding was approved and its stable provisioning operation is queued."
+          : "Manual fulfillment was confirmed Ready for Service with an audited activation time.",
+      );
     } catch (caught) {
       if (
         adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
@@ -4903,6 +4926,50 @@ export function App() {
           />
         )}
 
+        {route === "/customer" && sessionResolved && me?.context && (
+          <MarketingConsentPanel
+            active={route === "/customer"}
+            locale={locale}
+            viewerId={me.id}
+            clientAccountId={me.context.clientAccountId}
+            accessFingerprint={customerCommerceAccessFingerprint}
+            canRead={canReadMarketingConsent}
+            canWithdraw={canWithdrawMarketingConsent}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && me?.context && (
+          <CustomerQuotePanel
+            active={route === "/customer"}
+            locale={locale}
+            clientAccountId={me.context.clientAccountId}
+            accessFingerprint={customerCommerceAccessFingerprint}
+            canReadQuotes={canReadCustomerQuotes}
+            canAcceptQuotes={canCreateOrders}
+            legal={legal}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+            onAccepted={() => {
+              void refreshLatestOrder().catch((caught) => {
+                showTicketError(
+                  caught instanceof Error
+                    ? caught.message
+                    : "The accepted Quote Order could not be refreshed",
+                );
+              });
+              void refreshBilling().catch((caught) => {
+                showTicketError(
+                  caught instanceof Error
+                    ? caught.message
+                    : "Billing could not be refreshed after Quote acceptance",
+                );
+              });
+            }}
+          />
+        )}
+
         {route === "/admin" && sessionResolved && canViewAccount360 && me && (
           <AdminAccount360
             active={route === "/admin"}
@@ -4924,6 +4991,24 @@ export function App() {
             locale={locale}
             onNotice={setNotice}
             onError={setError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canOpenAdminWorkspace && (
+          <AdminCommercePanel
+            active={route === "/admin"}
+            locale={locale}
+            accessFingerprint={staffAccessFingerprint}
+            canCatalogRead={canReadCatalog}
+            canCatalogManage={canManageCatalog}
+            canPricingManage={canManageCatalogPricing}
+            canSupplyManage={canManageCatalogSupply}
+            canPromotionsRead={canReadPromotions}
+            canPromotionsManage={canManagePromotions}
+            canQuotesRead={canReadQuotes}
+            canQuotesManage={canManageQuotes}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
           />
         )}
 
@@ -6005,7 +6090,7 @@ export function App() {
             )}
             {canManageManualFulfillment && (
             <div className="admin-subsection" aria-label="Manual fulfillment queue">
-              <h3>Manual fulfillment queue</h3>
+              <h3>Staff fulfillment queue</h3>
               {operationAccount && (
                 <p className="notice" data-testid="manual-fulfillment-account-context">
                   Showing only {operationAccount.name} · {operationAccount.id}
@@ -6015,7 +6100,7 @@ export function App() {
                 <p className="muted">
                   {operationAccount === null && canViewAccount360 && !canUseFullAdminWorkspace
                     ? "Select a Client Account in Account 360 to open its fulfillment queue."
-                    : "No paid manual services are waiting."}
+                    : "No paid services are waiting for a Staff fulfillment action."}
                 </p>
               ) : (
                 <>
@@ -6034,13 +6119,24 @@ export function App() {
                         {item.clientAccountName} · {item.billingCycle} ·{" "}
                         {usd(item.paidMinor)} paid
                       </span>
+                      <span>
+                        {item.action === "approve_provider_provisioning"
+                          ? `Saved Provider binding${item.providerInstallationId ? ` · ${item.providerInstallationId}` : ""}${item.bindingPolicyVersion ? ` · policy v${item.bindingPolicyVersion}` : ""}`
+                          : item.fulfillmentExecutionMode === "unconfigured"
+                            ? "Binding snapshot unavailable"
+                            : item.bindingPolicyVersion
+                              ? `Saved manual fulfillment binding · policy v${item.bindingPolicyVersion}`
+                              : "Manual fulfillment mode · no Provider operation or job"}
+                      </span>
                     </div>
                     <button
                       className="primary"
                       disabled={adminPassword.length === 0 || manualReason.trim().length < 10}
                       onClick={() => completeManual(item)}
                     >
-                      Confirm Ready for Service
+                      {item.action === "approve_provider_provisioning"
+                        ? "Approve Provider Provisioning"
+                        : "Confirm Manual Ready"}
                     </button>
                   </article>
                 ))}
@@ -7366,62 +7462,21 @@ export function App() {
       </main>
 
       {(route === "/" || route === "/customer") && selected && (
-        <div className="modal-backdrop" role="presentation" onClick={() => setSelected(null)}>
-          <section className="modal" role="dialog" onClick={(event) => event.stopPropagation()}>
-            <button className="close" onClick={() => setSelected(null)}>
-              ×
-            </button>
-            <p className="eyebrow">Checkout configuration</p>
-            <h2>{selected.product.name}</h2>
-            <p>
-              {selected.price.billingCycle} ·{" "}
-              {usd(
-                (
-                  BigInt(selected.price.oneTimeMinor) +
-                  BigInt(selected.price.setupMinor) +
-                  BigInt(selected.price.recurringMinor)
-                ).toString(),
-              )}
-            </p>
-            {selected.product.id === "gsl-inbound" && (
-              <label>
-                100 Mbps units
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={quantity}
-                  onChange={(event) => setQuantity(Number(event.target.value))}
-                />
-              </label>
-            )}
-            <div className="legal-box">
-              <strong>{legal?.documents.terms.title}</strong>
-              <p>{legal?.documents.terms.body}</p>
-              <strong>{legal?.documents.aup.title}</strong>
-              <p>{legal?.documents.aup.body}</p>
-            </div>
-            {route === "/" ? (
-              <button
-                className="primary wide"
-                onClick={() => {
-                  setSelected(null);
-                  openRoute("/customer");
-                }}
-              >
-                Continue in customer workspace
-              </button>
-            ) : (
-              <button
-                className="primary wide"
-                disabled={!canCreateOrders || legal === null}
-                onClick={createOrder}
-              >
-                {canCreateOrders && legal !== null ? text.buy : text.pending}
-              </button>
-            )}
-          </section>
-        </div>
+        <CatalogCheckoutPanel
+          key={`${selected.product.id}:${selected.price.id}:${locale}:${route}`}
+          product={selected.product}
+          price={selected.price}
+          legal={legal}
+          locale={locale}
+          mode={route === "/" ? "public" : "customer"}
+          canCreateOrders={canCreateOrders}
+          onClose={() => setSelected(null)}
+          onContinueToCustomer={() => {
+            setSelected(null);
+            openRoute("/customer");
+          }}
+          onCreateOrder={createOrder}
+        />
       )}
     </>
   );

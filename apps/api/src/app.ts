@@ -27,6 +27,7 @@ import { registerAccountContextRoutes } from "./routes-account-context.js";
 import { registerAuthRoutes } from "./routes-auth.js";
 import { registerAdminRoutes } from "./routes-admin.js";
 import { registerCatalogRoutes } from "./routes-catalog.js";
+import { registerCatalogAutomationRoutes } from "./routes-catalog-automation.js";
 import { registerCommerceRoutes } from "./routes-commerce.js";
 import { registerBillingRoutes } from "./routes-billing.js";
 import { registerChargebackRoutes } from "./routes-chargebacks.js";
@@ -279,6 +280,7 @@ export async function buildApp(
   await registerChargebackRoutes(app, pool, config);
   await registerAddFundsRoutes(app, pool, config);
   await registerCatalogRoutes(app, pool, config);
+  await registerCatalogAutomationRoutes(app, pool, config);
   await registerCommerceRoutes(app, pool, config);
   await registerOrderRoutes(app, pool, config);
   await registerPaymentMethodRoutes(app, pool, config);

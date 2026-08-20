@@ -340,6 +340,21 @@ async function installMockApi(
       });
     } else if (url.pathname === "/api/v1/orders") {
       await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
+    } else if (url.pathname === "/api/v1/quotes" && request.method() === "GET") {
+      await route.fulfill({
+        headers: authenticatedHeaders,
+        json: { warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", items: [] },
+      });
+    } else if (url.pathname === "/api/v1/marketing-consent" && request.method() === "GET") {
+      await route.fulfill({
+        headers: authenticatedHeaders,
+        json: {
+          granted: false,
+          policyVersion: "mock-lab-marketing-v1",
+          recordedAt: null,
+          defaulted: true,
+        },
+      });
     } else if (url.pathname === "/api/v1/customer/business-history") {
       const context = activeContext(state)!;
       await route.fulfill({ headers: authenticatedHeaders, json: businessHistory(context.clientAccountId, context.name) });

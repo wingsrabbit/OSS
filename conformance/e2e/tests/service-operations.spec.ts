@@ -3,6 +3,7 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import pg from "pg";
+import { completeCatalogCheckout } from "./helpers/catalog-checkout.js";
 
 test.describe.configure({ retries: 0 });
 
@@ -46,7 +47,7 @@ test("customer reuses a lost-response operation intent and Staff sees the same b
 
   const product = page.locator("article").filter({ hasText: "HKBGP VPS" }).first();
   await product.getByRole("button", { name: /monthly/i }).click();
-  await page.getByRole("dialog").getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(page.getByRole("dialog"));
   const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await journey.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await journey.getByRole("button", { name: "Start mock payment" }).click();

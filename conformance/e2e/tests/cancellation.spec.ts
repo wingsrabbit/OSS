@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test } from "@playwright/test";
+import { completeCatalogCheckout } from "./helpers/catalog-checkout.js";
 
 test.describe.configure({ retries: 0 });
 
@@ -40,7 +41,7 @@ test("customer cancellation withdraws a pristine renewal and preserves the paid 
   await product.getByRole("button", { name: /monthly/i }).click();
   const checkoutDialog = page.getByRole("dialog");
   await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
-  await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(checkoutDialog);
   await expect(checkoutDialog).toBeHidden();
 
   const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });

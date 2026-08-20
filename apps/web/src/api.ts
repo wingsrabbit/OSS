@@ -306,8 +306,13 @@ function isAccountScopedPath(pathname: string): boolean {
     (pathname.startsWith("/api/v1/customer/") &&
       pathname !== "/api/v1/customer/content") ||
     pathname.startsWith("/api/v1/billing/") ||
+    pathname === "/api/v1/catalog/preview" ||
     pathname === "/api/v1/orders" ||
     pathname.startsWith("/api/v1/orders/") ||
+    pathname === "/api/v1/quotes" ||
+    pathname.startsWith("/api/v1/quotes/") ||
+    pathname === "/api/v1/marketing-consent" ||
+    pathname.startsWith("/api/v1/marketing-consent/") ||
     pathname.startsWith("/api/v1/invoices/") ||
     pathname.startsWith("/api/v1/services/") ||
     pathname === "/api/v1/tickets" ||

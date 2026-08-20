@@ -1006,7 +1006,11 @@ export async function issueCommercialOrder(
   const serviceId = serviceResult.rows[0]?.id;
   if (!serviceId) throw new Error("Unable to create service");
 
-  const binding = await client.query(
+  const binding = await client.query<{
+    provider_installation_id: string | null;
+    capability_snapshot: unknown;
+    product_policy_version: number;
+  }>(
     `INSERT INTO service_provider_bindings(
        service_id, provider_installation_id, overdue_action_snapshot,
        capability_snapshot, product_policy_version,
@@ -1026,15 +1030,33 @@ export async function issueCommercialOrder(
      LEFT JOIN provider_installation_capabilities provider
        ON provider.provider_installation_id = policy.provider_installation_id
      WHERE policy.product_id = $2
-       AND (policy.provider_installation_id IS NULL OR provider.provider_installation_id IS NOT NULL)`,
+       AND (
+         policy.provider_installation_id IS NULL
+         OR (provider.provider_installation_id IS NOT NULL AND provider.enabled)
+       )
+     RETURNING provider_installation_id, capability_snapshot, product_policy_version`,
     [serviceId, input.productId],
   );
-  if (input.fulfillmentMode === "automatic" && binding.rowCount !== 1) {
-    throw commerceError(
-      "Automatic fulfillment has no valid mock Provider binding",
-      409,
-      "SUPPLY_PREFLIGHT_FAILED",
-    );
+  const bindingCapabilities = Array.isArray(binding.rows[0]?.capability_snapshot) &&
+      binding.rows[0]?.capability_snapshot.every((entry) => typeof entry === "string")
+    ? binding.rows[0].capability_snapshot
+    : [];
+  if (input.fulfillmentMode === "automatic" || input.fulfillmentMode === "review") {
+    const bindingRow = binding.rows[0];
+    const manualBinding =
+      binding.rowCount === 1 && bindingRow?.provider_installation_id === null;
+    const providerBinding =
+      binding.rowCount === 1 &&
+      bindingRow?.provider_installation_id === "mock-provisioning-v1" &&
+      bindingCapabilities.includes("resource_create") &&
+      bindingCapabilities.includes("resource_reconcile");
+    if (!manualBinding && !providerBinding) {
+      throw commerceError(
+        "Automatic or Review fulfillment requires an explicit manual binding or a valid Mock Provider binding",
+        409,
+        "SUPPLY_PREFLIGHT_FAILED",
+      );
+    }
   }
 
   if (input.capacity.mode === "tracked") {

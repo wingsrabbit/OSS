@@ -77,6 +77,72 @@ export {
 
 export type BillingCycle = "monthly" | "quarterly" | "semiannual" | "annual" | "one_time";
 export type FulfillmentMode = "automatic" | "review" | "manual" | "quote";
+export type StaffFulfillmentAction =
+  | "approve_provider_provisioning"
+  | "confirm_manual_ready";
+
+export function paidOrderRequiresStaffFulfillmentReview(
+  fulfillmentMode: FulfillmentMode,
+  invoiceTotalMinor: bigint,
+): boolean {
+  if (invoiceTotalMinor < 0n) {
+    throw new Error("Invoice total cannot be negative");
+  }
+  return invoiceTotalMinor === 0n || fulfillmentMode !== "automatic";
+}
+
+export function staffFulfillmentAction(
+  fulfillmentMode: FulfillmentMode,
+  invoiceTotalMinor: bigint,
+): StaffFulfillmentAction | null {
+  if (invoiceTotalMinor < 0n) {
+    throw new Error("Invoice total cannot be negative");
+  }
+  if (fulfillmentMode === "manual" || fulfillmentMode === "quote") {
+    return "confirm_manual_ready";
+  }
+  if (fulfillmentMode === "review" || invoiceTotalMinor === 0n) {
+    return "approve_provider_provisioning";
+  }
+  return null;
+}
+
+export function staffFulfillmentActionForBinding(input: Readonly<{
+  fulfillmentMode: FulfillmentMode;
+  invoiceTotalMinor: bigint;
+  bindingConfigured: boolean;
+  providerInstallationId: string | null;
+}>): StaffFulfillmentAction | null {
+  if (
+    input.bindingConfigured &&
+    input.providerInstallationId === null &&
+    (input.fulfillmentMode === "automatic" || input.fulfillmentMode === "review")
+  ) {
+    if (input.invoiceTotalMinor < 0n) {
+      throw new Error("Invoice total cannot be negative");
+    }
+    return "confirm_manual_ready";
+  }
+  return staffFulfillmentAction(input.fulfillmentMode, input.invoiceTotalMinor);
+}
+
+export function providerProvisioningCanStart(input: Readonly<{
+  fulfillmentMode: FulfillmentMode;
+  invoiceTotalMinor: bigint;
+  explicitStaffApprovalRecorded: boolean;
+}>): boolean {
+  if (input.invoiceTotalMinor < 0n) {
+    throw new Error("Invoice total cannot be negative");
+  }
+  if (input.fulfillmentMode === "review") {
+    return input.explicitStaffApprovalRecorded;
+  }
+  if (input.fulfillmentMode !== "automatic") {
+    return false;
+  }
+  return input.invoiceTotalMinor > 0n || input.explicitStaffApprovalRecorded;
+}
+
 export type OrderStatus =
   | "waiting_payment"
   | "on_hold"

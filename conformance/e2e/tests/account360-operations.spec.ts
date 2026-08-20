@@ -131,6 +131,10 @@ function manualItem(clientAccountId: string, clientAccountName: string, suffix: 
     paidMinor: "500",
     totalMinor: "500",
     submittedAt: occurredAt,
+    action: "confirm_manual_ready",
+    fulfillmentExecutionMode: "manual",
+    providerInstallationId: null,
+    bindingPolicyVersion: 1,
   };
 }
 
@@ -660,6 +664,16 @@ function requestContractError(fact: RequestFact): string | null {
     if (keys.length !== 1 || keys[0] !== "status" || params.get("status") !== "unresolved") {
       return "expected the unresolved Service Operations queue query";
     }
+  } else if (fact.path === "/api/v1/admin/quotes") {
+    const keys = [...params.keys()];
+    if (
+      keys.some((key) => key !== "clientAccountId") ||
+      new Set(keys).size !== keys.length ||
+      (params.has("clientAccountId") &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          params.get("clientAccountId") ?? "",
+        ))
+    ) return "invalid Staff Quote list query contract";
   } else if (fact.query !== "") {
     return `unexpected query string ${fact.query}`;
   }
@@ -761,6 +775,25 @@ async function installApi(
     }
     if (path === "/api/v1/admin/content") {
       await route.fulfill({ json: { entries: [], revisions: [], legalDocuments: [] } });
+      return;
+    }
+    if (path === "/api/v1/admin/catalog") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          groups: [],
+          products: [],
+          revisions: [],
+          prices: [],
+          supply: [],
+        },
+      });
+      return;
+    }
+    if (path === "/api/v1/admin/promotions" || path === "/api/v1/admin/quotes") {
+      await route.fulfill({
+        json: { warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", items: [] },
+      });
       return;
     }
     if (path === "/api/v1/admin/service-operations") {
@@ -2119,7 +2152,7 @@ test("an Account A fulfillment follow-up cannot replace Account B queue state", 
   await page.getByLabel("Operation password confirmation").fill("Synthetic-Fulfillment-Reauth!");
   await page.getByPlaceholder("Reason and delivery evidence (10+ characters)")
     .fill("Synthetic delivery evidence for Account Alpha");
-  await page.getByRole("button", { name: "Confirm Ready for Service" }).click();
+  await page.getByRole("button", { name: "Confirm Manual Ready" }).click();
   await followUp.reached;
 
   await account360.getByTestId("account360-search-results")
@@ -2145,6 +2178,56 @@ test("an Account A fulfillment follow-up cannot replace Account B queue state", 
   expect(JSON.parse(
     requests.find((request) => request.path === completionPath)!.body ?? "{}",
   )).toEqual({ reason: "Synthetic delivery evidence for Account Alpha" });
+  expect(queueReads).toBe(2);
+});
+
+test("Staff fulfillment queue labels a saved Provider binding and approves its queue action", async ({ page }) => {
+  const item = {
+    ...manualItem(accountA, "Account Alpha", "01"),
+    productName: "Provider-bound automatic service",
+    action: "approve_provider_provisioning",
+    fulfillmentExecutionMode: "provider",
+    providerInstallationId: "mock-provisioning-v1",
+    bindingPolicyVersion: 1,
+  } as const;
+  let queueReads = 0;
+  const completionPath = `/api/v1/admin/services/${item.serviceId}/complete-manual`;
+  const requests = await installApi(
+    page,
+    ["accounts.view", "services.manual_fulfillment"],
+    async (path, route) => {
+      if (await account360Interceptor("manual_fulfillment", path, route)) return true;
+      if (path === "/api/v1/admin/manual-fulfillment") {
+        queueReads += 1;
+        await route.fulfill({ json: { items: queueReads === 1 ? [item] : [] } });
+        return true;
+      }
+      if (path === completionPath && route.request().method() === "POST") {
+        await route.fulfill({
+          json: {
+            fulfillment: "provider_queued",
+            providerOperationId: "00000000-0000-4000-8000-000000009901",
+            jobId: "00000000-0000-4000-8000-000000009902",
+          },
+        });
+        return true;
+      }
+      return false;
+    },
+  );
+
+  await page.goto("/admin");
+  await openAccountOperation(page, "Account Alpha", "Open manual fulfillment");
+  const queueItem = page.getByTestId("manual-fulfillment-item");
+  await expect(queueItem).toContainText("Saved Provider binding · mock-provisioning-v1 · policy v1");
+  await page.getByLabel("Operation password confirmation").fill("Synthetic-Fulfillment-Reauth!");
+  await page.getByPlaceholder("Reason and delivery evidence (10+ characters)")
+    .fill("Synthetic Provider approval evidence for Account Alpha");
+  await page.getByRole("button", { name: "Approve Provider Provisioning" }).click();
+  await expect(page.locator("main")).toContainText(
+    "The saved Provider binding was approved and its stable provisioning operation is queued.",
+  );
+  expect(requests.filter((request) => request.path === completionPath)).toHaveLength(1);
   expect(queueReads).toBe(2);
 });
 

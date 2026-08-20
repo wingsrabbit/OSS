@@ -236,6 +236,12 @@ jobs:
       - name: Run Catalog Commerce PostgreSQL and API journey
         run: pnpm --filter @opensales/api test:integration:catalog-commerce
 
+      - name: Run Catalog fulfillment binding snapshot PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:catalog-fulfillment
+
+      - name: Run Catalog Provider automation policy PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:catalog-automation-policy
+
       - name: Verify Schema 019 native catalog freeze through the latest schema
         run: pnpm --filter @opensales/api test:integration:schema-019-native
 

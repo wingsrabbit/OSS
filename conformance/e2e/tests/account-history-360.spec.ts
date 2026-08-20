@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test } from "@playwright/test";
+import { completeCatalogCheckout } from "./helpers/catalog-checkout.js";
 
 test.describe.configure({ retries: 0 });
 
@@ -41,7 +42,7 @@ test("customer returns to complete business history and Staff opens the same Acc
   const product = page.locator("article").filter({ hasText: "HKBGP VPS" }).first();
   await product.getByRole("button", { name: /monthly/i }).click();
   const checkout = page.getByRole("dialog");
-  await checkout.getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(checkout);
   const liveJourney = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await liveJourney.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await liveJourney.getByRole("button", { name: "Start mock payment" }).click();

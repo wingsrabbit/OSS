@@ -9,7 +9,11 @@ import {
   CUSTOMER_CAPABILITIES,
   customerMembershipCapabilities,
   isPaymentBusinessStatePayable,
+  paidOrderRequiresStaffFulfillmentReview,
   percentageFeeMinor,
+  providerProvisioningCanStart,
+  staffFulfillmentAction,
+  staffFulfillmentActionForBinding,
 } from "./index.js";
 
 test("customer membership capability defaults and explicit grants are exact", () => {
@@ -94,6 +98,89 @@ test("price snapshots use exact minor units and include option quantity", () => 
     ],
   });
   assert.equal(price.invoiceTotalMinor, 14_100n);
+});
+
+test("paid Order fulfillment keeps the four modes and zero-value review distinct", () => {
+  assert.equal(paidOrderRequiresStaffFulfillmentReview("automatic", 500n), false);
+  assert.equal(paidOrderRequiresStaffFulfillmentReview("automatic", 0n), true);
+  for (const fulfillmentMode of ["review", "manual", "quote"] as const) {
+    assert.equal(paidOrderRequiresStaffFulfillmentReview(fulfillmentMode, 500n), true);
+  }
+
+  assert.equal(staffFulfillmentAction("automatic", 500n), null);
+  assert.equal(
+    staffFulfillmentAction("automatic", 0n),
+    "approve_provider_provisioning",
+  );
+  assert.equal(
+    staffFulfillmentAction("review", 500n),
+    "approve_provider_provisioning",
+  );
+  assert.equal(staffFulfillmentAction("manual", 500n), "confirm_manual_ready");
+  assert.equal(staffFulfillmentAction("quote", 500n), "confirm_manual_ready");
+});
+
+test("Service binding snapshot selects manual or Provider Staff action", () => {
+  for (const fulfillmentMode of ["automatic", "review"] as const) {
+    assert.equal(
+      staffFulfillmentActionForBinding({
+        fulfillmentMode,
+        invoiceTotalMinor: 500n,
+        bindingConfigured: true,
+        providerInstallationId: null,
+      }),
+      "confirm_manual_ready",
+    );
+    assert.equal(
+      staffFulfillmentActionForBinding({
+        fulfillmentMode,
+        invoiceTotalMinor: fulfillmentMode === "automatic" ? 0n : 500n,
+        bindingConfigured: true,
+        providerInstallationId: "mock-provisioning-v1",
+      }),
+      "approve_provider_provisioning",
+    );
+  }
+});
+
+test("Provider provisioning starts only after the mode-specific approval fact", () => {
+  assert.equal(
+    providerProvisioningCanStart({
+      fulfillmentMode: "automatic",
+      invoiceTotalMinor: 500n,
+      explicitStaffApprovalRecorded: false,
+    }),
+    true,
+  );
+  for (const fulfillmentMode of ["automatic", "review"] as const) {
+    const invoiceTotalMinor = fulfillmentMode === "automatic" ? 0n : 500n;
+    assert.equal(
+      providerProvisioningCanStart({
+        fulfillmentMode,
+        invoiceTotalMinor,
+        explicitStaffApprovalRecorded: false,
+      }),
+      false,
+    );
+    assert.equal(
+      providerProvisioningCanStart({
+        fulfillmentMode,
+        invoiceTotalMinor,
+        explicitStaffApprovalRecorded: true,
+      }),
+      true,
+    );
+  }
+  for (const fulfillmentMode of ["manual", "quote"] as const) {
+    assert.equal(
+      providerProvisioningCanStart({
+        fulfillmentMode,
+        invoiceTotalMinor: 500n,
+        explicitStaffApprovalRecorded: true,
+      }),
+      false,
+    );
+  }
 });
 
 test("settled payment cannot be moved backwards by a late event", () => {

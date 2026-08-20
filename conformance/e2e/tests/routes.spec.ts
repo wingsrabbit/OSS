@@ -237,6 +237,28 @@ async function installMockApi(
       });
       return;
     }
+    if (request.method() === "GET" && path === "/api/v1/admin/catalog") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          groups: [],
+          products: [],
+          revisions: [],
+          prices: [],
+          supply: [],
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === "GET" &&
+      (path === "/api/v1/admin/promotions" || path === "/api/v1/admin/quotes")
+    ) {
+      await route.fulfill({
+        json: { warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", items: [] },
+      });
+      return;
+    }
     if (
       request.method() === "GET" &&
       (

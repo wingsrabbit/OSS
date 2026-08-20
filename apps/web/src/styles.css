@@ -651,6 +651,197 @@ select:focus {
   box-shadow: 0 30px 90px rgba(0, 0, 0, 0.5);
 }
 
+.catalog-checkout-modal {
+  width: min(720px, 100%);
+}
+
+.catalog-checkout-form,
+.checkout-review {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.25rem;
+}
+
+.checkout-fieldset {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+}
+
+.checkout-fieldset > legend {
+  padding: 0 0.4rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.checkout-option {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.checkout-option > span,
+.checkout-option > legend {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.checkout-option > small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.checkout-option-radio {
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+
+.checkout-option-radio > label,
+.checkout-review .legal-box > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.checkout-option-radio input,
+.checkout-review .legal-box input {
+  width: auto;
+  margin-top: 0.2rem;
+}
+
+.checkout-review .quote-summary span {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.checkout-review .quote-summary strong {
+  color: var(--text);
+}
+
+.checkout-review details {
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+}
+
+.checkout-review details > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.commerce-admin-panel,
+.customer-quote-panel,
+.marketing-consent-panel {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.commerce-admin-panel > .checkout-review,
+.customer-quote-panel > .checkout-review {
+  margin: 0;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: rgba(3, 10, 20, 0.28);
+}
+
+.commerce-admin-panel .form-columns {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr));
+  gap: 1rem;
+}
+
+.commerce-admin-panel form,
+.customer-quote-panel form {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid rgba(97, 217, 207, 0.16);
+  border-radius: 0.75rem;
+  background: rgba(3, 10, 20, 0.32);
+}
+
+.commerce-admin-panel label,
+.customer-quote-panel label {
+  display: grid;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.commerce-admin-panel label:has(> input[type="checkbox"]),
+.customer-quote-panel label:has(> input[type="checkbox"]) {
+  display: flex;
+  align-items: flex-start;
+}
+
+.commerce-admin-panel input[type="checkbox"],
+.customer-quote-panel input[type="checkbox"] {
+  width: auto;
+}
+
+.commerce-admin-panel textarea,
+.customer-quote-panel textarea {
+  width: 100%;
+  min-height: 5.5rem;
+  resize: vertical;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  outline: none;
+  color: var(--text);
+  background: rgba(3, 10, 20, 0.5);
+  font: inherit;
+}
+
+.commerce-admin-panel textarea:focus,
+.customer-quote-panel textarea:focus {
+  border-color: rgba(97, 217, 207, 0.6);
+  box-shadow: 0 0 0 3px rgba(97, 217, 207, 0.1);
+}
+
+.commerce-admin-panel .manual-item,
+.customer-quote-panel .manual-item {
+  flex-wrap: wrap;
+}
+
+.commerce-admin-panel .manual-item > pre,
+.customer-quote-panel pre {
+  flex-basis: 100%;
+  max-width: 100%;
+  overflow: auto;
+  padding: 0.8rem;
+  border-radius: 0.55rem;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.consent-status {
+  display: grid;
+  grid-template-columns: minmax(8rem, auto) minmax(6rem, auto) 1fr;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: rgba(3, 10, 20, 0.4);
+}
+
+.consent-status span {
+  color: var(--muted);
+}
+
+.marketing-consent-panel .button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
 .close {
   position: absolute;
   top: 1rem;
@@ -797,6 +988,10 @@ select:focus {
   }
 
   .admin-login-form {
+    grid-template-columns: 1fr;
+  }
+
+  .consent-status {
     grid-template-columns: 1fr;
   }
 

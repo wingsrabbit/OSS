@@ -5,7 +5,9 @@ import {
   assertRuntimeDatabaseRoleSafe,
   hasCustomerMembershipCapability,
   isPaymentBusinessStatePayable,
+  providerProvisioningCanStart,
   type CustomerMembershipRole,
+  type FulfillmentMode,
 } from "@opensales/core";
 import {
   providerOperationCapability,
@@ -54,6 +56,11 @@ import {
   processIdentityNotificationJob,
   recoverStaleIdentityNotificationJob,
 } from "./identity-notification-orchestration.js";
+import {
+  executeProviderBoundProvisioning,
+  providerBindingAllowsProvisioning,
+  type ProvisioningBindingInput,
+} from "./provisioning-binding.js";
 
 const config = z
   .object({
@@ -1906,7 +1913,7 @@ async function preflightProvision(
   serviceId: string,
   providerOperationId: string,
   mode: "start" | "reconcile",
-): Promise<PreflightResult<undefined>> {
+): Promise<PreflightResult<ProvisioningBindingInput | undefined>> {
   return transaction(async (client) => {
     const lockPointers = await client.query<{
       invoice_id: string;
@@ -1977,7 +1984,7 @@ async function preflightProvision(
     const result = await client.query<{
       service_status: string;
       service_client_account_id: string;
-      fulfillment_mode: string;
+      fulfillment_mode: FulfillmentMode;
       order_id: string;
       order_status: string;
       order_client_account_id: string;
@@ -1992,6 +1999,13 @@ async function preflightProvision(
       operation_kind: string;
       operation_attempt_count: number;
       operation_provider_installation_id: string;
+      binding_provider_installation_id: string | null;
+      binding_product_policy_version: number | null;
+      binding_capability_snapshot: unknown;
+      current_provider_type: string | null;
+      current_provider_enabled: boolean | null;
+      current_provider_capabilities: unknown;
+      explicit_staff_approval_recorded: boolean;
     }>(
       `SELECT
          s.status AS service_status, s.client_account_id AS service_client_account_id,
@@ -2003,7 +2017,23 @@ async function preflightProvision(
          ca.restricted_at AS account_restricted_at,
          po.status AS operation_status, po.kind AS operation_kind,
          po.attempt_count AS operation_attempt_count,
-         po.provider_installation_id AS operation_provider_installation_id
+         po.provider_installation_id AS operation_provider_installation_id,
+         binding.provider_installation_id AS binding_provider_installation_id,
+         binding.product_policy_version AS binding_product_policy_version,
+         binding.capability_snapshot AS binding_capability_snapshot,
+         provider.provider_type AS current_provider_type,
+         provider.enabled AS current_provider_enabled,
+         provider.capabilities AS current_provider_capabilities,
+         EXISTS (
+           SELECT 1
+           FROM audit_events approval
+           WHERE approval.action = 'service.provider_provisioning_approved'
+             AND approval.target_type = 'service'
+             AND approval.target_id = s.id::text
+             AND approval.metadata @> pg_catalog.jsonb_build_object(
+               'providerOperationId', po.id::text
+             )
+         ) AS explicit_staff_approval_recorded
        FROM services s
        JOIN order_items oi ON oi.id = s.order_item_id
        JOIN orders o ON o.id = oi.order_id
@@ -2014,6 +2044,9 @@ async function preflightProvision(
          ON po.id = $2
         AND po.subject_type = 'service'
         AND po.subject_id = s.id
+       LEFT JOIN service_provider_bindings binding ON binding.service_id = s.id
+       LEFT JOIN provider_installation_capabilities provider
+         ON provider.provider_installation_id = binding.provider_installation_id
        WHERE s.id = $1`,
       [serviceId, providerOperationId],
     );
@@ -2093,8 +2126,16 @@ async function preflightProvision(
     const consistentOwnership =
       service.service_client_account_id === service.invoice_client_account_id &&
       service.invoice_client_account_id === service.order_client_account_id;
-    const consistentProvider =
-      service.operation_provider_installation_id === "mock-provisioning-v1";
+    const bindingInput: ProvisioningBindingInput = {
+      operationProviderInstallationId: service.operation_provider_installation_id,
+      bindingProviderInstallationId: service.binding_provider_installation_id,
+      bindingProductPolicyVersion: service.binding_product_policy_version,
+      bindingCapabilitySnapshot: service.binding_capability_snapshot,
+      currentProviderType: service.current_provider_type,
+      currentProviderEnabled: service.current_provider_enabled,
+      currentProviderCapabilities: service.current_provider_capabilities,
+    };
+    const consistentProvider = providerBindingAllowsProvisioning(bindingInput);
 
     const allocationResult = await client.query<{ allocated_minor: string }>(
       `SELECT allocated_minor::text
@@ -2105,12 +2146,17 @@ async function preflightProvision(
     const paid =
       BigInt(allocationResult.rows[0]?.allocated_minor ?? "0") >=
       BigInt(service.invoice_total_minor);
+    const fulfillmentCanStart = providerProvisioningCanStart({
+      fulfillmentMode: service.fulfillment_mode,
+      invoiceTotalMinor: BigInt(service.invoice_total_minor),
+      explicitStaffApprovalRecorded: service.explicit_staff_approval_recorded,
+    });
     if (
       !eligible ||
       !consistentOwnership ||
       !consistentProvider ||
       !paid ||
-      service.fulfillment_mode !== "automatic" ||
+      !fulfillmentCanStart ||
       !["accepted", "fulfilling"].includes(service.order_status) ||
       service.service_status === "provisioned_hold" ||
       service.service_status === "provision_failed"
@@ -2128,6 +2174,8 @@ async function preflightProvision(
             ? "provisioning provider call blocked because the linked invoice is not fully allocated"
             : !consistentProvider
               ? "provisioning provider call blocked because Provider ownership records are inconsistent"
+              : !fulfillmentCanStart
+                ? "provisioning provider call blocked because this fulfillment mode lacks its required explicit Staff approval"
               : "provisioning provider call blocked because order, ownership, fulfillment, or operation state changed",
       );
     }
@@ -2182,7 +2230,7 @@ async function preflightProvision(
         [providerOperationId],
       );
     }
-    return { kind: "call", value: undefined };
+    return { kind: "call", value: bindingInput };
   });
 }
 
@@ -4624,26 +4672,30 @@ async function startProvision(job: Job): Promise<void> {
   if (!serviceId || !providerOperationId) throw new Error("Invalid provision.start payload");
   const preflight = await preflightProvision(job, serviceId, providerOperationId, "start");
   if (preflight.kind === "halted") return;
+  if (!preflight.value) throw new Error("Provisioning start lost its saved binding snapshot");
   const callbackCapability = providerOperationCapability(
     config.PROVIDER_OPERATION_CAPABILITY_SECRET,
     "mock-provisioning-v1",
     providerOperationId,
   );
   try {
-    const response = await providerRequest(
-      config.MOCK_PROVISIONING_PROVIDER_URL,
-      config.MOCK_PROVISIONING_PROVIDER_TOKEN,
-      "/v1/resources",
-      {
-        method: "POST",
-        headers: { "Idempotency-Key": providerOperationId },
-        body: JSON.stringify({
-          operationId: providerOperationId,
-          serviceId,
-          callbackCapability,
-          scenario: config.MOCK_PROVISION_SCENARIO,
-        }),
-      },
+    const response = await executeProviderBoundProvisioning(
+      preflight.value,
+      () => providerRequest(
+        config.MOCK_PROVISIONING_PROVIDER_URL,
+        config.MOCK_PROVISIONING_PROVIDER_TOKEN,
+        "/v1/resources",
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": providerOperationId },
+          body: JSON.stringify({
+            operationId: providerOperationId,
+            serviceId,
+            callbackCapability,
+            scenario: config.MOCK_PROVISION_SCENARIO,
+          }),
+        },
+      ),
     );
     if (!response.ok) {
       if (
