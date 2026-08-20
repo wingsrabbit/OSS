@@ -97,6 +97,26 @@ function json<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
 }
 
+async function waitForDatabaseConnectionsToClose(timeoutMilliseconds = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (true) {
+    const connections = await admin.query<{ count: string }>(
+      `SELECT pg_catalog.count(*)::text AS count
+       FROM pg_catalog.pg_stat_activity
+       WHERE datname = $1`,
+      [databaseName],
+    );
+    const count = Number(connections.rows[0]?.count ?? "0");
+    if (count === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Notification Operations database still has ${count} connection(s) after pool shutdown`,
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 async function createStaff(
   label: string,
   permissions: readonly string[],
@@ -738,14 +758,9 @@ try {
 
   process.stdout.write("Notification Operations PG18 integration: PASS\n");
 } finally {
-  if (pool) await pool.end();
   try {
-    await admin.query(
-      `SELECT pg_catalog.pg_terminate_backend(pid)
-       FROM pg_catalog.pg_stat_activity
-       WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()`,
-      [databaseName],
-    );
+    if (pool) await pool.end();
+    await waitForDatabaseConnectionsToClose();
     await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
   } finally {
     await admin.end();
