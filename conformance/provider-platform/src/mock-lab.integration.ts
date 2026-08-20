@@ -61,6 +61,9 @@ async function startProvider(): Promise<{ child: ChildProcess; output: () => str
       ...process.env,
       PROVIDER_DATABASE_URL: databaseUrl,
       MOCK_PROVIDER_PLATFORM_TOKEN: token,
+      // Public Provider contract conformance owns its synthetic resource lifecycle.
+      // Keep the legacy provisioning store out of this isolated adapter run.
+      MOCK_PROVISIONING_PROVIDER_TOKEN: undefined,
       MOCK_PROVIDER_PUBLIC_BASE_URL: baseUrl,
       CORE_CALLBACK_URL: "http://127.0.0.1:4398",
       PROVIDER_HOST: "127.0.0.1",

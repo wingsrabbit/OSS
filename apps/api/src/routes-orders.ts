@@ -526,7 +526,7 @@ export async function registerOrderRoutes(
 
     const result = await transaction(pool, async (client) => {
       const settlementIdentity = await client.query<{ target_user_id: string | null }>(
-        `SELECT pg_catalog.coalesce(
+        `SELECT coalesce(
                   order_record.submitted_by_user_id,
                   original_order.submitted_by_user_id
                 ) AS target_user_id

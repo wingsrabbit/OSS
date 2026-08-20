@@ -1229,7 +1229,7 @@ export async function registerAdminRoutes(
               target_user_id: string | null;
             }>(
               `SELECT invoice.client_account_id,
-                      pg_catalog.coalesce(
+                      coalesce(
                         order_record.submitted_by_user_id,
                         original_order.submitted_by_user_id
                       ) AS target_user_id

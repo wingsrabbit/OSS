@@ -274,7 +274,7 @@ function inspectDatabase(binary, database, env) {
       binary,
       database,
       `SELECT pg_catalog.count(*)::text,
-              pg_catalog.coalesce(pg_catalog.sum(size_bytes), 0)::text,
+              coalesce(pg_catalog.sum(size_bytes), 0)::text,
               pg_catalog.count(*) FILTER (
                 WHERE pg_catalog.octet_length(content) <> size_bytes
                    OR public.digest(content, 'sha256') <> sha256
