@@ -358,45 +358,10 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/notification_delivery
         run: pnpm --filter @opensales/worker test:integration:notification-delivery
 
-      - name: Prepare schema 014 rollback database
+      - name: Prepare schema 015 for the normal 014 rollback bridge journey
         shell: bash
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
-        run: >-
-          pnpm --filter @opensales/api exec node --input-type=module -e
-          "import { readdir, readFile } from 'node:fs/promises';
-          import { join } from 'node:path';
-          import pg from 'pg';
-          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
-          await client.connect();
-          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
-          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
-          const migrations = (await readdir(directory))
-            .filter((file) => /^(00[1-9]|01[0-4])_[a-z0-9_]+[.]sql$/.test(file))
-            .sort();
-          for (const file of migrations) {
-            await client.query('BEGIN');
-            try {
-              await client.query(await readFile(join(directory, file), 'utf8'));
-              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
-              await client.query('COMMIT');
-            } catch (error) {
-              await client.query('ROLLBACK');
-              throw error;
-            }
-          }
-          await client.end();"
-
-      - name: Run schema rollback PostgreSQL journey
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
-          OSS_SCHEMA_ROLLBACK_BRIDGE: "014-to-015"
-        run: pnpm --filter @opensales/api test:integration:schema-rollback-preflight
-
-      - name: Prepare schema 015 rollback bridge database
-        shell: bash
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
         run: >-
           pnpm --filter @opensales/api exec node --input-type=module -e
           "import { readdir, readFile } from 'node:fs/promises';
@@ -422,15 +387,16 @@ jobs:
           }
           await client.end();"
 
-      - name: Run schema 015 to 016 rollback bridge PostgreSQL journey
+      - name: Run normal schema 014 to 015 rollback bridge PostgreSQL journey
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
-        run: pnpm --filter @opensales/api test:integration:schema-015-016-rollback-preflight
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
+          OSS_NORMAL_ROLLBACK_BRIDGE: "014-to-015"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-normal
 
-      - name: Prepare schema 016 rollback bridge database
+      - name: Prepare schema 016 for the normal 015 rollback bridge journey
         shell: bash
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
         run: >-
           pnpm --filter @opensales/api exec node --input-type=module -e
           "import { readdir, readFile } from 'node:fs/promises';
@@ -456,10 +422,46 @@ jobs:
           }
           await client.end();"
 
-      - name: Run schema 016 to 017 rollback bridge PostgreSQL journey
+      - name: Run normal schema 015 to 016 rollback bridge PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
+          OSS_NORMAL_ROLLBACK_BRIDGE: "015-to-016"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-normal
+
+      - name: Prepare schema 017 for the normal 016 rollback bridge journey
+        shell: bash
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
-        run: pnpm --filter @opensales/api test:integration:schema-016-017-rollback-preflight
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-7])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
+      - name: Run normal schema 016 to 017 rollback bridge PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+          OSS_NORMAL_ROLLBACK_BRIDGE: "016-to-017"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-normal
 
       - name: Apply forward migrations and synthetic configuration
         shell: bash
