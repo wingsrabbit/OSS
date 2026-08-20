@@ -39,6 +39,17 @@ function fulfillJson(
   });
 }
 
+function isSupportDepartmentsRequest(
+  request: { url(): string; method(): string },
+  audience: "authenticated" | "presales",
+): boolean {
+  const url = new URL(request.url());
+  return request.method() === "GET"
+    && url.pathname === "/api/v1/support/departments"
+    && [...url.searchParams.keys()].length === 1
+    && url.searchParams.get("audience") === audience;
+}
+
 const legal = {
   requestedLocale: "en",
   documents: {
@@ -158,6 +169,10 @@ async function installAdminSurfaceMock(page: Page, surface: AdminSurface) {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     const method = request.method();
+    if (isSupportDepartmentsRequest(request, "presales")) {
+      await fulfillJson(route, { items: [] });
+      return;
+    }
     if (path === "/api/v1/catalog") {
       await fulfillJson(route, { locale: "en", currency: "USD", products: [] });
       return;
@@ -285,6 +300,10 @@ test("Customer Quote preview and acceptance grant optional Marketing Consent, wh
     const request = route.request();
     const path = new URL(request.url()).pathname;
     const method = request.method();
+    if (isSupportDepartmentsRequest(request, "authenticated")) {
+      await fulfillJson(route, { items: [] }, { account: true });
+      return;
+    }
     if (path === "/api/v1/auth/me") {
       await fulfillJson(route, {
         id: userId,
