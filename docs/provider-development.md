@@ -83,6 +83,9 @@ operator must drain, reconcile, export, or deliberately move those facts to
 manual ownership first.
 `providerUninstallDecision` turns those three ownership counts into an explicit
 blocker list; it never deletes or rewrites an operation, fund, or resource.
+The pure `runProviderManagementLifecycleConformance` journey verifies these
+normal management transitions, credential overlap and expiry, limit admission,
+and drain-before-uninstall behavior without a network or database.
 
 ## Run the examples and functional conformance
 

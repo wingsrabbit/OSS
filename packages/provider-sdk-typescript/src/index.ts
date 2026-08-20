@@ -443,3 +443,175 @@ export function providerUninstallDecision(
       : "drain_reconcile_export_or_manual_takeover",
   };
 }
+
+export type ProviderInstallationRuntimeStatus = "active" | "paused" | "revoked";
+export type ProviderInstallationTransition = "pause" | "resume" | "revoke";
+
+export interface ProviderCredentialWindow {
+  currentVersion: number;
+  previousVersion: number | null;
+  previousValidUntil: string | null;
+}
+
+export interface ProviderInstallationRuntimeState {
+  providerId: string;
+  status: ProviderInstallationRuntimeStatus;
+  credentials: ProviderCredentialWindow;
+}
+
+export type ProviderOperationAdmissionBlocker =
+  | "credential_not_current_or_in_overlap"
+  | "installation_paused"
+  | "installation_revoked"
+  | "concurrency_limit"
+  | "amount_limit"
+  | "resource_limit";
+
+export interface ProviderOperationAdmissionInput {
+  kind: "mutation" | "reconcile";
+  credentialVersion: number;
+  activeOperations: number;
+  ownedActiveResources: number;
+  amountMinor?: string;
+  createsOwnedResource?: boolean;
+  now: string;
+}
+
+export interface ProviderOperationAdmissionDecision {
+  allowed: boolean;
+  blockers: ProviderOperationAdmissionBlocker[];
+}
+
+function positiveCredentialVersion(value: number, label: string): number {
+  if (!Number.isInteger(value) || value <= 0) throw new RangeError(`${label} must be a positive integer`);
+  return value;
+}
+
+function instant(value: string, label: string): number {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new RangeError(`${label} must be an ISO-8601 instant`);
+  return timestamp;
+}
+
+function nonNegativeCount(value: number, label: string): number {
+  if (!Number.isInteger(value) || value < 0) throw new RangeError(`${label} must be a non-negative integer`);
+  return value;
+}
+
+function minorUnits(value: string, label: string): bigint {
+  if (!/^(0|[1-9]\d*)$/.test(value)) throw new RangeError(`${label} must be non-negative integer minor units`);
+  return BigInt(value);
+}
+
+export function installProviderRuntime(
+  manifest: ProviderManifest,
+  credentialVersion: number,
+): ProviderInstallationRuntimeState {
+  parseProviderManifest(manifest);
+  return {
+    providerId: manifest.providerId,
+    status: "active",
+    credentials: {
+      currentVersion: positiveCredentialVersion(credentialVersion, "credentialVersion"),
+      previousVersion: null,
+      previousValidUntil: null,
+    },
+  };
+}
+
+export function transitionProviderInstallation(
+  manifest: ProviderManifest,
+  state: ProviderInstallationRuntimeState,
+  transition: ProviderInstallationTransition,
+): ProviderInstallationRuntimeState {
+  if (state.providerId !== manifest.providerId) throw new Error("Installation state belongs to a different Provider");
+  if (state.status === "revoked") throw new Error("A revoked Provider installation cannot transition again");
+  if (transition === "pause") {
+    if (!manifest.lifecycle.supportsPause) throw new Error("Provider manifest does not support pause");
+    if (state.status !== "active") throw new Error("Only an active Provider installation can be paused");
+    return { ...state, status: "paused" };
+  }
+  if (transition === "resume") {
+    if (state.status !== "paused") throw new Error("Only a paused Provider installation can be resumed");
+    return { ...state, status: "active" };
+  }
+  return { ...state, status: "revoked" };
+}
+
+export function rotateProviderCredential(
+  manifest: ProviderManifest,
+  state: ProviderInstallationRuntimeState,
+  newVersion: number,
+  overlapValidUntil: string,
+  now: string,
+): ProviderInstallationRuntimeState {
+  if (state.providerId !== manifest.providerId) throw new Error("Installation state belongs to a different Provider");
+  if (!manifest.lifecycle.supportsCredentialRotation) {
+    throw new Error("Provider manifest does not support credential rotation");
+  }
+  if (state.status === "revoked") throw new Error("A revoked Provider installation cannot rotate credentials");
+  const nextVersion = positiveCredentialVersion(newVersion, "newVersion");
+  if (nextVersion <= state.credentials.currentVersion) {
+    throw new Error("Credential rotation requires a greater new version");
+  }
+  if (instant(overlapValidUntil, "overlapValidUntil") <= instant(now, "now")) {
+    throw new Error("Credential rotation overlap must end after the rotation time");
+  }
+  return {
+    ...state,
+    credentials: {
+      currentVersion: nextVersion,
+      previousVersion: state.credentials.currentVersion,
+      previousValidUntil: new Date(overlapValidUntil).toISOString(),
+    },
+  };
+}
+
+export function expireProviderCredentialOverlap(
+  state: ProviderInstallationRuntimeState,
+  now: string,
+): ProviderInstallationRuntimeState {
+  const previousValidUntil = state.credentials.previousValidUntil;
+  if (previousValidUntil === null || instant(now, "now") < instant(previousValidUntil, "previousValidUntil")) {
+    return state;
+  }
+  return {
+    ...state,
+    credentials: { ...state.credentials, previousVersion: null, previousValidUntil: null },
+  };
+}
+
+export function providerOperationAdmissionDecision(
+  manifest: ProviderManifest,
+  state: ProviderInstallationRuntimeState,
+  input: ProviderOperationAdmissionInput,
+): ProviderOperationAdmissionDecision {
+  if (state.providerId !== manifest.providerId) throw new Error("Installation state belongs to a different Provider");
+  const activeOperations = nonNegativeCount(input.activeOperations, "activeOperations");
+  const ownedActiveResources = nonNegativeCount(input.ownedActiveResources, "ownedActiveResources");
+  const now = instant(input.now, "now");
+  const credentialVersion = positiveCredentialVersion(input.credentialVersion, "credentialVersion");
+  const previousCredentialAccepted =
+    state.credentials.previousVersion === credentialVersion &&
+    state.credentials.previousValidUntil !== null &&
+    now < instant(state.credentials.previousValidUntil, "previousValidUntil");
+  const blockers: ProviderOperationAdmissionBlocker[] = [];
+  if (credentialVersion !== state.credentials.currentVersion && !previousCredentialAccepted) {
+    blockers.push("credential_not_current_or_in_overlap");
+  }
+  if (input.kind === "mutation") {
+    if (state.status === "paused") blockers.push("installation_paused");
+    if (state.status === "revoked") blockers.push("installation_revoked");
+    if (activeOperations >= manifest.limits.maxConcurrentOperations) blockers.push("concurrency_limit");
+    if (input.amountMinor !== undefined) {
+      const amount = minorUnits(input.amountMinor, "amountMinor");
+      const limit = manifest.limits.maxAmountMinor;
+      if (limit !== null && amount > minorUnits(limit, "manifest maxAmountMinor")) blockers.push("amount_limit");
+    }
+    const resourceLimit = manifest.limits.maxOwnedResources;
+    if (input.createsOwnedResource === true && resourceLimit !== null && ownedActiveResources >= resourceLimit) {
+      blockers.push("resource_limit");
+    }
+  }
+  return { allowed: blockers.length === 0, blockers };
+}

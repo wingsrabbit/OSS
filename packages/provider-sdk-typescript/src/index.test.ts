@@ -8,13 +8,18 @@ import {
   ProviderClient,
   ProviderUnknownOutcomeError,
   canonicalProviderJson,
+  expireProviderCredentialOverlap,
+  installProviderRuntime,
   providerRequestFingerprint,
   providerInstallationReview,
+  providerOperationAdmissionDecision,
   providerUninstallDecision,
   reconcileProviderOperation,
   reduceProviderEvents,
   reviewProviderPermissionExpansion,
+  rotateProviderCredential,
   stableProviderOperationId,
+  transitionProviderInstallation,
   type PaymentOperationRequest,
   type ProviderEvent,
   type ProviderOperationResult,
@@ -199,4 +204,45 @@ test("unknown results, pending funds, and owned Active resources block uninstall
     pendingFunds: 0,
     ownedActiveResources: 0,
   }).allowed, true);
+});
+
+test("normal Provider lifecycle preserves reconcile while controlling new mutations and credential overlap", () => {
+  const manifest: ProviderManifest = {
+    ...installationManifest,
+    limits: { maxConcurrentOperations: 2, maxAmountMinor: "1000", maxOwnedResources: 2 },
+  };
+  const admission = (state: ReturnType<typeof installProviderRuntime>, input: Partial<Parameters<typeof providerOperationAdmissionDecision>[2]> = {}) =>
+    providerOperationAdmissionDecision(manifest, state, {
+      kind: "mutation",
+      credentialVersion: state.credentials.currentVersion,
+      activeOperations: 0,
+      ownedActiveResources: 0,
+      now: "2026-08-20T00:00:00.000Z",
+      ...input,
+    });
+  let state = installProviderRuntime(manifest, 1);
+  assert.equal(admission(state).allowed, true);
+  state = transitionProviderInstallation(manifest, state, "pause");
+  assert.deepEqual(admission(state).blockers, ["installation_paused"]);
+  assert.equal(admission(state, { kind: "reconcile" }).allowed, true);
+  state = transitionProviderInstallation(manifest, state, "resume");
+  state = rotateProviderCredential(
+    manifest,
+    state,
+    2,
+    "2026-08-21T00:00:00.000Z",
+    "2026-08-20T00:00:00.000Z",
+  );
+  assert.equal(admission(state, { credentialVersion: 1 }).allowed, true);
+  assert.equal(admission(state, { credentialVersion: 2 }).allowed, true);
+  state = expireProviderCredentialOverlap(state, "2026-08-21T00:00:00.000Z");
+  assert.deepEqual(
+    admission(state, { credentialVersion: 1, now: "2026-08-21T00:00:00.000Z" }).blockers,
+    ["credential_not_current_or_in_overlap"],
+  );
+  assert.deepEqual(admission(state, { amountMinor: "1001" }).blockers, ["amount_limit"]);
+  assert.deepEqual(admission(state, { createsOwnedResource: true, ownedActiveResources: 2 }).blockers, ["resource_limit"]);
+  state = transitionProviderInstallation(manifest, state, "revoke");
+  assert.deepEqual(admission(state).blockers, ["installation_revoked"]);
+  assert.equal(admission(state, { kind: "reconcile" }).allowed, true);
 });

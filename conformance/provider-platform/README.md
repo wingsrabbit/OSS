@@ -12,6 +12,12 @@ envelopes for each operation. The Mock reliability profile additionally covers
 functional failure, duplicate events, out-of-order events, timeout-as-unknown,
 process restart, and query-only reconciliation for every capability.
 
+`runProviderManagementLifecycleConformance` is a pure, deterministic public
+contract check. It covers install, pause without new mutation side effects,
+resume, bounded credential-version overlap and expiry, manifest limit
+admission, uninstall blocking and drain, and final revoke while retaining
+query-only reconciliation. It requires no network or database.
+
 The Mock reliability profile uses `X-OSS-Lab-Scenario`. That header is a
 laboratory control and is deliberately absent from the public Provider schema.
 It cannot be used to add Provider-specific business fields to a real contract.
