@@ -440,13 +440,34 @@ function ticketItem(subject: string, suffix: string) {
   };
 }
 
+function staffTicketSummary(
+  subject: string,
+  suffix: string,
+  clientAccountId = accountA,
+  clientAccountName = "Account Alpha",
+) {
+  const item = ticketItem(subject, suffix);
+  return {
+    id: item.id,
+    subject: item.subject,
+    status: item.status,
+    service: null,
+    orderId: null,
+    authorizationPurpose: null,
+    department: { code: "general-support", name: "General Support" },
+    priority: "normal",
+    assignedStaffUserId: null,
+    clientAccount: { id: clientAccountId, name: clientAccountName },
+    publicMessageCount: item.publicMessageCount,
+    internalMessageCount: item.internalMessageCount,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  };
+}
+
 function staffTicketDetail(subject: string, suffix: string) {
   return {
-    ticket: {
-      ...ticketItem(subject, suffix),
-      service: null,
-      clientAccount: { id: accountA, name: "Account Alpha" },
-    },
+    ticket: staffTicketSummary(subject, suffix),
     messages: [{
       id: `00000000-0000-4000-8000-0000000013${suffix}`,
       authorType: "customer",
@@ -454,6 +475,27 @@ function staffTicketDetail(subject: string, suffix: string) {
       authorEmail: "account-alpha@example.invalid",
       body: "Synthetic customer opening message",
       createdAt: occurredAt,
+    }],
+    attachments: [],
+    statusHistory: [{
+      id: `00000000-0000-4000-8000-0000000014${suffix}`,
+      previousStatus: null,
+      status: "awaiting_staff",
+      actorType: "customer",
+      actorEmail: "account-alpha@example.invalid",
+      reason: "Synthetic customer opened the ticket",
+      occurredAt,
+    }],
+    assignmentHistory: [],
+    routingHistory: [{
+      id: `00000000-0000-4000-8000-0000000015${suffix}`,
+      department: { code: "general-support", name: "General Support", revision: 1 },
+      priority: "normal",
+      actorType: "customer",
+      actorEmail: "account-alpha@example.invalid",
+      sequence: 1,
+      reason: "Synthetic initial Support routing",
+      occurredAt,
     }],
   };
 }
@@ -686,6 +728,16 @@ function requestContractError(fact: RequestFact): string | null {
           params.get("clientAccountId") ?? "",
         ))
     ) return "invalid Staff Quote list query contract";
+  } else if (fact.path === "/api/v1/admin/tickets") {
+    const keys = [...params.keys()];
+    if (
+      keys.some((key) => key !== "clientAccountId") ||
+      new Set(keys).size !== keys.length ||
+      (params.has("clientAccountId") &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          params.get("clientAccountId") ?? "",
+        ))
+    ) return "invalid Staff ticket list query contract";
   } else if (fact.query !== "") {
     return `unexpected query string ${fact.query}`;
   }
@@ -909,14 +961,19 @@ function operationInterceptor(kind: OperationKind, includeBothAccounts: boolean)
       return true;
     }
     if (kind === "ticket" && path === "/api/v1/admin/tickets") {
+      const clientAccountId = new URL(route.request().url()).searchParams.get("clientAccountId");
+      const items = clientAccountId === accountA
+        ? [staffTicketSummary("Account Alpha ticket", "01")]
+        : clientAccountId === accountB
+          ? [staffTicketSummary("Account Beta ticket", "02", accountB, "Account Beta")]
+          : includeBothAccounts
+            ? [
+                staffTicketSummary("Account Alpha ticket", "01"),
+                staffTicketSummary("Account Beta ticket", "02", accountB, "Account Beta"),
+              ]
+            : [staffTicketSummary("Account Alpha ticket", "01")];
       await route.fulfill({
-        json: {
-          items: [{
-            ...ticketItem("Account Alpha ticket", "01"),
-            service: null,
-            clientAccount: { id: accountA, name: "Account Alpha" },
-          }],
-        },
+        json: { items },
       });
       return true;
     }
@@ -1101,6 +1158,18 @@ test("the operation mock fails closed on method, query, and body drift", () => {
     query: "",
     body: JSON.stringify({ password: "Synthetic!" }),
   })).toBeNull();
+  expect(requestContractError({
+    method: "GET",
+    path: "/api/v1/admin/tickets",
+    query: `?clientAccountId=${accountA}`,
+    body: null,
+  })).toBeNull();
+  expect(requestContractError({
+    method: "GET",
+    path: "/api/v1/admin/tickets",
+    query: "?clientAccountId=not-a-uuid",
+    body: null,
+  })).toContain("invalid Staff ticket list query contract");
 });
 
 for (const operation of fullAdminAccessChangeCases) {
@@ -1262,7 +1331,12 @@ for (const operation of operationCases) {
         ? ["/api/v1/admin/manual-fulfillment"]
         : operation.kind === "refund"
           ? [...refundReadPaths].sort()
-          : ["/api/v1/admin/tickets"];
+          : [
+              "/api/v1/admin/presales/inquiries",
+              "/api/v1/admin/support/departments",
+              "/api/v1/admin/tickets",
+              "/api/v1/admin/tickets/staff-options",
+            ];
     expect(adminGetPaths(requests)).toEqual(expected);
   });
 }
@@ -1290,9 +1364,18 @@ for (const operation of operationCases) {
     await actions.getByRole("button", { name: operation.action }).click();
 
     if (operation.kind === "ticket") {
-      await expect(page.getByTestId("staff-ticket-account-context")).toContainText(accountA);
+      await expect(page.getByTestId("staff-support-account-context")).toContainText(accountA);
       await expect(page.getByTestId("staff-ticket-list")).toContainText("Account Alpha ticket");
-      expect(adminGetPaths(requests)).not.toContain("/api/v1/admin/tickets");
+      const queueQueries = requests
+        .filter((request) =>
+          request.method === "GET" && request.path === "/api/v1/admin/tickets"
+        )
+        .map((request) => request.query);
+      expect(queueQueries).toContain("");
+      expect(queueQueries).toContain(`?clientAccountId=${accountA}`);
+      expect(queueQueries.every((query) =>
+        query === "" || query === `?clientAccountId=${accountA}`
+      )).toBe(true);
     } else {
       await expect(page.getByTestId("admin-operation-account-context")).toContainText(accountA);
     }
