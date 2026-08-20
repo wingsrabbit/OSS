@@ -30,6 +30,29 @@ if (!adminDatabaseUrl) {
 
 const admin = new pg.Client({ connectionString: adminDatabaseUrl });
 
+async function waitForDatabaseConnectionsToClose(
+  databaseName: string,
+  timeoutMilliseconds = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (true) {
+    const connections = await admin.query<{ count: string }>(
+      `SELECT pg_catalog.count(*)::text AS count
+       FROM pg_catalog.pg_stat_activity
+       WHERE datname = $1`,
+      [databaseName],
+    );
+    const count = Number(connections.rows[0]?.count ?? "0");
+    if (count === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Schema 026 database ${databaseName} still has ${count} connection(s) after pool shutdown`,
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 async function withFreshDatabase(
   label: string,
   run: (pool: DatabasePool) => Promise<void>,
@@ -49,13 +72,8 @@ async function withFreshDatabase(
     });
     await run(pool);
   } finally {
-    await pool?.end().catch(() => undefined);
-    await admin.query(
-      `SELECT pg_catalog.pg_terminate_backend(pid)
-       FROM pg_catalog.pg_stat_activity
-       WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()`,
-      [databaseName],
-    ).catch(() => undefined);
+    await pool?.end();
+    await waitForDatabaseConnectionsToClose(databaseName);
     await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
   }
 }
