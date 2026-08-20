@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const accountA = "00000000-0000-4000-8000-000000000401";
 const accountB = "00000000-0000-4000-8000-000000000402";
@@ -708,6 +712,7 @@ async function installApi(
   interceptor?: Interceptor,
 ): Promise<RequestFact[]> {
   const requests: RequestFact[] = [];
+  const notificationPreferences = notificationPreferencesMockState();
   await page.route("**/api/v1/**", async (rawRoute) => {
     const route = withStaffSessionContext(rawRoute);
     const request = route.request();
@@ -720,6 +725,12 @@ async function installApi(
       body: request.postData(),
     };
     requests.push(fact);
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: false,
+      adminTemplates:
+        permissions.includes("*") || permissions.includes("notifications.templates.read"),
+      preferenceState: notificationPreferences,
+    })) return;
     const contractError = requestContractError(fact);
     if (contractError) {
       unexpectedRequests.push(fact);

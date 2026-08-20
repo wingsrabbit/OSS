@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { api } from "./api.js";
 
 type Locale = "en" | "zh-CN";
@@ -40,6 +47,17 @@ type TemplateEvent = Readonly<{
 type TemplateRegistrySnapshot = Readonly<{
   events: TemplateEvent[];
 }>;
+
+type AccessScopeToken = Readonly<{
+  key: string;
+  generation: number;
+}>;
+
+type AccessScopeState = {
+  key: string;
+  generation: number;
+  mounted: boolean;
+};
 
 function displayTime(value: string | null, locale: Locale): string {
   if (!value) return "—";
@@ -89,43 +107,68 @@ export function NotificationTemplateRegistryPanel({
   const [password, setPassword] = useState("");
   const [actionReason, setActionReason] = useState("");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
-  const generation = useRef(0);
-  const mounted = useRef(false);
-  const fingerprintRef = useRef(accessFingerprint);
+  const scopeKey = JSON.stringify([
+    accessFingerprint,
+    active,
+    canRead,
+    canCreate,
+    canPublish,
+    canRetire,
+  ]);
+  const accessScope = useRef<AccessScopeState>({
+    key: scopeKey,
+    generation: 0,
+    mounted: false,
+  });
+  if (accessScope.current.key !== scopeKey) {
+    accessScope.current = {
+      key: scopeKey,
+      generation: accessScope.current.generation + 1,
+      mounted: accessScope.current.mounted,
+    };
+  }
+  const refreshGeneration = useRef(0);
   const localeRef = useRef(locale);
   const onNoticeRef = useRef(onNotice);
   const onErrorRef = useRef(onError);
-  fingerprintRef.current = accessFingerprint;
   localeRef.current = locale;
   onNoticeRef.current = onNotice;
   onErrorRef.current = onError;
 
-  const requestIsCurrent = useCallback((requestGeneration: number, fingerprint: string) => (
-    mounted.current &&
-    generation.current === requestGeneration &&
-    fingerprintRef.current === fingerprint
-  ), []);
+  const captureScope = useCallback(
+    (): AccessScopeToken => ({
+      key: accessScope.current.key,
+      generation: accessScope.current.generation,
+    }),
+    [],
+  );
+  const scopeIsCurrent = useCallback(
+    (scope: AccessScopeToken): boolean =>
+      accessScope.current.mounted &&
+      accessScope.current.key === scope.key &&
+      accessScope.current.generation === scope.generation,
+    [],
+  );
 
-  const refresh = useCallback(async (): Promise<boolean> => {
-    const requestGeneration = ++generation.current;
-    const fingerprint = accessFingerprint;
-    if (!active || !canRead) {
-      if (mounted.current) {
-        setSnapshot({ events: [] });
-        setLoading(false);
-      }
-      return false;
-    }
+  const refresh = useCallback(async (scope: AccessScopeToken): Promise<boolean> => {
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !active || !canRead) return false;
+    const requestGeneration = ++refreshGeneration.current;
     setLoading(true);
     try {
       const result = await api<TemplateRegistrySnapshot>(
         "/api/v1/admin/notification-templates",
       );
-      if (!requestIsCurrent(requestGeneration, fingerprint)) return false;
+      if (
+        !scopeIsCurrent(scope) ||
+        refreshGeneration.current !== requestGeneration
+      ) return false;
       setSnapshot(result);
       return true;
     } catch (caught) {
-      if (!requestIsCurrent(requestGeneration, fingerprint)) return false;
+      if (
+        !scopeIsCurrent(scope) ||
+        refreshGeneration.current !== requestGeneration
+      ) return false;
       setSnapshot({ events: [] });
       onErrorRef.current(
         caught instanceof Error
@@ -136,56 +179,65 @@ export function NotificationTemplateRegistryPanel({
       );
       return false;
     } finally {
-      if (requestIsCurrent(requestGeneration, fingerprint)) setLoading(false);
+      if (
+        scopeIsCurrent(scope) &&
+        refreshGeneration.current === requestGeneration
+      ) setLoading(false);
     }
   }, [
-    accessFingerprint,
     active,
-    canCreate,
-    canPublish,
     canRead,
-    canRetire,
-    requestIsCurrent,
+    scopeIsCurrent,
+    scopeKey,
   ]);
 
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-      generation.current += 1;
-    };
-  }, []);
-
-  useEffect(() => {
-    generation.current += 1;
+  useLayoutEffect(() => {
+    accessScope.current.mounted = true;
+    refreshGeneration.current += 1;
     setSnapshot({ events: [] });
     setLoading(false);
     setPassword("");
     setActionReason("");
     setPendingAction(null);
-    void refresh();
     return () => {
-      generation.current += 1;
+      refreshGeneration.current += 1;
+      accessScope.current = {
+        key: accessScope.current.key,
+        generation: accessScope.current.generation + 1,
+        mounted: false,
+      };
     };
-  }, [refresh]);
+  }, [scopeKey]);
+
+  useEffect(() => {
+    const scope = captureScope();
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !active || !canRead) return;
+    void refresh(scope);
+  }, [active, canRead, captureScope, refresh, scopeIsCurrent, scopeKey]);
 
   async function commit(
     actionKey: string,
     path: string,
     body: Record<string, unknown>,
   ): Promise<boolean> {
-    if (!active || !canRead || password.length === 0 || pendingAction !== null) return false;
-    const requestGeneration = ++generation.current;
-    const fingerprint = accessFingerprint;
+    const scope = captureScope();
+    if (
+      scope.key !== scopeKey ||
+      !scopeIsCurrent(scope) ||
+      !active ||
+      !canRead ||
+      password.length === 0 ||
+      pendingAction !== null
+    ) return false;
     setPendingAction(actionKey);
     try {
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password }),
       });
-      if (!requestIsCurrent(requestGeneration, fingerprint)) return false;
+      if (!scopeIsCurrent(scope)) return false;
       await api(path, { method: "POST", body: JSON.stringify(body) });
-      if (!requestIsCurrent(requestGeneration, fingerprint)) return false;
+      if (!scopeIsCurrent(scope)) return false;
       setPassword("");
       setActionReason("");
       onNoticeRef.current(
@@ -193,10 +245,11 @@ export function NotificationTemplateRegistryPanel({
           ? "通知模板事实已提交。"
           : "Notification template fact committed.",
       );
-      await refresh();
-      return mounted.current && fingerprintRef.current === fingerprint;
+      const refreshed = await refresh(scope);
+      if (!scopeIsCurrent(scope)) return false;
+      return refreshed;
     } catch (caught) {
-      if (!requestIsCurrent(requestGeneration, fingerprint)) return false;
+      if (!scopeIsCurrent(scope)) return false;
       onErrorRef.current(
         caught instanceof Error
           ? caught.message
@@ -206,7 +259,7 @@ export function NotificationTemplateRegistryPanel({
       );
       return false;
     } finally {
-      if (mounted.current && fingerprintRef.current === fingerprint) setPendingAction(null);
+      if (scopeIsCurrent(scope)) setPendingAction(null);
     }
   }
 

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 type MockViewer = {
   id: string;
@@ -111,6 +115,7 @@ async function installMockApi(
   } = {},
 ): Promise<string[]> {
   const requests: string[] = [];
+  const notificationPreferences = notificationPreferencesMockState();
   await page.route("**/api/v1/**", async (rawRoute) => {
     const viewer = currentMockViewer(viewerSource);
     const route = withViewerSessionContext(rawRoute, viewer);
@@ -119,6 +124,21 @@ async function installMockApi(
     requests.push(path);
 
     if (options.intercept && await options.intercept(path, route)) return;
+
+    const viewerStaffPermissions = Array.isArray(viewer?.staff?.permissions)
+      ? viewer.staff.permissions.filter((permission): permission is string => typeof permission === "string")
+      : [];
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences:
+        viewer?.verification.email === "passed" && viewer.restrictions.user === false,
+      adminTemplates:
+        viewer?.verification.email === "passed" &&
+        viewer.restrictions.user === false &&
+        viewer.staff !== null &&
+        (viewerStaffPermissions.includes("*") ||
+          viewerStaffPermissions.includes("notifications.templates.read")),
+      preferenceState: notificationPreferences,
+    })) return;
 
     if (path === "/api/v1/auth/me") {
       if (viewer) {

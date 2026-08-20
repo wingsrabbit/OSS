@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const clientAccountId = "00000000-0000-4000-8000-000000003101";
 const userId = "00000000-0000-4000-8000-000000003102";
@@ -262,6 +266,7 @@ test("Customer Quote preview and acceptance grant optional Marketing Consent, wh
   let acceptancePayload: Record<string, unknown> | null = null;
   let withdrawalPayload: Record<string, unknown> | null = null;
   const unexpected: string[] = [];
+  const notificationPreferences = notificationPreferencesMockState();
 
   const quote = () => ({
     quoteId,
@@ -300,6 +305,12 @@ test("Customer Quote preview and acceptance grant optional Marketing Consent, wh
     const request = route.request();
     const path = new URL(request.url()).pathname;
     const method = request.method();
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: true,
+      adminTemplates: false,
+      preferenceState: notificationPreferences,
+      headers: accountHeaders,
+    })) return;
     if (isSupportDepartmentsRequest(request, "authenticated")) {
       await fulfillJson(route, { items: [] }, { account: true });
       return;

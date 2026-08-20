@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const clientAccountId = "00000000-0000-4000-8000-000000002101";
 const userId = "00000000-0000-4000-8000-000000002102";
@@ -30,11 +34,18 @@ test("generic configurable Checkout previews exact pricing and keeps its one-tim
   let previewPayload: Record<string, unknown> | null = null;
   let orderPayload: Record<string, unknown> | null = null;
   let orderCreated = false;
+  const notificationPreferences = notificationPreferencesMockState();
 
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: true,
+      adminTemplates: false,
+      preferenceState: notificationPreferences,
+      headers: contextHeaders,
+    })) return;
 
     if (path === "/api/v1/auth/me") {
       await fulfillAccount(route, {

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type BrowserContext, type Page, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const accountId = "00000000-0000-4000-8000-000000000024";
 const userId = "00000000-0000-4000-8000-000000000124";
@@ -64,9 +68,16 @@ async function installIdentityApi(
   context: BrowserContext,
   state: MockIdentityState,
 ): Promise<void> {
+  const notificationPreferences = notificationPreferencesMockState();
   await context.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: state.authenticated,
+      adminTemplates: false,
+      preferenceState: notificationPreferences,
+      headers: identityHeaders(state),
+    })) return;
     if (path === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
       return;

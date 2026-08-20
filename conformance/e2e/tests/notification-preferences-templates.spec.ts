@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const accountId = "10000000-0000-4000-8000-000000000001";
 const sessionHeaders = {
@@ -16,6 +20,204 @@ const eventType = "notification.invoice_issued";
 const publishedRevisionId = "20000000-0000-4000-8000-000000000001";
 const draftRevisionId = "20000000-0000-4000-8000-000000000002";
 const olderDraftRevisionId = "20000000-0000-4000-8000-000000000003";
+
+const realAppLegal = {
+  requestedLocale: "en",
+  documents: Object.fromEntries(
+    ["terms", "aup", "privacy"].map((kind, index) => [
+      kind,
+      {
+        id: `30000000-0000-4000-8000-00000000000${index + 1}`,
+        documentId: `30000000-0000-4000-8000-00000000000${index + 1}`,
+        kind,
+        requestedLocale: "en",
+        locale: "en",
+        fallback: false,
+        revision: "1",
+        version: "notification-browser-v1",
+        title: `Synthetic ${kind}`,
+        body: "Normal Mock-only browser fixture.",
+        publishedAt: occurredAt,
+      },
+    ]),
+  ),
+};
+
+function realAppViewer(permissions: string[] | null) {
+  const customer = permissions === null;
+  return {
+    id: "30000000-0000-4000-8000-000000000010",
+    email: permissions === null
+      ? "notification-customer@example.invalid"
+      : "notification-staff@example.invalid",
+    locale: "en",
+    clientAccountId: customer ? accountId : null,
+    membershipRole: customer ? "owner" : null,
+    accountContextVersion: "1",
+    authorizationEpoch: "1",
+    context: customer
+      ? {
+          clientAccountId: accountId,
+          name: "Notification customer account",
+          role: "owner",
+          permissions: [],
+          capabilities: [],
+          version: "1",
+        }
+      : null,
+    verification: { email: "passed" },
+    restrictions: { user: false, clientAccount: false },
+    eligible: customer,
+    staff: permissions === null ? null : { roles: ["operations"], permissions },
+  };
+}
+
+async function fulfillRealAppShell(route: Route, viewer: ReturnType<typeof realAppViewer>) {
+  const request = route.request();
+  const url = new URL(request.url());
+  const authenticatedHeaders = viewer.clientAccountId ? accountHeaders : sessionHeaders;
+  if (request.method() === "GET" && url.pathname === "/api/v1/catalog") {
+    await route.fulfill({ json: { products: [] } });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/legal/current") {
+    await route.fulfill({ json: realAppLegal });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/content") {
+    await route.fulfill({ json: { requestedLocale: "en", items: [] } });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/customer/content") {
+    await route.fulfill({ headers: authenticatedHeaders, json: { requestedLocale: "en", items: [] } });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/auth/me") {
+    await route.fulfill({ headers: authenticatedHeaders, json: viewer });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/auth/account-contexts") {
+    await route.fulfill({
+      headers: authenticatedHeaders,
+      json: {
+        activeClientAccountId: viewer.clientAccountId,
+        accountContextVersion: "1",
+        items: viewer.context
+          ? [{
+              clientAccountId: viewer.context.clientAccountId,
+              name: viewer.context.name,
+              role: viewer.context.role,
+              permissions: viewer.context.permissions,
+              capabilities: viewer.context.capabilities,
+              restrictions: { membership: false, clientAccount: false },
+            }]
+          : [],
+        limit: 25,
+        hasMore: false,
+        nextCursor: null,
+      },
+    });
+    return true;
+  }
+  if (
+    request.method() === "GET" &&
+    url.pathname === "/api/v1/support/departments" &&
+    [...url.searchParams.keys()].length === 1 &&
+    url.searchParams.get("audience") === "presales"
+  ) {
+    await route.fulfill({ json: { items: [] } });
+    return true;
+  }
+  if (
+    request.method() === "GET" &&
+    url.pathname === "/api/v1/support/departments" &&
+    [...url.searchParams.keys()].length === 1 &&
+    url.searchParams.get("audience") === "authenticated"
+  ) {
+    await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/customer/business-history") {
+    await route.fulfill({
+      headers: authenticatedHeaders,
+      json: {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        account: { id: accountId, name: "Notification customer account" },
+        orders: [],
+        invoices: [],
+        payments: [],
+        credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+        refunds: [],
+        services: [],
+        renewals: [],
+        cancellations: [],
+        tickets: [],
+      },
+    });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/billing/summary") {
+    await route.fulfill({
+      headers: authenticatedHeaders,
+      json: {
+        currency: "USD",
+        creditBalanceMinor: "0",
+        paymentMethods: [],
+        addFunds: {
+          enabled: false,
+          allowed: false,
+          minimumMinor: "100",
+          maximumMinor: "10000",
+          balanceCapMinor: "10000",
+        },
+      },
+    });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/billing/payment-settings") {
+    await route.fulfill({
+      headers: authenticatedHeaders,
+      json: {
+        defaults: { savePaymentMethod: false, automaticRenewal: false },
+        consentVersions: { savePaymentMethod: "mock-v1", automaticRenewal: "mock-v1" },
+        methods: [],
+        automaticRenewals: [],
+        pendingAutomaticRenewals: [],
+        serviceDecisions: [],
+      },
+    });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/billing/renewals") {
+    await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
+    return true;
+  }
+  if (request.method() === "GET" && url.pathname === "/api/v1/billing/chargeback-status") {
+    await route.fulfill({
+      headers: authenticatedHeaders,
+      json: {
+        clientAccountId: accountId,
+        restricted: false,
+        creditBalanceMinor: "0",
+        debtBalanceMinor: "0",
+        chargebacks: [],
+        unclaimedChargebacks: [],
+        manualHolds: [],
+      },
+    });
+    return true;
+  }
+  if (
+    request.method() === "GET" &&
+    (url.pathname === "/api/v1/orders" ||
+      url.pathname === "/api/v1/tickets" ||
+      url.pathname === "/api/v1/tickets/service-options")
+  ) {
+    await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
+    return true;
+  }
+  return false;
+}
 
 type PreferenceState = {
   billingEnabled: boolean;
@@ -476,4 +678,126 @@ test("a late preference response from the previous subject cannot replace the cu
   await expect(panel.getByTestId("notification-preference-billing")).toContainText("Current subject billing");
   await expect(panel).not.toContainText("Previous subject");
   expect(getCount).toBe(2);
+});
+
+test("real App customer mounts personal preferences and persists one optional category", async ({ page }) => {
+  const viewer = realAppViewer(null);
+  const state = notificationPreferencesMockState();
+  state.versions.billing = 4n;
+  const unexpected: string[] = [];
+  let preferenceGets = 0;
+  let preferencePuts = 0;
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/v1/customer/notification-preferences") preferenceGets += 1;
+    if (path === "/api/v1/customer/notification-preferences/billing/email") preferencePuts += 1;
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: true,
+      adminTemplates: false,
+      preferenceState: state,
+      headers: accountHeaders,
+    })) return;
+    if (await fulfillRealAppShell(route, viewer)) return;
+    unexpected.push(`${request.method()} ${path}`);
+    await route.fulfill({ status: 500, headers: sessionHeaders, json: { error: `Unexpected ${path}` } });
+  });
+
+  await page.goto("/customer");
+  const panel = page.getByTestId("notification-preferences");
+  await expect(panel).toBeVisible();
+  await panel.getByTestId("notification-preference-billing").getByRole("checkbox").uncheck();
+  await expect(panel.getByTestId("notification-preference-billing")).toContainText("version 5");
+  expect(preferenceGets).toBeGreaterThanOrEqual(1);
+  expect(preferencePuts).toBe(1);
+  expect(unexpected).toEqual([]);
+});
+
+test("real App Staff mounts only the read-authorized notification template registry", async ({ page }) => {
+  const viewer = realAppViewer(["notifications.templates.read"]);
+  const preferenceState = notificationPreferencesMockState();
+  const unexpected: string[] = [];
+  let registryGets = 0;
+  let customerPreferenceRequests = 0;
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/v1/admin/notification-templates") registryGets += 1;
+    if (path.startsWith("/api/v1/customer/notification-preferences")) {
+      customerPreferenceRequests += 1;
+    }
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: false,
+      adminTemplates: true,
+      preferenceState,
+      headers: sessionHeaders,
+      templateRegistry: registry("initial"),
+    })) return;
+    if (await fulfillRealAppShell(route, viewer)) return;
+    unexpected.push(`${request.method()} ${path}`);
+    await route.fulfill({ status: 500, headers: sessionHeaders, json: { error: `Unexpected ${path}` } });
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("notification-template-registry");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText(eventType);
+  await expect(panel.getByTestId("notification-template-create")).toHaveCount(0);
+  await expect(page.getByTestId("notification-operations")).toHaveCount(0);
+  expect(registryGets).toBeGreaterThanOrEqual(1);
+  expect(customerPreferenceRequests).toBe(0);
+  expect(unexpected).toEqual([]);
+});
+
+test("real App route leave invalidates pending template reauthentication before publication", async ({ page }) => {
+  const viewer = realAppViewer([
+    "notifications.templates.read",
+    "notifications.templates.publish",
+  ]);
+  let markReauthStarted!: () => void;
+  let releaseReauth!: () => void;
+  const reauthStarted = new Promise<void>((resolve) => { markReauthStarted = resolve; });
+  const reauthGate = new Promise<void>((resolve) => { releaseReauth = resolve; });
+  let publishPosts = 0;
+  const unexpected: string[] = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "GET" && path === "/api/v1/admin/notification-templates") {
+      await route.fulfill({ headers: sessionHeaders, json: registry("draft") });
+      return;
+    }
+    if (request.method() === "POST" && path === "/api/v1/auth/reauth") {
+      markReauthStarted();
+      await reauthGate;
+      await route.fulfill({ headers: sessionHeaders, json: { expiresAt: "2026-08-20T09:15:00.000Z" } });
+      return;
+    }
+    if (request.method() === "POST" && path.endsWith(`/revisions/${draftRevisionId}/publish`)) {
+      publishPosts += 1;
+      await route.fulfill({ status: 201, headers: sessionHeaders, json: { committed: true } });
+      return;
+    }
+    if (await fulfillRealAppShell(route, viewer)) return;
+    unexpected.push(`${request.method()} ${path}`);
+    await route.fulfill({ status: 500, headers: sessionHeaders, json: { error: `Unexpected ${path}` } });
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("notification-template-registry");
+  await expect(panel).toBeVisible();
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Template-Password!");
+  await panel.getByLabel("Publication or retirement reason").fill("Publish reviewed revision");
+  await panel.getByRole("button", { name: "Publish revision" }).click();
+  await reauthStarted;
+
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByTestId("notification-template-registry")).toHaveCount(0);
+  releaseReauth();
+  await page.waitForTimeout(100);
+
+  expect(publishPosts).toBe(0);
+  await expect(page.locator("main > .notice")).toHaveCount(0);
+  expect(unexpected).toEqual([]);
 });

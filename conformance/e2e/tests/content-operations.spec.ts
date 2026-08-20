@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const contentEntryId = "10000000-0000-4000-8000-000000000001";
 const contentRevisionId = "10000000-0000-4000-8000-000000000002";
@@ -140,6 +144,7 @@ async function routeCommon(
     admin?: (route: Route, path: string) => Promise<boolean>;
   }> = {},
 ) {
+  const notificationPreferences = notificationPreferencesMockState();
   await page.route("**/api/v1/**", async (route) => {
     const requestUrl = new URL(route.request().url());
     const path = requestUrl.pathname;
@@ -148,6 +153,14 @@ async function routeCommon(
       ? {}
       : establishedSessionHeaders;
     if (options.admin && await options.admin(route, path)) return;
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: options.permissions !== undefined,
+      adminTemplates:
+        options.permissions?.includes("*") === true ||
+        options.permissions?.includes("notifications.templates.read") === true,
+      preferenceState: notificationPreferences,
+      headers: sessionHeaders,
+    })) return;
     if (path === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
       return;
@@ -250,10 +263,17 @@ test("the saved User locale survives Customer refresh and a persisted language c
 
 test("login adopts the saved User locale before rendering its success notice", async ({ page }) => {
   let signedIn = false;
+  const notificationPreferences = notificationPreferencesMockState();
   await page.route("**/api/v1/**", async (route) => {
     const requestUrl = new URL(route.request().url());
     const path = requestUrl.pathname;
     const locale = requestUrl.searchParams.get("locale") === "zh-CN" ? "zh-CN" : "en";
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: signedIn,
+      adminTemplates: false,
+      preferenceState: notificationPreferences,
+      headers: establishedSessionHeaders,
+    })) return;
     if (path === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
       return;

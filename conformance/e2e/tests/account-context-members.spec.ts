@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Request, type Route } from "@playwright/test";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 const accountA = "00000000-0000-4000-8000-000000001901";
 const accountB = "00000000-0000-4000-8000-000000001902";
@@ -300,6 +304,7 @@ async function installMockApi(
   } = {},
 ): Promise<SeenRequest[]> {
   const seen: SeenRequest[] = [];
+  const notificationPreferences = notificationPreferencesMockState();
   await pageInstance.route("**/api/v1/**", async (rawRoute) => {
     const route = withAuthorizationEpoch(rawRoute, state.authorizationEpoch);
     const request = route.request();
@@ -313,6 +318,23 @@ async function installMockApi(
     seen.push(fact);
     if (options.intercept && await options.intercept(url.pathname, route, seen)) return;
     const authenticatedHeaders = options.omitContextHeaders ? {} : headers(state);
+    const notificationHeaders = options.omitContextHeaders
+      ? {}
+      : headers({
+          ...state,
+          version: state.activeId === null ? "0" : state.version,
+        });
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences: state.authenticated && !state.userRestricted,
+      adminTemplates:
+        state.authenticated &&
+        !state.userRestricted &&
+        state.staffPermissions !== null &&
+        (state.staffPermissions.includes("*") ||
+          state.staffPermissions.includes("notifications.templates.read")),
+      preferenceState: notificationPreferences,
+      headers: notificationHeaders,
+    })) return;
 
     if (url.pathname === "/api/v1/catalog") {
       await route.fulfill({ json: { products: [] } });
@@ -2150,6 +2172,9 @@ test("invitation deep link never verifies email, survives 409 login, retries, th
   await browserPage.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(browserPage.getByText("Temporary Mock Provider failure")).toBeVisible();
   expect(new URL(browserPage.url()).searchParams.get("token")).toBe(invitationToken);
+  expect(seen.filter((fact) =>
+    fact.path.startsWith("/api/v1/customer/notification-preferences")
+  )).toHaveLength(0);
   await browserPage.getByRole("button", { name: "Retry invitation acceptance" }).click();
   await expect(browserPage).toHaveURL(/\/customer$/);
   await expect(browserPage.getByTestId("account-context-switcher")).toContainText("Invited Beta");
@@ -2299,6 +2324,9 @@ test("a brand-new invited email creates only an identity, verifies in place, acc
   await browserPage.getByRole("button", { name: "Open my Mock Provider mailbox" }).click();
   await expect(browserPage.getByText("Current membership invitation link (already open)")).toBeVisible();
   await expect(browserPage.getByRole("link", { name: "Use one-time verification link" })).toHaveCount(1);
+  expect(seen.filter((fact) =>
+    fact.path.startsWith("/api/v1/customer/notification-preferences")
+  )).toHaveLength(0);
   await browserPage.getByRole("link", { name: "Use one-time verification link" }).click();
 
   await expect(browserPage).toHaveURL(/\/customer$/);

@@ -4928,7 +4928,7 @@ export function App() {
           />
         )}
 
-        {route === "/customer" && sessionResolved && me && (
+        {route === "/customer" && sessionResolved && me && !membershipInvitationToken && (
           <NotificationPreferencesPanel
             active={route === "/customer"}
             locale={locale}
