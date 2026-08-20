@@ -4,7 +4,8 @@
 
 This runbook covers release-candidate backup evidence and a deliberately non-executing blank-restore
 plan for the disposable OpenSales System laboratory. It supports the `TestA` Core/Staging profile,
-the `TestB` Provider Lab profile, and a combined `local` fixture profile. It does not authorize a
+the `TestB` Provider Lab profile, a combined five-database `local` fixture profile, and the four-
+database `DemoLocal` launcher topology. It does not authorize a
 production deployment, remote-host access, DNS changes, vulnerability scanning, or destructive
 recovery against a populated database.
 
@@ -30,10 +31,12 @@ their SHA-256 digests live in that database, so the Core custom-format dump incl
 capture, `create` refuses an attachment row whose database-native size or digest check fails.
 
 `TestB` contains the separate Mock payment, provisioning, mail/mailbox, and six-capability Provider
-Platform PostgreSQL databases. `local` contains all five databases. A profile also has one encrypted
-configuration/credential bundle. The bundle must contain the revision-matched runtime configuration,
-Compose inputs, and credential material required by that profile; do not put a plaintext copy in the
-backup directory.
+Platform PostgreSQL databases. `local` contains all five databases. `DemoLocal` matches
+`tools/demo-local.mjs`: Provider Platform shares `provisioning_provider`, while mailbox shares
+`mail_provider`, so the physical inventory is Core plus three Provider databases. A profile also has
+one encrypted configuration/credential bundle. The bundle must contain the revision-matched runtime
+configuration, Compose inputs, and credential material required by that profile; do not put a
+plaintext copy in the backup directory.
 
 The manifest records only opaque, non-secret configuration and credential-set version identifiers.
 It binds those identifiers to the release commit and profile with a SHA-256 digest. It never records
@@ -68,6 +71,10 @@ Before either profile is captured:
 | `TestB` | Mock provisioning | `LAB_RC_PROVIDER_PROVISIONING_` |
 | `TestB` | Mock mail/mailbox | `LAB_RC_PROVIDER_MAIL_` |
 | `TestB` | Mock Provider Platform | `LAB_RC_PROVIDER_PLATFORM_` |
+| `DemoLocal` | Core | `LAB_RC_CORE_` |
+| `DemoLocal` | Mock payment | `LAB_RC_PROVIDER_PAYMENT_` |
+| `DemoLocal` | Mock provisioning and Provider Platform (shared database) | `LAB_RC_PROVIDER_PROVISIONING_` |
+| `DemoLocal` | Mock mail and mailbox (shared database) | `LAB_RC_PROVIDER_MAIL_` |
 
 For each prefix, provide either `PGSERVICE` plus an explicit `PGSERVICEFILE`, or `PGHOST`, `PGUSER`,
 and `PGDATABASE`. Optional libpq fields include `PGPORT`, `PGPASSWORD`, `PGPASSFILE`, and the
@@ -93,7 +100,9 @@ tar -C "$LAB_RC_PRIVATE_CONFIG_ROOT" -cf - . | \
 ```
 
 Use `--profile TestB` with the four Provider prefixes for the Provider Lab. Use `local` only for a
-combined local fixture exercise. If any inspection, dump, or encryption process fails, `create`
+combined five-database fixture exercise. Use `DemoLocal` only for the physical database layout
+created by `tools/demo-local.mjs`; do not provide a separate Provider Platform prefix for that
+profile. If any inspection, dump, or encryption process fails, `create`
 removes the newly created incomplete output directory and reports only the affected logical
 component; it does not print child stderr.
 

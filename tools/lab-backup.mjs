@@ -68,6 +68,24 @@ const PROFILES = Object.freeze({
     DATABASES["provider-platform"],
   ]),
   local: Object.freeze(Object.values(DATABASES)),
+  DemoLocal: Object.freeze([
+    DATABASES.core,
+    DATABASES["provider-payment"],
+    Object.freeze({
+      ...DATABASES["provider-provisioning"],
+      contents: Object.freeze([
+        "Mock provisioning provider PostgreSQL 18",
+        "six-capability Mock Provider Platform PostgreSQL 18 (shared Demo-local database)",
+      ]),
+    }),
+    Object.freeze({
+      ...DATABASES["provider-mail"],
+      contents: Object.freeze([
+        "Mock mail provider PostgreSQL 18",
+        "Mock mailbox PostgreSQL 18 (shared Demo-local database)",
+      ]),
+    }),
+  ]),
 });
 
 const LIBPQ_SUFFIXES = Object.freeze([
@@ -106,7 +124,8 @@ export function normalizeProfile(value) {
   if (normalized === "testa") return "TestA";
   if (normalized === "testb") return "TestB";
   if (normalized === "local") return "local";
-  fail("profile must be TestA, TestB, or local");
+  if (normalized === "demolocal") return "DemoLocal";
+  fail("profile must be TestA, TestB, local, or DemoLocal");
 }
 
 function parseIso(value, label) {
@@ -551,7 +570,7 @@ export function validateManifest(manifest) {
     }
     assertArtifactName(database.artifact);
   }
-  if (profile === "TestA" || profile === "local") {
+  if (profile === "TestA" || profile === "local" || profile === "DemoLocal") {
     const core = databases.find(({ id }) => id === "core");
     if (!core?.attachmentInventory || core.attachmentInventory.invalid !== 0) {
       fail("core attachment inventory is absent or invalid");
@@ -936,7 +955,7 @@ function requireOption(values, name) {
 function usage() {
   return `OpenSales laboratory RC backup (mock-only)
 
-create --profile TestA|TestB|local --output DIR --age-recipient RECIPIENT \\
+create --profile TestA|TestB|local|DemoLocal --output DIR --age-recipient RECIPIENT \\
   --configuration-version ID --credential-set-version ID --paused-at ISO8601
   Reads the configuration/credential bundle from stdin. Database libpq fields come from
   LAB_RC_<COMPONENT>_PG* environment variables; database URLs are rejected.

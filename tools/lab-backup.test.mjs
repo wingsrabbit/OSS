@@ -130,11 +130,19 @@ function databaseEnv(prefix, database) {
 function manifest(profile = "TestA") {
   const databaseIds = profile === "TestB"
     ? ["provider-payment", "provider-provisioning", "provider-mail", "provider-platform"]
-    : ["core"];
+    : profile === "local"
+      ? ["core", "provider-payment", "provider-provisioning", "provider-mail", "provider-platform"]
+      : profile === "DemoLocal"
+        ? ["core", "provider-payment", "provider-provisioning", "provider-mail"]
+        : ["core"];
   const databases = databaseIds.map((id) => ({
     id,
-    ownerProfile: profile,
-    contents: [id],
+    ownerProfile: id === "core" ? "TestA" : "TestB",
+    contents: profile === "DemoLocal" && id === "provider-provisioning"
+      ? ["provider-provisioning", "provider-platform-shared"]
+      : profile === "DemoLocal" && id === "provider-mail"
+        ? ["provider-mail", "provider-mailbox-shared"]
+        : [id],
     artifact: `artifacts/${id}.dump.age`,
     serverVersionNumber: 180002,
     schemaHistory: { kind: id === "core" ? "migration-history" : "table-inventory", versions: ["fixture"] },
@@ -195,13 +203,16 @@ function manifest(profile = "TestA") {
   };
 }
 
-test("profiles normalize without broadening TestA or TestB", () => {
+test("profiles normalize to exact reviewed database inventories", () => {
   assert.equal(normalizeProfile("test-a"), "TestA");
   assert.equal(normalizeProfile("TestB"), "TestB");
+  assert.equal(normalizeProfile("demo-local"), "DemoLocal");
   assert.throws(() => normalizeProfile("production"), /profile must be/);
   assert.equal(validateManifest(manifest("TestB")).databases.length, 4);
   assertSchemaValid(manifest("TestA"));
   assertSchemaValid(manifest("TestB"));
+  assertSchemaValid(manifest("local"));
+  assertSchemaValid(manifest("DemoLocal"));
   const extraField = structuredClone(manifest("TestA"));
   extraField.release.unreviewed = true;
   assert.equal(validateManifestSchema(extraField), false);
@@ -211,6 +222,51 @@ test("profiles normalize without broadening TestA or TestB", () => {
   const providerWithAttachments = structuredClone(manifest("TestB"));
   providerWithAttachments.databases[0].attachmentInventory = { count: 0, totalBytes: 0, invalid: 0 };
   assert.equal(validateManifestSchema(providerWithAttachments), false);
+});
+
+test("DemoLocal profile records the launcher's four physical databases and shared Provider contents", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-lab-backup-demo-local-"));
+  const output = join(directory, "backup");
+  try {
+    const toolEnv = fakeTools(directory);
+    const repositoryRoot = cleanRepository(directory);
+    const env = {
+      ...process.env,
+      ...toolEnv,
+      ...databaseEnv("LAB_RC_CORE", "oss_fixture"),
+      ...databaseEnv("LAB_RC_PROVIDER_PAYMENT", "payment_fixture"),
+      ...databaseEnv("LAB_RC_PROVIDER_PROVISIONING", "provisioning_fixture"),
+      ...databaseEnv("LAB_RC_PROVIDER_MAIL", "mail_fixture"),
+    };
+    const result = await createBackup({
+      profile: "DemoLocal",
+      output,
+      recipient: "age1fixturefixturefixturefixturefixturefixturefixture",
+      configurationVersion: "demo-local-config-fixture-1",
+      credentialSetVersion: "demo-local-credential-fixture-1",
+      pausedAt: new Date(Date.now() - 1_000).toISOString(),
+      repositoryRoot,
+      env,
+      stdin: [Buffer.from("private Demo-local fixture configuration")],
+    });
+    assert.deepEqual(
+      result.databases.map(({ id }) => id),
+      ["core", "provider-payment", "provider-provisioning", "provider-mail"],
+    );
+    assert.match(
+      result.databases.find(({ id }) => id === "provider-provisioning").contents.join(" "),
+      /Provider Platform/,
+    );
+    assert.match(
+      result.databases.find(({ id }) => id === "provider-mail").contents.join(" "),
+      /mailbox/,
+    );
+    assert.equal(result.artifacts.length, 5);
+    assertSchemaValid(result);
+    assert.equal((await verifyBackup({ archive: output, deep: false, env })).status, "verified");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("database environment rejects URLs and maps only component-scoped libpq fields", () => {

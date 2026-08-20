@@ -20,7 +20,7 @@
     "format": { "const": "opensales-lab-rc-backup/v1" },
     "warning": { "const": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY" },
     "status": { "const": "complete" },
-    "profile": { "enum": ["TestA", "TestB", "local"] },
+    "profile": { "enum": ["TestA", "TestB", "local", "DemoLocal"] },
     "release": {
       "type": "object",
       "additionalProperties": false,
