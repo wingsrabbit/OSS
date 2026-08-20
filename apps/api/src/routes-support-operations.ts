@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
@@ -17,6 +17,7 @@ import {
   type DatabaseClient,
   type DatabasePool,
 } from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
 import {
   requireStaffActionLocked,
   requireStaffPermission,
@@ -39,6 +40,7 @@ const departmentRevisionBody = z
     acceptsAuthenticated: z.boolean().default(true),
     acceptsPresales: z.boolean().default(false),
     reason: z.string().trim().min(1).max(1_000).optional(),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -51,6 +53,7 @@ const assignTicketBody = z
   .object({
     assignedStaffUserId: canonicalUuid.nullable(),
     reason: z.string().trim().min(1).max(1_000),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -59,6 +62,7 @@ const routeTicketBody = z
     departmentCode,
     priority,
     reason: z.string().trim().min(1).max(1_000),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -66,6 +70,7 @@ const statusBody = z
   .object({
     status: z.enum(["awaiting_staff", "closed"]),
     reason: z.string().trim().min(1).max(1_000),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -88,6 +93,7 @@ const attachmentBody = z
       "image/jpeg",
     ]),
     contentBase64: z.string().min(1).max(1_400_000),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -121,17 +127,22 @@ const presalesCreateBody = z
     subject: z.string().trim().min(3).max(160),
     message: z.string().trim().min(1).max(10_000),
     departmentCode: departmentCode.default("general-support"),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
 const presalesReplyBody = z
-  .object({ message: z.string().trim().min(1).max(10_000) })
+  .object({
+    message: z.string().trim().min(1).max(10_000),
+    idempotencyKey: canonicalUuid.optional(),
+  })
   .strict();
 
 const staffPresalesMessageBody = z
   .object({
     kind: z.enum(["public_reply", "internal_note"]),
     message: z.string().trim().min(1).max(10_000),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -140,6 +151,14 @@ function requestError(message: string, statusCode: number, code?: string): Error
     statusCode,
     ...(code ? { code } : {}),
   });
+}
+
+function idempotencyConflict(resource: string): never {
+  throw requestError(
+    `This idempotency key was already used for a different ${resource}`,
+    409,
+    "IDEMPOTENCY_CONFLICT",
+  );
 }
 
 function digestToken(token: string): Buffer {
@@ -182,6 +201,238 @@ function attachmentShape(body: z.infer<typeof attachmentBody>) {
   };
 }
 
+async function assertAssignmentReplay(
+  client: DatabaseClient,
+  input: Readonly<{
+    eventId: string;
+    ticketId: string;
+    assignedStaffUserId: string | null;
+    actorStaffUserId: string;
+    reason: string;
+  }>,
+): Promise<boolean> {
+  const result = await client.query<{
+    ticket_id: string;
+    assigned_staff_user_id: string | null;
+    actor_staff_user_id: string;
+    reason: string;
+  }>(
+    `SELECT ticket_id, assigned_staff_user_id, actor_staff_user_id, reason
+     FROM support_ticket_assignment_events WHERE id = $1`,
+    [input.eventId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.ticket_id !== input.ticketId ||
+    existing.assigned_staff_user_id !== input.assignedStaffUserId ||
+    existing.actor_staff_user_id !== input.actorStaffUserId ||
+    existing.reason !== input.reason
+  ) idempotencyConflict("Support assignment");
+  return true;
+}
+
+async function assertRoutingReplay(
+  client: DatabaseClient,
+  input: Readonly<{
+    eventId: string;
+    ticketId: string;
+    departmentCode: string;
+    priority: z.infer<typeof priority>;
+    actorStaffUserId: string;
+    reason: string;
+  }>,
+): Promise<boolean> {
+  const result = await client.query<{
+    ticket_id: string;
+    department_code: string;
+    priority: z.infer<typeof priority>;
+    actor_staff_user_id: string;
+    reason: string;
+  }>(
+    `SELECT event.ticket_id, department.code::text AS department_code,
+            event.priority, event.actor_staff_user_id, event.reason
+     FROM support_ticket_routing_events event
+     JOIN support_department_revisions revision
+       ON revision.id = event.department_revision_id
+     JOIN support_departments department ON department.id = revision.department_id
+     WHERE event.id = $1`,
+    [input.eventId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.ticket_id !== input.ticketId ||
+    existing.department_code !== input.departmentCode ||
+    existing.priority !== input.priority ||
+    existing.actor_staff_user_id !== input.actorStaffUserId ||
+    existing.reason !== input.reason
+  ) idempotencyConflict("Support routing event");
+  return true;
+}
+
+async function assertTicketStatusReplay(
+  client: DatabaseClient,
+  input: Readonly<{
+    eventId: string;
+    ticketId: string;
+    status: z.infer<typeof ticketStatus>;
+    actorType: "customer" | "staff";
+    actorUserId: string;
+    reason: string;
+  }>,
+): Promise<boolean> {
+  const result = await client.query<{
+    ticket_id: string;
+    status: z.infer<typeof ticketStatus>;
+    actor_type: string;
+    actor_user_id: string | null;
+    reason: string;
+  }>(
+    `SELECT ticket_id, status, actor_type, actor_user_id, reason
+     FROM support_ticket_status_events WHERE id = $1`,
+    [input.eventId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.ticket_id !== input.ticketId ||
+    existing.status !== input.status ||
+    existing.actor_type !== input.actorType ||
+    existing.actor_user_id !== input.actorUserId ||
+    existing.reason !== input.reason
+  ) idempotencyConflict("Support status event");
+  return true;
+}
+
+async function assertAttachmentReplay(
+  client: DatabaseClient,
+  input: Readonly<{
+    attachmentId: string;
+    ticketId: string;
+    messageId: string;
+    uploadedByUserId: string;
+    uploadedByType: "customer" | "staff";
+    visibility: "public" | "internal";
+    filename: string;
+    extension: string;
+    contentType: string;
+    content: Buffer;
+    sha256: Buffer;
+  }>,
+): Promise<boolean> {
+  const result = await client.query<{
+    ticket_id: string;
+    message_id: string;
+    uploaded_by_user_id: string;
+    uploaded_by_type: "customer" | "staff";
+    visibility: "public" | "internal";
+    original_filename: string;
+    extension: string;
+    declared_content_type: string;
+    size_bytes: number;
+    sha256: Buffer;
+    content: Buffer;
+  }>(
+    `SELECT ticket_id, message_id, uploaded_by_user_id, uploaded_by_type,
+            visibility, original_filename, extension, declared_content_type,
+            size_bytes, sha256, content
+     FROM support_ticket_attachments WHERE id = $1`,
+    [input.attachmentId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.ticket_id !== input.ticketId ||
+    existing.message_id !== input.messageId ||
+    existing.uploaded_by_user_id !== input.uploadedByUserId ||
+    existing.uploaded_by_type !== input.uploadedByType ||
+    existing.visibility !== input.visibility ||
+    existing.original_filename !== input.filename ||
+    existing.extension !== input.extension ||
+    existing.declared_content_type !== input.contentType ||
+    existing.size_bytes !== input.content.length ||
+    !existing.sha256.equals(input.sha256) ||
+    !existing.content.equals(input.content)
+  ) idempotencyConflict("Support attachment");
+  return true;
+}
+
+async function assertPresalesMessageReplay(
+  client: DatabaseClient,
+  input: Readonly<{
+    messageId: string;
+    inquiryId: string;
+    authorType: "visitor" | "staff";
+    authorUserId: string | null;
+    visibility: "public" | "internal";
+    body: string;
+  }>,
+): Promise<boolean> {
+  const result = await client.query<{
+    inquiry_id: string;
+    author_type: "visitor" | "staff";
+    author_user_id: string | null;
+    visibility: "public" | "internal";
+    body: string;
+  }>(
+    `SELECT inquiry_id, author_type, author_user_id, visibility, body
+     FROM presales_inquiry_messages WHERE id = $1`,
+    [input.messageId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.inquiry_id !== input.inquiryId ||
+    existing.author_type !== input.authorType ||
+    existing.author_user_id !== input.authorUserId ||
+    existing.visibility !== input.visibility ||
+    existing.body !== input.body
+  ) idempotencyConflict("Presales message");
+  return true;
+}
+
+async function assertPresalesStatusReplay(
+  client: DatabaseClient,
+  input: Readonly<{
+    eventId: string;
+    inquiryId: string;
+    status: z.infer<typeof presalesStatus>;
+    actorUserId: string;
+    reason: string;
+  }>,
+): Promise<boolean> {
+  const result = await client.query<{
+    inquiry_id: string;
+    status: z.infer<typeof presalesStatus>;
+    actor_type: string;
+    actor_user_id: string | null;
+    reason: string;
+  }>(
+    `SELECT inquiry_id, status, actor_type, actor_user_id, reason
+     FROM presales_inquiry_status_events WHERE id = $1`,
+    [input.eventId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.inquiry_id !== input.inquiryId ||
+    existing.status !== input.status ||
+    existing.actor_type !== "staff" ||
+    existing.actor_user_id !== input.actorUserId ||
+    existing.reason !== input.reason
+  ) idempotencyConflict("Presales status event");
+  return true;
+}
+
+function stablePresalesAccessToken(config: Config, idempotencyKey?: string): string {
+  if (!idempotencyKey) return randomBytes(32).toString("base64url");
+  return createHmac("sha256", config.IDENTITY_SECRET_KEY)
+    .update("opensales:presales-access:v1\0")
+    .update(idempotencyKey)
+    .digest("base64url");
+}
+
 async function transitionTicket(
   client: DatabaseClient,
   input: Readonly<{
@@ -191,10 +442,11 @@ async function transitionTicket(
     actorType: "customer" | "staff";
     actorUserId: string;
     reason: string;
+    eventId?: string;
   }>,
 ): Promise<void> {
   if (input.status === input.previousStatus) return;
-  const eventId = randomUUID();
+  const eventId = input.eventId ?? randomUUID();
   await client.query(
     `INSERT INTO support_ticket_status_events(
        id, ticket_id, previous_status, status,
@@ -229,6 +481,7 @@ async function transitionPresales(
     actorType: "visitor" | "staff";
     actorUserId: string | null;
     reason: string;
+    eventId?: string;
   }>,
 ): Promise<void> {
   if (input.status === input.previousStatus) {
@@ -241,7 +494,7 @@ async function transitionPresales(
     );
     return;
   }
-  const eventId = randomUUID();
+  const eventId = input.eventId ?? randomUUID();
   await client.query(
     `INSERT INTO presales_inquiry_status_events(
        id, inquiry_id, previous_status, status,
@@ -372,10 +625,43 @@ export async function registerSupportOperationRoutes(
     const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const body = createDepartmentBody.parse(request.body);
-    const id = randomUUID();
-    const revisionId = randomUUID();
+    const id = body.idempotencyKey ?? randomUUID();
+    const revisionId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       await requireStaffActionLocked(client, user, "support.tickets.manage");
+      if (body.idempotencyKey) {
+        const existing = await client.query<{
+          code: string;
+          name: string | null;
+          description: string | null;
+          accepts_authenticated: boolean | null;
+          accepts_presales: boolean | null;
+          created_by_staff_user_id: string | null;
+        }>(
+          `SELECT department.code::text, revision.name, revision.description,
+                  revision.accepts_authenticated, revision.accepts_presales,
+                  revision.created_by_staff_user_id
+           FROM support_departments department
+           LEFT JOIN support_department_revisions revision
+             ON revision.id = $1 AND revision.department_id = department.id
+           WHERE department.id = $1`,
+          [id],
+        );
+        const previous = existing.rows[0];
+        if (previous) {
+          if (
+            previous.code !== body.code ||
+            previous.name !== body.name ||
+            previous.description !== body.description ||
+            previous.accepts_authenticated !== body.acceptsAuthenticated ||
+            previous.accepts_presales !== body.acceptsPresales ||
+            previous.created_by_staff_user_id !== user.userId
+          ) idempotencyConflict("Support department");
+          replayed = true;
+          return;
+        }
+      }
       await client.query(
         `INSERT INTO support_departments(id, code, current_revision_id)
          VALUES ($1, $2, $3)`,
@@ -401,10 +687,10 @@ export async function registerSupportOperationRoutes(
            actor_type, actor_id, action, target_type, target_id, metadata
          ) VALUES ('staff', $1, 'support.department_created',
                    'support_department', $2, $3)`,
-        [user.userId, id, { code: body.code, revisionId }],
+        [user.userId, id, { code: body.code, revisionId, idempotencyKey: body.idempotencyKey ?? null }],
       );
     });
-    return reply.code(201).send({ id, code: body.code, revisionId, revision: 1 });
+    return reply.code(replayed ? 200 : 201).send({ id, code: body.code, revisionId, revision: 1 });
   });
 
   app.post(
@@ -414,9 +700,58 @@ export async function registerSupportOperationRoutes(
       await requireStaffPermission(pool, user, "support.tickets.manage");
       const params = z.object({ departmentId: canonicalUuid }).parse(request.params);
       const body = departmentRevisionBody.parse(request.body);
-      const revisionId = randomUUID();
+      const revisionId = body.idempotencyKey ?? randomUUID();
+      const fingerprint = requestFingerprint("support.department.revision:v1", {
+        departmentId: params.departmentId,
+        actorStaffUserId: user.userId,
+        name: body.name,
+        description: body.description,
+        acceptsAuthenticated: body.acceptsAuthenticated,
+        acceptsPresales: body.acceptsPresales,
+        reason: body.reason ?? "Superseded by a new department revision",
+      });
+      let replayed = false;
       const revision = await transaction(pool, async (client) => {
         await requireStaffActionLocked(client, user, "support.tickets.manage");
+        if (body.idempotencyKey) {
+          const existing = await client.query<{
+            department_id: string;
+            revision: number;
+            name: string;
+            description: string;
+            accepts_authenticated: boolean;
+            accepts_presales: boolean;
+            created_by_staff_user_id: string;
+            request_fingerprint: string | null;
+          }>(
+            `SELECT revision.department_id, revision.revision, revision.name,
+                    revision.description, revision.accepts_authenticated,
+                    revision.accepts_presales, revision.created_by_staff_user_id,
+                    audit.metadata->>'requestFingerprint' AS request_fingerprint
+             FROM support_department_revisions revision
+             LEFT JOIN audit_events audit
+               ON audit.action = 'support.department_revised'
+              AND audit.target_type = 'support_department'
+              AND audit.target_id = revision.department_id
+              AND audit.metadata->>'revisionId' = revision.id::text
+             WHERE revision.id = $1`,
+            [revisionId],
+          );
+          const previousReplay = existing.rows[0];
+          if (previousReplay) {
+            if (
+              previousReplay.department_id !== params.departmentId ||
+              previousReplay.name !== body.name ||
+              previousReplay.description !== body.description ||
+              previousReplay.accepts_authenticated !== body.acceptsAuthenticated ||
+              previousReplay.accepts_presales !== body.acceptsPresales ||
+              previousReplay.created_by_staff_user_id !== user.userId ||
+              previousReplay.request_fingerprint !== fingerprint
+            ) idempotencyConflict("Support department revision");
+            replayed = true;
+            return previousReplay.revision;
+          }
+        }
         const pointer = await client.query<{ current_revision_id: string }>(
           `SELECT current_revision_id
            FROM support_departments
@@ -476,12 +811,17 @@ export async function registerSupportOperationRoutes(
           [
             user.userId,
             params.departmentId,
-            { previousRevisionId: previous.id, revisionId, revision: nextRevision },
+            {
+              previousRevisionId: previous.id,
+              revisionId,
+              revision: nextRevision,
+              requestFingerprint: fingerprint,
+            },
           ],
         );
         return nextRevision;
       });
-      return reply.code(201).send({
+      return reply.code(replayed ? 200 : 201).send({
         departmentId: params.departmentId,
         revisionId,
         revision,
@@ -494,7 +834,8 @@ export async function registerSupportOperationRoutes(
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = assignTicketBody.parse(request.body);
-    const eventId = randomUUID();
+    const eventId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       await requireStaffActionLocked(
         client,
@@ -502,6 +843,16 @@ export async function registerSupportOperationRoutes(
         "support.tickets.manage",
         body.assignedStaffUserId ? [body.assignedStaffUserId] : [],
       );
+      if (body.idempotencyKey && await assertAssignmentReplay(client, {
+        eventId,
+        ticketId: params.ticketId,
+        assignedStaffUserId: body.assignedStaffUserId,
+        actorStaffUserId: user.userId,
+        reason: body.reason,
+      })) {
+        replayed = true;
+        return;
+      }
       const ticket = await client.query(
         `SELECT id FROM support_tickets WHERE id = $1 FOR UPDATE`,
         [params.ticketId],
@@ -521,7 +872,7 @@ export async function registerSupportOperationRoutes(
         [params.ticketId],
       );
     });
-    return reply.code(201).send({
+    return reply.code(replayed ? 200 : 201).send({
       id: eventId,
       ticketId: params.ticketId,
       assignedStaffUserId: body.assignedStaffUserId,
@@ -533,9 +884,21 @@ export async function registerSupportOperationRoutes(
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = routeTicketBody.parse(request.body);
-    const eventId = randomUUID();
+    const eventId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       await requireStaffActionLocked(client, user, "support.tickets.manage");
+      if (body.idempotencyKey && await assertRoutingReplay(client, {
+        eventId,
+        ticketId: params.ticketId,
+        departmentCode: body.departmentCode,
+        priority: body.priority,
+        actorStaffUserId: user.userId,
+        reason: body.reason,
+      })) {
+        replayed = true;
+        return;
+      }
       const department = await client.query<{ current_revision_id: string }>(
         `SELECT current_revision_id
          FROM support_departments
@@ -578,7 +941,7 @@ export async function registerSupportOperationRoutes(
         [params.ticketId],
       );
     });
-    return reply.code(201).send({
+    return reply.code(replayed ? 200 : 201).send({
       id: eventId,
       ticketId: params.ticketId,
       departmentCode: body.departmentCode,
@@ -591,14 +954,31 @@ export async function registerSupportOperationRoutes(
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = statusBody.parse(request.body);
+    const eventId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       await requireStaffActionLocked(client, user, "support.tickets.manage");
+      if (body.idempotencyKey && await assertTicketStatusReplay(client, {
+        eventId,
+        ticketId: params.ticketId,
+        status: body.status,
+        actorType: "staff",
+        actorUserId: user.userId,
+        reason: body.reason,
+      })) {
+        replayed = true;
+        return;
+      }
       const result = await client.query<{ status: z.infer<typeof ticketStatus> }>(
         `SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE`,
         [params.ticketId],
       );
       const current = result.rows[0];
       if (!current) throw requestError("Ticket not found", 404);
+      if (current.status === body.status) {
+        replayed = true;
+        return;
+      }
       await transitionTicket(client, {
         ticketId: params.ticketId,
         previousStatus: current.status,
@@ -606,9 +986,10 @@ export async function registerSupportOperationRoutes(
         actorType: "staff",
         actorUserId: user.userId,
         reason: body.reason,
+        eventId,
       });
     });
-    return reply.code(201).send({ ticketId: params.ticketId, status: body.status });
+    return reply.code(replayed ? 200 : 201).send({ ticketId: params.ticketId, status: body.status });
   });
 
   app.post("/api/v1/tickets/:ticketId/status", async (request, reply) => {
@@ -618,6 +999,8 @@ export async function registerSupportOperationRoutes(
     assertCustomerCapability(user, "support.tickets.write");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = statusBody.parse(request.body);
+    const eventId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       const context = await lockSupportAccountContextForMutation(
         client,
@@ -633,6 +1016,21 @@ export async function registerSupportOperationRoutes(
       );
       const current = result.rows[0];
       if (!current) throw requestError("Ticket not found", 404);
+      if (body.idempotencyKey && await assertTicketStatusReplay(client, {
+        eventId,
+        ticketId: params.ticketId,
+        status: body.status,
+        actorType: "customer",
+        actorUserId: user.userId,
+        reason: body.reason,
+      })) {
+        replayed = true;
+        return;
+      }
+      if (current.status === body.status) {
+        replayed = true;
+        return;
+      }
       if (body.status === "awaiting_staff" && current.status !== "closed") {
         throw requestError("Only a closed ticket can be reopened", 409);
       }
@@ -643,9 +1041,10 @@ export async function registerSupportOperationRoutes(
         actorType: "customer",
         actorUserId: user.userId,
         reason: body.reason,
+        eventId,
       });
     });
-    return reply.code(201).send({ ticketId: params.ticketId, status: body.status });
+    return reply.code(replayed ? 200 : 201).send({ ticketId: params.ticketId, status: body.status });
   });
 
   app.post(
@@ -661,7 +1060,8 @@ export async function registerSupportOperationRoutes(
         .parse(request.params);
       const body = attachmentBody.parse(request.body);
       const attachment = attachmentShape(body);
-      const id = randomUUID();
+      const id = body.idempotencyKey ?? randomUUID();
+      let replayed = false;
       await transaction(pool, async (client) => {
         const context = await lockSupportAccountContextForMutation(
           client,
@@ -669,13 +1069,12 @@ export async function registerSupportOperationRoutes(
           expectedVersion,
         );
         assertCustomerCapability(context, "support.tickets.write");
-        const message = await client.query(
-          `SELECT message.id
+        const message = await client.query<{ status: z.infer<typeof ticketStatus> }>(
+          `SELECT ticket.status
            FROM support_tickets ticket
            JOIN support_ticket_messages message ON message.ticket_id = ticket.id
            WHERE ticket.id = $1
              AND ticket.client_account_id = $2
-             AND ticket.status <> 'closed'
              AND message.id = $3
              AND message.author_type = 'customer'
              AND message.author_user_id = $4
@@ -683,7 +1082,27 @@ export async function registerSupportOperationRoutes(
            FOR UPDATE OF ticket`,
           [params.ticketId, user.clientAccountId, params.messageId, user.userId],
         );
-        if (message.rowCount !== 1) throw requestError("Ticket message not found", 404);
+        const source = message.rows[0];
+        if (!source) throw requestError("Ticket message not found", 404);
+        if (body.idempotencyKey && await assertAttachmentReplay(client, {
+          attachmentId: id,
+          ticketId: params.ticketId,
+          messageId: params.messageId,
+          uploadedByUserId: user.userId,
+          uploadedByType: "customer",
+          visibility: "public",
+          filename: body.filename,
+          extension: attachment.extension,
+          contentType: body.contentType,
+          content: attachment.content,
+          sha256: attachment.sha256,
+        })) {
+          replayed = true;
+          return;
+        }
+        if (source.status === "closed") {
+          throw requestError("Closed tickets cannot receive attachments", 409, "TICKET_CLOSED");
+        }
         await client.query(
           `INSERT INTO support_ticket_attachments(
              id, ticket_id, message_id, uploaded_by_user_id,
@@ -728,7 +1147,7 @@ export async function registerSupportOperationRoutes(
           [params.ticketId],
         );
       });
-      return reply.code(201).send({
+      return reply.code(replayed ? 200 : 201).send({
         id,
         ticketId: params.ticketId,
         messageId: params.messageId,
@@ -750,15 +1169,18 @@ export async function registerSupportOperationRoutes(
         .parse(request.params);
       const body = attachmentBody.parse(request.body);
       const attachment = attachmentShape(body);
-      const id = randomUUID();
+      const id = body.idempotencyKey ?? randomUUID();
+      let replayed = false;
       await transaction(pool, async (client) => {
         await requireStaffActionLocked(client, user, "support.tickets.manage");
-        const message = await client.query<{ visibility: "public" | "internal" }>(
-          `SELECT message.visibility
+        const message = await client.query<{
+          visibility: "public" | "internal";
+          status: z.infer<typeof ticketStatus>;
+        }>(
+          `SELECT message.visibility, ticket.status
            FROM support_tickets ticket
            JOIN support_ticket_messages message ON message.ticket_id = ticket.id
            WHERE ticket.id = $1 AND message.id = $2
-             AND ticket.status <> 'closed'
              AND message.author_type = 'staff'
              AND message.author_user_id = $3
            FOR UPDATE OF ticket`,
@@ -766,6 +1188,25 @@ export async function registerSupportOperationRoutes(
         );
         const source = message.rows[0];
         if (!source) throw requestError("Ticket message not found", 404);
+        if (body.idempotencyKey && await assertAttachmentReplay(client, {
+          attachmentId: id,
+          ticketId: params.ticketId,
+          messageId: params.messageId,
+          uploadedByUserId: user.userId,
+          uploadedByType: "staff",
+          visibility: source.visibility,
+          filename: body.filename,
+          extension: attachment.extension,
+          contentType: body.contentType,
+          content: attachment.content,
+          sha256: attachment.sha256,
+        })) {
+          replayed = true;
+          return;
+        }
+        if (source.status === "closed") {
+          throw requestError("Closed tickets cannot receive attachments", 409, "TICKET_CLOSED");
+        }
         await client.query(
           `INSERT INTO support_ticket_attachments(
              id, ticket_id, message_id, uploaded_by_user_id,
@@ -795,7 +1236,7 @@ export async function registerSupportOperationRoutes(
           [params.ticketId],
         );
       });
-      return reply.code(201).send({
+      return reply.code(replayed ? 200 : 201).send({
         id,
         ticketId: params.ticketId,
         messageId: params.messageId,
@@ -894,6 +1335,11 @@ export async function registerSupportOperationRoutes(
       const params = z
         .object({ ticketId: canonicalUuid, attachmentId: canonicalUuid })
         .parse(request.params);
+      const body = z
+        .object({ idempotencyKey: canonicalUuid.optional() })
+        .strict()
+        .parse(request.body ?? {});
+      const deletionId = body.idempotencyKey ?? randomUUID();
       await transaction(pool, async (client) => {
         const context = await lockSupportAccountContextForMutation(
           client,
@@ -901,8 +1347,8 @@ export async function registerSupportOperationRoutes(
           expectedVersion,
         );
         assertCustomerCapability(context, "support.tickets.write");
-        const attachment = await client.query(
-          `SELECT attachment.id
+        const attachment = await client.query<{ id: string; deletion_id: string | null }>(
+          `SELECT attachment.id, deletion.id AS deletion_id
            FROM support_ticket_attachments attachment
            JOIN support_tickets ticket ON ticket.id = attachment.ticket_id
            LEFT JOIN support_ticket_attachment_deletions deletion
@@ -912,16 +1358,17 @@ export async function registerSupportOperationRoutes(
              AND ticket.client_account_id = $3
              AND attachment.uploaded_by_user_id = $4
              AND attachment.uploaded_by_type = 'customer'
-             AND deletion.id IS NULL
            FOR UPDATE OF ticket`,
           [params.attachmentId, params.ticketId, user.clientAccountId, user.userId],
         );
-        if (attachment.rowCount !== 1) throw requestError("Attachment not found", 404);
+        const existing = attachment.rows[0];
+        if (!existing) throw requestError("Attachment not found", 404);
+        if (existing.deletion_id) return;
         await client.query(
           `INSERT INTO support_ticket_attachment_deletions(
-             attachment_id, deleted_by_user_id, deleted_by_type, reason
-           ) VALUES ($1, $2, 'customer', $3)`,
-          [params.attachmentId, user.userId, "Customer removed the attachment"],
+             id, attachment_id, deleted_by_user_id, deleted_by_type, reason
+           ) VALUES ($1, $2, $3, 'customer', $4)`,
+          [deletionId, params.attachmentId, user.userId, "Customer removed the attachment"],
         );
       });
       return reply.code(204).send();
@@ -971,11 +1418,65 @@ export async function registerSupportOperationRoutes(
 
   app.post("/api/v1/presales/inquiries", async (request, reply) => {
     const body = presalesCreateBody.parse(request.body);
-    const inquiryId = randomUUID();
-    const statusEventId = randomUUID();
-    const messageId = randomUUID();
-    const accessToken = randomBytes(32).toString("base64url");
+    const inquiryId = body.idempotencyKey ?? randomUUID();
+    const statusEventId = body.idempotencyKey ?? randomUUID();
+    const messageId = body.idempotencyKey ?? randomUUID();
+    const accessToken = stablePresalesAccessToken(config, body.idempotencyKey);
+    const fingerprint = requestFingerprint("support.presales.create:v1", {
+      visitorName: body.visitorName,
+      visitorEmail: body.visitorEmail,
+      topic: body.topic,
+      subject: body.subject,
+      message: body.message,
+      departmentCode: body.departmentCode,
+    });
+    let replayed = false;
     await transaction(pool, async (client) => {
+      if (body.idempotencyKey) {
+        const existing = await client.query<{
+          visitor_name: string;
+          visitor_email: string;
+          topic: string;
+          subject: string;
+          department_code: string;
+          message: string | null;
+          access_token_digest: Buffer;
+          request_fingerprint: string | null;
+        }>(
+          `SELECT inquiry.visitor_name, inquiry.visitor_email::text,
+                  inquiry.topic, inquiry.subject,
+                  department.code::text AS department_code,
+                  opening.body AS message, inquiry.access_token_digest,
+                  audit.metadata->>'requestFingerprint' AS request_fingerprint
+           FROM presales_inquiries inquiry
+           JOIN support_department_revisions revision
+             ON revision.id = inquiry.department_revision_id
+           JOIN support_departments department ON department.id = revision.department_id
+           LEFT JOIN presales_inquiry_messages opening
+             ON opening.id = $1 AND opening.inquiry_id = inquiry.id
+           LEFT JOIN audit_events audit
+             ON audit.action = 'support.presales_created'
+            AND audit.target_type = 'presales_inquiry'
+            AND audit.target_id = inquiry.id
+           WHERE inquiry.id = $1`,
+          [inquiryId],
+        );
+        const previous = existing.rows[0];
+        if (previous) {
+          if (
+            previous.visitor_name !== body.visitorName ||
+            previous.visitor_email !== body.visitorEmail ||
+            previous.topic !== body.topic ||
+            previous.subject !== body.subject ||
+            previous.department_code !== body.departmentCode ||
+            previous.message !== body.message ||
+            !previous.access_token_digest.equals(digestToken(accessToken)) ||
+            previous.request_fingerprint !== fingerprint
+          ) idempotencyConflict("Presales inquiry");
+          replayed = true;
+          return;
+        }
+      }
       const department = await client.query<{ current_revision_id: string }>(
         `SELECT current_revision_id
          FROM support_departments
@@ -1027,10 +1528,18 @@ export async function registerSupportOperationRoutes(
            actor_type, actor_id, action, target_type, target_id, metadata
          ) VALUES ('system', 'core', 'support.presales_created',
                    'presales_inquiry', $1, $2)`,
-        [inquiryId, { topic: body.topic, departmentCode: body.departmentCode }],
+        [
+          inquiryId,
+          {
+            topic: body.topic,
+            departmentCode: body.departmentCode,
+            requestFingerprint: fingerprint,
+            messageId,
+          },
+        ],
       );
     });
-    return reply.code(201).send({
+    return reply.code(replayed ? 200 : 201).send({
       inquiryId,
       accessToken,
       status: "awaiting_staff",
@@ -1108,7 +1617,8 @@ export async function registerSupportOperationRoutes(
     const token = presalesToken(request);
     const params = z.object({ inquiryId: canonicalUuid }).parse(request.params);
     const body = presalesReplyBody.parse(request.body);
-    const messageId = randomUUID();
+    const messageId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       const inquiry = await client.query<{
         status: z.infer<typeof presalesStatus>;
@@ -1127,6 +1637,17 @@ export async function registerSupportOperationRoutes(
       );
       const current = inquiry.rows[0];
       if (!current) throw requestError("Presales inquiry not found", 404);
+      if (body.idempotencyKey && await assertPresalesMessageReplay(client, {
+        messageId,
+        inquiryId: params.inquiryId,
+        authorType: "visitor",
+        authorUserId: null,
+        visibility: "public",
+        body: body.message,
+      })) {
+        replayed = true;
+        return;
+      }
       if (current.status === "closed") {
         throw requestError("Closed Presales inquiries cannot be replied to", 409);
       }
@@ -1143,9 +1664,10 @@ export async function registerSupportOperationRoutes(
         actorType: "visitor",
         actorUserId: null,
         reason: "Visitor replied to the Presales inquiry",
+        ...(body.idempotencyKey ? { eventId: body.idempotencyKey } : {}),
       });
     });
-    return reply.code(201).send({ id: messageId, status: "awaiting_staff" });
+    return reply.code(replayed ? 200 : 201).send({ id: messageId, status: "awaiting_staff" });
   });
 
   app.get("/api/v1/admin/presales/inquiries", async (request) => {
@@ -1265,7 +1787,9 @@ export async function registerSupportOperationRoutes(
       await requireStaffPermission(pool, user, "support.tickets.manage");
       const params = z.object({ inquiryId: canonicalUuid }).parse(request.params);
       const body = staffPresalesMessageBody.parse(request.body);
-      const messageId = randomUUID();
+      const messageId = body.idempotencyKey ?? randomUUID();
+      const visibility = body.kind === "internal_note" ? "internal" : "public";
+      let replayed = false;
       await transaction(pool, async (client) => {
         await requireStaffActionLocked(client, user, "support.tickets.manage");
         const inquiry = await client.query<{
@@ -1276,10 +1800,20 @@ export async function registerSupportOperationRoutes(
         );
         const current = inquiry.rows[0];
         if (!current) throw requestError("Presales inquiry not found", 404);
+        if (body.idempotencyKey && await assertPresalesMessageReplay(client, {
+          messageId,
+          inquiryId: params.inquiryId,
+          authorType: "staff",
+          authorUserId: user.userId,
+          visibility,
+          body: body.message,
+        })) {
+          replayed = true;
+          return;
+        }
         if (current.status === "closed") {
           throw requestError("Closed Presales inquiries cannot be replied to", 409);
         }
-        const visibility = body.kind === "internal_note" ? "internal" : "public";
         await client.query(
           `INSERT INTO presales_inquiry_messages(
              id, inquiry_id, author_type, author_user_id, visibility, body
@@ -1294,6 +1828,7 @@ export async function registerSupportOperationRoutes(
             actorType: "staff",
             actorUserId: user.userId,
             reason: "Staff posted a public Presales reply",
+            ...(body.idempotencyKey ? { eventId: body.idempotencyKey } : {}),
           });
         } else {
           await client.query(
@@ -1305,7 +1840,7 @@ export async function registerSupportOperationRoutes(
           );
         }
       });
-      return reply.code(201).send({ id: messageId, kind: body.kind });
+      return reply.code(replayed ? 200 : 201).send({ id: messageId, kind: body.kind });
     },
   );
 
@@ -1317,11 +1852,24 @@ export async function registerSupportOperationRoutes(
       .object({
         status: presalesStatus,
         reason: z.string().trim().min(1).max(1_000),
+        idempotencyKey: canonicalUuid.optional(),
       })
       .strict()
       .parse(request.body);
+    const eventId = body.idempotencyKey ?? randomUUID();
+    let replayed = false;
     await transaction(pool, async (client) => {
       await requireStaffActionLocked(client, user, "support.tickets.manage");
+      if (body.idempotencyKey && await assertPresalesStatusReplay(client, {
+        eventId,
+        inquiryId: params.inquiryId,
+        status: body.status,
+        actorUserId: user.userId,
+        reason: body.reason,
+      })) {
+        replayed = true;
+        return;
+      }
       const inquiry = await client.query<{
         status: z.infer<typeof presalesStatus>;
       }>(
@@ -1330,6 +1878,10 @@ export async function registerSupportOperationRoutes(
       );
       const current = inquiry.rows[0];
       if (!current) throw requestError("Presales inquiry not found", 404);
+      if (current.status === body.status) {
+        replayed = true;
+        return;
+      }
       await transitionPresales(client, {
         inquiryId: params.inquiryId,
         previousStatus: current.status,
@@ -1337,9 +1889,10 @@ export async function registerSupportOperationRoutes(
         actorType: "staff",
         actorUserId: user.userId,
         reason: body.reason,
+        eventId,
       });
     });
-    return reply.code(201).send({ inquiryId: params.inquiryId, status: body.status });
+    return reply.code(replayed ? 200 : 201).send({ inquiryId: params.inquiryId, status: body.status });
   });
 
   app.post(
@@ -1378,28 +1931,33 @@ export async function registerSupportOperationRoutes(
         .object({ ticketId: canonicalUuid, attachmentId: canonicalUuid })
         .parse(request.params);
       const body = z
-        .object({ reason: z.string().trim().min(1).max(1_000) })
+        .object({
+          reason: z.string().trim().min(1).max(1_000),
+          idempotencyKey: canonicalUuid.optional(),
+        })
         .strict()
         .parse(request.body);
+      const deletionId = body.idempotencyKey ?? randomUUID();
       await transaction(pool, async (client) => {
         await requireStaffActionLocked(client, user, "support.tickets.manage");
-        const attachment = await client.query(
-          `SELECT attachment.id
+        const attachment = await client.query<{ id: string; deletion_id: string | null }>(
+          `SELECT attachment.id, deletion.id AS deletion_id
            FROM support_ticket_attachments attachment
            LEFT JOIN support_ticket_attachment_deletions deletion
              ON deletion.attachment_id = attachment.id
            WHERE attachment.id = $1
              AND attachment.ticket_id = $2
-             AND deletion.id IS NULL
            FOR UPDATE OF attachment`,
           [params.attachmentId, params.ticketId],
         );
-        if (attachment.rowCount !== 1) throw requestError("Attachment not found", 404);
+        const existing = attachment.rows[0];
+        if (!existing) throw requestError("Attachment not found", 404);
+        if (existing.deletion_id) return;
         await client.query(
           `INSERT INTO support_ticket_attachment_deletions(
-             attachment_id, deleted_by_user_id, deleted_by_type, reason
-           ) VALUES ($1, $2, 'staff', $3)`,
-          [params.attachmentId, user.userId, body.reason],
+             id, attachment_id, deleted_by_user_id, deleted_by_type, reason
+           ) VALUES ($1, $2, $3, 'staff', $4)`,
+          [deletionId, params.attachmentId, user.userId, body.reason],
         );
       });
       return reply.code(204).send();

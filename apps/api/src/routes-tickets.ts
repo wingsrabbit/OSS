@@ -12,7 +12,12 @@ import {
   requireUser,
 } from "./auth.js";
 import type { Config } from "./config.js";
-import { transaction, type DatabasePool } from "./database.js";
+import {
+  transaction,
+  type DatabaseClient,
+  type DatabasePool,
+} from "./database.js";
+import { requestFingerprint } from "./idempotency.js";
 import {
   enqueueNotification,
   enqueueSubscribedContactNotifications,
@@ -23,6 +28,13 @@ import {
 } from "./routes-admin.js";
 
 const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
+const supportDepartmentCode = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(/^[a-z0-9][a-z0-9-]{1,62}$/);
+const ticketStatus = z.enum(["awaiting_staff", "awaiting_customer", "closed"]);
+const ticketPriority = z.enum(["low", "normal", "high", "urgent"]);
 
 const createTicketSchema = z
   .object({
@@ -47,17 +59,22 @@ const createTicketSchema = z
       ])
       .nullable()
       .optional(),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
 const customerReplySchema = z
-  .object({ message: z.string().trim().min(1).max(10_000) })
+  .object({
+    message: z.string().trim().min(1).max(10_000),
+    idempotencyKey: canonicalUuid.optional(),
+  })
   .strict();
 
 const staffMessageSchema = z
   .object({
     kind: z.enum(["public_reply", "internal_note"]),
     message: z.string().trim().min(1).max(10_000),
+    idempotencyKey: canonicalUuid.optional(),
   })
   .strict();
 
@@ -100,8 +117,132 @@ type TicketAttachmentRow = {
   created_at: Date;
 };
 
+type TicketStatusEventRow = {
+  id: string;
+  previous_status: TicketStatus | null;
+  status: TicketStatus;
+  actor_type: "migration" | "customer" | "staff" | "system";
+  actor_user_id: string | null;
+  actor_email: string | null;
+  reason: string;
+  occurred_at: Date;
+};
+
+type TicketAssignmentEventRow = {
+  id: string;
+  assigned_staff_user_id: string | null;
+  assigned_staff_email: string | null;
+  actor_type: "customer" | "staff";
+  actor_user_id: string;
+  actor_email: string;
+  sequence: number;
+  reason: string;
+  occurred_at: Date;
+};
+
+type TicketRoutingEventRow = {
+  id: string;
+  department_revision_id: string;
+  department_code: string;
+  department_name: string;
+  department_revision: number;
+  priority: "low" | "normal" | "high" | "urgent";
+  actor_type: "customer" | "staff";
+  actor_user_id: string;
+  actor_email: string;
+  sequence: number;
+  reason: string;
+  occurred_at: Date;
+};
+
 function requestError(message: string, statusCode: number, code?: string): Error {
   return Object.assign(new Error(message), { statusCode, ...(code ? { code } : {}) });
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "23505");
+}
+
+async function assertMessageReplay(
+  queryable: DatabasePool | DatabaseClient,
+  input: Readonly<{
+    messageId: string;
+    ticketId: string;
+    authorUserId: string;
+    authorType: "customer" | "staff";
+    visibility: "public" | "internal";
+    body: string;
+  }>,
+): Promise<boolean> {
+  const result = await queryable.query<{
+    ticket_id: string;
+    author_user_id: string;
+    author_type: "customer" | "staff";
+    visibility: "public" | "internal";
+    body: string;
+  }>(
+    `SELECT ticket_id, author_user_id, author_type, visibility, body
+     FROM support_ticket_messages
+     WHERE id = $1`,
+    [input.messageId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.ticket_id !== input.ticketId ||
+    existing.author_user_id !== input.authorUserId ||
+    existing.author_type !== input.authorType ||
+    existing.visibility !== input.visibility ||
+    existing.body !== input.body
+  ) {
+    throw requestError(
+      "This idempotency key was already used for a different Support message",
+      409,
+      "IDEMPOTENCY_CONFLICT",
+    );
+  }
+  return true;
+}
+
+async function assertTicketCreateReplay(
+  queryable: DatabasePool | DatabaseClient,
+  input: Readonly<{
+    ticketId: string;
+    clientAccountId: string;
+    createdByUserId: string;
+    fingerprint: string;
+  }>,
+): Promise<boolean> {
+  const result = await queryable.query<{
+    client_account_id: string;
+    created_by_user_id: string;
+    request_fingerprint: string | null;
+  }>(
+    `SELECT ticket.client_account_id,
+            ticket.created_by_user_id,
+            audit.metadata->>'requestFingerprint' AS request_fingerprint
+     FROM support_tickets ticket
+     LEFT JOIN audit_events audit
+       ON audit.action = 'support.ticket_created'
+      AND audit.target_type = 'support_ticket'
+      AND audit.target_id = ticket.id
+     WHERE ticket.id = $1`,
+    [input.ticketId],
+  );
+  const existing = result.rows[0];
+  if (!existing) return false;
+  if (
+    existing.client_account_id !== input.clientAccountId ||
+    existing.created_by_user_id !== input.createdByUserId ||
+    existing.request_fingerprint !== input.fingerprint
+  ) {
+    throw requestError(
+      "This idempotency key was already used for a different Support ticket",
+      409,
+      "IDEMPOTENCY_CONFLICT",
+    );
+  }
+  return true;
 }
 
 function rethrowNotificationRecipientLock(error: unknown): never {
@@ -148,6 +289,153 @@ function staffMessage(row: TicketMessageRow) {
     visibility: row.visibility,
     authorEmail: row.author_email,
   };
+}
+
+async function loadStatusHistory(pool: DatabasePool, ticketId: string) {
+  const result = await pool.query<TicketStatusEventRow>(
+    `SELECT event.id, event.previous_status, event.status,
+            event.actor_type, event.actor_user_id,
+            actor.email::text AS actor_email,
+            event.reason, event.occurred_at
+     FROM support_ticket_status_events event
+     LEFT JOIN users actor ON actor.id = event.actor_user_id
+     WHERE event.ticket_id = $1
+     ORDER BY event.occurred_at, event.id`,
+    [ticketId],
+  );
+  return result.rows.map((event) => ({
+    id: event.id,
+    previousStatus: event.previous_status,
+    status: event.status,
+    actorType: event.actor_type,
+    actorUserId: event.actor_user_id,
+    actorEmail: event.actor_email,
+    reason: event.reason,
+    occurredAt: event.occurred_at.toISOString(),
+  }));
+}
+
+async function loadAssignmentHistory(pool: DatabasePool, ticketId: string) {
+  const result = await pool.query<TicketAssignmentEventRow>(
+    `SELECT history.id, history.assigned_staff_user_id,
+            assignee.email::text AS assigned_staff_email,
+            history.actor_type, history.actor_user_id,
+            actor.email::text AS actor_email,
+            history.sequence, history.reason, history.occurred_at
+     FROM (
+       SELECT ticket.id, NULL::uuid AS assigned_staff_user_id,
+              'customer'::text AS actor_type,
+              ticket.created_by_user_id AS actor_user_id,
+              0 AS sequence, 'Ticket created unassigned'::text AS reason,
+              ticket.created_at AS occurred_at
+       FROM support_tickets ticket
+       WHERE ticket.id = $1
+       UNION ALL
+       SELECT event.id, event.assigned_staff_user_id,
+              'staff'::text, event.actor_staff_user_id,
+              event.sequence, event.reason, event.occurred_at
+       FROM support_ticket_assignment_events event
+       WHERE event.ticket_id = $1
+     ) history
+     LEFT JOIN users assignee ON assignee.id = history.assigned_staff_user_id
+     JOIN users actor ON actor.id = history.actor_user_id
+     ORDER BY history.sequence, history.id`,
+    [ticketId],
+  );
+  return result.rows.map((event) => ({
+    id: event.id,
+    assignedStaffUserId: event.assigned_staff_user_id,
+    assignedStaffEmail: event.assigned_staff_email,
+    actorType: event.actor_type,
+    actorUserId: event.actor_user_id,
+    actorEmail: event.actor_email,
+    sequence: event.sequence,
+    reason: event.reason,
+    occurredAt: event.occurred_at.toISOString(),
+  }));
+}
+
+async function loadRoutingHistory(pool: DatabasePool, ticketId: string) {
+  const result = await pool.query<TicketRoutingEventRow>(
+    `SELECT history.id, history.department_revision_id,
+            department.code::text AS department_code,
+            revision.name AS department_name,
+            revision.revision AS department_revision,
+            history.priority, history.actor_type, history.actor_user_id,
+            actor.email::text AS actor_email,
+            history.sequence, history.reason, history.occurred_at
+     FROM (
+       SELECT ticket.id, ticket.department_revision_id,
+              ticket.priority, 'customer'::text AS actor_type,
+              ticket.created_by_user_id AS actor_user_id,
+              0 AS sequence, 'Customer selected the initial route'::text AS reason,
+              ticket.created_at AS occurred_at
+       FROM support_tickets ticket
+       WHERE ticket.id = $1
+       UNION ALL
+       SELECT event.id, event.department_revision_id,
+              event.priority, 'staff'::text, event.actor_staff_user_id,
+              event.sequence, event.reason, event.occurred_at
+       FROM support_ticket_routing_events event
+       WHERE event.ticket_id = $1
+     ) history
+     JOIN support_department_revisions revision
+       ON revision.id = history.department_revision_id
+     JOIN support_departments department ON department.id = revision.department_id
+     JOIN users actor ON actor.id = history.actor_user_id
+     ORDER BY history.sequence, history.id`,
+    [ticketId],
+  );
+  return result.rows.map((event) => ({
+    id: event.id,
+    departmentRevisionId: event.department_revision_id,
+    department: {
+      code: event.department_code,
+      name: event.department_name,
+      revision: event.department_revision,
+    },
+    priority: event.priority,
+    actorType: event.actor_type,
+    actorUserId: event.actor_user_id,
+    actorEmail: event.actor_email,
+    sequence: event.sequence,
+    reason: event.reason,
+    occurredAt: event.occurred_at.toISOString(),
+  }));
+}
+
+function customerStatusHistory(
+  history: Awaited<ReturnType<typeof loadStatusHistory>>,
+) {
+  return history.map((event) => ({
+    previousStatus: event.previousStatus,
+    status: event.status,
+    summary: event.previousStatus === null
+      ? "Ticket created"
+      : event.status === "closed"
+        ? "Ticket closed"
+        : event.previousStatus === "closed"
+          ? "Ticket reopened"
+          : event.status === "awaiting_customer"
+            ? "Support replied"
+            : event.status === "awaiting_staff"
+              ? "Customer replied"
+              : "Ticket status updated",
+    occurredAt: event.occurredAt,
+  }));
+}
+
+function customerRoutingHistory(
+  history: Awaited<ReturnType<typeof loadRoutingHistory>>,
+) {
+  return history.map((event) => ({
+    department: event.department,
+    priority: event.priority,
+    summary: event.sequence === 0
+      ? "Initial Support routing"
+      : "Support routing updated",
+    occurredAt: event.occurredAt,
+  }));
 }
 
 async function loadCustomerTicket(
@@ -229,6 +517,10 @@ async function loadCustomerTicket(
      ORDER BY attachment.created_at, attachment.id`,
     [ticketId, clientAccountId],
   );
+  const [statusHistory, routingHistory] = await Promise.all([
+    loadStatusHistory(pool, ticketId),
+    loadRoutingHistory(pool, ticketId),
+  ]);
   return {
     ticket: customerTicket(ticket),
     messages: messages.rows.map(publicMessage),
@@ -242,6 +534,8 @@ async function loadCustomerTicket(
       scanStatus: attachment.scan_status,
       createdAt: attachment.created_at.toISOString(),
     })),
+    statusHistory: customerStatusHistory(statusHistory),
+    routingHistory: customerRoutingHistory(routingHistory),
   };
 }
 
@@ -317,6 +611,11 @@ async function loadStaffTicket(pool: DatabasePool, ticketId: string) {
      ORDER BY attachment.created_at, attachment.id`,
     [ticketId],
   );
+  const [statusHistory, assignmentHistory, routingHistory] = await Promise.all([
+    loadStatusHistory(pool, ticketId),
+    loadAssignmentHistory(pool, ticketId),
+    loadRoutingHistory(pool, ticketId),
+  ]);
   return {
     ticket: {
       ...customerTicket(ticket),
@@ -337,6 +636,9 @@ async function loadStaffTicket(pool: DatabasePool, ticketId: string) {
       scanStatus: attachment.scan_status,
       createdAt: attachment.created_at.toISOString(),
     })),
+    statusHistory,
+    assignmentHistory,
+    routingHistory,
   };
 }
 
@@ -423,15 +725,39 @@ export async function registerTicketRoutes(
         "TICKET_AUTHORIZATION_REFERENCE_REQUIRED",
       );
     }
-    const ticketId = randomUUID();
-    const statusEventId = randomUUID();
-    await transaction(pool, async (client) => {
-      const context = await lockSupportAccountContextForMutation(
-        client,
-        user,
-        expectedContextVersion,
-      );
-      assertCustomerCapability(context, "support.tickets.write");
+    const ticketId = body.idempotencyKey ?? randomUUID();
+    const statusEventId = body.idempotencyKey ?? randomUUID();
+    const messageId = body.idempotencyKey ?? randomUUID();
+    const fingerprint = requestFingerprint("support.ticket.create:v1", {
+      clientAccountId: user.clientAccountId,
+      createdByUserId: user.userId,
+      subject: body.subject,
+      message: body.message,
+      serviceId: body.serviceId ?? null,
+      orderId: body.orderId ?? null,
+      departmentCode: body.departmentCode,
+      priority: body.priority,
+      authorizationPurpose: body.authorizationPurpose ?? null,
+    });
+    const replayInput = {
+      ticketId,
+      clientAccountId: user.clientAccountId,
+      createdByUserId: user.userId,
+      fingerprint,
+    };
+    let replayed = false;
+    try {
+      await transaction(pool, async (client) => {
+        const context = await lockSupportAccountContextForMutation(
+          client,
+          user,
+          expectedContextVersion,
+        );
+        assertCustomerCapability(context, "support.tickets.write");
+        if (body.idempotencyKey && await assertTicketCreateReplay(client, replayInput)) {
+          replayed = true;
+          return;
+        }
       let serviceOrderId: string | null = null;
       if (body.serviceId) {
         const service = await client.query<{ order_id: string }>(
@@ -504,9 +830,9 @@ export async function registerTicketRoutes(
       );
       await client.query(
         `INSERT INTO support_ticket_messages(
-           ticket_id, author_user_id, author_type, visibility, body
-         ) VALUES ($1, $2, 'customer', 'public', $3)`,
-        [ticketId, user.userId, body.message],
+           id, ticket_id, author_user_id, author_type, visibility, body
+         ) VALUES ($1, $2, $3, 'customer', 'public', $4)`,
+        [messageId, ticketId, user.userId, body.message],
       );
       await client.query(
         `INSERT INTO audit_events(
@@ -522,11 +848,27 @@ export async function registerTicketRoutes(
             departmentCode: body.departmentCode,
             priority: body.priority,
             authorizationPurpose: body.authorizationPurpose ?? null,
+            requestFingerprint: fingerprint,
+            messageId,
           },
         ],
       );
-    });
-    return reply.code(201).send(
+      });
+    } catch (error) {
+      if (!body.idempotencyKey || !isUniqueViolation(error)) throw error;
+      const matched = await transaction(pool, async (client) => {
+        const context = await lockSupportAccountContextForMutation(
+          client,
+          user,
+          expectedContextVersion,
+        );
+        assertCustomerCapability(context, "support.tickets.write");
+        return assertTicketCreateReplay(client, replayInput);
+      });
+      if (!matched) throw error;
+      replayed = true;
+    }
+    return reply.code(replayed ? 200 : 201).send(
       await loadCustomerTicket(pool, ticketId, user.clientAccountId),
     );
   });
@@ -545,14 +887,24 @@ export async function registerTicketRoutes(
     assertCustomerCapability(user, "support.tickets.write");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = customerReplySchema.parse(request.body);
-    const messageId = randomUUID();
-    await transaction(pool, async (client) => {
-      const context = await lockSupportAccountContextForMutation(
-        client,
-        user,
-        expectedContextVersion,
-      );
-      assertCustomerCapability(context, "support.tickets.write");
+    const messageId = body.idempotencyKey ?? randomUUID();
+    const replayInput = {
+      messageId,
+      ticketId: params.ticketId,
+      authorUserId: user.userId,
+      authorType: "customer" as const,
+      visibility: "public" as const,
+      body: body.message,
+    };
+    let replayed = false;
+    try {
+      await transaction(pool, async (client) => {
+        const context = await lockSupportAccountContextForMutation(
+          client,
+          user,
+          expectedContextVersion,
+        );
+        assertCustomerCapability(context, "support.tickets.write");
       const ticket = await client.query<{
         status: TicketStatus;
         current_status_event_id: string;
@@ -563,6 +915,10 @@ export async function registerTicketRoutes(
         [params.ticketId, user.clientAccountId],
       );
       if (!ticket.rows[0]) throw requestError("Ticket not found", 404);
+      if (body.idempotencyKey && await assertMessageReplay(client, replayInput)) {
+        replayed = true;
+        return;
+      }
       if (ticket.rows[0].status === "closed") {
         throw requestError("Closed tickets cannot be replied to", 409, "TICKET_CLOSED");
       }
@@ -612,8 +968,28 @@ export async function registerTicketRoutes(
                    'support_ticket', $2, $3)`,
         [user.userId, params.ticketId, { messageId }],
       );
-    });
-    return reply.code(201).send(
+      });
+    } catch (error) {
+      if (!body.idempotencyKey || !isUniqueViolation(error)) throw error;
+      const matched = await transaction(pool, async (client) => {
+        const context = await lockSupportAccountContextForMutation(
+          client,
+          user,
+          expectedContextVersion,
+        );
+        assertCustomerCapability(context, "support.tickets.write");
+        const ticket = await client.query(
+          `SELECT id FROM support_tickets
+           WHERE id = $1 AND client_account_id = $2`,
+          [params.ticketId, user.clientAccountId],
+        );
+        if (ticket.rowCount !== 1) throw requestError("Ticket not found", 404);
+        return assertMessageReplay(client, replayInput);
+      });
+      if (!matched) throw error;
+      replayed = true;
+    }
+    return reply.code(replayed ? 200 : 201).send(
       await loadCustomerTicket(pool, params.ticketId, user.clientAccountId),
     );
   });
@@ -621,6 +997,15 @@ export async function registerTicketRoutes(
   app.get("/api/v1/admin/tickets", async (request) => {
     const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "support.tickets.manage");
+    const query = z
+      .object({
+        status: ticketStatus.optional(),
+        department: supportDepartmentCode.optional(),
+        priority: ticketPriority.optional(),
+        assignee: z.union([canonicalUuid, z.literal("unassigned")]).optional(),
+      })
+      .strict()
+      .parse(request.query);
     const result = await pool.query<
       CustomerTicketRow & {
         client_account_id: string;
@@ -659,10 +1044,24 @@ export async function registerTicketRoutes(
        LEFT JOIN current_support_ticket_assignments assignment
          ON assignment.ticket_id = ticket.id
        LEFT JOIN support_ticket_messages message ON message.ticket_id = ticket.id
+       WHERE ($1::text IS NULL OR ticket.status = $1)
+         AND ($2::text IS NULL OR department.code::text = $2)
+         AND ($3::text IS NULL OR routing.priority = $3)
+         AND (
+           $4::text IS NULL OR
+           ($4 = 'unassigned' AND assignment.assigned_staff_user_id IS NULL) OR
+           assignment.assigned_staff_user_id::text = $4
+         )
        GROUP BY ticket.id, account.name, item.product_name, department.code,
                 department_revision.name, routing.priority,
                 assignment.assigned_staff_user_id
        ORDER BY ticket.updated_at DESC, ticket.id DESC`,
+      [
+        query.status ?? null,
+        query.department ?? null,
+        query.priority ?? null,
+        query.assignee ?? null,
+      ],
     );
     return {
       items: result.rows.map((row) => ({
@@ -672,6 +1071,26 @@ export async function registerTicketRoutes(
         internalMessageCount: Number(row.internal_message_count),
       })),
     };
+  });
+
+  app.get("/api/v1/admin/tickets/staff-options", async (request) => {
+    const user = await requireSessionIdentity(request, pool, config);
+    await requireStaffPermission(pool, user, "support.tickets.manage");
+    const result = await pool.query<{
+      id: string;
+      email: string;
+      roles: string[];
+    }>(
+      `SELECT principal.id, principal.email::text, staff.roles
+       FROM staff_members staff
+       JOIN users principal ON principal.id = staff.user_id
+       WHERE staff.active
+         AND principal.email_verified_at IS NOT NULL
+         AND principal.restricted_at IS NULL
+         AND (staff.permissions ? '*' OR staff.permissions ? 'support.tickets.manage')
+       ORDER BY principal.email, principal.id`,
+    );
+    return { items: result.rows };
   });
 
   app.get("/api/v1/admin/tickets/:ticketId", async (request) => {
@@ -686,10 +1105,25 @@ export async function registerTicketRoutes(
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const params = z.object({ ticketId: canonicalUuid }).parse(request.params);
     const body = staffMessageSchema.parse(request.body);
-    const messageId = randomUUID();
-    await transaction(pool, async (client) => {
-      await requireStaffActionLocked(client, user, "support.tickets.manage");
-      const visibility = body.kind === "internal_note" ? "internal" : "public";
+    const messageId = body.idempotencyKey ?? randomUUID();
+    const visibility: "internal" | "public" =
+      body.kind === "internal_note" ? "internal" : "public";
+    const replayInput = {
+      messageId,
+      ticketId: params.ticketId,
+      authorUserId: user.userId,
+      authorType: "staff" as const,
+      visibility,
+      body: body.message,
+    };
+    let replayed = false;
+    try {
+      await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "support.tickets.manage");
+        if (body.idempotencyKey && await assertMessageReplay(client, replayInput)) {
+          replayed = true;
+          return;
+        }
       let notificationPrimary: "creator" | "recorded_owner" | null = null;
       let notificationTicketSnapshot:
         | Readonly<{
@@ -935,7 +1369,16 @@ export async function registerTicketRoutes(
           { visibility, messageId, notificationPrimary },
         ],
       );
-    });
-    return reply.code(201).send(await loadStaffTicket(pool, params.ticketId));
+      });
+    } catch (error) {
+      if (!body.idempotencyKey || !isUniqueViolation(error)) throw error;
+      const matched = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "support.tickets.manage");
+        return assertMessageReplay(client, replayInput);
+      });
+      if (!matched) throw error;
+      replayed = true;
+    }
+    return reply.code(replayed ? 200 : 201).send(await loadStaffTicket(pool, params.ticketId));
   });
 }

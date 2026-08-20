@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Support Operations component harness</title>
+  </head>
+  <body>
+    <main id="support-operations-root"></main>
+    <output id="support-notice" aria-label="Support notice"></output>
+    <output id="support-error" aria-label="Support error"></output>
+    <script type="module">
+      import React from "react";
+      import { createRoot } from "react-dom/client";
+      import { SupportOperationsPanel } from "./src/SupportOperationsPanel.tsx";
+
+      const query = new URLSearchParams(window.location.search);
+      const mode = query.get("mode") ?? "customer";
+      createRoot(document.querySelector("#support-operations-root")).render(
+        React.createElement(SupportOperationsPanel, {
+          mode,
+          locale: query.get("locale") === "zh-CN" ? "zh-CN" : "en",
+          canReadCustomerTickets: mode === "customer" && query.get("read") !== "0",
+          canWriteCustomerTickets: mode === "customer" && query.get("write") !== "0",
+          canManageSupport: mode === "staff" && query.get("manage") !== "0",
+          onNotice: (message) => {
+            document.querySelector("#support-notice").textContent = message;
+          },
+          onError: (message) => {
+            document.querySelector("#support-error").textContent = message;
+          },
+        }),
+      );
+    </script>
+  </body>
+</html>
