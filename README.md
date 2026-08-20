@@ -88,11 +88,13 @@ Provider Operation, Refund, and Service as separate facts. It never presents
 payment success as service activation, or a refund as implicit cancellation.
 
 This code is protected by strict TypeScript checks, production builds, and
-PostgreSQL exact-money/state journeys. A consistent Demo backup/restore and
-Schema 018 forward-upgrade/rollback rehearsal, notification template and User
-preference work, ordinary Support attachment download, bulk exports, account
-deletion/anonymization, remaining Service credential/usage workflows, two-VPS
-deployment, and final release evidence are not yet complete. This version is
+PostgreSQL exact-money/state journeys. Notification templates and User
+preferences are implemented, and isolated blank TestA/TestB archive restores
+have been rehearsed through Schema 028. A consistent backup and exact rollback
+of the currently running Schema 018 Demo, ordinary Support attachment download,
+bulk exports, account deletion/anonymization, remaining Service credential and
+usage workflows, prebuilt digest-bound images, the actual two-VPS deployment and
+TLS evidence, and final release evidence are not yet complete. This version is
 therefore not the final Laboratory Release Candidate.
 
 ## Quick start
