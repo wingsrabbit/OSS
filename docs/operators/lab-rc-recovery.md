@@ -154,10 +154,62 @@ The resulting file always says:
 - blank PostgreSQL 18 databases are required.
 - exact-release native integrity and reconciliation precede any explicit resume.
 
-This command is intentionally dry-run only. Never aim an improvised `pg_restore --clean`,
-`dropdb`, or schema-reset command at an existing database. Provision disposable blank databases,
-prove they have no user tables, and keep every API, Worker, Provider, callback, and scheduled job
-stopped before an executing restore workflow is introduced and reviewed.
+The plan command does not execute a restore. Never aim an improvised `pg_restore --clean`, `dropdb`,
+or schema-reset command at an existing database. Provision disposable blank databases and keep every
+API, Worker, Provider, callback, and scheduled job stopped.
+
+## Execute a blank DemoLocal database restore
+
+The reviewed executor accepts only a deep-verified four-database `DemoLocal` archive. It does not
+create databases, restore the configuration bundle, start processes, run migrations, or resume side
+effects. Provide four distinct disposable PostgreSQL 18 databases through the same component-scoped
+environment fields used for backup creation, plus the mode-`0600` age identity file.
+
+First use a new private journal directory for a read-only target preflight:
+
+```sh
+set +x
+umask 077
+export LAB_RC_AGE_IDENTITY_FILE="$LAB_RC_PRIVATE_AGE_IDENTITY"
+node tools/lab-backup.mjs restore-demo-local \
+  --archive "$LAB_RC_BACKUP_OUTPUT" \
+  --journal "$LAB_RC_RESTORE_DRY_RUN_JOURNAL" \
+  --dry-run
+```
+
+The preflight deep-verifies every encrypted artifact and checks all four target databases before any
+restore begins. A target is blank only when it has no non-system schema and no relation, routine, or
+type in `public`. Each target connection identity must be distinct. A dry-run journal cannot be
+reused for execution; choose another new directory for the real disposable exercise:
+
+```sh
+node tools/lab-backup.mjs restore-demo-local \
+  --archive "$LAB_RC_BACKUP_OUTPUT" \
+  --journal "$LAB_RC_RESTORE_JOURNAL"
+```
+
+The executor restores Core, payment, shared provisioning/Provider Platform, and shared mail/mailbox
+in manifest order. Each `pg_restore` uses one transaction, stops on its first error, omits ownership,
+privileges, and tablespaces, and writes a mode-`0600` per-component log plus an atomic
+`restore-state.json`. It then compares Core migration/attachment evidence and each Provider table
+inventory with the manifest. No connection field or age identity path is written to argv or the
+journal.
+
+After a failed step, keep the journal. A resume deep-verifies the archive again, skips only the
+ordered completed prefix recorded in the journal, and requires every pending target to still be
+blank before running it:
+
+```sh
+node tools/lab-backup.mjs restore-demo-local \
+  --archive "$LAB_RC_BACKUP_OUTPUT" \
+  --journal "$LAB_RC_RESTORE_JOURNAL" \
+  --resume
+```
+
+Because every step is one transaction, a normal command failure leaves that step blank. If the
+process ended after a database committed but before its journal update, the next blank check refuses
+to continue. Inspect the preserved evidence and use a newly provisioned blank target; do not clean or
+reuse the uncertain database.
 
 ## Native integrity and reconciliation acceptance
 
@@ -211,5 +263,6 @@ git diff --check
 ```
 
 The fixture tests use fake `psql`, `pg_dump`, `pg_restore`, and `age` executables. They exercise
-TestA/TestB inventory validation, encrypted artifact creation, shallow/deep verification, sensitive
-manifest rejection, and the non-resumable restore gate without opening a network connection.
+TestA/TestB/DemoLocal inventory validation, encrypted artifact creation, shallow/deep verification,
+blank-only dry-run, ordered DemoLocal restore, completed resume, and failure journaling without
+opening a network connection.

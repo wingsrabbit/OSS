@@ -23,10 +23,12 @@ import addFormats from "ajv-formats";
 import {
   LAB_WARNING,
   MANIFEST_FORMAT,
+  DEMO_LOCAL_RESTORE_FORMAT,
   buildRestorePlan,
   createBackup,
   databaseEnvironment,
   normalizeProfile,
+  restoreDemoLocal,
   validateManifest,
   verifyBackup,
 } from "./lab-backup.mjs";
@@ -58,7 +60,8 @@ function fakeTools(directory, options = {}) {
     `let sql="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>sql+=c);process.stdin.on("end",()=>{
       if(Object.keys(process.env).some(k=>k.includes("DATABASE_URL")||k.startsWith("LAB_RC_")))process.exit(12);
       if(process.argv.includes("--version")){console.log("psql (PostgreSQL) 18.2");return;}
-      if(sql.includes("server_version_num"))console.log("180002");
+      if(sql.includes("blank_database_object_count"))console.log((process.env.PGDATABASE||"fixture")+"\\t180002\\t"+(${JSON.stringify(options.nonBlankDatabase ?? "")}===(process.env.PGDATABASE||"")?"1":"0"));
+      else if(sql.includes("server_version_num"))console.log("180002");
       else if(sql.includes("schema_migrations"))console.log("021_stage_c_support_operations\\n022_stage_c_catalog_commerce_hardening");
       else if(sql.includes("support_ticket_attachments"))console.log(${JSON.stringify(options.invalidAttachment ? "2\t9\t1" : "2\t9\t0")});
       else if(sql.includes("pg_catalog.pg_tables"))console.log("mock_events\\nmock_operations");
@@ -74,9 +77,13 @@ function fakeTools(directory, options = {}) {
   );
   executable(
     join(bin, "pg_restore"),
-    `if(Object.keys(process.env).some(k=>k.includes("DATABASE_URL")||k.startsWith("LAB_RC_")||k==="PGPASSWORD"||k==="PGPASSFILE"))process.exit(12);
+    `const restoring=process.argv.includes("--dbname=");
+     if(Object.keys(process.env).some(k=>k.includes("DATABASE_URL")||k.startsWith("LAB_RC_")||(!restoring&&(k==="PGPASSWORD"||k==="PGPASSFILE"))))process.exit(12);
      if(process.argv.includes("--version")){console.log("pg_restore (PostgreSQL) 18.2");process.exit(0);}
-     let data="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>data+=c);process.stdin.on("end",()=>{if(!data.startsWith("PGDMP:"))process.exitCode=8;});`,
+     let data="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>data+=c);process.stdin.on("end",()=>{
+       if(!data.startsWith("PGDMP:"))process.exitCode=8;
+       if(restoring&&${JSON.stringify(options.failRestoreDatabase ?? "")}===(process.env.PGDATABASE||"")){console.error("fixture restore failed");process.exitCode=7;}
+     });`,
   );
   executable(
     join(bin, "age"),
@@ -125,6 +132,35 @@ function databaseEnv(prefix, database) {
     [`${prefix}_PGDATABASE`]: database,
     [`${prefix}_PGPASSWORD`]: "fixture-password-never-recorded",
   };
+}
+
+async function demoLocalBackupFixture(directory, toolOptions = {}) {
+  const archive = join(directory, "backup");
+  const identity = join(directory, "fixture-identity");
+  const toolEnv = fakeTools(directory, toolOptions);
+  const repositoryRoot = cleanRepository(directory);
+  const env = {
+    ...process.env,
+    ...toolEnv,
+    ...databaseEnv("LAB_RC_CORE", "oss_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_PAYMENT", "payment_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_PROVISIONING", "provisioning_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_MAIL", "mail_restore_fixture"),
+    LAB_RC_AGE_IDENTITY_FILE: identity,
+  };
+  writeFileSync(identity, "AGE-SECRET-KEY-DEMO-LOCAL-FIXTURE\n", { mode: 0o600 });
+  await createBackup({
+    profile: "DemoLocal",
+    output: archive,
+    recipient: "age1fixturefixturefixturefixturefixturefixturefixture",
+    configurationVersion: "demo-local-restore-config-fixture-1",
+    credentialSetVersion: "demo-local-restore-credential-fixture-1",
+    pausedAt: new Date(Date.now() - 1_000).toISOString(),
+    repositoryRoot,
+    env,
+    stdin: [Buffer.from("private Demo-local restore fixture configuration")],
+  });
+  return { archive, env };
 }
 
 function manifest(profile = "TestA") {
@@ -264,6 +300,82 @@ test("DemoLocal profile records the launcher's four physical databases and share
     assert.equal(result.artifacts.length, 5);
     assertSchemaValid(result);
     assert.equal((await verifyBackup({ archive: output, deep: false, env })).status, "verified");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("DemoLocal blank restore dry-run deep-verifies all four distinct blank targets", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-local-restore-dry-run-"));
+  try {
+    const { archive, env } = await demoLocalBackupFixture(directory);
+    const journal = join(directory, "restore-journal");
+    const state = await restoreDemoLocal({ archive, journal, dryRun: true, resume: false, env });
+    assert.equal(state.format, DEMO_LOCAL_RESTORE_FORMAT);
+    assert.equal(state.status, "dry-run-complete");
+    assert.equal(state.dryRun, true);
+    assert.deepEqual(state.completed, []);
+    assert.equal(existsSync(join(journal, "restore-state.json")), true);
+    assert.equal(existsSync(join(journal, "01-core.log")), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("DemoLocal blank restore runs in order and completed resume performs no database restore", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-local-restore-complete-"));
+  try {
+    const { archive, env } = await demoLocalBackupFixture(directory);
+    const journal = join(directory, "restore-journal");
+    const state = await restoreDemoLocal({ archive, journal, dryRun: false, resume: false, env });
+    assert.equal(state.status, "complete");
+    assert.deepEqual(
+      state.completed.map(({ id }) => id),
+      ["core", "provider-payment", "provider-provisioning", "provider-mail"],
+    );
+    for (const completed of state.completed) {
+      assert.equal(existsSync(join(journal, completed.log)), true);
+      assert.match(readFileSync(join(journal, completed.log), "utf8"), /completed .* manifest comparison/);
+    }
+    const beforeResume = readFileSync(join(journal, "restore-state.json"), "utf8");
+    const resumed = await restoreDemoLocal({ archive, journal, dryRun: false, resume: true, env });
+    assert.equal(resumed.status, "complete");
+    assert.equal(readFileSync(join(journal, "restore-state.json"), "utf8"), beforeResume);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("DemoLocal blank restore stops on first fixture failure and preserves its journal", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-local-restore-failure-"));
+  try {
+    const { archive, env } = await demoLocalBackupFixture(directory, { failRestoreDatabase: "oss_restore_fixture" });
+    const journal = join(directory, "restore-journal");
+    await assert.rejects(
+      restoreDemoLocal({ archive, journal, dryRun: false, resume: false, env }),
+      /core restore failed; execution stopped and the journal was preserved/,
+    );
+    const state = JSON.parse(readFileSync(join(journal, "restore-state.json"), "utf8"));
+    assert.equal(state.status, "failed");
+    assert.deepEqual(state.completed, []);
+    assert.equal(state.failed.id, "core");
+    assert.match(readFileSync(join(journal, state.failed.log), "utf8"), /fixture restore failed/);
+    assert.equal(existsSync(join(journal, "02-provider-payment.log")), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("DemoLocal blank restore refuses a nonblank target before starting any restore", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-local-restore-nonblank-"));
+  try {
+    const { archive, env } = await demoLocalBackupFixture(directory, { nonBlankDatabase: "payment_restore_fixture" });
+    const journal = join(directory, "restore-journal");
+    await assert.rejects(
+      restoreDemoLocal({ archive, journal, dryRun: true, resume: false, env }),
+      /provider-payment restore target is not a blank database/,
+    );
+    assert.equal(existsSync(join(journal, "01-core.log")), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

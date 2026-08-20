@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 export const LAB_WARNING = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY";
 export const MANIFEST_FORMAT = "opensales-lab-rc-backup/v1";
 export const RESTORE_PLAN_FORMAT = "opensales-lab-rc-restore-plan/v1";
+export const DEMO_LOCAL_RESTORE_FORMAT = "opensales-lab-rc-demo-local-restore/v1";
 
 const DATABASES = Object.freeze({
   core: Object.freeze({
@@ -306,6 +307,58 @@ function inspectDatabase(binary, database, env) {
     serverVersionNumber,
     schemaHistory: { kind: "table-inventory", versions: tables },
   };
+}
+
+function inspectBlankTarget(binary, database, env) {
+  const rows = runPsql(
+    binary,
+    database,
+    `SELECT pg_catalog.current_database(),
+            pg_catalog.current_setting('server_version_num'),
+            (
+              SELECT pg_catalog.count(*)
+              FROM pg_catalog.pg_namespace n
+              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'public')
+                AND n.nspname NOT LIKE 'pg_toast%'
+            ) + (
+              SELECT pg_catalog.count(*)
+              FROM pg_catalog.pg_class c
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public'
+            ) + (
+              SELECT pg_catalog.count(*)
+              FROM pg_catalog.pg_proc p
+              JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public'
+            ) + (
+              SELECT pg_catalog.count(*)
+              FROM pg_catalog.pg_type t
+              JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+              WHERE n.nspname = 'public'
+            ) AS blank_database_object_count;`,
+    env,
+  );
+  const [databaseName, serverVersion, objectCount] = (rows[0] ?? "").split("\t");
+  const serverVersionNumber = Number.parseInt(serverVersion ?? "", 10);
+  if (!databaseName || !Number.isInteger(serverVersionNumber) || !/^\d+$/.test(objectCount ?? "")) {
+    fail(`blank target inspection returned an invalid result for ${database.id}`);
+  }
+  if (serverVersionNumber < 180000 || serverVersionNumber >= 190000) {
+    fail(`${database.id} restore target must run PostgreSQL 18`);
+  }
+  if (objectCount !== "0") fail(`${database.id} restore target is not a blank database`);
+  const connection = databaseEnvironment(database, env);
+  const targetIdentitySha256 = createHash("sha256")
+    .update([
+      connection.PGSERVICE ?? "",
+      connection.PGSERVICEFILE ?? "",
+      connection.PGHOST ?? "",
+      connection.PGHOSTADDR ?? "",
+      connection.PGPORT ?? "",
+      databaseName,
+    ].join("\0"))
+    .digest("hex");
+  return { databaseName, serverVersionNumber, targetIdentitySha256 };
 }
 
 function waitForExit(child, label) {
@@ -868,6 +921,238 @@ export async function verifyBackup(options) {
   };
 }
 
+function restoreJournalDirectory(path, archive, resume) {
+  const journal = resolve(path);
+  if (pathIsWithin(realpathSync(archive), canonicalProspectivePath(journal))) {
+    fail("restore journal must be outside the immutable backup archive");
+  }
+  if (!resume) {
+    if (existsSync(journal)) fail("restore journal must not already exist unless --resume is used");
+    mkdirSync(journal, { mode: 0o700 });
+    return journal;
+  }
+  if (!existsSync(journal) || !lstatSync(journal).isDirectory() || lstatSync(journal).isSymbolicLink()) {
+    fail("resume requires a regular non-symlink restore journal directory");
+  }
+  return journal;
+}
+
+function writeRestoreState(path, state) {
+  const partial = `${path}.partial`;
+  writeFileSync(partial, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  chmodSync(partial, 0o600);
+  renameSync(partial, path);
+}
+
+function validateRestoreState(state, manifestSha256) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) fail("restore journal state is invalid");
+  assertExactKeys(
+    state,
+    ["format", "warning", "manifestSha256", "profile", "status", "dryRun", "startedAt", "updatedAt", "completed", "failed"],
+    "restore journal state",
+  );
+  if (state.format !== DEMO_LOCAL_RESTORE_FORMAT || state.warning !== LAB_WARNING) {
+    fail("restore journal format or warning is invalid");
+  }
+  if (state.profile !== "DemoLocal" || state.manifestSha256 !== manifestSha256) {
+    fail("restore journal does not match this verified DemoLocal archive");
+  }
+  if (!["ready", "running", "failed", "complete", "dry-run-complete"].includes(state.status)) {
+    fail("restore journal status is invalid");
+  }
+  parseIso(state.startedAt, "restore journal startedAt");
+  parseIso(state.updatedAt, "restore journal updatedAt");
+  if (!Array.isArray(state.completed)) fail("restore journal completed steps are invalid");
+  const expectedIds = PROFILES.DemoLocal.map(({ id }) => id);
+  for (let index = 0; index < state.completed.length; index += 1) {
+    const completed = state.completed[index];
+    assertExactKeys(completed, ["id", "databaseName", "serverVersionNumber", "targetIdentitySha256", "completedAt", "log"], "completed restore step");
+    if (completed.id !== expectedIds[index]) fail("restore journal completed steps are not an ordered prefix");
+    if (!completed.databaseName || !Number.isInteger(completed.serverVersionNumber) || !SHA256.test(completed.targetIdentitySha256)) {
+      fail("restore journal completed target metadata is invalid");
+    }
+    if (!/^\d{2}-[a-z0-9-]+[.]log$/.test(completed.log)) fail("restore journal log name is invalid");
+    parseIso(completed.completedAt, "restore step completedAt");
+  }
+  if (state.failed !== null) {
+    assertExactKeys(state.failed, ["id", "failedAt", "log"], "failed restore step");
+    if (!expectedIds.includes(state.failed.id) || !/^\d{2}-[a-z0-9-]+[.]log$/.test(state.failed.log)) {
+      fail("restore journal failed step is invalid");
+    }
+    parseIso(state.failed.failedAt, "restore step failedAt");
+  }
+  return state;
+}
+
+function appendRestoreLog(path, message) {
+  if (existsSync(path) && (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())) {
+    fail("restore log must be a regular non-symlink file");
+  }
+  writeFileSync(path, `${new Date().toISOString()} ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" });
+}
+
+async function restoreEncryptedDatabase({ binaries, archive, database, identityFile, logPath, env }) {
+  const identityFd = openIdentity(identityFile);
+  const logFd = openSync(logPath, "a", 0o600);
+  let decrypt;
+  let restore;
+  try {
+    decrypt = spawn(
+      binaries.age,
+      ["--decrypt", "--identity", "-", resolveArtifact(archive, database.artifact)],
+      { env: safeProcessEnvironment(env), stdio: [identityFd, "pipe", logFd] },
+    );
+    restore = spawn(
+      binaries.pgRestore,
+      ["--dbname=", "--exit-on-error", "--single-transaction", "--no-owner", "--no-privileges", "--no-tablespaces", "--no-password"],
+      { env: databaseEnvironment(DATABASES[database.id], env), stdio: ["pipe", "ignore", logFd] },
+    );
+  } finally {
+    closeSync(identityFd);
+    closeSync(logFd);
+  }
+  restore.stdin.on("error", () => {});
+  decrypt.stdout.pipe(restore.stdin);
+  const results = await Promise.allSettled([
+    waitForExit(decrypt, `age decryption for ${database.id}`),
+    waitForExit(restore, `pg_restore for ${database.id}`),
+  ]);
+  const failure = results.find(({ status }) => status === "rejected");
+  if (failure) throw failure.reason;
+}
+
+function assertRestoredInspection(expected, actual) {
+  if (actual.schemaHistory.kind !== expected.schemaHistory.kind ||
+      actual.schemaHistory.versions.join("\0") !== expected.schemaHistory.versions.join("\0")) {
+    fail(`${expected.id} restored schema history differs from the manifest`);
+  }
+  if (expected.id === "core") {
+    const expectedAttachments = expected.attachmentInventory;
+    const actualAttachments = actual.attachmentInventory;
+    if (actualAttachments.count !== expectedAttachments.count ||
+        actualAttachments.totalBytes !== expectedAttachments.totalBytes ||
+        actualAttachments.invalid !== 0) {
+      fail("core restored attachment inventory differs from the manifest");
+    }
+  }
+}
+
+export async function restoreDemoLocal(options) {
+  if (process.version !== "v24.18.0") fail("DemoLocal restore requires the repository-pinned Node.js 24.18.0");
+  const archive = resolve(options.archive);
+  const verification = await verifyBackup({ archive, deep: true, env: options.env });
+  const manifest = validateManifest(JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8")));
+  if (manifest.profile !== "DemoLocal" || manifest.databases.length !== 4) {
+    fail("blank restore executor accepts only a verified four-database DemoLocal manifest");
+  }
+  if (verification.status !== "verified" || verification.deep !== "passed") {
+    fail("blank restore executor requires deep verification to pass");
+  }
+  const journal = restoreJournalDirectory(options.journal, archive, options.resume === true);
+  const statePath = join(journal, "restore-state.json");
+  const startedAt = new Date().toISOString();
+  let state;
+  if (options.resume === true) {
+    if (!existsSync(statePath) || !lstatSync(statePath).isFile() || lstatSync(statePath).isSymbolicLink()) {
+      fail("resume requires a regular non-symlink restore-state.json");
+    }
+    state = validateRestoreState(JSON.parse(readFileSync(statePath, "utf8")), verification.manifestSha256);
+    if (state.dryRun || state.status === "dry-run-complete") fail("a dry-run journal cannot be resumed as a restore");
+    if (state.status === "complete") return state;
+  } else {
+    state = {
+      format: DEMO_LOCAL_RESTORE_FORMAT,
+      warning: LAB_WARNING,
+      manifestSha256: verification.manifestSha256,
+      profile: "DemoLocal",
+      status: "ready",
+      dryRun: options.dryRun === true,
+      startedAt,
+      updatedAt: startedAt,
+      completed: [],
+      failed: null,
+    };
+    writeRestoreState(statePath, state);
+  }
+
+  const binaries = binaryNames(options.env);
+  for (const [binary, label] of [[binaries.psql, "psql"], [binaries.pgRestore, "pg_restore"]]) {
+    if (!/^\S.*PostgreSQL\)? 18(?:\.|\s|$)/.test(commandVersion(binary, label, options.env))) {
+      fail(`${label} must be PostgreSQL 18 for DemoLocal restore`);
+    }
+  }
+  commandVersion(binaries.age, "age", options.env);
+
+  const completedIds = new Set(state.completed.map(({ id }) => id));
+  const completedTargets = new Set(state.completed.map(({ targetIdentitySha256 }) => targetIdentitySha256));
+  const pending = manifest.databases.filter(({ id }) => !completedIds.has(id));
+  const targets = [];
+  for (const database of pending) {
+    const target = inspectBlankTarget(binaries.psql, DATABASES[database.id], options.env);
+    if (completedTargets.has(target.targetIdentitySha256) || targets.some(({ targetIdentitySha256 }) => targetIdentitySha256 === target.targetIdentitySha256)) {
+      fail("each DemoLocal component requires a distinct blank target database");
+    }
+    targets.push({ id: database.id, ...target });
+  }
+
+  if (options.dryRun === true) {
+    state.status = "dry-run-complete";
+    state.updatedAt = new Date().toISOString();
+    writeRestoreState(statePath, state);
+    return state;
+  }
+
+  state.status = "running";
+  state.failed = null;
+  state.updatedAt = new Date().toISOString();
+  writeRestoreState(statePath, state);
+  for (const database of pending) {
+    const index = manifest.databases.findIndex(({ id }) => id === database.id);
+    const target = targets.find(({ id }) => id === database.id);
+    const log = `${String(index + 1).padStart(2, "0")}-${database.id}.log`;
+    const logPath = join(journal, log);
+    appendRestoreLog(logPath, `starting ${database.id} single-transaction restore`);
+    try {
+      await restoreEncryptedDatabase({
+        binaries,
+        archive,
+        database,
+        identityFile: options.env.LAB_RC_AGE_IDENTITY_FILE,
+        logPath,
+        env: options.env,
+      });
+      assertRestoredInspection(database, inspectDatabase(binaries.psql, DATABASES[database.id], options.env));
+      const completedAt = new Date().toISOString();
+      appendRestoreLog(logPath, `completed ${database.id} restore and manifest comparison`);
+      state.completed.push({
+        id: database.id,
+        databaseName: target.databaseName,
+        serverVersionNumber: target.serverVersionNumber,
+        targetIdentitySha256: target.targetIdentitySha256,
+        completedAt,
+        log,
+      });
+      state.updatedAt = completedAt;
+      state.failed = null;
+      writeRestoreState(statePath, state);
+    } catch (error) {
+      const failedAt = new Date().toISOString();
+      const reason = error instanceof Error ? error.message : "unknown restore failure";
+      appendRestoreLog(logPath, `failed ${database.id} restore; execution stopped: ${reason}`);
+      state.status = "failed";
+      state.updatedAt = failedAt;
+      state.failed = { id: database.id, failedAt, log };
+      writeRestoreState(statePath, state);
+      fail(`${database.id} restore failed; execution stopped and the journal was preserved`);
+    }
+  }
+  state.status = "complete";
+  state.updatedAt = new Date().toISOString();
+  state.failed = null;
+  writeRestoreState(statePath, state);
+  return state;
+}
+
 export function buildRestorePlan(manifest, verifiedAt = new Date().toISOString(), manifestSha256) {
   validateManifest(manifest);
   const manifestDigest = manifestSha256 ?? createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
@@ -933,8 +1218,8 @@ function parseArguments(argv) {
   const values = {};
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index];
-    if (argument === "--deep") {
-      values.deep = true;
+    if (["--deep", "--dry-run", "--resume"].includes(argument)) {
+      values[argument.slice(2)] = true;
       continue;
     }
     if (!argument.startsWith("--")) fail("unexpected positional argument");
@@ -966,6 +1251,11 @@ verify --archive DIR [--deep]
 
 restore-plan --archive DIR --output FILE
   Writes a non-executing restore plan whose Worker and Provider side effects remain disabled.
+
+restore-demo-local --archive DIR --journal DIR [--dry-run|--resume]
+  Deep-verifies one four-database DemoLocal archive, requires distinct blank PostgreSQL 18 targets,
+  and restores them sequentially with single-transaction pg_restore. Target libpq fields come from
+  the DemoLocal LAB_RC_<COMPONENT>_PG* environment variables. LAB_RC_AGE_IDENTITY_FILE is required.
 `;
 }
 
@@ -1007,6 +1297,18 @@ async function main(argv = process.argv.slice(2)) {
     const manifest = JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8"));
     jsonFile(output, buildRestorePlan(manifest, new Date().toISOString(), verification.manifestSha256));
     process.stdout.write("restore plan written; Worker dispatch and Provider mutation remain disabled\n");
+    return;
+  }
+  if (command === "restore-demo-local") {
+    if (values["dry-run"] === true && values.resume === true) fail("--dry-run and --resume are mutually exclusive");
+    const state = await restoreDemoLocal({
+      archive: requireOption(values, "archive"),
+      journal: requireOption(values, "journal"),
+      dryRun: values["dry-run"] === true,
+      resume: values.resume === true,
+      env: process.env,
+    });
+    process.stdout.write(`${JSON.stringify(state, null, 2)}\n`);
     return;
   }
   process.stdout.write(usage());
