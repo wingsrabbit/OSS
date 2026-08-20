@@ -183,7 +183,10 @@ try {
   await pool.query(
     `INSERT INTO staff_members(user_id, roles, permissions)
      VALUES ($1, ARRAY['Operations'], $2::jsonb)`,
-    [staff.userId, JSON.stringify(["accounts.view", "orders.read"])],
+    [
+      staff.userId,
+      JSON.stringify(["accounts.view", "orders.read", "support.tickets.manage"]),
+    ],
   );
   const supportDepartment = await pool.query<{ id: string }>(
     `SELECT revision.id
