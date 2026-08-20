@@ -3852,7 +3852,7 @@ try {
            WHERE application_name = 'opensales-api'
              AND state = 'active'
              AND wait_event_type = 'Lock'
-             AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+             AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
         );
         return result.rows[0]?.waiting ?? "0";
       },
@@ -3873,7 +3873,7 @@ try {
                WHERE application_name = 'opensales-api'
                  AND state = 'active'
                  AND wait_event_type = 'Lock'
-                 AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%')
+                 AND query ILIKE '%SELECT id FROM users%FOR UPDATE%')
                AS callbacks_waiting,
              (SELECT count(*)::text
                 FROM pg_stat_activity
