@@ -533,14 +533,14 @@ async function refreshAccountContext(expectedClientAccountId: string): Promise<v
     return;
   }
   assert.equal(current.clientAccountId, null);
-  const selected = await request<{ clientAccountId: string }>(
+  const selected = await request<{ context: { clientAccountId: string } }>(
     "/api/v1/auth/account-context",
     {
       method: "PUT",
       body: JSON.stringify({ clientAccountId: expectedClientAccountId }),
     },
   );
-  assert.equal(selected.clientAccountId, expectedClientAccountId);
+  assert.equal(selected.context.clientAccountId, expectedClientAccountId);
 }
 
 async function submitPaymentFact(
