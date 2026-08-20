@@ -183,11 +183,24 @@ try {
   await pool.query(
     `INSERT INTO staff_members(user_id, roles, permissions)
      VALUES ($1, ARRAY['Operations'], $2::jsonb)`,
-    [
-      staff.userId,
-      JSON.stringify(["accounts.view", "orders.read", "support.tickets.manage"]),
-    ],
+    [staff.userId, JSON.stringify(["accounts.view", "orders.read"])],
   );
+  const supportMessageStaffUserId = randomUUID();
+  await transaction(pool, async (client) => {
+    await client.query(
+      `INSERT INTO users(id, email, password_hash, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', pg_catalog.now())`,
+      [
+        supportMessageStaffUserId,
+        `account-history-support-staff-${databaseName}@example.invalid`,
+      ],
+    );
+    await client.query(
+      `INSERT INTO staff_members(user_id, roles, permissions)
+       VALUES ($1, ARRAY['Support'], '["support.tickets.manage"]'::jsonb)`,
+      [supportMessageStaffUserId],
+    );
+  });
   const supportDepartment = await pool.query<{ id: string }>(
     `SELECT revision.id
      FROM support_departments department
@@ -420,7 +433,7 @@ try {
      ) VALUES
        ($1, $2, 'customer', 'public', 'Synthetic customer-visible history'),
        ($1, $3, 'staff', 'internal', 'Synthetic internal account note')`,
-    [ticketId, customer.userId, staff.userId],
+    [ticketId, customer.userId, supportMessageStaffUserId],
   );
 
   await pool.query(
