@@ -721,7 +721,6 @@ export async function registerServiceRoutes(
       } as const;
       await enqueueNotification(client, {
         eventType: "notification.service_cancellation_scheduled",
-        templateRevision: "service-cancellation-scheduled-v1",
         uniqueKey: `service-cancellation:${requestId}`,
         payload: notificationPayload,
         recipient: {
@@ -735,7 +734,6 @@ export async function registerServiceRoutes(
       });
       await enqueueSubscribedContactNotifications(client, {
         eventType: "notification.service_cancellation_scheduled",
-        templateRevision: "service-cancellation-scheduled-v1",
         uniqueKeyPrefix: `service-cancellation:${requestId}`,
         payload: notificationPayload,
         clientAccountId: user.clientAccountId,

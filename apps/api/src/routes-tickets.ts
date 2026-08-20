@@ -1249,7 +1249,6 @@ export async function registerTicketRoutes(
         if (creatorEligible && creator) {
           await enqueueNotification(client, {
             eventType: "notification.support_ticket_reply_requested",
-            templateRevision: "support-ticket-reply-v1",
             uniqueKey: `support-ticket-reply:${messageId}`,
             payload: notificationPayload,
             recipient: {
@@ -1266,7 +1265,6 @@ export async function registerTicketRoutes(
         } else if (owner && ownerMembership?.role === "owner") {
           const ownerNotification = await enqueueNotification(client, {
             eventType: "notification.support_ticket_reply_requested",
-            templateRevision: "support-ticket-reply-v1",
             uniqueKey: `support-ticket-reply:${messageId}`,
             payload: notificationPayload,
             recipient: {
@@ -1283,7 +1281,6 @@ export async function registerTicketRoutes(
         }
         await enqueueSubscribedContactNotifications(client, {
           eventType: "notification.support_ticket_reply_requested",
-          templateRevision: "support-ticket-reply-v1",
           uniqueKeyPrefix: `support-ticket-reply:${messageId}`,
           payload: notificationPayload,
           clientAccountId: pointer.client_account_id,

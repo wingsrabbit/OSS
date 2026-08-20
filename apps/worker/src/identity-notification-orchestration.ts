@@ -4,6 +4,11 @@ import {
   decryptIdentitySecret,
   type IdentitySecretKeyring,
 } from "@opensales/core/identity-security";
+import {
+  renderNotificationTemplate,
+  type NotificationPreferenceCategory,
+  type NotificationTemplateRevision,
+} from "@opensales/core";
 import { createHash } from "node:crypto";
 import type pg from "pg";
 import { z } from "zod";
@@ -56,6 +61,15 @@ type BundleRow = Readonly<{
   post_attempted_at: Date | null;
   last_reconciled_at: Date | null;
   reconcile_query_count: number;
+  template_revision_id: string;
+  template_revision: string;
+  template_locale: "en" | "zh-CN";
+  provider_template_ref: string;
+  template_subject: string;
+  template_body: string;
+  template_sensitive: boolean;
+  preference_category: NotificationPreferenceCategory;
+  required_delivery: boolean;
   user_id: string;
   kind: "password_recovery" | "email_change";
   recipient: string;
@@ -130,6 +144,15 @@ function operationSelect(): string {
                  operation.post_attempted_at,
                  operation.last_reconciled_at,
                  operation.reconcile_query_count,
+                 operation.template_revision_id,
+                 operation.template_revision,
+                 operation.template_locale,
+                 template.provider_template_ref,
+                 template.subject_template AS template_subject,
+                 template.body_template AS template_body,
+                 template_event.sensitive AS template_sensitive,
+                 template_event.preference_category,
+                 template_event.required_delivery,
                  event.user_id,
                  event.kind,
                  event.recipient::text,
@@ -140,7 +163,11 @@ function operationSelect(): string {
                  event.expires_at
           FROM public.identity_notification_delivery_operations operation
           JOIN public.identity_notification_outbox event
-            ON event.id = operation.outbox_id`;
+            ON event.id = operation.outbox_id
+          JOIN public.notification_template_revisions template
+            ON template.id = operation.template_revision_id
+          JOIN public.notification_template_events template_event
+            ON template_event.event_type = template.event_type`;
 }
 
 async function loadBundle(
@@ -316,20 +343,31 @@ function renderNotification(
   ) {
     throw new Error("Identity notification encrypted payload contract is invalid");
   }
-  const passwordRecovery = operation.kind === "password_recovery";
-  const subject = operation.locale === "zh-CN"
-    ? passwordRecovery ? "重置 OpenSales System 实验室密码" : "确认 OpenSales System 实验室邮箱变更"
-    : passwordRecovery ? "Reset your OpenSales System laboratory password" : "Confirm your OpenSales System laboratory email change";
-  const action = operation.locale === "zh-CN"
-    ? passwordRecovery ? "密码恢复链接" : "邮箱变更确认链接"
-    : passwordRecovery ? "Password recovery link" : "Email change confirmation link";
+  const template: NotificationTemplateRevision = {
+    revisionId: operation.template_revision_id,
+    eventType: `identity.notification.${operation.kind}`,
+    revisionKey: operation.template_revision,
+    providerTemplateRef: operation.provider_template_ref,
+    templateLocale: operation.template_locale,
+    requestedLocale: operation.locale,
+    fallback: operation.template_locale !== operation.locale,
+    preferenceCategory: operation.preference_category,
+    requiredDelivery: operation.required_delivery,
+    sensitive: operation.template_sensitive,
+    subjectTemplate: operation.template_subject,
+    bodyTemplate: operation.template_body,
+  };
+  const rendered = renderNotificationTemplate(template, {
+    actionUrl: payload.url,
+    expiresAt: payload.expiresAt,
+  });
   return mockMailRequestSnapshot({
     recipient: operation.recipient,
-    template: passwordRecovery ? "password-recovery-v1" : "email-change-v1",
+    template: rendered.template,
     locale: operation.locale,
-    subject,
-    body: `NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n${action}: ${payload.url}\n\nExpires: ${payload.expiresAt}`,
-    sensitive: true,
+    subject: rendered.subject,
+    body: rendered.body,
+    sensitive: rendered.sensitive,
   }, config.scenario);
 }
 
@@ -403,7 +441,7 @@ async function appendDeliveryRetry(
   const inserted = await client.query<{ id: string }>(
     `INSERT INTO public.identity_notification_delivery_operations(
        outbox_id, attempt_number, provider_operation_id, request_fingerprint,
-       status
+       template_revision_id, template_revision, template_locale, status
      )
      SELECT event.id, $2,
             public.opensales_notification_provider_operation_id(event.id, $2),
@@ -412,11 +450,17 @@ async function appendDeliveryRetry(
               event.subject_id, event.encrypted_payload,
               event.encryption_key_version, event.expires_at
             ),
-            'queued'
+            $3, $4, $5, 'queued'
      FROM public.identity_notification_outbox event
      WHERE event.id = $1
      RETURNING id`,
-    [operation.outbox_id, attemptNumber],
+    [
+      operation.outbox_id,
+      attemptNumber,
+      operation.template_revision_id,
+      operation.template_revision,
+      operation.template_locale,
+    ],
   );
   const operationId = inserted.rows[0]?.id;
   if (!operationId) throw new IdentityNotificationStateChangedError();

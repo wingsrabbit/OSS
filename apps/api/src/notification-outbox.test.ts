@@ -10,6 +10,26 @@ import {
 } from "./notification-outbox.js";
 import type { DatabaseClient } from "./database.js";
 
+function templateRow(
+  eventType: string,
+  revisionKey: string,
+  preferenceCategory: "identity" | "high_risk" | "support",
+  requiredDelivery: boolean,
+) {
+  return {
+    revision_id: "00000000-0000-4000-8000-000000000299",
+    event_type: eventType,
+    revision_key: revisionKey,
+    provider_template_ref: revisionKey,
+    template_locale: "en",
+    preference_category: preferenceCategory,
+    required_delivery: requiredDelivery,
+    sensitive: preferenceCategory === "identity",
+    subject_template: "Synthetic subject",
+    body_template: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\nSynthetic body",
+  } as const;
+}
+
 test("notification request fingerprints are canonical and scope-bound", () => {
   const first = notificationRequestFingerprint("notification.example", "example-v1", {
     z: [3, { b: true, a: "value" }],
@@ -109,6 +129,16 @@ test("notification enqueue locks account Users before Account and Membership and
       if (normalized.includes("FROM public.client_memberships")) {
         return { rows: [{ removed_at: null, restricted_at: null }] };
       }
+      if (normalized.includes("FROM public.current_notification_templates")) {
+        return {
+          rows: [templateRow(
+            "notification.service_cancellation_scheduled",
+            "service-cancellation-scheduled-v1",
+            "high_risk",
+            true,
+          )],
+        };
+      }
       if (normalized.startsWith("SELECT pg_catalog.pg_advisory_xact_lock")) {
         return { rows: [{}] };
       }
@@ -135,7 +165,6 @@ test("notification enqueue locks account Users before Account and Membership and
 
   const enqueued = await enqueueNotification(client, {
     eventType: "notification.service_cancellation_scheduled",
-    templateRevision: "service-cancellation-scheduled-v1",
     uniqueKey: "service-cancellation:synthetic",
     payload: {
       cancellationRequestId: "00000000-0000-4000-8000-000000000204",
@@ -154,14 +183,18 @@ test("notification enqueue locks account Users before Account and Membership and
     },
   });
 
-  assert.ok(statements[0]?.includes("FROM public.users"));
-  assert.ok(statements[0]?.includes("FOR SHARE NOWAIT"));
-  assert.ok(statements[1]?.includes("FROM public.client_accounts"));
-  assert.ok(statements[2]?.includes("FROM public.client_memberships"));
-  assert.ok(statements[3]?.startsWith("SELECT pg_catalog.pg_advisory_xact_lock"));
+  assert.ok(statements[0]?.startsWith("SELECT pg_catalog.pg_advisory_xact_lock"));
+  const userLock = statements.findIndex((statement) => statement.includes("FROM public.users"));
+  const accountLock = statements.findIndex((statement) => statement.includes("FROM public.client_accounts"));
+  const membershipLock = statements.findIndex((statement) => statement.includes("FROM public.client_memberships"));
+  assert.ok(userLock > 0 && statements[userLock]?.includes("FOR SHARE NOWAIT"));
+  assert.ok(accountLock > userLock);
+  assert.ok(membershipLock > accountLock);
   assert.equal(operationParameters?.[3], "notification.service_cancellation_scheduled");
   assert.equal(operationParameters?.[4], "service-cancellation-scheduled-v1");
-  assert.deepEqual(operationParameters?.[5], {
+  assert.equal(operationParameters?.[5], "00000000-0000-4000-8000-000000000299");
+  assert.equal(operationParameters?.[6], "en");
+  assert.deepEqual(operationParameters?.[7], {
     cancellationRequestId: "00000000-0000-4000-8000-000000000204",
     serviceId: "00000000-0000-4000-8000-000000000205",
     productName: "Synthetic VPS",
@@ -209,6 +242,16 @@ test("a stable ineligible account User records a skipped fact without rolling ba
       if (normalized.includes("FROM public.client_memberships")) {
         return { rows: [{ removed_at: null, restricted_at: null }] };
       }
+      if (normalized.includes("FROM public.current_notification_templates")) {
+        return {
+          rows: [templateRow(
+            "notification.service_cancellation_scheduled",
+            "service-cancellation-scheduled-v1",
+            "high_risk",
+            true,
+          )],
+        };
+      }
       if (normalized.startsWith("SELECT pg_catalog.pg_advisory_xact_lock")) {
         return { rows: [{}] };
       }
@@ -223,8 +266,8 @@ test("a stable ineligible account User records a skipped fact without rolling ba
         return { rows: [] };
       }
       if (normalized.startsWith("INSERT INTO public.notification_delivery_operations")) {
-        operationStatus = parameters?.[17];
-        operationReason = parameters?.[18];
+        operationStatus = parameters?.[19];
+        operationReason = parameters?.[20];
         return { rows: [], rowCount: 1 };
       }
       if (normalized.startsWith("INSERT INTO public.notification_delivery_facts")) {
@@ -246,7 +289,6 @@ test("a stable ineligible account User records a skipped fact without rolling ba
 
   const enqueued = await enqueueNotification(client, {
     eventType: "notification.service_cancellation_scheduled",
-    templateRevision: "service-cancellation-scheduled-v1",
     uniqueKey: "service-cancellation:restricted-recipient",
     payload: {
       cancellationRequestId: "00000000-0000-4000-8000-000000000209",
@@ -284,7 +326,6 @@ test("notification enqueue exposes recipient lock races as a retryable product c
     () =>
       enqueueNotification(client, {
         eventType: "notification.email_verification_requested",
-        templateRevision: "email-verification-v1",
         uniqueKey: "verification:synthetic",
         payload: { verificationUrl: "https://example.invalid/verify?token=synthetic" },
         recipient: {
@@ -311,6 +352,23 @@ test("membership invitation enqueue binds the exact URL token to the locked invi
   const client = {
     query: async (statement: string, parameters?: readonly unknown[]) => {
       const normalized = statement.replaceAll(/\s+/g, " ").trim();
+      if (normalized.startsWith("SELECT pg_catalog.pg_advisory_xact_lock")) {
+        return { rows: [{}] };
+      }
+      if (normalized.includes("FROM public.outbox")) return { rows: [] };
+      if (normalized.includes("FROM public.notification_delivery_operations")) {
+        return { rows: [] };
+      }
+      if (normalized.includes("FROM public.current_notification_templates")) {
+        return {
+          rows: [templateRow(
+            "notification.membership_invitation_requested",
+            "membership-invitation-v1",
+            "high_risk",
+            true,
+          )],
+        };
+      }
       if (normalized.includes("FROM public.client_accounts")) {
         return { rows: [{ id: clientAccountId }] };
       }
@@ -331,7 +389,6 @@ test("membership invitation enqueue binds the exact URL token to the locked invi
     () =>
       enqueueNotification(client, {
         eventType: "notification.membership_invitation_requested",
-        templateRevision: "membership-invitation-v1",
         uniqueKey: `membership-invitation:${invitationId}`,
         payload: {
           accountName: "Synthetic Account",
@@ -363,6 +420,23 @@ test("email verification enqueue binds the exact URL token to the locked token r
   const client = {
     query: async (statement: string, parameters?: readonly unknown[]) => {
       const normalized = statement.replaceAll(/\s+/g, " ").trim();
+      if (normalized.startsWith("SELECT pg_catalog.pg_advisory_xact_lock")) {
+        return { rows: [{}] };
+      }
+      if (normalized.includes("FROM public.outbox")) return { rows: [] };
+      if (normalized.includes("FROM public.notification_delivery_operations")) {
+        return { rows: [] };
+      }
+      if (normalized.includes("FROM public.current_notification_templates")) {
+        return {
+          rows: [templateRow(
+            "notification.email_verification_requested",
+            "email-verification-v1",
+            "identity",
+            true,
+          )],
+        };
+      }
       if (normalized.includes("FROM public.users")) {
         return {
           rows: [{
@@ -392,7 +466,6 @@ test("email verification enqueue binds the exact URL token to the locked token r
     () =>
       enqueueNotification(client, {
         eventType: "notification.email_verification_requested",
-        templateRevision: "email-verification-v1",
         uniqueKey: `verification:${verificationTokenId}`,
         payload: {
           verificationTokenId,

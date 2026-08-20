@@ -10,7 +10,7 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema026ApplicationGuard,
+  holdSchema027ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -47,6 +47,7 @@ import { registerSupportOperationRoutes } from "./routes-support-operations.js";
 import { registerIdentitySecurityRoutes } from "./routes-identity-security.js";
 import { registerCustomerApiRoutes } from "./routes-customer-api.js";
 import { registerContentRoutes } from "./routes-content.js";
+import { registerNotificationTemplateRoutes } from "./routes-notification-templates.js";
 
 export async function buildApp(
   config: Config,
@@ -129,10 +130,10 @@ export async function buildApp(
   try {
     if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
       throw new Error(
-        "Schema 026 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
+        "Schema 027 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
       );
     }
-    releaseSchemaRollbackGuard = await holdSchema026ApplicationGuard(pool);
+    releaseSchemaRollbackGuard = await holdSchema027ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
@@ -293,6 +294,7 @@ export async function buildApp(
   await registerSupportOperationRoutes(app, pool, config);
   await registerNotificationOperationRoutes(app, pool, config);
   await registerContentRoutes(app, pool, config);
+  await registerNotificationTemplateRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
     return { app, pool };

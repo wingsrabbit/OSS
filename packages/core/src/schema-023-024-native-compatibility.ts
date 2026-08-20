@@ -39,7 +39,10 @@ function rowRecord(row: unknown): Record<string, unknown> {
 
 export async function schema024CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
+  input: Readonly<{ allowSchema027NotificationTemplateExtensions?: boolean }> = {},
 ): Promise<string | null> {
+  const allowSchema027NotificationTemplateExtensions =
+    input.allowSchema027NotificationTemplateExtensions === true;
   const result = await database.query(
     `WITH target_relations(name) AS (
        VALUES
@@ -179,6 +182,13 @@ export async function schema024CatalogFingerprintInput(
              SELECT relation_name, column_name FROM target_base_columns
            )
          )
+         AND NOT (
+           $1::boolean
+           AND actual.table_name = 'identity_notification_delivery_operations'
+           AND actual.column_name IN (
+             'template_revision_id', 'template_revision', 'template_locale'
+           )
+         )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'constraint', relation.relname, actual.conname,
                 actual.contype::text, actual.convalidated::text,
@@ -195,6 +205,18 @@ export async function schema024CatalogFingerprintInput(
            relation.relname IN (SELECT name FROM target_relations)
            OR (relation.relname, actual.conname) IN (
              SELECT relation_name, constraint_name FROM target_base_constraints
+           )
+         )
+         AND NOT (
+           $1::boolean
+           AND relation.relname = 'identity_notification_delivery_operations'
+           AND actual.conname IN (
+             'identity_notification_operations_template_revision_check',
+             'identity_notification_operations_template_locale_check',
+             'identity_notification_operations_template_revision_fkey',
+             'identity_notification_delivery_op_template_revision_id_not_null',
+             'identity_notification_delivery_opera_template_revision_not_null',
+             'identity_notification_delivery_operati_template_locale_not_null'
            )
          )
        UNION ALL
@@ -223,6 +245,11 @@ export async function schema024CatalogFingerprintInput(
            relation.relname IN (SELECT name FROM target_relations)
            OR actual.tgname IN (SELECT name FROM target_triggers)
          )
+         AND NOT (
+           $1::boolean
+           AND relation.relname = 'identity_notification_delivery_operations'
+           AND actual.tgname = 'identity_notification_operations_template_revision_guard'
+         )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'function', namespace.nspname, actual.proname,
                 pg_catalog.pg_get_function_identity_arguments(actual.oid),
@@ -243,6 +270,7 @@ export async function schema024CatalogFingerprintInput(
        FROM catalog_items
      )
      SELECT value FROM fingerprint`,
+    [allowSchema027NotificationTemplateExtensions],
   );
   const value = result.rows[0] ? rowRecord(result.rows[0]).value : null;
   return typeof value === "string" ? value : null;
@@ -265,9 +293,10 @@ export function assertSchema024CatalogDigest(digest: string | null): void {
 
 export async function assertSchema024CatalogShape(
   database: RollbackPreflightQueryable,
+  input: Readonly<{ allowSchema027NotificationTemplateExtensions?: boolean }> = {},
 ): Promise<void> {
   assertSchema024CatalogDigest(
-    schema024CatalogDigest(await schema024CatalogFingerprintInput(database)),
+    schema024CatalogDigest(await schema024CatalogFingerprintInput(database, input)),
   );
 }
 

@@ -294,6 +294,7 @@ export async function assertSchema023NativeSafe(
  */
 export async function assertSchema023FoundationCatalogShape(
   database: RollbackPreflightQueryable,
+  input: Readonly<{ allowSchema027NotificationTemplateExtensions?: boolean }> = {},
 ): Promise<void> {
   const schema017Shape = await schema017CatalogFingerprintInput(database, {
     expectedMigrationHistory: EXPECTED_SCHEMA_019_HISTORY,
@@ -311,7 +312,10 @@ export async function assertSchema023FoundationCatalogShape(
   await assertSchema018CatalogShape(database, {
     allowSchema021SupportExtensions: true,
   });
-  const schema019Shape = await schema019CatalogFingerprintInput(database);
+  const schema019Shape = await schema019CatalogFingerprintInput(database, {
+    allowSchema027NotificationTemplateExtensions:
+      input.allowSchema027NotificationTemplateExtensions === true,
+  });
   assertSchema019CatalogDigest(schema019CatalogDigest(schema019Shape.fingerprintInput));
   await assertSchema020CatalogShape(database, {
     allowSchema022CommerceExtensions: true,

@@ -69,6 +69,10 @@
       "types": "./dist/schema-025-026-native-compatibility.d.ts",
       "default": "./dist/schema-025-026-native-compatibility.js"
     },
+    "./schema-026-027-native-compatibility": {
+      "types": "./dist/schema-026-027-native-compatibility.d.ts",
+      "default": "./dist/schema-026-027-native-compatibility.js"
+    },
     "./identity-security": {
       "types": "./dist/identity-security.d.ts",
       "default": "./dist/identity-security.js"

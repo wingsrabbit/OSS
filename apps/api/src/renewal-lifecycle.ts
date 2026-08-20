@@ -78,7 +78,6 @@ async function enqueueReminder(
   if (existing.rowCount) return false;
 
   const eventType = "notification.renewal_reminder_requested";
-  const templateRevision = `renewal-${input.kind.replaceAll("_", "-")}-v1`;
   const uniqueKey = `renewal:${input.invoiceId}:${input.kind}`;
   const notificationPayload = {
     invoiceId: input.invoiceId,
@@ -91,7 +90,6 @@ async function enqueueReminder(
   } as const;
   const ownerNotification = await enqueueNotification(client, {
     eventType,
-    templateRevision,
     uniqueKey,
     payload: notificationPayload,
     recipient: {
@@ -126,7 +124,6 @@ async function enqueueReminder(
   if (insertedIntent.rowCount !== 1) return false;
   await enqueueSubscribedContactNotifications(client, {
     eventType,
-    templateRevision,
     uniqueKeyPrefix: uniqueKey,
     payload: notificationPayload,
     clientAccountId: input.clientAccountId,

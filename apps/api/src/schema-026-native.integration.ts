@@ -444,7 +444,10 @@ try {
        FROM public.schema_migrations`,
     );
     assert.deepEqual(history.rows[0]?.versions, [...EXPECTED_SCHEMA_026_HISTORY]);
-    assert.equal((await assertSchemaCompatible(pool)).installedSchemaVersion, SCHEMA_026);
+    await assert.rejects(
+      assertSchemaCompatible(pool),
+      /026_stage_c_service_cancellation_authority.*027_stage_c_notification_templates_preferences/,
+    );
 
     for (const statement of [
       `CREATE OR REPLACE FUNCTION public.opensales_validate_service_cancellation_request()

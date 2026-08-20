@@ -518,7 +518,6 @@ export async function registerAccountContextRoutes(
         if (!invitation) throw new Error("Unable to create membership invitation");
         await enqueueNotification(client, {
           eventType: "notification.membership_invitation_requested",
-          templateRevision: "membership-invitation-v1",
           uniqueKey: `membership-invitation:${invitation.id}`,
           payload: {
             accountName: context.accountName,

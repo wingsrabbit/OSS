@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import {
+  renderNotificationTemplate,
+  type NotificationPreferenceCategory,
+  type NotificationTemplateRevision,
+  type NotificationTemplateValue,
+} from "@opensales/core";
 import type pg from "pg";
 import {
   getMockMailNotification,
@@ -9,7 +15,6 @@ import {
   notificationOperationId,
   parseMockMailRequestSnapshot,
   postMockMailNotification,
-  renderStandardNotification,
   type MockMailRequestSnapshot,
   type NotificationDeliveryFact,
   type StandardNotificationPayload,
@@ -55,6 +60,14 @@ type OperationRow = Readonly<{
   operation_origin: "application" | "schema_019_backfill";
   event_type: string;
   template_revision: string;
+  template_revision_id: string;
+  template_locale: "en" | "zh-CN";
+  provider_template_ref: string;
+  template_subject: string;
+  template_body: string;
+  template_sensitive: boolean;
+  preference_category: NotificationPreferenceCategory;
+  required_delivery: boolean;
   payload_snapshot: StandardNotificationPayload;
   rendered_request_snapshot: unknown | null;
   rendered_request_fingerprint: string | null;
@@ -145,7 +158,15 @@ function operationSelect(): string {
                  operation.provider_operation_id,
                  operation.provider_installation_id,
                  operation.operation_origin, operation.event_type,
-                 operation.template_revision, operation.payload_snapshot,
+                 operation.template_revision, operation.template_revision_id,
+                 operation.template_locale,
+                 template.provider_template_ref,
+                 template.subject_template AS template_subject,
+                 template.body_template AS template_body,
+                 template_event.sensitive AS template_sensitive,
+                 template_event.preference_category,
+                 template_event.required_delivery,
+                 operation.payload_snapshot,
                  operation.rendered_request_snapshot,
                  operation.rendered_request_fingerprint,
                  operation.invitation_id, operation.contact_id,
@@ -158,7 +179,11 @@ function operationSelect(): string {
                  operation.last_checked_at, operation.last_error,
                  event.published_at AS outbox_published_at
           FROM public.notification_delivery_operations operation
-          JOIN public.outbox event ON event.id = operation.outbox_id`;
+          JOIN public.outbox event ON event.id = operation.outbox_id
+          JOIN public.notification_template_revisions template
+            ON template.id = operation.template_revision_id
+          JOIN public.notification_template_events template_event
+            ON template_event.event_type = template.event_type`;
 }
 
 async function loadLatestOperation(
@@ -334,6 +359,38 @@ function oneTimeToken(value: unknown, pathname: string): string | null {
   }
 }
 
+export async function currentUserNotificationPreferenceAllowsAtDispatch(
+  client: Pick<DatabaseClient, "query">,
+  input: Readonly<{
+    userId: string | null;
+    preferenceCategory: NotificationPreferenceCategory;
+    requiredDelivery: boolean;
+  }>,
+): Promise<boolean> {
+  if (input.requiredDelivery || !input.userId) return true;
+  const result = await client.query<{ enabled: boolean }>(
+    `SELECT preference.enabled
+     FROM public.user_notification_preferences preference
+     WHERE preference.user_id = $1
+       AND preference.category = $2
+       AND preference.channel = 'email'
+     FOR SHARE`,
+    [input.userId, input.preferenceCategory],
+  );
+  return result.rows[0]?.enabled ?? true;
+}
+
+async function currentUserPreferenceAllows(
+  client: DatabaseClient,
+  operation: OperationRow,
+): Promise<boolean> {
+  return currentUserNotificationPreferenceAllowsAtDispatch(client, {
+    userId: operation.recipient_user_id,
+    preferenceCategory: operation.preference_category,
+    requiredDelivery: operation.required_delivery,
+  });
+}
+
 async function lockRecipientForDispatch(
   client: DatabaseClient,
   operation: OperationRow,
@@ -385,10 +442,13 @@ async function lockRecipientForDispatch(
       [operation.recipient_user_id, tokenId, token],
     );
     const verification = lockedToken.rows[0];
-    return verification && !verification.used_at && !verification.invalidated_at &&
-      verification.eligible
+    if (
+      !verification || verification.used_at || verification.invalidated_at ||
+      !verification.eligible
+    ) return invalid("VERIFICATION_TOKEN_INELIGIBLE");
+    return await currentUserPreferenceAllows(client, operation)
       ? { kind: "eligible" }
-      : invalid("VERIFICATION_TOKEN_INELIGIBLE");
+      : invalid("USER_NOTIFICATION_PREFERENCE_DISABLED");
   }
 
   if (operation.recipient_kind === "account_user") {
@@ -423,11 +483,15 @@ async function lockRecipientForDispatch(
     );
     const user = principal.rows[0];
     const member = membership.rows[0];
-    return user && user.email === operation.recipient && user.locale === operation.locale &&
+    const eligible = Boolean(
+      user && user.email === operation.recipient && user.locale === operation.locale &&
       user.email_verified_at && !user.restricted_at && account.rows[0] && member &&
-      !member.removed_at && !member.restricted_at
+      !member.removed_at && !member.restricted_at,
+    );
+    if (!eligible) return invalid("ACCOUNT_USER_RECIPIENT_INELIGIBLE");
+    return await currentUserPreferenceAllows(client, operation)
       ? { kind: "eligible" }
-      : invalid("ACCOUNT_USER_RECIPIENT_INELIGIBLE");
+      : invalid("USER_NOTIFICATION_PREFERENCE_DISABLED");
   }
 
   const account = await client.query(
@@ -664,6 +728,49 @@ async function manualCurrentOperation(
   await updateJob(client, job, config, { status: "manual", reason });
 }
 
+function notificationTemplateValues(
+  operation: OperationRow,
+  payload: StandardNotificationPayload,
+): Readonly<Record<string, NotificationTemplateValue | undefined>> {
+  const values: Record<string, NotificationTemplateValue | undefined> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (typeof value === "string" || typeof value === "number") values[key] = value;
+  }
+  if (payload.amountDueMinor && /^\d+$/.test(payload.amountDueMinor)) {
+    const amountDueMinor = BigInt(payload.amountDueMinor);
+    values.amountDue = `${amountDueMinor / 100n}.${(amountDueMinor % 100n)
+      .toString()
+      .padStart(2, "0")}`;
+  }
+  if (payload.executionMode) {
+    values.executionMode = operation.template_locale === "zh-CN"
+      ? payload.executionMode === "automatic"
+        ? "Mock Provider 自动终止"
+        : "管理员人工终止"
+      : payload.executionMode === "automatic"
+        ? "automatic Mock Provider termination"
+        : "administrator manual termination";
+  }
+  return values;
+}
+
+function operationTemplateRevision(operation: OperationRow): NotificationTemplateRevision {
+  return {
+    revisionId: operation.template_revision_id,
+    eventType: operation.event_type,
+    revisionKey: operation.template_revision,
+    providerTemplateRef: operation.provider_template_ref,
+    templateLocale: operation.template_locale,
+    requestedLocale: operation.locale,
+    fallback: operation.template_locale !== operation.locale,
+    preferenceCategory: operation.preference_category,
+    requiredDelivery: operation.required_delivery,
+    sensitive: operation.template_sensitive,
+    subjectTemplate: operation.template_subject,
+    bodyTemplate: operation.template_body,
+  };
+}
+
 async function prepareDispatch(
   pool: pg.Pool,
   pointer: OperationRow,
@@ -703,12 +810,19 @@ async function prepareDispatch(
           throw new Error("rendered fingerprint mismatch");
         }
       } else {
+        const rendered = renderNotificationTemplate(
+          operationTemplateRevision(operation),
+          notificationTemplateValues(operation, renewal.payload),
+        );
         requestSnapshot = mockMailRequestSnapshot(
-          renderStandardNotification(
-            operation.event_type,
-            renewal.payload,
-            operation.template_revision,
-          ),
+          {
+            recipient: operation.recipient,
+            template: rendered.template,
+            locale: operation.locale,
+            subject: rendered.subject,
+            body: rendered.body,
+            sensitive: rendered.sensitive,
+          },
           config.scenario,
         );
       }
@@ -1044,15 +1158,16 @@ async function insertNextOperation(
     `INSERT INTO public.notification_delivery_operations(
        outbox_id, attempt_number, provider_operation_id,
        provider_installation_id, operation_origin,
-       event_type, template_revision, payload_snapshot,
+       event_type, template_revision, template_revision_id, template_locale,
+       payload_snapshot,
        invitation_id, contact_id, recipient_user_id, client_account_id,
        recipient_subject_id, recipient_scope_id,
        recipient_kind, category, recipient, locale, request_fingerprint,
        status, last_error
      ) VALUES (
-       $1, $2, $3, $4, $5, $6, $7, $8,
-       $9, $10, $11, $12, $13, $14,
-       $15, $16, $17, $18, $19, $20, $21
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+       $11, $12, $13, $14, $15, $16,
+       $17, $18, $19, $20, $21, $22, $23
      )
      RETURNING *, NULL::timestamptz AS outbox_published_at`,
     [
@@ -1063,6 +1178,8 @@ async function insertNextOperation(
       previous.operation_origin,
       previous.event_type,
       previous.template_revision,
+      previous.template_revision_id,
+      previous.template_locale,
       previous.payload_snapshot,
       previous.invitation_id,
       previous.contact_id,

@@ -505,7 +505,6 @@ export async function registerAuthRoutes(
         if (!verification) throw new Error("Unable to create verification token");
         await enqueueNotification(client, {
           eventType: "notification.email_verification_requested",
-          templateRevision: "email-verification-v1",
           uniqueKey: `registration:${userId}`,
           payload: {
             verificationTokenId: verification.id,
@@ -617,7 +616,6 @@ export async function registerAuthRoutes(
         if (!verification) throw new Error("Unable to create verification token");
         await enqueueNotification(client, {
           eventType: "notification.email_verification_requested",
-          templateRevision: "email-verification-v1",
           uniqueKey: `invitation-registration:${userId}`,
           payload: {
             verificationTokenId: verification.id,
@@ -1548,7 +1546,6 @@ export async function registerAuthRoutes(
       if (!verification) throw new Error("Unable to create verification token");
       await enqueueNotification(client, {
         eventType: "notification.email_verification_requested",
-        templateRevision: "email-verification-v1",
         uniqueKey: `verification:${verification.id}`,
         payload: {
           verificationTokenId: verification.id,

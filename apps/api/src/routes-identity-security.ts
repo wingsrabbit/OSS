@@ -33,6 +33,7 @@ import {
 import { identitySecretKeyring, type Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { activeTotpCredential, verifyConfiguredFactorLocked } from "./identity-factor.js";
+import { resolveCurrentNotificationTemplate } from "./notification-templates.js";
 import {
   clearLabIdentityMailboxCapability,
   rotateLabIdentityMailboxCapability,
@@ -258,6 +259,11 @@ async function enqueueIdentityNotification(
     expiresAt: Date;
   }>,
 ): Promise<void> {
+  const template = await resolveCurrentNotificationTemplate(
+    client,
+    `identity.notification.${input.kind}`,
+    input.locale,
+  );
   const encrypted = encryptIdentitySecret(
     JSON.stringify({ url: input.url, expiresAt: input.expiresAt.toISOString() }),
     `identity-notification:${input.kind}`,
@@ -286,7 +292,7 @@ async function enqueueIdentityNotification(
   const operation = await client.query<{ id: string; attempt_number: number }>(
     `INSERT INTO public.identity_notification_delivery_operations(
        outbox_id, attempt_number, provider_operation_id, request_fingerprint,
-       status
+       template_revision_id, template_revision, template_locale, status
      )
      SELECT event.id, 1,
             public.opensales_notification_provider_operation_id(event.id, 1),
@@ -295,11 +301,11 @@ async function enqueueIdentityNotification(
               event.subject_id, event.encrypted_payload,
               event.encryption_key_version, event.expires_at
             ),
-            'queued'
+            $2, $3, $4, 'queued'
      FROM public.identity_notification_outbox event
      WHERE event.id = $1
      RETURNING id, attempt_number`,
-    [outboxId],
+    [outboxId, template.revisionId, template.revisionKey, template.templateLocale],
   );
   const delivery = operation.rows[0];
   if (!delivery) throw new Error("Unable to create identity delivery operation");

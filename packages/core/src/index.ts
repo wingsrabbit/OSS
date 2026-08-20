@@ -3,6 +3,15 @@
 export const LAB_BANNER = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY" as const;
 
 export {
+  NOTIFICATION_PREFERENCE_CATEGORIES,
+  renderNotificationTemplate,
+  type NotificationPreferenceCategory,
+  type NotificationTemplateLocale,
+  type NotificationTemplateRevision,
+  type NotificationTemplateValue,
+} from "./notification-templates.js";
+
+export {
   CONTENT_KINDS,
   CONTENT_LOCALES,
   CONTENT_STATUS_LEVELS,

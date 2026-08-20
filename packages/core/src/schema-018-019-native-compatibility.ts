@@ -80,7 +80,10 @@ async function installedSchemaVersion(
 
 export async function schema019CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
+  input: Readonly<{ allowSchema027NotificationTemplateExtensions?: boolean }> = {},
 ): Promise<Readonly<{ historyExact: boolean; fingerprintInput: string | null }>> {
+  const allowSchema027NotificationTemplateExtensions =
+    input.allowSchema027NotificationTemplateExtensions === true;
   const result = await database.query(
     `WITH catalog_items(item) AS (
        SELECT pg_catalog.concat_ws('|', 'relation', namespace.nspname, relation.relname,
@@ -138,6 +141,11 @@ export async function schema019CatalogFingerprintInput(
                AND actual.column_name IN (
                  'client_account_id', 'schema_019_legacy_relationship'
                ))
+         )
+         AND NOT (
+           $2::boolean
+           AND actual.table_name = 'notification_delivery_operations'
+           AND actual.column_name IN ('template_revision_id', 'template_locale')
          )
        UNION ALL
        SELECT pg_catalog.concat_ws('|', 'index', actual.schemaname,
@@ -211,6 +219,16 @@ export async function schema019CatalogFingerprintInput(
              'service_periods_service_account_fkey',
              'service_periods_invoice_account_fkey',
              'service_periods_schema_019_account_check'
+           )
+         )
+         AND NOT (
+           $2::boolean
+           AND relation.relname = 'notification_delivery_operations'
+           AND actual.conname IN (
+             'notification_delivery_operations_template_locale_check',
+             'notification_delivery_operations_template_revision_fkey',
+             'notification_delivery_operations_template_locale_not_null',
+             'notification_delivery_operations_template_revision_id_not_null'
            )
          )
        UNION ALL
@@ -296,7 +314,57 @@ export async function schema019CatalogFingerprintInput(
                 COALESCE(pg_catalog.array_to_string(actual.proconfig, ','), ''),
                 pg_catalog.pg_get_function_identity_arguments(actual.oid),
                 pg_catalog.pg_get_function_result(actual.oid),
-                pg_catalog.regexp_replace(pg_catalog.btrim(actual.prosrc), '\\s+', ' ', 'g'))
+                pg_catalog.regexp_replace(
+                  pg_catalog.btrim(
+                    CASE WHEN $2::boolean AND actual.proname =
+                      'opensales_validate_notification_delivery_operation'
+                    THEN pg_catalog.replace(
+                      pg_catalog.replace(
+                        pg_catalog.replace(
+                          pg_catalog.replace(
+                            actual.prosrc,
+$schema027$       AND NEW.payload_snapshot ->> 'amountDueMinor' ~ '^\\d+$' THEN$schema027$,
+$schema019$       AND NEW.payload_snapshot ->> 'amountDueMinor' ~ '^\\d+$'
+       AND NEW.template_revision =
+         'renewal-' || pg_catalog.replace(
+           NEW.payload_snapshot ->> 'kind', '_', '-'
+         ) || '-v1' THEN$schema019$
+                          ),
+$schema027$       AND NEW.payload_snapshot ->> 'executionMode' IN ('automatic', 'manual') THEN$schema027$,
+$schema019$       AND NEW.payload_snapshot ->> 'executionMode' IN ('automatic', 'manual')
+       AND NEW.template_revision = 'service-cancellation-scheduled-v1' THEN$schema019$
+                        ),
+$schema027$       AND pg_catalog.jsonb_typeof(NEW.payload_snapshot -> 'ticketMessage') = 'string' THEN$schema027$,
+$schema019$       AND pg_catalog.jsonb_typeof(NEW.payload_snapshot -> 'ticketMessage') = 'string'
+       AND NEW.template_revision = 'support-ticket-reply-v1' THEN$schema019$
+                      ),
+$schema027$  IF (
+    COALESCE(recipient_is_valid, false)
+    AND NEW.status <> 'queued'
+    AND NOT (
+      NEW.status = 'skipped'
+      AND NEW.last_error = 'USER_NOTIFICATION_PREFERENCE_DISABLED'
+      AND NEW.recipient_user_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM public.notification_template_events template_event
+        JOIN public.user_notification_preferences preference
+          ON preference.user_id = NEW.recipient_user_id
+         AND preference.category = template_event.preference_category
+         AND preference.channel = 'email'
+        WHERE template_event.event_type = NEW.event_type
+          AND NOT template_event.required_delivery
+          AND NOT preference.enabled
+      )
+    )
+  )
+  OR (NOT COALESCE(recipient_is_valid, false) AND NEW.status <> 'skipped') THEN$schema027$,
+$schema019$  IF (COALESCE(recipient_is_valid, false) AND NEW.status <> 'queued')
+     OR (NOT COALESCE(recipient_is_valid, false) AND NEW.status <> 'skipped') THEN$schema019$
+                    ) ELSE actual.prosrc END
+                  ),
+                  '\\s+', ' ', 'g'
+                ))
        FROM pg_catalog.pg_namespace namespace
        JOIN pg_catalog.pg_proc actual ON actual.pronamespace = namespace.oid
        JOIN pg_catalog.pg_language language ON language.oid = actual.prolang
@@ -345,7 +413,7 @@ export async function schema019CatalogFingerprintInput(
        (SELECT pg_catalog.array_agg(version ORDER BY version COLLATE "C")
         FROM public.schema_migrations) = $1::text[] AS history_exact,
        (SELECT value FROM fingerprint) AS fingerprint_input`,
-    [[...EXPECTED_SCHEMA_019_HISTORY]],
+    [[...EXPECTED_SCHEMA_019_HISTORY], allowSchema027NotificationTemplateExtensions],
   );
   const row = rowRecord(result.rows[0]);
   return {

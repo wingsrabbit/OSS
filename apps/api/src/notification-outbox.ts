@@ -2,6 +2,11 @@
 
 import { createHash } from "node:crypto";
 import type { DatabaseClient } from "./database.js";
+import {
+  resolveCurrentNotificationTemplate,
+  userNotificationPreferenceAllows,
+} from "./notification-templates.js";
+import type { NotificationTemplateRevision } from "@opensales/core";
 
 export type NotificationCategory =
   | "identity"
@@ -125,6 +130,7 @@ async function lockNotificationRecipient(
   eventType: string,
   payload: NotificationPayload,
   recipient: NotificationRecipient,
+  template: NotificationTemplateRevision,
 ): Promise<NotificationRecipientLockResult> {
   const mismatch = (): never => {
     throw Object.assign(new Error("Notification recipient is no longer eligible"), {
@@ -174,7 +180,14 @@ async function lockNotificationRecipient(
     if (row.restricted_at) {
       return { status: "skipped", reason: "IDENTITY_RECIPIENT_INELIGIBLE" };
     }
-    return { status: "queued" };
+    return await userNotificationPreferenceAllows(
+      client,
+      recipient.userId,
+      template.preferenceCategory,
+      template.requiredDelivery,
+    )
+      ? { status: "queued" }
+      : { status: "skipped", reason: "USER_NOTIFICATION_PREFERENCE_DISABLED" };
   }
 
   if (recipient.kind === "account_user") {
@@ -226,7 +239,14 @@ async function lockNotificationRecipient(
     ) {
       return { status: "skipped", reason: "ACCOUNT_USER_RECIPIENT_INELIGIBLE" };
     }
-    return { status: "queued" };
+    return await userNotificationPreferenceAllows(
+      client,
+      recipient.userId,
+      template.preferenceCategory,
+      template.requiredDelivery,
+    )
+      ? { status: "queued" }
+      : { status: "skipped", reason: "USER_NOTIFICATION_PREFERENCE_DISABLED" };
   }
 
   const account = await client.query(
@@ -401,6 +421,8 @@ function sameOperationSnapshot(
     operation_origin: string;
     event_type: string;
     template_revision: string;
+    template_revision_id: string;
+    template_locale: NotificationLocale;
     payload_snapshot: NotificationPayload;
     invitation_id: string | null;
     contact_id: string | null;
@@ -418,6 +440,8 @@ function sameOperationSnapshot(
     providerOperationId: string;
     eventType: string;
     templateRevision: string;
+    templateRevisionId: string;
+    templateLocale: NotificationLocale;
     payload: NotificationPayload;
     invitationId: string | null;
     contactId: string | null;
@@ -435,6 +459,8 @@ function sameOperationSnapshot(
     row.operation_origin === "application" &&
     row.event_type === expected.eventType &&
     row.template_revision === expected.templateRevision &&
+    row.template_revision_id === expected.templateRevisionId &&
+    row.template_locale === expected.templateLocale &&
     canonicalJson(row.payload_snapshot) === canonicalJson(expected.payload) &&
     row.invitation_id === expected.invitationId &&
     row.contact_id === expected.contactId &&
@@ -454,29 +480,12 @@ export async function enqueueNotification(
   client: DatabaseClient,
   input: Readonly<{
     eventType: string;
-    templateRevision: string;
     uniqueKey: string;
     payload: NotificationPayload;
     recipient: NotificationRecipient;
   }>,
 ): Promise<EnqueuedNotification> {
   const payload = payloadWithRecipient(input.payload, input.recipient);
-  const requestFingerprint = notificationRequestFingerprint(
-    input.eventType,
-    input.templateRevision,
-    payload,
-  );
-  let recipientState: NotificationRecipientLockResult;
-  try {
-    recipientState = await lockNotificationRecipient(
-      client,
-      input.eventType,
-      input.payload,
-      input.recipient,
-    );
-  } catch (error) {
-    rethrowNotificationRecipientLock(error);
-  }
   try {
     await client.query(
       "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))",
@@ -492,26 +501,10 @@ export async function enqueueNotification(
   );
   let outboxId = existingOutbox.rows[0]?.id;
   if (outboxId) {
-    const existingFingerprint = notificationRequestFingerprint(
-      input.eventType,
-      input.templateRevision,
-      existingOutbox.rows[0]!.payload,
-    );
-    if (existingFingerprint !== requestFingerprint) {
+    if (canonicalJson(existingOutbox.rows[0]!.payload) !== canonicalJson(payload)) {
       throw new Error("Notification outbox key was reused with a different immutable request");
     }
-  } else {
-    const insertedOutbox = await client.query<{ id: string }>(
-      `INSERT INTO public.outbox(event_type, unique_key, payload)
-       VALUES ($1, $2, $3)
-       RETURNING id`,
-      [input.eventType, input.uniqueKey, payload],
-    );
-    outboxId = insertedOutbox.rows[0]?.id;
   }
-  if (!outboxId) throw new Error("Unable to create notification outbox event");
-
-  const providerOperationId = notificationProviderOperationId(outboxId, 1);
   const identity = operationIdentity(input.recipient);
   const existingOperation = await client.query<{
     provider_operation_id: string;
@@ -519,6 +512,8 @@ export async function enqueueNotification(
     operation_origin: string;
     event_type: string;
     template_revision: string;
+    template_revision_id: string;
+    template_locale: NotificationLocale;
     payload_snapshot: NotificationPayload;
     invitation_id: string | null;
     contact_id: string | null;
@@ -534,56 +529,107 @@ export async function enqueueNotification(
     status: string;
   }>(
     `SELECT provider_operation_id, provider_installation_id, operation_origin,
-            event_type, template_revision, payload_snapshot,
+            event_type, template_revision, template_revision_id::text,
+            template_locale, payload_snapshot,
             invitation_id, contact_id, recipient_user_id, client_account_id,
             recipient_subject_id, recipient_scope_id, recipient_kind,
             category, recipient::text, locale, request_fingerprint, status
      FROM public.notification_delivery_operations
      WHERE outbox_id = $1 AND attempt_number = 1
      FOR UPDATE`,
-    [outboxId],
+    [outboxId ?? null],
   );
   const operation = existingOperation.rows[0];
-  let notificationStatus: "queued" | "skipped" = recipientState.status;
-  const skippedReason = recipientState.status === "skipped"
-    ? recipientState.reason
-    : "RECIPIENT_INELIGIBLE_AT_EVENT_COMMIT";
-  const expectedOperation = {
-    providerOperationId,
-    eventType: input.eventType,
-    templateRevision: input.templateRevision,
-    payload,
-    ...identity,
-    recipient: input.recipient,
-    requestFingerprint,
-  };
-  if (operation) {
+  if (outboxId && !operation) {
+    throw new Error("Notification outbox exists without its immutable first attempt");
+  }
+  if (outboxId && operation) {
+    const requestFingerprint = notificationRequestFingerprint(
+      input.eventType,
+      operation.template_revision,
+      payload,
+    );
+    const expectedOperation = {
+      providerOperationId: notificationProviderOperationId(outboxId, 1),
+      eventType: input.eventType,
+      templateRevision: operation.template_revision,
+      templateRevisionId: operation.template_revision_id,
+      templateLocale: operation.template_locale,
+      payload,
+      ...identity,
+      recipient: input.recipient,
+      requestFingerprint,
+    };
     if (!sameOperationSnapshot(operation, expectedOperation)) {
       throw new Error("Notification delivery operation does not match its immutable outbox");
     }
-    notificationStatus = operation.status === "skipped" ? "skipped" : "queued";
-  } else {
-    await client.query(
+    return {
+      outboxId,
+      providerOperationId: operation.provider_operation_id,
+      requestFingerprint,
+      status: operation.status === "skipped" ? "skipped" : "queued",
+    };
+  }
+
+  const template = await resolveCurrentNotificationTemplate(
+    client,
+    input.eventType,
+    input.recipient.locale,
+  );
+  const requestFingerprint = notificationRequestFingerprint(
+    input.eventType,
+    template.revisionKey,
+    payload,
+  );
+  let recipientState: NotificationRecipientLockResult;
+  try {
+    recipientState = await lockNotificationRecipient(
+      client,
+      input.eventType,
+      input.payload,
+      input.recipient,
+      template,
+    );
+  } catch (error) {
+    rethrowNotificationRecipientLock(error);
+  }
+  const insertedOutbox = await client.query<{ id: string }>(
+    `INSERT INTO public.outbox(event_type, unique_key, payload)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [input.eventType, input.uniqueKey, payload],
+  );
+  outboxId = insertedOutbox.rows[0]?.id;
+  if (!outboxId) throw new Error("Unable to create notification outbox event");
+  const providerOperationId = notificationProviderOperationId(outboxId, 1);
+  const notificationStatus: "queued" | "skipped" = recipientState.status;
+  const skippedReason = recipientState.status === "skipped"
+    ? recipientState.reason
+    : "RECIPIENT_INELIGIBLE_AT_EVENT_COMMIT";
+  await client.query(
       `INSERT INTO public.notification_delivery_operations(
          outbox_id, attempt_number, provider_operation_id,
          provider_installation_id, operation_origin,
-         event_type, template_revision, payload_snapshot,
+         event_type, template_revision, template_revision_id, template_locale,
+         payload_snapshot,
          invitation_id, contact_id,
          recipient_user_id, client_account_id,
          recipient_subject_id, recipient_scope_id,
          recipient_kind, category, recipient, locale, request_fingerprint,
          status, last_error
        ) VALUES (
-         $1, 1, $2, $3, 'application', $4, $5, $6,
-         $7, $8, $9, $10, $11, $12,
-         $13, $14, $15, $16, $17, $18, $19
+         $1, 1, $2, $3, 'application', $4, $5, $6, $7, $8,
+         $9, $10, $11, $12, $13, $14,
+         $15, $16, $17, $18, $19, $20, $21
        )`,
       [
         outboxId,
         providerOperationId,
         MOCK_MAIL_PROVIDER_INSTALLATION_ID,
         input.eventType,
-        input.templateRevision,
+        template.revisionKey,
+        template.revisionId,
+        template.templateLocale,
         payload,
         identity.invitationId,
         identity.contactId,
@@ -600,7 +646,6 @@ export async function enqueueNotification(
         notificationStatus === "skipped" ? skippedReason : null,
       ],
     );
-  }
 
   if (notificationStatus === "skipped") {
     await client.query(
@@ -654,7 +699,6 @@ export async function enqueueSubscribedContactNotifications(
   client: DatabaseClient,
   input: Readonly<{
     eventType: string;
-    templateRevision: string;
     uniqueKeyPrefix: string;
     payload: NotificationPayload;
     clientAccountId: string;
@@ -702,7 +746,6 @@ export async function enqueueSubscribedContactNotifications(
     enqueued.push(
       await enqueueNotification(client, {
         eventType: input.eventType,
-        templateRevision: input.templateRevision,
         uniqueKey: `${input.uniqueKeyPrefix}:contact:${contact.id}`,
         payload: input.payload,
         recipient: {
