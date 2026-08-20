@@ -13445,8 +13445,8 @@ await assert.rejects(
      WHERE id = $1`,
     [dueCancellationActive.service.id],
   ),
-  /confirmed Provider success/i,
-  "automatic cancellation cannot mark a service terminated before Provider success",
+  /without exact completion evidence/i,
+  "automatic cancellation cannot mark a service terminated without exact completion evidence",
 );
 await corePool.query(
   `UPDATE durable_jobs
