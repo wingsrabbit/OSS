@@ -309,7 +309,19 @@ type OrderDetail = {
       effectiveAt: string;
       result: Record<string, unknown>;
       lastError: string | null;
-      providerOperation: { status: string; attempts: number } | null;
+      providerOperation: {
+        status: string;
+        attempts: number;
+        attemptId: string | null;
+        dispatchedAt: string | null;
+        reconcileQueries: number;
+        unresolvedReconcileQueries: number;
+        latestResult: {
+          outcome: "succeeded" | "failed";
+          source: "callback" | "reconciliation";
+          occurredAt: string | null;
+        } | null;
+      } | null;
     } | null;
   };
 };
@@ -12404,7 +12416,15 @@ assert.deepEqual(scheduledService.service.cancellation, {
   effectiveAt: cancellationActive.service.termEnd,
   result: { status: "scheduled" },
   lastError: null,
-  providerOperation: { status: "queued", attempts: 0 },
+  providerOperation: {
+    status: "queued",
+    attempts: 0,
+    attemptId: null,
+    dispatchedAt: null,
+    reconcileQueries: 0,
+    unresolvedReconcileQueries: 0,
+    latestResult: null,
+  },
 });
 
 cookie = terminatedCreditCookie;
