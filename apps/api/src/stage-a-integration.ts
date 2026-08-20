@@ -10969,8 +10969,11 @@ assert.deepEqual(
 );
 await new Promise((resolve) => setTimeout(resolve, 200));
 const restrictedBilling = await rawCoreRequest("/api/v1/billing/summary", { method: "GET" });
-assert.equal(restrictedBilling.status, 403);
-assert.equal(restrictedBilling.body.code, "ACCOUNT_RESTRICTED");
+assert.equal(restrictedBilling.status, 200);
+assert.equal(
+  (restrictedBilling.body.addFunds as { allowed?: unknown } | undefined)?.allowed,
+  false,
+);
 
 const chargebackEffects = await corePool.query<{
   effects: string;
