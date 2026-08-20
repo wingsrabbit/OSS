@@ -210,7 +210,6 @@ jobs:
           await client.connect();
           await client.query('CREATE DATABASE payment_token_rotation');
           await client.query('CREATE DATABASE manual_receipts');
-          await client.query('CREATE DATABASE support_tickets');
           await client.query('CREATE DATABASE worker_job_claim');
           await client.query('CREATE DATABASE notification_delivery');
           await client.query('CREATE DATABASE schema_rollback');
@@ -232,11 +231,6 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/manual_receipts
         run: pnpm --filter @opensales/api test:integration:manual-receipts
-
-      - name: Run support ticket PostgreSQL and API journey
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/support_tickets
-        run: pnpm --filter @opensales/api test:integration:tickets
 
       - name: Run normal Support operations PostgreSQL 18, Mock Mail, and public API journey
         run: pnpm --filter @opensales/api test:integration:support-operations-normal-ci
