@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import {
   PROVIDER_CONTRACT_VERSION,
   PROVIDER_TRANSPORT_VERSION,
+  capabilityMutationOperations,
   capabilityOperations,
   parseProviderEventPage,
   parseProviderManifest,
@@ -57,6 +58,17 @@ export interface ConformanceReport {
   timeoutOperationsReconciled: number;
 }
 
+type ProviderMutationAction = ProviderOperationRequest["action"];
+
+const representativeMutationActions: Readonly<Record<ProviderCapability, ProviderMutationAction>> = {
+  payment: "payment.capture",
+  provisioning: "resource.create",
+  mail: "mail.send",
+  verification: "verification.evaluate",
+  tax: "tax.quote",
+  anti_abuse_challenge: "challenge.evaluate",
+};
+
 function normalizedBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
 }
@@ -84,7 +96,11 @@ export function requestFor(
   capability: ProviderCapability,
   operationId: string,
   intentRef: string,
+  action: ProviderMutationAction = representativeMutationActions[capability],
 ): ProviderOperationRequest {
+  if (!(capabilityMutationOperations[capability] as readonly string[]).includes(action)) {
+    throw new Error(`${action} is not a mutation operation for ${capability}`);
+  }
   const base = {
     transportVersion: PROVIDER_TRANSPORT_VERSION,
     contractVersion: PROVIDER_CONTRACT_VERSION,
@@ -97,21 +113,35 @@ export function requestFor(
       return {
         ...base,
         capability,
-        action: "payment.capture",
+        action: action as "payment.authorize" | "payment.capture" | "payment.refund",
         input: { amountMinor: "1999", currency: "USD", customerRef: "synthetic-customer" },
       };
     case "provisioning":
       return {
         ...base,
         capability,
-        action: "resource.create",
-        input: { serviceRef: "synthetic-service", planRef: "synthetic-plan" },
+        action: action as
+          | "resource.create"
+          | "resource.start"
+          | "resource.stop"
+          | "resource.reboot"
+          | "resource.change_password"
+          | "resource.change_plan"
+          | "resource.terminate",
+        input: {
+          serviceRef: "synthetic-service",
+          planRef: action === "resource.change_plan" ? "synthetic-plan-v2" : "synthetic-plan",
+          ...(action === "resource.create" ? {} : { externalResourceRef: "synthetic-existing-resource" }),
+          ...(action === "resource.change_password"
+            ? { configuration: { requestedPasswordRef: "synthetic-credential-reference" } }
+            : {}),
+        },
       };
     case "mail":
       return {
         ...base,
         capability,
-        action: "mail.send",
+        action: action as "mail.send",
         input: {
           recipient: "provider-conformance@example.test",
           templateRef: "synthetic-template-v1",
@@ -124,7 +154,7 @@ export function requestFor(
       return {
         ...base,
         capability,
-        action: "verification.evaluate",
+        action: action as "verification.evaluate",
         input: {
           subjectRef: "synthetic-subject",
           purpose: "account_eligibility",
@@ -135,7 +165,7 @@ export function requestFor(
       return {
         ...base,
         capability,
-        action: "tax.quote",
+        action: action as "tax.quote",
         input: {
           currency: "USD",
           jurisdictionCountry: "US",
@@ -146,7 +176,7 @@ export function requestFor(
       return {
         ...base,
         capability,
-        action: "challenge.evaluate",
+        action: action as "challenge.evaluate",
         input: {
           subjectRef: "synthetic-subject",
           actionRef: "synthetic-checkout",
@@ -160,11 +190,12 @@ async function operationIdFor(
   capability: ProviderCapability,
   scenario: string,
   runId: string,
+  action: ProviderMutationAction = representativeMutationActions[capability],
 ): Promise<string> {
   return stableProviderOperationId({
     accountRef: `provider-conformance:${runId}`,
     capability,
-    action: capabilityOperations[capability][0],
+    action,
     intentRef: scenario,
   });
 }
@@ -215,15 +246,24 @@ export async function operationEvents(
   return parseProviderEventPage(await responseJson(response)).events;
 }
 
-function assertFunctionalOutput(result: ProviderOperationResult): void {
+function assertFunctionalOutput(
+  result: ProviderOperationResult,
+  action: ProviderMutationAction = representativeMutationActions[result.capability],
+): void {
   assert.equal(result.status, "succeeded");
   assert.ok(result.output, `${result.capability} must return a functional output fact`);
   switch (result.capability) {
     case "payment":
-      assert.equal("paymentState" in result.output && result.output.paymentState, "captured");
+      assert.equal(
+        "paymentState" in result.output && result.output.paymentState,
+        action === "payment.refund" ? "refunded" : action === "payment.authorize" ? "authorized" : "captured",
+      );
       break;
     case "provisioning":
-      assert.equal("resourceState" in result.output && result.output.resourceState, "ready");
+      assert.equal(
+        "resourceState" in result.output && result.output.resourceState,
+        action === "resource.terminate" ? "terminated" : action === "resource.stop" ? "stopped" : "ready",
+      );
       break;
     case "mail":
       assert.equal("deliveryState" in result.output && result.output.deliveryState, "delivered");
@@ -250,37 +290,41 @@ export async function runPublicProviderConformance(
   for (const declaration of manifest.capabilities) {
     const capability = declaration.capability;
     assert.equal(declaration.contractVersion, PROVIDER_CONTRACT_VERSION);
-    assert.ok(declaration.operations.length > 0);
-    const operationId = await operationIdFor(capability, "public-normal", runId);
-    const request = requestFor(capability, operationId, `public-normal:${runId}`);
-    const concurrent = await Promise.all([
-      executeOperation(target, request),
-      executeOperation(target, request),
-    ]);
-    const first = concurrent[0];
-    const replay = concurrent[1];
-    assert.ok(first && replay);
-    assert.equal(first.response.status, 202, `${capability} normal operation was not accepted`);
-    assert.equal(replay.response.status, 202, `${capability} concurrent idempotent replay failed`);
-    assert.deepEqual(
-      new Set(concurrent.map(({ response }) => response.headers.get("x-oss-idempotent-replay"))),
-      new Set(["false", "true"]),
-      `${capability} did not serialize the first request and its concurrent replay`,
-    );
-    const firstResult = parseProviderOperationResult(first.body);
-    assertFunctionalOutput(firstResult);
-    assert.deepEqual(parseProviderOperationResult(replay.body), firstResult);
-    const conflictingRequest: ProviderOperationRequest = {
-      ...request,
-      intentRef: `${request.intentRef}:conflict`,
-    };
-    const conflict = await executeOperation(target, conflictingRequest);
-    assert.equal(conflict.response.status, 409, `${capability} accepted conflicting idempotency reuse`);
-    const reconciled = await reconcileOperation(target, capability, operationId);
-    assert.deepEqual(reconciled, firstResult);
-    const events = await operationEvents(target, operationId);
-    assert.equal(reduceProviderEvents(events).latest?.result.status, "succeeded");
-    operations += 1;
+    const reconcileAction = capabilityOperations[capability].find((action) => action.endsWith(".reconcile"));
+    assert.ok(reconcileAction && declaration.operations.includes(reconcileAction));
+    for (const action of capabilityMutationOperations[capability]) {
+      assert.ok(declaration.operations.includes(action), `${capability} manifest omitted ${action}`);
+      const operationId = await operationIdFor(capability, `public-normal:${action}`, runId, action);
+      const request = requestFor(capability, operationId, `public-normal:${action}:${runId}`, action);
+      const concurrent = await Promise.all([
+        executeOperation(target, request),
+        executeOperation(target, request),
+      ]);
+      const first = concurrent[0];
+      const replay = concurrent[1];
+      assert.ok(first && replay);
+      assert.equal(first.response.status, 202, `${action} normal operation was not accepted`);
+      assert.equal(replay.response.status, 202, `${action} concurrent idempotent replay failed`);
+      assert.deepEqual(
+        new Set(concurrent.map(({ response }) => response.headers.get("x-oss-idempotent-replay"))),
+        new Set(["false", "true"]),
+        `${action} did not serialize the first request and its concurrent replay`,
+      );
+      const firstResult = parseProviderOperationResult(first.body);
+      assertFunctionalOutput(firstResult, action);
+      assert.deepEqual(parseProviderOperationResult(replay.body), firstResult);
+      const conflictingRequest: ProviderOperationRequest = {
+        ...request,
+        intentRef: `${request.intentRef}:conflict`,
+      };
+      const conflict = await executeOperation(target, conflictingRequest);
+      assert.equal(conflict.response.status, 409, `${action} accepted conflicting idempotency reuse`);
+      const reconciled = await reconcileOperation(target, capability, operationId);
+      assert.deepEqual(reconciled, firstResult);
+      const events = await operationEvents(target, operationId);
+      assert.equal(reduceProviderEvents(events).latest?.result.status, "succeeded");
+      operations += 1;
+    }
   }
   return operations;
 }

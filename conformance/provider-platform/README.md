@@ -6,10 +6,11 @@
 
 This package is an HTTP-only consumer of the public Provider contract. It does
 not import Mock implementation code or Core. The public journey validates the
-manifest, every declared capability, stable idempotency, reconciliation, and
-event envelopes. The Mock reliability profile additionally covers functional
-failure, duplicate events, out-of-order events, timeout-as-unknown, process
-restart, and query-only reconciliation.
+manifest and executes all 14 declared mutation operations across the six
+capabilities, including stable idempotency, reconciliation, and event
+envelopes for each operation. The Mock reliability profile additionally covers
+functional failure, duplicate events, out-of-order events, timeout-as-unknown,
+process restart, and query-only reconciliation for every capability.
 
 The Mock reliability profile uses `X-OSS-Lab-Scenario`. That header is a
 laboratory control and is deliberately absent from the public Provider schema.

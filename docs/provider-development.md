@@ -33,6 +33,11 @@ query-only reconciliation, and duplicate/out-of-order event reduction. It is
 optional: `providers/example-schema-only-tax` implements the published schema
 without importing the SDK or Core.
 
+The public HTTP conformance journey executes every declared mutation operation:
+three Payment actions, seven Provisioning actions, and one action for each of
+Mail, Verification, Tax, and Anti-abuse Challenge. Each operation must preserve
+its stable idempotency result, reconcile by GET, and expose a valid event fact.
+
 ## Stable operation journey
 
 1. Core creates one stable UUID `operationId` for one business intent.
