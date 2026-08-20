@@ -4166,6 +4166,22 @@ const restorableCredit = await corePool.query<{ balance_minor: string }>(
 const restorableCreditMinor = restorableCredit.rows[0]?.balance_minor;
 assert.ok(restorableCreditMinor && BigInt(restorableCreditMinor) > 0n);
 
+const eligibilityAnchorOwnerUserId = randomUUID();
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [eligibilityAnchorOwnerUserId, `eligibility-owner-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+   VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+  [staffMe.clientAccountId, eligibilityAnchorOwnerUserId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [staffMe.clientAccountId, eligibilityAnchorOwnerUserId],
+);
+
 const eligibilityRevocations: Array<{
   label: string;
   revoke: () => Promise<unknown>;
@@ -4323,6 +4339,17 @@ for (const revocation of eligibilityRevocations) {
   );
   assert.equal(retriedOrder.invoice.status, "paid");
 }
+
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [staffMe.clientAccountId, staffMe.id],
+);
+await corePool.query(
+  `UPDATE client_memberships
+   SET role = 'viewer', permissions = '[]'::jsonb
+   WHERE client_account_id = $1 AND user_id = $2`,
+  [staffMe.clientAccountId, eligibilityAnchorOwnerUserId],
+);
 
 const capabilityOwnerCookie = cookie;
 const explicitCapabilityUserId = randomUUID();
