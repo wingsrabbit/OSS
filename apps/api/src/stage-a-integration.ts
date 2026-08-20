@@ -2326,19 +2326,31 @@ try {
     occurredAt: manualPaymentRecord.provider_occurred_at.toISOString(),
   });
   await waitFor(
-    "manual fulfillment and duplicate payment callback to share the Invoice root lock",
+    "manual fulfillment and duplicate payment callback to follow the canonical identity-to-Invoice order",
     async () => {
-      const result = await corePool.query<{ waiting: string }>(
-        `SELECT count(*)::text AS waiting
+      const result = await corePool.query<{
+        manual_waiting: string;
+        callback_waiting: string;
+      }>(
+        `SELECT
+           count(*) FILTER (
+             WHERE query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'
+           )::text AS manual_waiting,
+           count(*) FILTER (
+             WHERE query ILIKE '%SELECT id FROM users%FOR UPDATE%'
+           )::text AS callback_waiting
          FROM pg_stat_activity
          WHERE application_name = 'opensales-api'
            AND state = 'active'
-           AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+           AND wait_event_type = 'Lock'`,
       );
-      return result.rows[0]?.waiting ?? "0";
+      return {
+        manualWaiting: result.rows[0]?.manual_waiting ?? "0",
+        callbackWaiting: result.rows[0]?.callback_waiting ?? "0",
+      };
     },
-    (waiting) => BigInt(waiting) >= 2n,
+    (waiting) =>
+      BigInt(waiting.manualWaiting) >= 1n && BigInt(waiting.callbackWaiting) >= 1n,
   );
   await manualInvoiceGate.query("COMMIT");
   manualInvoiceGateOpen = false;
