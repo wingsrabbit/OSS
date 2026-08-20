@@ -21,8 +21,10 @@ The current recovery slice has four commands:
   decrypt configuration to disk, run `pg_restore`, start an application, or resume side effects.
 - `restore-demo-local` deep-verifies a `DemoLocal` archive, refuses nonblank or overlapping
   PostgreSQL 18 targets, restores the four physical databases in manifest order, and records an
-  atomic resumable journal. It does not create/drop databases, restore configuration, migrate,
-  start applications, or resume side effects.
+  atomic resumable journal. For a Core history containing Schema 024, it also applies the narrow
+  exact semantic repair described below before recording that component complete. It does not
+  create/drop databases, restore configuration, run forward migrations, start applications, or
+  resume side effects.
 
 An operator must not claim recovery acceptance from `restore-plan`, or from a restore that has not
 also completed the native-integrity, reconciliation, and application checks below.
@@ -198,6 +200,21 @@ privileges, and tablespaces, and writes a mode-`0600` per-component log plus an 
 inventory with the manifest. No connection field or age identity path is written to argv or the
 journal.
 
+PostgreSQL 18 logical restore can resolve the two Schema 024 `citext` email comparisons as `text`
+when replaying archive DDL with an empty search path. That is a case-sensitive semantic change, not
+a harmless catalog-printing difference, so the native digest remains strict. For Core histories
+containing Schema 024, the executor runs one additional transaction before completing the Core
+journal step. It sets the local search path to `public, pg_catalog`, locks `public.users` and
+`public.identity_email_change_events`, and accepts only one of two complete states: both definitions
+are already the exact native definitions (no-op), or both are the exact PostgreSQL 18 restore forms
+observed for this archive shape. Only the latter pair is dropped and recreated from the Schema 024
+DDL, followed by an exact native-definition check. Before either state is accepted and again after
+repair, the gate also requires the native constraint type, validation and deferrability flags plus
+the native trigger enablement, type, deferrability, internal flag, and function identity. A missing,
+mixed, disabled, unvalidated, redirected, or otherwise different pair fails and rolls back the
+repair transaction; the executor never normalizes arbitrary catalog text, changes a migration
+record, or relaxes a native digest.
+
 After a failed step, keep the journal. A resume deep-verifies the archive again, skips only the
 ordered completed prefix recorded in the journal, and requires every pending target to still be
 blank before running it:
@@ -209,10 +226,11 @@ node tools/lab-backup.mjs restore-demo-local \
   --resume
 ```
 
-Because every step is one transaction, a normal command failure leaves that step blank. If the
-process ended after a database committed but before its journal update, the next blank check refuses
-to continue. Inspect the preserved evidence and use a newly provisioned blank target; do not clean or
-reuse the uncertain database.
+A `pg_restore` command failure rolls back that component's restore transaction. A later manifest
+comparison or Schema 024 repair-gate failure happens after `pg_restore` committed, so that target is
+intentionally no longer blank. Likewise, if the process ended after a database committed but before
+its journal update, the next blank check refuses to continue. Inspect the preserved evidence and use
+a newly provisioned blank target; do not clean or reuse the uncertain database.
 
 ## Native integrity and reconciliation acceptance
 
@@ -267,5 +285,5 @@ git diff --check
 
 The fixture tests use fake `psql`, `pg_dump`, `pg_restore`, and `age` executables. They exercise
 TestA/TestB/DemoLocal inventory validation, encrypted artifact creation, shallow/deep verification,
-blank-only dry-run, ordered DemoLocal restore, completed resume, and failure journaling without
-opening a network connection.
+blank-only dry-run, ordered DemoLocal restore, the exact Schema 024 semantic repair gate, completed
+resume, and failure journaling without opening a network connection.

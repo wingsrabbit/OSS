@@ -113,6 +113,16 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const AGE_HEADER = Buffer.from("age-encryption.org/v1\n", "utf8");
 const MAX_SECRET_BUNDLE_BYTES = 64 * 1024 * 1024;
+const SCHEMA_024 = "024_stage_c_identity_security";
+
+const SCHEMA_024_NATIVE_EMAIL_CHANGE_CONSTRAINT =
+  "CHECK (old_email IS DISTINCT FROM new_email)";
+const SCHEMA_024_RESTORED_EMAIL_CHANGE_CONSTRAINT =
+  "CHECK (old_email::text IS DISTINCT FROM new_email::text)";
+const SCHEMA_024_NATIVE_EMAIL_CHANGE_TRIGGER =
+  "CREATE TRIGGER users_record_email_change_event AFTER UPDATE OF email ON users FOR EACH ROW WHEN (new.email IS DISTINCT FROM old.email) EXECUTE FUNCTION opensales_record_email_change_event()";
+const SCHEMA_024_RESTORED_EMAIL_CHANGE_TRIGGER =
+  "CREATE TRIGGER users_record_email_change_event AFTER UPDATE OF email ON users FOR EACH ROW WHEN (new.email::text IS DISTINCT FROM old.email::text) EXECUTE FUNCTION opensales_record_email_change_event()";
 
 function fail(message) {
   const error = new Error(message);
@@ -230,7 +240,7 @@ export function databaseEnvironment(database, env = process.env) {
   return child;
 }
 
-function runPsql(binary, database, sql, env) {
+function runPsql(binary, database, sql, env, failureLabel = "read-only PostgreSQL inspection") {
   const result = spawnSync(
     binary,
     [
@@ -248,12 +258,191 @@ function runPsql(binary, database, sql, env) {
       timeout: 30_000,
     },
   );
-  if (result.status !== 0) fail(`read-only PostgreSQL inspection failed for ${database.id}`);
+  if (result.status !== 0) fail(`${failureLabel} failed for ${database.id}`);
   return String(result.stdout)
     .trim()
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function repairSchema024LogicalRestoreSemantics(binary, database, env) {
+  runPsql(
+    binary,
+    database,
+    `BEGIN;
+     SET LOCAL search_path TO public, pg_catalog;
+     DO $schema024_logical_restore_semantic_repair$
+     DECLARE
+       constraint_definition text;
+       constraint_type text;
+       constraint_validated boolean;
+       constraint_deferrable boolean;
+       constraint_deferred boolean;
+       constraint_no_inherit boolean;
+       trigger_definition text;
+       trigger_enabled text;
+       trigger_type text;
+       trigger_deferrable boolean;
+       trigger_initially_deferred boolean;
+       trigger_internal boolean;
+       trigger_function_namespace text;
+       trigger_function_name text;
+     BEGIN
+       IF NOT EXISTS (
+         SELECT 1
+         FROM public.schema_migrations
+         WHERE version = '${SCHEMA_024}'
+       ) THEN
+         RAISE EXCEPTION 'Schema 024 restore repair requires an installed Schema 024 migration';
+       END IF;
+
+       EXECUTE 'LOCK TABLE public.users, public.identity_email_change_events IN ACCESS EXCLUSIVE MODE';
+
+       SELECT pg_catalog.pg_get_constraintdef(actual.oid, true),
+              actual.contype::text,
+              actual.convalidated,
+              actual.condeferrable,
+              actual.condeferred,
+              actual.connoinherit
+       INTO constraint_definition,
+            constraint_type,
+            constraint_validated,
+            constraint_deferrable,
+            constraint_deferred,
+            constraint_no_inherit
+       FROM pg_catalog.pg_constraint actual
+       WHERE actual.conrelid = 'public.identity_email_change_events'::pg_catalog.regclass
+         AND actual.conname = 'identity_email_change_events_check';
+
+       SELECT pg_catalog.pg_get_triggerdef(actual.oid, true),
+              actual.tgenabled::text,
+              actual.tgtype::text,
+              actual.tgdeferrable,
+              actual.tginitdeferred,
+              actual.tgisinternal,
+              procedure_namespace.nspname,
+              procedure.proname
+       INTO trigger_definition,
+            trigger_enabled,
+            trigger_type,
+            trigger_deferrable,
+            trigger_initially_deferred,
+            trigger_internal,
+            trigger_function_namespace,
+            trigger_function_name
+       FROM pg_catalog.pg_trigger actual
+       JOIN pg_catalog.pg_proc procedure ON procedure.oid = actual.tgfoid
+       JOIN pg_catalog.pg_namespace procedure_namespace
+         ON procedure_namespace.oid = procedure.pronamespace
+       WHERE actual.tgrelid = 'public.users'::pg_catalog.regclass
+         AND actual.tgname = 'users_record_email_change_event';
+
+       IF constraint_type IS DISTINCT FROM 'c'
+          OR constraint_validated IS DISTINCT FROM true
+          OR constraint_deferrable IS DISTINCT FROM false
+          OR constraint_deferred IS DISTINCT FROM false
+          OR constraint_no_inherit IS DISTINCT FROM false
+          OR trigger_enabled IS DISTINCT FROM 'O'
+          OR trigger_type IS DISTINCT FROM '17'
+          OR trigger_deferrable IS DISTINCT FROM false
+          OR trigger_initially_deferred IS DISTINCT FROM false
+          OR trigger_internal IS DISTINCT FROM false
+          OR trigger_function_namespace IS DISTINCT FROM 'public'
+          OR trigger_function_name IS DISTINCT FROM 'opensales_record_email_change_event' THEN
+         RAISE EXCEPTION 'Schema 024 logical restore has unexpected email comparison catalog attributes';
+       END IF;
+
+       IF constraint_definition = $native_constraint$${SCHEMA_024_NATIVE_EMAIL_CHANGE_CONSTRAINT}$native_constraint$
+          AND trigger_definition = $native_trigger$${SCHEMA_024_NATIVE_EMAIL_CHANGE_TRIGGER}$native_trigger$ THEN
+         RETURN;
+       END IF;
+
+       IF constraint_definition IS DISTINCT FROM $restored_constraint$${SCHEMA_024_RESTORED_EMAIL_CHANGE_CONSTRAINT}$restored_constraint$
+          OR trigger_definition IS DISTINCT FROM $restored_trigger$${SCHEMA_024_RESTORED_EMAIL_CHANGE_TRIGGER}$restored_trigger$ THEN
+         RAISE EXCEPTION 'Schema 024 logical restore has an unexpected email comparison definition';
+       END IF;
+
+       EXECUTE $constraint_ddl$
+         ALTER TABLE public.identity_email_change_events
+           DROP CONSTRAINT identity_email_change_events_check
+       $constraint_ddl$;
+       EXECUTE $constraint_ddl$
+         ALTER TABLE public.identity_email_change_events
+           ADD CONSTRAINT identity_email_change_events_check
+           CHECK (old_email IS DISTINCT FROM new_email)
+       $constraint_ddl$;
+       EXECUTE $trigger_ddl$
+         DROP TRIGGER users_record_email_change_event ON public.users
+       $trigger_ddl$;
+       EXECUTE $trigger_ddl$
+         CREATE TRIGGER users_record_email_change_event
+         AFTER UPDATE OF email ON public.users FOR EACH ROW
+         WHEN (NEW.email IS DISTINCT FROM OLD.email)
+         EXECUTE FUNCTION public.opensales_record_email_change_event()
+       $trigger_ddl$;
+
+       SELECT pg_catalog.pg_get_constraintdef(actual.oid, true),
+              actual.contype::text,
+              actual.convalidated,
+              actual.condeferrable,
+              actual.condeferred,
+              actual.connoinherit
+       INTO constraint_definition,
+            constraint_type,
+            constraint_validated,
+            constraint_deferrable,
+            constraint_deferred,
+            constraint_no_inherit
+       FROM pg_catalog.pg_constraint actual
+       WHERE actual.conrelid = 'public.identity_email_change_events'::pg_catalog.regclass
+         AND actual.conname = 'identity_email_change_events_check';
+
+       SELECT pg_catalog.pg_get_triggerdef(actual.oid, true),
+              actual.tgenabled::text,
+              actual.tgtype::text,
+              actual.tgdeferrable,
+              actual.tginitdeferred,
+              actual.tgisinternal,
+              procedure_namespace.nspname,
+              procedure.proname
+       INTO trigger_definition,
+            trigger_enabled,
+            trigger_type,
+            trigger_deferrable,
+            trigger_initially_deferred,
+            trigger_internal,
+            trigger_function_namespace,
+            trigger_function_name
+       FROM pg_catalog.pg_trigger actual
+       JOIN pg_catalog.pg_proc procedure ON procedure.oid = actual.tgfoid
+       JOIN pg_catalog.pg_namespace procedure_namespace
+         ON procedure_namespace.oid = procedure.pronamespace
+       WHERE actual.tgrelid = 'public.users'::pg_catalog.regclass
+         AND actual.tgname = 'users_record_email_change_event';
+
+       IF constraint_definition IS DISTINCT FROM $native_constraint$${SCHEMA_024_NATIVE_EMAIL_CHANGE_CONSTRAINT}$native_constraint$
+          OR constraint_type IS DISTINCT FROM 'c'
+          OR constraint_validated IS DISTINCT FROM true
+          OR constraint_deferrable IS DISTINCT FROM false
+          OR constraint_deferred IS DISTINCT FROM false
+          OR constraint_no_inherit IS DISTINCT FROM false
+          OR trigger_definition IS DISTINCT FROM $native_trigger$${SCHEMA_024_NATIVE_EMAIL_CHANGE_TRIGGER}$native_trigger$
+          OR trigger_enabled IS DISTINCT FROM 'O'
+          OR trigger_type IS DISTINCT FROM '17'
+          OR trigger_deferrable IS DISTINCT FROM false
+          OR trigger_initially_deferred IS DISTINCT FROM false
+          OR trigger_internal IS DISTINCT FROM false
+          OR trigger_function_namespace IS DISTINCT FROM 'public'
+          OR trigger_function_name IS DISTINCT FROM 'opensales_record_email_change_event' THEN
+         RAISE EXCEPTION 'Schema 024 logical restore email comparison repair did not reach the native definitions';
+       END IF;
+     END
+     $schema024_logical_restore_semantic_repair$;
+     COMMIT;`,
+    env,
+    "Schema 024 logical-restore semantic repair",
+  );
 }
 
 function inspectDatabase(binary, database, env) {
@@ -1121,7 +1310,27 @@ export async function restoreDemoLocal(options) {
         logPath,
         env: options.env,
       });
-      assertRestoredInspection(database, inspectDatabase(binaries.psql, DATABASES[database.id], options.env));
+      const restoredInspection = inspectDatabase(
+        binaries.psql,
+        DATABASES[database.id],
+        options.env,
+      );
+      assertRestoredInspection(database, restoredInspection);
+      if (
+        database.id === "core" &&
+        restoredInspection.schemaHistory.versions.includes(SCHEMA_024)
+      ) {
+        repairSchema024LogicalRestoreSemantics(
+          binaries.psql,
+          DATABASES.core,
+          options.env,
+        );
+        assertRestoredInspection(
+          database,
+          inspectDatabase(binaries.psql, DATABASES.core, options.env),
+        );
+        appendRestoreLog(logPath, "completed exact Schema 024 logical-restore semantic repair gate");
+      }
       const completedAt = new Date().toISOString();
       appendRestoreLog(logPath, `completed ${database.id} restore and manifest comparison`);
       state.completed.push({

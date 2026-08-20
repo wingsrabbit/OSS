@@ -54,15 +54,60 @@ function executable(path, body) {
 
 function fakeTools(directory, options = {}) {
   const bin = join(directory, "bin");
+  const psqlTrace = join(directory, "psql-trace.jsonl");
   mkdirSync(bin);
   executable(
     join(bin, "psql"),
-    `let sql="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>sql+=c);process.stdin.on("end",()=>{
+    `const fs=require("node:fs");let sql="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>sql+=c);process.stdin.on("end",()=>{
       if(Object.keys(process.env).some(k=>k.includes("DATABASE_URL")||k.startsWith("LAB_RC_")))process.exit(12);
       if(process.argv.includes("--version")){console.log("psql (PostgreSQL) 18.2");return;}
+      const repair=sql.includes("schema024_logical_restore_semantic_repair");
+      fs.appendFileSync(${JSON.stringify(psqlTrace)},JSON.stringify({database:process.env.PGDATABASE||"",repair})+"\\n");
+      if(repair){
+        const required=[
+          "024_stage_c_identity_security",
+          "SET LOCAL search_path TO public, pg_catalog",
+          "LOCK TABLE public.users, public.identity_email_change_events IN ACCESS EXCLUSIVE MODE",
+          "CHECK (old_email IS DISTINCT FROM new_email)",
+          "CHECK (old_email::text IS DISTINCT FROM new_email::text)",
+          "WHEN (new.email IS DISTINCT FROM old.email)",
+          "WHEN (new.email::text IS DISTINCT FROM old.email::text)",
+          "constraint_definition IS DISTINCT FROM",
+          "trigger_definition IS DISTINCT FROM",
+          "actual.contype::text",
+          "actual.convalidated",
+          "actual.condeferrable",
+          "actual.condeferred",
+          "actual.connoinherit",
+          "actual.tgenabled::text",
+          "actual.tgtype::text",
+          "actual.tgdeferrable",
+          "actual.tginitdeferred",
+          "actual.tgisinternal",
+          "procedure_namespace.nspname",
+          "procedure.proname"
+        ];
+        const requiredBeforeAndAfter=[
+          "constraint_type IS DISTINCT FROM 'c'",
+          "constraint_validated IS DISTINCT FROM true",
+          "constraint_deferrable IS DISTINCT FROM false",
+          "constraint_deferred IS DISTINCT FROM false",
+          "constraint_no_inherit IS DISTINCT FROM false",
+          "trigger_enabled IS DISTINCT FROM 'O'",
+          "trigger_type IS DISTINCT FROM '17'",
+          "trigger_deferrable IS DISTINCT FROM false",
+          "trigger_initially_deferred IS DISTINCT FROM false",
+          "trigger_internal IS DISTINCT FROM false",
+          "trigger_function_namespace IS DISTINCT FROM 'public'",
+          "trigger_function_name IS DISTINCT FROM 'opensales_record_email_change_event'"
+        ];
+        if(required.some(value=>!sql.includes(value))||requiredBeforeAndAfter.some(value=>sql.split(value).length<3))process.exit(15);
+        if(${JSON.stringify(options.failSchema024Repair ?? false)})process.exit(16);
+        return;
+      }
       if(sql.includes("blank_database_object_count"))console.log((process.env.PGDATABASE||"fixture")+"\\t180002\\t"+(${JSON.stringify(options.nonBlankDatabase ?? "")}===(process.env.PGDATABASE||"")?"1":"0"));
       else if(sql.includes("server_version_num"))console.log("180002");
-      else if(sql.includes("schema_migrations"))console.log("021_stage_c_support_operations\\n022_stage_c_catalog_commerce_hardening");
+      else if(sql.includes("schema_migrations"))console.log("021_stage_c_support_operations\\n022_stage_c_catalog_commerce_hardening\\n024_stage_c_identity_security");
       else if(sql.includes("support_ticket_attachments"))console.log(${JSON.stringify(options.invalidAttachment ? "2\t9\t1" : "2\t9\t0")});
       else if(sql.includes("pg_catalog.pg_tables"))console.log("mock_events\\nmock_operations");
       else process.exitCode=2;
@@ -337,10 +382,45 @@ test("DemoLocal blank restore runs in order and completed resume performs no dat
       assert.equal(existsSync(join(journal, completed.log)), true);
       assert.match(readFileSync(join(journal, completed.log), "utf8"), /completed .* manifest comparison/);
     }
+    const repairCalls = readFileSync(join(directory, "psql-trace.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter(({ repair }) => repair);
+    assert.deepEqual(repairCalls, [{ database: "oss_restore_fixture", repair: true }]);
+    assert.match(
+      readFileSync(join(journal, "01-core.log"), "utf8"),
+      /completed exact Schema 024 logical-restore semantic repair gate/,
+    );
     const beforeResume = readFileSync(join(journal, "restore-state.json"), "utf8");
     const resumed = await restoreDemoLocal({ archive, journal, dryRun: false, resume: true, env });
     assert.equal(resumed.status, "complete");
     assert.equal(readFileSync(join(journal, "restore-state.json"), "utf8"), beforeResume);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("DemoLocal blank restore stops before Provider databases when the exact Schema 024 repair gate fails", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-demo-local-restore-schema024-repair-"));
+  try {
+    const { archive, env } = await demoLocalBackupFixture(directory, {
+      failSchema024Repair: true,
+    });
+    const journal = join(directory, "restore-journal");
+    await assert.rejects(
+      restoreDemoLocal({ archive, journal, dryRun: false, resume: false, env }),
+      /core restore failed; execution stopped and the journal was preserved/,
+    );
+    const state = JSON.parse(readFileSync(join(journal, "restore-state.json"), "utf8"));
+    assert.equal(state.status, "failed");
+    assert.deepEqual(state.completed, []);
+    assert.equal(state.failed.id, "core");
+    assert.match(
+      readFileSync(join(journal, state.failed.log), "utf8"),
+      /Schema 024 logical-restore semantic repair failed for core/,
+    );
+    assert.equal(existsSync(join(journal, "02-provider-payment.log")), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
