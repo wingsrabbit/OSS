@@ -5222,6 +5222,22 @@ await corePool.query(
   [disabledPolicy.command.addFundsAttemptId],
 );
 
+const revokedMembershipAnchorUserId = randomUUID();
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [revokedMembershipAnchorUserId, `add-funds-owner-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+   VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+  [recoveryMe.clientAccountId, revokedMembershipAnchorUserId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [recoveryMe.clientAccountId, revokedMembershipAnchorUserId],
+);
+
 const revokedMembershipQuote = await createAddFundsQuote("5000", "card");
 const revokedMembership = await startAddFunds(revokedMembershipQuote.quoteId, "success");
 const revokedMembershipOperation = await corePool.query<{ id: string }>(
@@ -5293,6 +5309,16 @@ await corePool.query(
    SET removed_at = NULL
    WHERE user_id = $1 AND client_account_id = $2`,
   [recoveryMe.id, recoveryMe.clientAccountId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [recoveryMe.clientAccountId, recoveryMe.id],
+);
+await corePool.query(
+  `UPDATE client_memberships
+   SET role = 'viewer', permissions = '[]'::jsonb
+   WHERE client_account_id = $1 AND user_id = $2`,
+  [recoveryMe.clientAccountId, revokedMembershipAnchorUserId],
 );
 await refreshAccountContext(recoveryMe.clientAccountId);
 const revokedMembershipManual = await waitForAddFunds(
