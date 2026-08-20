@@ -135,6 +135,7 @@ test("TestA Compose contains only Core services and external Provider URLs", asy
   assertDigestBoundService(compose.services["core-edge"], "CADDY_IMAGE");
 
   assert.deepEqual(Object.keys(compose.services.worker.depends_on), ["api"]);
+  assert.deepEqual(compose.services.worker.profiles, ["worker-dispatch"]);
   for (const key of [
     "MOCK_PAYMENT_PROVIDER_URL",
     "MOCK_PROVISIONING_PROVIDER_URL",
@@ -224,10 +225,21 @@ test("TestB Compose owns exactly four Provider databases and five isolated Provi
 
 test("edge gateways expose only the reviewed Core and Provider routes", async () => {
   const core = await read("deploy/Caddyfile.core-edge");
-  assert.match(core, /\/api\/v1\/provider-events\/payment/u);
-  assert.match(core, /\/api\/v1\/provider-events\/provisioning/u);
+  const callback = await read("deploy/Caddyfile.callback");
+  for (const path of [
+    "/api/v1/provider-events/payment",
+    "/api/v1/provider-events/refund",
+    "/api/v1/provider-events/add-funds-chargeback",
+    "/api/v1/provider-events/provisioning",
+    "/api/v1/provider-events/resource-action",
+    "/api/v1/provider-events/resource-termination",
+  ]) {
+    assert.match(core, new RegExp(path.replaceAll("/", "\\/"), "u"));
+    assert.match(callback, new RegExp(path.replaceAll("/", "\\/"), "u"));
+  }
   assert.match(core, /reverse_proxy callback-gateway:8081/u);
   assert.match(core, /reverse_proxy web:8080/u);
+  assert.match(callback, /reverse_proxy api:3000/u);
 
   const provider = await read("deploy/Caddyfile.provider-edge");
   for (const upstream of [
@@ -277,6 +289,7 @@ test("two-host runbook preserves Provider-first startup and recovery claim bound
   assert.ok(startTestB > 0 && startTestB < startTestA && startTestA < startWorker);
   assert.match(runbook, /linux\/amd64/u);
   assert.match(runbook, /pull_policy: never/u);
+  assert.match(runbook, /--profile worker-dispatch up -d worker/u);
   assert.match(runbook, /current reviewed restore executor accepts only `DemoLocal`/u);
   assert.match(runbook, /Do not call the deployment a completed final RC/u);
   assert.match(runbook, /no production data, real\s+Provider/u);

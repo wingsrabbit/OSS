@@ -20,8 +20,8 @@ disable certificate verification, or widen a bind address merely to make a readi
 
 TestA uses one `PROVIDER_BASE_URL` for Payment, Provisioning, Mail, Mailbox, and Provider Platform.
 `Caddyfile.provider-edge` dispatches only the reviewed paths to the corresponding TestB process.
-TestB uses one `CORE_CALLBACK_URL`; `Caddyfile.core-edge` sends only the two Provider callback paths
-through the narrow callback gateway and sends other application traffic to Web.
+TestB uses one `CORE_CALLBACK_URL`; `Caddyfile.core-edge` sends the six exact Payment/Provisioning
+Provider callback paths through the narrow callback gateway and sends other application traffic to Web.
 
 The independent Provider Platform process owns its own TestB database and token. Provisioning does
 not receive the Platform token. This differs intentionally from `DemoLocal`, where the launcher
@@ -141,12 +141,13 @@ or native check. Do not bypass a migration error or rerun seed against an uncert
 Repeat the five exact TestB readiness requests from TestA. Only after they all pass:
 
 ```sh
-docker compose --env-file "$LAB_TESTA_ENV_FILE" -f deploy/compose.testa.yaml up -d worker
+docker compose --env-file "$LAB_TESTA_ENV_FILE" -f deploy/compose.testa.yaml --profile worker-dispatch up -d worker
 ```
 
 Record container image identities, health state, start time, and configuration version without
-recording environment values. A generic `docker compose up` before this point is not allowed because
-it can start Worker before the cross-host readiness gate.
+recording environment values. Worker belongs to the `worker-dispatch` Compose profile, so a generic
+`docker compose up` excludes it. Continue to start Worker only with the explicit command above after
+the cross-host readiness gate.
 
 ## Functional acceptance
 
@@ -157,7 +158,7 @@ Use synthetic identities and ordinary product flows only. At minimum, verify:
    Core and their owning Provider databases;
 3. one Provider Platform operation proving the independent `provider_platform` database is used and
    the provisioning process has no Platform capability;
-4. both signed callback paths enter through the TestA callback gateway;
+4. all six signed Payment/Provisioning callback endpoints enter through the TestA callback gateway;
 5. API and Worker use only the Core runtime role, and no Provider database is reachable through a
    Core database credential;
 6. restart of an application container retains database facts and creates no duplicate operation.
