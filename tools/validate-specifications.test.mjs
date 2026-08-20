@@ -4719,7 +4719,12 @@ test("a later Gate subject must descend from the predecessor Gate report", () =>
     ]);
     hasIssue(issues, "Gate G1 subject must descend from the G0 report commit");
   } finally {
-    rmSync(temporaryRoot, { recursive: true, force: true });
+    rmSync(temporaryRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25,
+    });
   }
 });
 
