@@ -700,6 +700,51 @@ ALTER TABLE public.notification_delivery_operations
   ADD COLUMN template_revision_id uuid,
   ADD COLUMN template_locale text;
 
+-- Schema 019 intentionally retained legacy terminal Provider outcomes whose
+-- pre-019 runtime could not persist a rendered request snapshot.  The normal
+-- Schema 027 registry binding below changes only the two newly-added columns,
+-- but the inherited UPDATE guard would otherwise reject those legitimate
+-- saved terminal rows.  Disable only that exact guard for this deterministic
+-- migration-owned backfill, then restore it before any application can observe
+-- Schema 027.  PostgreSQL rolls both changes back atomically if the UPDATE or a
+-- later migration statement fails.
+DO $$
+DECLARE
+  exact_guard_count integer;
+BEGIN
+  SELECT pg_catalog.count(*)::integer
+  INTO exact_guard_count
+  FROM pg_catalog.pg_trigger trigger_row
+  JOIN pg_catalog.pg_class relation
+    ON relation.oid = trigger_row.tgrelid
+  JOIN pg_catalog.pg_namespace relation_namespace
+    ON relation_namespace.oid = relation.relnamespace
+  JOIN pg_catalog.pg_proc function_row
+    ON function_row.oid = trigger_row.tgfoid
+  JOIN pg_catalog.pg_namespace function_namespace
+    ON function_namespace.oid = function_row.pronamespace
+  WHERE relation_namespace.nspname = 'public'
+    AND relation.relname = 'notification_delivery_operations'
+    AND trigger_row.tgname = 'notification_delivery_operations_guard'
+    AND NOT trigger_row.tgisinternal
+    AND trigger_row.tgenabled = 'O'
+    AND trigger_row.tgtype = 27
+    AND NOT trigger_row.tgdeferrable
+    AND NOT trigger_row.tginitdeferred
+    AND function_namespace.nspname = 'public'
+    AND function_row.proname = 'opensales_guard_notification_delivery_operation'
+    AND function_row.pronargs = 0;
+
+  IF exact_guard_count <> 1 THEN
+    RAISE EXCEPTION
+      'Schema 027 requires the exact enabled Schema 019 notification delivery UPDATE guard';
+  END IF;
+END;
+$$;
+
+ALTER TABLE public.notification_delivery_operations
+  DISABLE TRIGGER notification_delivery_operations_guard;
+
 UPDATE public.notification_delivery_operations operation
 SET template_revision_id = revision.id,
     template_locale = revision.locale
@@ -707,6 +752,9 @@ FROM public.notification_template_revisions revision
 WHERE revision.event_type = operation.event_type
   AND revision.locale = operation.locale
   AND revision.revision_key = operation.template_revision;
+
+ALTER TABLE public.notification_delivery_operations
+  ENABLE TRIGGER notification_delivery_operations_guard;
 
 DO $$
 DECLARE
