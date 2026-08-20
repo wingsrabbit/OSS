@@ -35,6 +35,16 @@ type Fixture = {
   sessionToken: string;
 };
 
+type SupportTicketFixture = {
+  id: string;
+  clientAccountId: string;
+  serviceId?: string;
+  createdByUserId: string;
+  subject: string;
+  departmentRevisionId: string;
+  createdAt?: string;
+};
+
 function responseJson<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
 }
@@ -110,6 +120,46 @@ async function createFixture(label: string): Promise<Fixture> {
   return { userId, accountId, email, sessionToken };
 }
 
+async function createSupportTicketFixture(
+  fixture: SupportTicketFixture,
+): Promise<void> {
+  if (!pool) throw new Error("Test database is not ready");
+  const statusEventId = randomUUID();
+  await transaction(pool, async (client) => {
+    await client.query(
+      `INSERT INTO support_ticket_status_events(
+         id, ticket_id, previous_status, status,
+         actor_type, actor_user_id, reason, occurred_at
+       ) VALUES (
+         $1, $2, NULL, 'awaiting_staff',
+         'customer', $3, 'Synthetic account history ticket created',
+         COALESCE($4::timestamptz, pg_catalog.now())
+       )`,
+      [statusEventId, fixture.id, fixture.createdByUserId, fixture.createdAt ?? null],
+    );
+    await client.query(
+      `INSERT INTO support_tickets(
+         id, client_account_id, service_id, created_by_user_id, subject,
+         department_revision_id, current_status_event_id, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7,
+         COALESCE($8::timestamptz, pg_catalog.now()),
+         COALESCE($8::timestamptz, pg_catalog.now())
+       )`,
+      [
+        fixture.id,
+        fixture.clientAccountId,
+        fixture.serviceId ?? null,
+        fixture.createdByUserId,
+        fixture.subject,
+        fixture.departmentRevisionId,
+        statusEventId,
+        fixture.createdAt ?? null,
+      ],
+    );
+  });
+}
+
 try {
   await admin.connect();
   await admin.query(`CREATE DATABASE "${databaseName}"`);
@@ -135,6 +185,16 @@ try {
      VALUES ($1, ARRAY['Operations'], $2::jsonb)`,
     [staff.userId, JSON.stringify(["accounts.view", "orders.read"])],
   );
+  const supportDepartment = await pool.query<{ id: string }>(
+    `SELECT revision.id
+     FROM support_departments department
+     JOIN support_department_revisions revision
+       ON revision.id = department.current_revision_id
+     WHERE department.code = 'general-support'
+       AND revision.accepts_authenticated`,
+  );
+  const supportDepartmentRevisionId = supportDepartment.rows[0]?.id;
+  assert.ok(supportDepartmentRevisionId);
 
   const orderId = randomUUID();
   const itemId = randomUUID();
@@ -343,12 +403,14 @@ try {
       `history-credit-fingerprint:${randomUUID()}`,
     ],
   );
-  await pool.query(
-    `INSERT INTO support_tickets(
-       id, client_account_id, service_id, created_by_user_id, subject
-     ) VALUES ($1, $2, $3, $4, 'Synthetic account history ticket')`,
-    [ticketId, customer.accountId, serviceId, customer.userId],
-  );
+  await createSupportTicketFixture({
+    id: ticketId,
+    clientAccountId: customer.accountId,
+    serviceId,
+    createdByUserId: customer.userId,
+    subject: "Synthetic account history ticket",
+    departmentRevisionId: supportDepartmentRevisionId,
+  });
   await pool.query(
     `INSERT INTO support_ticket_messages(
        ticket_id, author_user_id, author_type, visibility, body
@@ -475,12 +537,14 @@ try {
      ) VALUES ($1, $2, 'initial', $3, $4, $3)`,
     [otherServiceId, otherInvoiceId, term.start_at, term.end_at],
   );
-  await pool.query(
-    `INSERT INTO support_tickets(
-       id, client_account_id, service_id, created_by_user_id, subject
-     ) VALUES ($1, $2, $3, $4, 'Synthetic Beta account history ticket')`,
-    [otherTicketId, otherCustomer.accountId, otherServiceId, otherCustomer.userId],
-  );
+  await createSupportTicketFixture({
+    id: otherTicketId,
+    clientAccountId: otherCustomer.accountId,
+    serviceId: otherServiceId,
+    createdByUserId: otherCustomer.userId,
+    subject: "Synthetic Beta account history ticket",
+    departmentRevisionId: supportDepartmentRevisionId,
+  });
   await pool.query(
     `INSERT INTO support_ticket_messages(
        ticket_id, author_user_id, author_type, visibility, body
@@ -493,12 +557,13 @@ try {
      VALUES ($1, $2, 'USD', 0, now() + interval '7 days')`,
     [standaloneInvoiceId, customer.accountId],
   );
-  await pool.query(
-    `INSERT INTO support_tickets(
-       id, client_account_id, created_by_user_id, subject
-     ) VALUES ($1, $2, $3, 'Account-level history ticket without a Service')`,
-    [unscopedTicketId, customer.accountId, customer.userId],
-  );
+  await createSupportTicketFixture({
+    id: unscopedTicketId,
+    clientAccountId: customer.accountId,
+    createdByUserId: customer.userId,
+    subject: "Account-level history ticket without a Service",
+    departmentRevisionId: supportDepartmentRevisionId,
+  });
 
   for (const [index, paginationOrderId] of paginationOrderIds.entries()) {
     const paginationItemId = paginationItemIds[index];
@@ -634,20 +699,15 @@ try {
         fixtureAt,
       ],
     );
-    await pool.query(
-      `INSERT INTO support_tickets(
-         id, client_account_id, service_id, created_by_user_id, subject,
-         created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-      [
-        paginationTicketId,
-        customer.accountId,
-        paginationServiceId,
-        customer.userId,
-        `Pagination history ticket ${index + 1}`,
-        fixtureAt,
-      ],
-    );
+    await createSupportTicketFixture({
+      id: paginationTicketId,
+      clientAccountId: customer.accountId,
+      serviceId: paginationServiceId,
+      createdByUserId: customer.userId,
+      subject: `Pagination history ticket ${index + 1}`,
+      departmentRevisionId: supportDepartmentRevisionId,
+      createdAt: fixtureAt,
+    });
   }
 
   const customerSession = await pool.query<{ id: string }>(

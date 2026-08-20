@@ -1227,7 +1227,7 @@ try {
 
   await assert.rejects(
     runMigrations(pool),
-    /running schema-026 API or Worker/,
+    new RegExp(`running schema-${REQUIRED_SCHEMA_VERSION.slice(0, 3)} API or Worker`),
   );
   await app.close();
   app = null;
