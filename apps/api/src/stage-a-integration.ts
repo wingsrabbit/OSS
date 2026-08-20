@@ -1151,12 +1151,14 @@ const automaticPrice = catalog.products
 const manualPrice = catalog.products
   .find((product) => product.id === "hk-r640-hkbgp")
   ?.prices.find((price) => price.billingCycle === "monthly");
+const remoteHands = catalog.products.find((product) => product.id === "remote-hands");
 assert.ok(automaticPrice, "automatic laboratory product is missing");
 assert.ok(manualPrice, "manual laboratory product is missing");
-assert.equal(
-  catalog.products.some((product) => product.id === "remote-hands"),
-  false,
-  "Remote Hands must remain hidden until Colocation and authenticated ticket prerequisites exist",
+assert.ok(remoteHands, "Remote Hands must be visible in the current laboratory catalog");
+assert.equal(remoteHands.fulfillmentMode, "manual");
+assert.ok(
+  remoteHands.prices.some((price) => price.billingCycle === "one_time"),
+  "Remote Hands must retain its one-time manual fulfillment price",
 );
 
 const email = "stage-a-browser-admin@example.invalid";
