@@ -74,6 +74,26 @@ function json<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
 }
 
+async function waitForDatabaseConnectionsToClose(timeoutMilliseconds = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (true) {
+    const connections = await admin.query<{ count: string }>(
+      `SELECT pg_catalog.count(*)::text AS count
+       FROM pg_catalog.pg_stat_activity
+       WHERE datname = $1`,
+      [databaseName],
+    );
+    const count = Number(connections.rows[0]?.count ?? "0");
+    if (count === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Notification preferences database still has ${count} connection(s) after pool shutdown`,
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 async function requestJson(request: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
@@ -901,20 +921,56 @@ try {
     await app.close();
   }
 } finally {
+  const cleanupErrors: unknown[] = [];
   if (mockMailServer) {
-    await new Promise<void>((resolve) => mockMailServer!.close(() => resolve()))
-      .catch(() => undefined);
+    try {
+      await new Promise<void>((resolve, reject) =>
+        mockMailServer!.close((error) => error ? reject(error) : resolve()),
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
   }
-  await workerPool?.end().catch(() => undefined);
-  await pool?.end().catch(() => undefined);
-  await admin.query(
-    `SELECT pg_catalog.pg_terminate_backend(pid)
-     FROM pg_catalog.pg_stat_activity
-     WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()`,
-    [databaseName],
-  ).catch(() => undefined);
-  await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`).catch(() => undefined);
-  await admin.query(`DROP ROLE IF EXISTS "${apiRole}"`).catch(() => undefined);
-  await admin.query(`DROP ROLE IF EXISTS "${workerRole}"`).catch(() => undefined);
-  await admin.end().catch(() => undefined);
+  try {
+    await workerPool?.end();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await pool?.end();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await waitForDatabaseConnectionsToClose();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await admin.query(`DROP ROLE IF EXISTS "${apiRole}"`);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await admin.query(`DROP ROLE IF EXISTS "${workerRole}"`);
+  } catch (error) {
+    cleanupErrors.push(error);
+  } finally {
+    try {
+      await admin.end();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      cleanupErrors,
+      "Notification preferences integration cleanup failed",
+    );
+  }
 }
