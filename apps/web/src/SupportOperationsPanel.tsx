@@ -179,6 +179,7 @@ export type SupportOperationsPanelProps = {
   canReadCustomerTickets?: boolean;
   canWriteCustomerTickets?: boolean;
   canManageSupport?: boolean;
+  staffAccountContext?: { id: string; name: string } | null;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
 };
@@ -319,11 +320,13 @@ export function SupportOperationsPanel({
   canReadCustomerTickets = false,
   canWriteCustomerTickets = false,
   canManageSupport = false,
+  staffAccountContext = null,
   onNotice,
   onError,
 }: SupportOperationsPanelProps) {
   const tr = (en: string, zh: string) => locale === "zh-CN" ? zh : en;
   const [pending, setPending] = useState(false);
+  const mounted = useRef(true);
   const mutationIntents = useRef(new Map<string, { key: string; fingerprint: string }>());
   const [departments, setDepartments] = useState<Department[]>([]);
   const [services, setServices] = useState<ServiceOption[]>([]);
@@ -355,7 +358,6 @@ export function SupportOperationsPanel({
   const [assignment, setAssignment] = useState("");
   const [staffTicketReason, setStaffTicketReason] = useState("");
   const [staffTicketReplyText, setStaffTicketReplyText] = useState("");
-  const [staffTicketMessageKind, setStaffTicketMessageKind] = useState<"public_reply" | "internal_note">("public_reply");
   const [staffAttachment, setStaffAttachment] = useState<File | null>(null);
   const [presalesReason, setPresalesReason] = useState("");
   const [presalesReplyText, setPresalesReplyText] = useState("");
@@ -372,6 +374,14 @@ export function SupportOperationsPanel({
   const [visitorName, setVisitorName] = useState("");
   const [visitorEmail, setVisitorEmail] = useState("");
   const [visitorTopic, setVisitorTopic] = useState<"general_sales" | "product_question">("general_sales");
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      mutationIntents.current.clear();
+    };
+  }, []);
 
   function intentKeyFor(scope: string, payload: unknown): string {
     const fingerprint = JSON.stringify(payload);
@@ -390,10 +400,13 @@ export function SupportOperationsPanel({
     try {
       value = await plan.request(idempotencyKey);
     } catch (error) {
+      if (!mounted.current) return;
       onError(errorMessage(error, plan.failure));
       setPending(false);
       return;
     }
+
+    if (!mounted.current) return;
 
     mutationIntents.current.delete(plan.scope);
     plan.committed?.(value);
@@ -420,6 +433,7 @@ export function SupportOperationsPanel({
       api<{ items: ServiceOption[] }>("/api/v1/tickets/service-options"),
       api<{ items: Department[] }>("/api/v1/support/departments?audience=authenticated"),
     ]);
+    if (!mounted.current) return;
     setTickets(ticketResponse.items);
     setServices(serviceResponse.items);
     setDepartments(departmentResponse.items);
@@ -427,13 +441,14 @@ export function SupportOperationsPanel({
 
   const queueUrl = useMemo(() => {
     const query = new URLSearchParams();
+    if (staffAccountContext) query.set("clientAccountId", staffAccountContext.id);
     if (queueStatus) query.set("status", queueStatus);
     if (queueDepartment) query.set("department", queueDepartment);
     if (queuePriority) query.set("priority", queuePriority);
     if (queueAssignee) query.set("assignee", queueAssignee);
     const encoded = query.toString();
     return `/api/v1/admin/tickets${encoded ? `?${encoded}` : ""}`;
-  }, [queueAssignee, queueDepartment, queuePriority, queueStatus]);
+  }, [queueAssignee, queueDepartment, queuePriority, queueStatus, staffAccountContext]);
 
   const refreshStaff = useCallback(async () => {
     if (mode !== "staff" || !canManageSupport) return;
@@ -443,6 +458,7 @@ export function SupportOperationsPanel({
       api<{ items: Department[] }>("/api/v1/admin/support/departments"),
       api<{ items: PresalesSummary[] }>("/api/v1/admin/presales/inquiries"),
     ]);
+    if (!mounted.current) return;
     setStaffTickets(queue.items);
     setStaffOptions(options.items);
     setDepartments(departmentResponse.items);
@@ -454,6 +470,7 @@ export function SupportOperationsPanel({
     const response = await publicRequest<{ items: Department[] }>(
       "/api/v1/support/departments?audience=presales",
     );
+    if (!mounted.current) return;
     setDepartments(response.items);
     setDepartmentCode((current) =>
       response.items.some((item) => item.code === current)
@@ -468,10 +485,13 @@ export function SupportOperationsPanel({
       : mode === "staff"
         ? refreshStaff()
         : refreshVisitorDepartments();
-    void run.catch((error: unknown) => onError(errorMessage(
-      error,
-      tr("Support data could not be loaded", "无法加载客服数据"),
-    )));
+    void run.catch((error: unknown) => {
+      if (!mounted.current) return;
+      onError(errorMessage(
+        error,
+        tr("Support data could not be loaded", "无法加载客服数据"),
+      ));
+    });
   }, [mode, onError, refreshCustomer, refreshStaff, refreshVisitorDepartments]);
 
   async function refreshCustomerDetail(ticketId: string): Promise<void> {
@@ -637,7 +657,6 @@ export function SupportOperationsPanel({
     setPresalesReason("");
     if (staffDetail?.ticket.id !== ticketId) {
       setStaffTicketReplyText("");
-      setStaffTicketMessageKind("public_reply");
       setStaffTicketReason("");
       setStaffAttachment(null);
     }
@@ -667,11 +686,11 @@ export function SupportOperationsPanel({
     });
   }
 
-  async function sendStaffMessage() {
+  async function sendStaffMessage(kind: "public_reply" | "internal_note") {
     if (!staffDetail || !staffTicketReplyText.trim() || pending) return;
     const ticketId = staffDetail.ticket.id;
     const payload = {
-      kind: staffTicketMessageKind,
+      kind,
       message: staffTicketReplyText.trim(),
     };
     await runMutation<StaffTicketDetail>({
@@ -686,7 +705,7 @@ export function SupportOperationsPanel({
         setStaffTicketReplyText("");
       },
       refresh: refreshStaff,
-      success: staffTicketMessageKind === "internal_note"
+      success: kind === "internal_note"
         ? tr("Internal note saved.", "内部备注已保存。")
         : tr("Public reply sent.", "公开回复已发送。"),
       failure: tr("Message could not be saved", "无法保存消息"),
@@ -806,7 +825,6 @@ export function SupportOperationsPanel({
 
   async function openPresales(inquiryId: string) {
     setStaffTicketReplyText("");
-    setStaffTicketMessageKind("public_reply");
     setStaffTicketReason("");
     setStaffAttachment(null);
     if (presalesDetail?.inquiry.id !== inquiryId) {
@@ -983,33 +1001,36 @@ export function SupportOperationsPanel({
   }
 
   if (mode === "customer") {
-    return <section className="order-panel support-operations" aria-label={tr("Customer Support operations", "客户工单操作")}>
-      <p className="eyebrow">{tr("Customer Support · Mock-only", "客户支持 · 仅 Mock")}</p><h2>{tr("Support tickets", "客服工单")}</h2>
+    return <section className="order-panel support-operations" aria-label="Customer support tickets">
+      <p className="eyebrow">{tr("Customer Support · Mock-only", "客户支持 · 仅 Mock")}</p><h2>{tr("My support tickets", "我的工单")}</h2>
       {canWriteCustomerTickets && <form onSubmit={createTicket}>
-        <label>{tr("Subject", "主题")}<input value={subject} onChange={(event) => setSubject(event.target.value)} required minLength={3} /></label>
+        <label>{tr("Subject", "主题")}<input aria-label="Ticket subject" value={subject} onChange={(event) => setSubject(event.target.value)} required minLength={3} /></label>
         <label>{tr("Department", "部门")}<select value={departmentCode} onChange={(event) => setDepartmentCode(event.target.value)}>{departments.map((item) => <option key={item.code} value={item.code}>{item.name ?? item.code}</option>)}</select></label>
         <label>{tr("Priority", "优先级")}<select value={priority} onChange={(event) => setPriority(event.target.value as TicketPriority)}>{["low", "normal", "high", "urgent"].map((item) => <option key={item}>{item}</option>)}</select></label>
-        <label>{tr("Related Service", "关联服务")}<select value={serviceId} onChange={(event) => setServiceId(event.target.value)}><option value="">{tr("None", "无")}</option>{services.map((item) => <option key={item.id} value={item.id}>{item.productName} · {item.status}</option>)}</select></label>
+        <label>{tr("Related Service", "关联服务")}<select aria-label="Related service" value={serviceId} onChange={(event) => setServiceId(event.target.value)}><option value="">{tr("None", "无")}</option>{services.map((item) => <option key={item.id} value={item.id}>{item.productName} · {item.status}</option>)}</select></label>
         <label>{tr("Related Order UUID", "关联订单 UUID")}<input value={orderId} onChange={(event) => setOrderId(event.target.value)} placeholder={tr("Optional", "可选")} /></label>
         <label>{tr("Authorization purpose", "授权用途")}<select value={authorizationPurpose} onChange={(event) => setAuthorizationPurpose(event.target.value)}><option value="">{tr("None", "无")}</option>{["bgp", "remote_hands", "colocation_inbound", "colocation_outbound", "third_party_refund"].map((item) => <option key={item}>{item}</option>)}</select></label>
-        <label>{tr("Opening message", "首条消息")}<textarea value={message} onChange={(event) => setMessage(event.target.value)} required /></label>
+        <label>{tr("Opening message", "首条消息")}<textarea aria-label="Opening message" value={message} onChange={(event) => setMessage(event.target.value)} required /></label>
         <button className="primary" disabled={pending}>{tr("Create ticket", "创建工单")}</button>
       </form>}
-      <div className="ticket-layout"><div className="ticket-list">{tickets.map((ticket) => <button key={ticket.id} onClick={() => void openCustomer(ticket.id)}><strong>{ticket.subject}</strong><span>{ticket.status} · {ticket.department.name} · {ticket.priority}</span></button>)}</div>
-      {customerDetail && <article className="ticket-thread" data-testid="customer-support-operations-detail">
+      <div className="ticket-layout"><div className="ticket-list" data-testid="customer-ticket-list">{tickets.map((ticket) => <button key={ticket.id} onClick={() => void openCustomer(ticket.id)}><strong>{ticket.subject}</strong><span>{ticket.status} · {ticket.department.name} · {ticket.priority}</span></button>)}</div>
+      {customerDetail && <article className="ticket-thread" data-testid="customer-ticket-thread">
         <h3>{customerDetail.ticket.subject}</h3><p>{customerDetail.ticket.department.name} · {customerDetail.ticket.priority}</p>
         {customerDetail.messages.map((item) => <div key={item.id}><strong>{item.authorType}</strong><p>{item.body}</p></div>)}
         <CustomerHistory detail={customerDetail} locale={locale} />
         <AttachmentList locale={locale} attachments={customerDetail.attachments} canDelete={(item) => canWriteCustomerTickets && item.uploadedByType === "customer"} onDelete={(item) => void deleteCustomerAttachment(item)} />
-        {canWriteCustomerTickets && customerDetail.ticket.status !== "closed" && <><textarea aria-label={tr("Customer Support reply", "客户工单回复")} value={customerReplyText} onChange={(event) => setCustomerReplyText(event.target.value)} /><button disabled={pending || !customerReplyText.trim()} onClick={() => void customerReply()}>{tr("Send reply", "发送回复")}</button><input aria-label={tr("Customer attachment", "客户附件")} type="file" accept=".txt,.log,.csv,.pdf,.png,.jpg,.jpeg" onChange={(event) => setCustomerAttachment(event.target.files?.[0] ?? null)} /><button disabled={pending || !customerAttachment} onClick={() => void uploadCustomerAttachment()}>{tr("Upload attachment", "上传附件")}</button><button disabled={pending} onClick={() => void setCustomerStatus("closed")}>{tr("Close ticket", "关闭工单")}</button></>}
+        {canWriteCustomerTickets && customerDetail.ticket.status !== "closed" && <><textarea aria-label="Customer ticket reply" value={customerReplyText} onChange={(event) => setCustomerReplyText(event.target.value)} /><button disabled={pending || !customerReplyText.trim()} onClick={() => void customerReply()}>{tr("Send reply", "发送回复")}</button><input aria-label={tr("Customer attachment", "客户附件")} type="file" accept=".txt,.log,.csv,.pdf,.png,.jpg,.jpeg" onChange={(event) => setCustomerAttachment(event.target.files?.[0] ?? null)} /><button disabled={pending || !customerAttachment} onClick={() => void uploadCustomerAttachment()}>{tr("Upload attachment", "上传附件")}</button><button disabled={pending} onClick={() => void setCustomerStatus("closed")}>{tr("Close ticket", "关闭工单")}</button></>}
         {canWriteCustomerTickets && customerDetail.ticket.status === "closed" && <button disabled={pending} onClick={() => void setCustomerStatus("awaiting_staff")}>{tr("Reopen ticket", "重新开启工单")}</button>}
       </article>}</div>
     </section>;
   }
 
-  return <section className="admin-panel support-operations" aria-label={tr("Staff Support operations", "客服人员工单操作")}>
+  return <section className="admin-panel support-operations" aria-label="Staff support tickets">
     <p className="eyebrow">{tr("Staff Support workspace", "客服人员工作区")}</p>
-    <h2>{tr("Support operations", "客服操作")}</h2>
+    <h2>{tr("Ticket queue", "工单队列")}</h2>
+    {staffAccountContext && <p className="notice" data-testid="staff-support-account-context">
+      {tr("Fixed Client Account", "已固定客户账户")}: {staffAccountContext.name} · {staffAccountContext.id}
+    </p>}
     <fieldset><legend>{tr("Queue filters", "队列筛选")}</legend>
       <label>{tr("Status", "状态")}<select aria-label={tr("Queue status", "队列状态")} value={queueStatus} onChange={(event) => setQueueStatus(event.target.value)}><option value="">{tr("All", "全部")}</option>{["awaiting_staff", "awaiting_customer", "closed"].map((item) => <option key={item}>{item}</option>)}</select></label>
       <label>{tr("Department", "部门")}<select aria-label={tr("Queue department", "队列部门")} value={queueDepartment} onChange={(event) => setQueueDepartment(event.target.value)}><option value="">{tr("All", "全部")}</option>{departments.map((item) => <option key={item.code} value={item.code}>{item.currentRevision?.name ?? item.name ?? item.code}</option>)}</select></label>
@@ -1018,8 +1039,8 @@ export function SupportOperationsPanel({
       <button onClick={() => void refreshStaff()}>{tr("Apply filters", "应用筛选")}</button>
     </fieldset>
     <div className="ticket-layout">
-      <div className="ticket-list" data-testid="support-queue">{staffTickets.map((ticket) => <button key={ticket.id} onClick={() => void openStaff(ticket.id)}><strong>{ticket.subject}</strong><span>{ticket.clientAccount.name} · {ticket.status} · {ticket.department.name} · {ticket.priority}</span></button>)}</div>
-      {staffDetail && <article className="ticket-thread" data-testid="staff-support-operations-detail">
+      <div className="ticket-list" data-testid="staff-ticket-list">{staffTickets.map((ticket) => <button key={ticket.id} onClick={() => void openStaff(ticket.id)}><strong>{ticket.subject}</strong><span>{ticket.clientAccount.name} · {ticket.status} · {ticket.department.name} · {ticket.priority}</span></button>)}</div>
+      {staffDetail && <article className="ticket-thread" data-testid="staff-ticket-thread">
         <h3>{staffDetail.ticket.subject}</h3><p>{staffDetail.ticket.clientAccount.name}</p>
         <label>{tr("Assignee", "负责人")}<select value={assignment} onChange={(event) => setAssignment(event.target.value)}><option value="">{tr("Unassigned", "未分配")}</option>{staffOptions.map((item) => <option key={item.id} value={item.id}>{item.email}</option>)}</select></label>
         <label>{tr("Department", "部门")}<select value={departmentCode} onChange={(event) => setDepartmentCode(event.target.value)}>{departments.map((item) => <option key={item.code} value={item.code}>{item.currentRevision?.name ?? item.name ?? item.code}</option>)}</select></label>
@@ -1029,9 +1050,9 @@ export function SupportOperationsPanel({
         <button disabled={pending || !staffTicketReason.trim()} onClick={() => void staffMutation(`/api/v1/admin/tickets/${staffDetail.ticket.id}/routing`, { departmentCode, priority, reason: staffTicketReason }, tr("Routing saved.", "路由已保存。"))}>{tr("Save routing", "保存路由")}</button>
         <button disabled={pending || !staffTicketReason.trim()} onClick={() => void staffMutation(`/api/v1/admin/tickets/${staffDetail.ticket.id}/status`, { status: staffDetail.ticket.status === "closed" ? "awaiting_staff" : "closed", reason: staffTicketReason }, tr("Status saved.", "状态已保存。"))}>{staffDetail.ticket.status === "closed" ? tr("Reopen", "重新开启") : tr("Close", "关闭")}</button>
         {staffDetail.messages.map((item) => <div key={item.id} data-visibility={item.visibility}><strong>{item.authorEmail ?? item.authorType} · {item.visibility}</strong><p>{item.body}</p></div>)}
-        <label>{tr("Message kind", "消息类型")}<select value={staffTicketMessageKind} onChange={(event) => setStaffTicketMessageKind(event.target.value as typeof staffTicketMessageKind)}><option value="public_reply">{tr("Public reply", "公开回复")}</option><option value="internal_note">{tr("Internal note", "内部备注")}</option></select></label>
-        <textarea aria-label={tr("Staff Support message", "客服工单消息")} value={staffTicketReplyText} onChange={(event) => setStaffTicketReplyText(event.target.value)} />
-        <button disabled={pending || !staffTicketReplyText.trim() || staffDetail.ticket.status === "closed"} onClick={() => void sendStaffMessage()}>{tr("Save message", "保存消息")}</button>
+        <textarea aria-label="Staff ticket message" value={staffTicketReplyText} onChange={(event) => setStaffTicketReplyText(event.target.value)} />
+        <button disabled={pending || !staffTicketReplyText.trim() || staffDetail.ticket.status === "closed"} onClick={() => void sendStaffMessage("public_reply")}>{tr("Send public reply", "发送公开回复")}</button>
+        <button disabled={pending || !staffTicketReplyText.trim() || staffDetail.ticket.status === "closed"} onClick={() => void sendStaffMessage("internal_note")}>{tr("Save internal note", "保存内部备注")}</button>
         <StaffHistory detail={staffDetail} locale={locale} />
         <AttachmentList locale={locale} attachments={staffDetail.attachments} canDelete={() => true} onDelete={(item) => void deleteStaffAttachment(item)} />
         {staffDetail.ticket.status !== "closed" && <><input aria-label={tr("Staff attachment", "客服附件")} type="file" accept=".txt,.log,.csv,.pdf,.png,.jpg,.jpeg" onChange={(event) => setStaffAttachment(event.target.files?.[0] ?? null)} /><button disabled={pending || !staffAttachment} onClick={() => void uploadStaffAttachment()}>{tr("Upload attachment", "上传附件")}</button></>}

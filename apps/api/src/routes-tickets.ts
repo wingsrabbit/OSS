@@ -999,6 +999,7 @@ export async function registerTicketRoutes(
     await requireStaffPermission(pool, user, "support.tickets.manage");
     const query = z
       .object({
+        clientAccountId: canonicalUuid.optional(),
         status: ticketStatus.optional(),
         department: supportDepartmentCode.optional(),
         priority: ticketPriority.optional(),
@@ -1052,6 +1053,7 @@ export async function registerTicketRoutes(
            ($4 = 'unassigned' AND assignment.assigned_staff_user_id IS NULL) OR
            assignment.assigned_staff_user_id::text = $4
          )
+         AND ($5::uuid IS NULL OR ticket.client_account_id = $5)
        GROUP BY ticket.id, account.name, item.product_name, department.code,
                 department_revision.name, routing.priority,
                 assignment.assigned_staff_user_id
@@ -1061,6 +1063,7 @@ export async function registerTicketRoutes(
         query.department ?? null,
         query.priority ?? null,
         query.assignee ?? null,
+        query.clientAccountId ?? null,
       ],
     );
     return {

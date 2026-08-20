@@ -218,6 +218,10 @@ async function installMockApi(
       await route.fulfill({ json: { items: [] } });
       return;
     }
+    if (path === "/api/v1/support/departments") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (request.method() === "GET" && path === "/api/v1/admin/service-operations") {
       await route.fulfill({
         json: {
@@ -407,6 +411,9 @@ async function installMockApi(
     if (
       [
         "/api/v1/admin/tickets",
+        "/api/v1/admin/tickets/staff-options",
+        "/api/v1/admin/support/departments",
+        "/api/v1/admin/presales/inquiries",
         "/api/v1/admin/billing/renewals",
         "/api/v1/admin/manual-fulfillment",
         "/api/v1/admin/services/cancellations",
@@ -465,6 +472,47 @@ test("public, customer, and admin routes mount only their intended workspace", a
     "page",
   );
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
+});
+
+test("real App visitor Presales entry clears its unsent draft after leaving Home", async ({ page }) => {
+  const requests = await installMockApi(page, null);
+  await page.goto("/");
+  const presales = page.locator('section[aria-label="Visitor Presales"]');
+  await expect(presales).toBeVisible();
+  await presales.getByLabel("Name").fill("Draft Visitor");
+  await presales.getByLabel("Subject").fill("Draft product question");
+  await presales.getByLabel("Message").fill("This ordinary question has not been submitted.");
+
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  await expect(presales).toHaveCount(0);
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  const returning = page.locator('section[aria-label="Visitor Presales"]');
+  await expect(returning.getByLabel("Name")).toHaveValue("");
+  await expect(returning.getByLabel("Subject")).toHaveValue("");
+  await expect(returning.getByLabel("Message")).toHaveValue("");
+  expect(requests.filter((path) => path === "/api/v1/support/departments").length).toBeGreaterThanOrEqual(2);
+});
+
+test("real App customer Support read and write stay account-scoped and clear drafts on navigation", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({ email: "customer-support-entry@example.invalid" }),
+  );
+  await page.goto("/customer");
+  const support = page.locator('section[aria-label="Customer support tickets"]');
+  await expect(support).toBeVisible();
+  await expect(support.getByRole("button", { name: "Create ticket" })).toBeVisible();
+  await support.getByLabel("Ticket subject").fill("Unsent account-scoped draft");
+  await support.getByLabel("Opening message").fill("This ordinary draft must not cross routes.");
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  const returning = page.locator('section[aria-label="Customer support tickets"]');
+  await expect(returning.getByLabel("Ticket subject")).toHaveValue("");
+  await expect(returning.getByLabel("Opening message")).toHaveValue("");
+  expect(requests).toContain("/api/v1/tickets");
+  expect(requests).toContain("/api/v1/tickets/service-options");
+  expect(requests).toContain("/api/v1/support/departments");
+  expect(requests.filter((path) => path.startsWith("/api/v1/admin/"))).toEqual([]);
 });
 
 test("customer and Staff sessions stay separated and can switch accounts through sign out", async ({
@@ -585,13 +633,13 @@ test("public Home stays session-neutral for a signed-in wildcard Staff account",
   await expect(page.getByRole("button", { name: "Register", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
   expect(new Set(requests)).toEqual(
-    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content"]),
+    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content", "/api/v1/support/departments"]),
   );
   const requestCountBeforeLocaleChange = requests.length;
   await page.getByRole("button", { name: "简体中文" }).click();
   await expect.poll(() => requests.length).toBeGreaterThan(requestCountBeforeLocaleChange);
   expect(new Set(requests)).toEqual(
-    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content"]),
+    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content", "/api/v1/support/departments"]),
   );
 });
 
@@ -767,7 +815,101 @@ test("limited ticket Staff mounts only its permitted panel and fetch", async ({ 
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
   await expect(page.getByTestId("admin-access-restricted")).toHaveCount(0);
   const adminPaths = [...new Set(requests.filter((path) => path.startsWith("/api/v1/admin/")))];
-  expect(adminPaths).toEqual(["/api/v1/admin/tickets"]);
+  expect(adminPaths).toEqual([
+    "/api/v1/admin/tickets",
+    "/api/v1/admin/tickets/staff-options",
+    "/api/v1/admin/support/departments",
+    "/api/v1/admin/presales/inquiries",
+  ]);
+});
+
+test("Staff without support.tickets.manage mounts no Support panel and sends zero Support GET", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "content-only-staff@example.invalid",
+      permissions: ["content.read"],
+    }),
+  );
+  await page.goto("/admin");
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
+  const supportPaths = requests.filter((path) =>
+    path === "/api/v1/admin/tickets" ||
+    path === "/api/v1/admin/tickets/staff-options" ||
+    path === "/api/v1/admin/support/departments" ||
+    path === "/api/v1/admin/presales/inquiries",
+  );
+  expect(supportPaths).toEqual([]);
+});
+
+test("Account 360 ticket action replaces the global Staff queue with an exact Client Account filter", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000711";
+  const occurredAt = "2026-08-20T00:00:00.000Z";
+  const queueUrls: URL[] = [];
+  await installMockApi(
+    page,
+    mockViewer({
+      email: "account-scoped-support@example.invalid",
+      permissions: ["accounts.view", "support.tickets.manage"],
+    }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/tickets" && route.request().method() === "GET") {
+          queueUrls.push(new URL(route.request().url()));
+          await route.fulfill({ json: { items: [] } });
+          return true;
+        }
+        if (path === "/api/v1/admin/client-accounts") {
+          await route.fulfill({ json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            items: [{
+              id: accountId,
+              name: "Scoped Support Account",
+              owner: { userId: accountId, email: "scoped@example.invalid", emailVerifiedAt: occurredAt },
+              restrictedAt: null,
+              activeMemberCount: 1,
+              createdAt: occurredAt,
+            }],
+            hasMore: false,
+            nextCursor: null,
+          } });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+          await route.fulfill({ json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Scoped Support Account", createdAt: occurredAt, restrictedAt: null },
+            owner: { userId: accountId, email: "scoped@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+            memberships: [],
+            restrictions: [],
+          } });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/tickets`) {
+          await route.fulfill({ json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Scoped Support Account" },
+            items: [],
+            limit: 25,
+            hasMore: false,
+            nextCursor: null,
+          } });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  await expect.poll(() => queueUrls.some((url) => !url.searchParams.has("clientAccountId"))).toBe(true);
+  const account360 = page.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill("Scoped Support Account");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByRole("button", { name: /Scoped Support Account/ }).click();
+  await account360.getByRole("button", { name: "Open ticket operations" }).click();
+  await expect(page.getByTestId("staff-support-account-context")).toContainText(accountId);
+  await expect.poll(() => queueUrls.some((url) => url.searchParams.get("clientAccountId") === accountId)).toBe(true);
 });
 
 test("Client Account restriction keeps verified customer history readable while writes stay unavailable", async ({ page }) => {
@@ -1752,6 +1894,11 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
     subject: "Delayed Staff ticket",
     status: "awaiting_staff",
     service: null,
+    orderId: null,
+    authorizationPurpose: null,
+    department: { code: "general-support", name: "General Support" },
+    priority: "normal",
+    assignedStaffUserId: null,
     publicMessageCount: 1,
     createdAt,
     updatedAt: createdAt,
@@ -1774,7 +1921,14 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
           return true;
         }
         if (path === `/api/v1/admin/tickets/${ticketId}`) {
-          await route.fulfill({ json: { ticket, messages: [] } });
+          await route.fulfill({ json: {
+            ticket,
+            messages: [],
+            attachments: [],
+            statusHistory: [],
+            assignmentHistory: [],
+            routingHistory: [],
+          } });
           return true;
         }
         if (
@@ -1797,6 +1951,10 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
                   createdAt,
                 },
               ],
+              attachments: [],
+              statusHistory: [],
+              assignmentHistory: [],
+              routingHistory: [],
             },
           });
           markResponseFulfilled();

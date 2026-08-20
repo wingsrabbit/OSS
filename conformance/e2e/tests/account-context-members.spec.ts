@@ -321,6 +321,8 @@ async function installMockApi(
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
     } else if (url.pathname === "/api/v1/content") {
       await route.fulfill({ json: { items: [] } });
+    } else if (url.pathname === "/api/v1/support/departments") {
+      await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
     } else if (url.pathname === "/api/v1/customer/content") {
       await route.fulfill({ headers: authenticatedHeaders, json: { items: [] } });
     } else if (url.pathname === "/api/v1/auth/me") {
@@ -1987,14 +1989,22 @@ test("restricted Client Account keeps financial and order facts read-only while 
         expect(requestBody(route.request())).toEqual({
           subject: "Restriction support lifeline",
           message: "Please help while commerce remains restricted.",
+          departmentCode: "general-support",
+          priority: "normal",
           serviceId: null,
+          orderId: null,
+          authorizationPurpose: null,
+          idempotencyKey: expect.any(String),
         });
         await route.fulfill({
           status: 201,
           headers: headers(state),
           json: {
-            ticket: { id: "ticket-restricted", subject: "Restriction support lifeline", status: "awaiting_staff", service: null, publicMessageCount: 1, createdAt: occurredAt, updatedAt: occurredAt },
+            ticket: { id: "ticket-restricted", subject: "Restriction support lifeline", status: "awaiting_staff", service: null, orderId: null, authorizationPurpose: null, department: { code: "general-support", name: "General Support" }, priority: "normal", publicMessageCount: 1, createdAt: occurredAt, updatedAt: occurredAt },
             messages: [{ id: "message-one", authorType: "customer", body: "Please help while commerce remains restricted.", createdAt: occurredAt }],
+            attachments: [],
+            statusHistory: [],
+            routingHistory: [],
           },
         });
         return true;
@@ -2002,15 +2012,21 @@ test("restricted Client Account keeps financial and order facts read-only while 
       if (path === "/api/v1/tickets/ticket-restricted/replies") {
         supportReplies += 1;
         expect(route.request().headers()[contextVersionHeader.toLowerCase()]).toBe("1");
-        expect(requestBody(route.request())).toEqual({ message: "Adding the requested support detail." });
+        expect(requestBody(route.request())).toEqual({
+          message: "Adding the requested support detail.",
+          idempotencyKey: expect.any(String),
+        });
         await route.fulfill({
           headers: headers(state),
           json: {
-            ticket: { id: "ticket-restricted", subject: "Restriction support lifeline", status: "awaiting_staff", service: null, publicMessageCount: 2, createdAt: occurredAt, updatedAt: occurredAt },
+            ticket: { id: "ticket-restricted", subject: "Restriction support lifeline", status: "awaiting_staff", service: null, orderId: null, authorizationPurpose: null, department: { code: "general-support", name: "General Support" }, priority: "normal", publicMessageCount: 2, createdAt: occurredAt, updatedAt: occurredAt },
             messages: [
               { id: "message-one", authorType: "customer", body: "Please help while commerce remains restricted.", createdAt: occurredAt },
               { id: "message-two", authorType: "customer", body: "Adding the requested support detail.", createdAt: occurredAt },
             ],
+            attachments: [],
+            statusHistory: [],
+            routingHistory: [],
           },
         });
         return true;

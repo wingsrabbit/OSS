@@ -275,15 +275,17 @@ async function routeCustomer(page: Page) {
 test("customer Support component shows fields, immutable history, ordinary attachments, close and reopen controls", async ({ page }) => {
   const observed = await routeCustomer(page);
   await page.goto("/support-operations-harness.html?mode=customer");
-  const panel = page.getByRole("region", { name: "Customer Support operations" });
-  await expect(panel.getByRole("heading", { name: "Support tickets" })).toBeVisible();
+  const panel = page.getByRole("region", { name: "Customer support tickets" });
+  await expect(
+    panel.getByRole("heading", { name: "My support tickets", exact: true }),
+  ).toBeVisible();
   await expect(panel.getByLabel("Department")).toBeVisible();
   await expect(panel.getByLabel("Priority")).toBeVisible();
   await expect(panel.getByLabel("Related Service")).toBeVisible();
   await expect(panel.getByLabel("Related Order UUID")).toBeVisible();
   await expect(panel.getByLabel("Authorization purpose")).toBeVisible();
   await panel.getByRole("button", { name: /Ordinary browser Support request/ }).click();
-  const detail = panel.getByTestId("customer-support-operations-detail");
+  const detail = panel.getByTestId("customer-ticket-thread");
   await expect(detail.getByTestId("support-ticket-history")).toContainText("Ticket created");
   await expect(detail.getByTestId("support-ticket-history")).not.toContainText("customer@example.invalid");
   await expect(detail).toContainText("ordinary.txt");
@@ -291,7 +293,7 @@ test("customer Support component shows fields, immutable history, ordinary attac
   await expect(detail.getByRole("link")).toHaveCount(0);
   await detail.getByRole("button", { name: "Delete" }).click();
   await expect(detail).not.toContainText("ordinary.txt");
-  await detail.getByLabel("Customer Support reply").fill("Customer browser reply");
+  await detail.getByLabel("Customer ticket reply").fill("Customer browser reply");
   await detail.getByRole("button", { name: "Send reply" }).click();
   await expect(detail).toContainText("Customer browser reply");
   await detail.getByLabel("Customer attachment").setInputFiles({
@@ -406,7 +408,7 @@ test("Staff Support component filters, assigns, routes, separates internal notes
   });
 
   await page.goto("/support-operations-harness.html?mode=staff");
-  const panel = page.getByRole("region", { name: "Staff Support operations" });
+  const panel = page.getByRole("region", { name: "Staff support tickets" });
   await panel.getByLabel("Queue status").selectOption("awaiting_staff");
   await panel.getByLabel("Queue department").selectOption(department.code);
   await panel.getByLabel("Queue priority").selectOption("high");
@@ -419,8 +421,8 @@ test("Staff Support component filters, assigns, routes, separates internal notes
     url.includes(`assignee=${staffId}`),
   )).toBe(true);
 
-  await panel.getByTestId("support-queue").getByRole("button", { name: /Ordinary browser/ }).click();
-  const detail = panel.getByTestId("staff-support-operations-detail");
+  await panel.getByTestId("staff-ticket-list").getByRole("button", { name: /Ordinary browser/ }).click();
+  const detail = panel.getByTestId("staff-ticket-thread");
   await expect(detail.getByTestId("support-ticket-history")).toContainText("Assignment");
   await expect(detail.getByTestId("support-ticket-history")).toContainText("Take ownership");
   await expect(detail.locator('[data-visibility="internal"]')).toContainText("Staff-only browser note");
@@ -439,8 +441,8 @@ test("Staff Support component filters, assigns, routes, separates internal notes
   await expect.poll(() => postedPaths).toContain(`/api/v1/admin/tickets/${ticketId}/assignments`);
   await expect.poll(() => postedPaths).toContain(`/api/v1/admin/tickets/${ticketId}/routing`);
 
-  await detail.getByLabel("Staff Support message").fill("Staff browser public reply");
-  await detail.getByRole("button", { name: "Save message" }).click();
+  await detail.getByLabel("Staff ticket message").fill("Staff browser public reply");
+  await detail.getByRole("button", { name: "Send public reply" }).click();
   await expect(detail).toContainText("Staff browser public reply");
   await detail.getByLabel("Staff attachment").setInputFiles({
     name: "staff-upload.txt",
@@ -459,7 +461,7 @@ test("Staff Support component filters, assigns, routes, separates internal notes
   await departments.getByRole("button", { name: "Save immutable revision" }).click();
   await expect.poll(() => postedPaths).toContain(`/api/v1/admin/support/departments/${departmentId}/revisions`);
 
-  await detail.getByLabel("Staff Support message").fill("Ticket-only unsent draft");
+  await detail.getByLabel("Staff ticket message").fill("Ticket-only unsent draft");
   const staffPresales = page.getByRole("region", { name: "Staff Presales" });
   await staffPresales.getByRole("button", { name: /Ordinary product question/ }).click();
   await expect(staffPresales.getByTestId("staff-presales-detail")).toContainText("Private Presales note");
@@ -557,9 +559,9 @@ test("committed mutation survives refresh failure and an ambiguous retry reuses 
   });
 
   await page.goto("/support-operations-harness.html?mode=customer");
-  const panel = page.getByRole("region", { name: "Customer Support operations" });
+  const panel = page.getByRole("region", { name: "Customer support tickets" });
   await panel.getByRole("button", { name: /Ordinary browser Support request/ }).click();
-  const reply = panel.getByLabel("Customer Support reply");
+  const reply = panel.getByLabel("Customer ticket reply");
   await reply.fill("Committed exactly once");
   await panel.getByRole("button", { name: "Send reply" }).click();
   await expect(page.getByLabel("Support error")).not.toHaveText("");

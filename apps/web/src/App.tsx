@@ -47,7 +47,7 @@ import { ContentOperationsPanel } from "./ContentOperationsPanel.js";
 import { LegalHub } from "./LegalHub.js";
 import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
 import { EmailChangePage, PasswordRecoveryPage, SecurityPanel } from "./SecurityPanel.js";
-import { TicketsPanel } from "./TicketsPanel.js";
+import { SupportOperationsPanel } from "./SupportOperationsPanel.js";
 
 type Locale = "en" | "zh-CN";
 type AppRoute = "/" | "/customer" | "/admin" | "/security" | "/password-recovery" | "/email-change";
@@ -5012,26 +5012,34 @@ export function App() {
           />
         )}
 
-        {route === "/customer" && (
-          <TicketsPanel
-            mode="customer"
-            canUseCustomerSupport={canUseCustomerSupport}
-            canWriteCustomerSupport={canWriteCustomerSupport}
-            me={me}
+        {route === "/" && (
+          <SupportOperationsPanel
+            key={`visitor-support:${routeGenerationRef.current}`}
+            mode="visitor"
             locale={locale}
             onNotice={showTicketNotice}
             onError={showTicketError}
           />
         )}
 
+        {route === "/customer" && sessionResolved && (
+          <SupportOperationsPanel
+            key={`customer-support:${customerCommerceAccessFingerprint}`}
+            mode="customer"
+            locale={locale}
+            canReadCustomerTickets={canUseCustomerSupport}
+            canWriteCustomerTickets={canWriteCustomerSupport}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
         {route === "/admin" && sessionResolved && canManageStaffTickets && (
-          <TicketsPanel
+          <SupportOperationsPanel
+            key={`staff-support:${staffAccessFingerprint}:${operationAccount?.id ?? "global"}`}
             mode="staff"
-            canManageTickets={canManageStaffTickets}
-            staffAccessFingerprint={staffAccessFingerprint}
+            canManageSupport={canManageStaffTickets}
             staffAccountContext={operationAccount}
-            requireStaffAccountContext={!canUseFullAdminWorkspace && canViewAccount360}
-            me={me}
             locale={locale}
             onNotice={showTicketNotice}
             onError={showTicketError}

@@ -127,6 +127,31 @@ const unassignedQueue = expectStatus(
 );
 assert.equal(unassignedQueue.items.some((ticket) => ticket.id === ticketId), true);
 
+const customerIdentity = expectStatus(
+  await request<{ clientAccountId: string }>("/api/v1/auth/me", { cookie: customerCookie }),
+  200,
+);
+const otherCustomerIdentity = expectStatus(
+  await request<{ clientAccountId: string }>("/api/v1/auth/me", { cookie: otherCustomerCookie }),
+  200,
+);
+const accountScopedQueue = expectStatus(
+  await request<{ items: Array<{ id: string }> }>(
+    `/api/v1/admin/tickets?clientAccountId=${encodeURIComponent(customerIdentity.clientAccountId)}`,
+    { cookie: staffCookie },
+  ),
+  200,
+);
+assert.equal(accountScopedQueue.items.some((ticket) => ticket.id === ticketId), true);
+const otherAccountQueue = expectStatus(
+  await request<{ items: Array<{ id: string }> }>(
+    `/api/v1/admin/tickets?clientAccountId=${encodeURIComponent(otherCustomerIdentity.clientAccountId)}`,
+    { cookie: staffCookie },
+  ),
+  200,
+);
+assert.equal(otherAccountQueue.items.some((ticket) => ticket.id === ticketId), false);
+
 const staffOptions = expectStatus(
   await request<{ items: Array<{ id: string; email: string }> }>(
     "/api/v1/admin/tickets/staff-options",
