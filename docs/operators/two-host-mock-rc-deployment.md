@@ -174,10 +174,12 @@ documented `TestA` or `TestB` connection-field prefixes; never expose a database
 Capture the two profile archives while the corresponding writers are stopped as required by
 `docs/operators/lab-rc-recovery.md`.
 
-The current reviewed restore executor accepts only `DemoLocal`. A TestA/TestB backup plus generated
-restore plan is not two-host restore acceptance. Do not call the deployment a completed final RC
-until a separately reviewed blank TestA/TestB restore exercise, native checks, Provider inventory
-comparison, reconciliation, RPO, and RTO evidence have completed.
+The reviewed blank-only executor accepts the exact host archive through
+`tools/lab-backup.mjs restore --profile TestA|TestB`. It deep-verifies the archive, preflights every
+profile target before writing, restores in manifest order, and records resumable per-component
+evidence. A generated restore plan alone is not two-host restore acceptance. Do not call the
+deployment a completed final RC until both blank TestA and TestB restore exercises, native checks,
+Provider inventory comparison, reconciliation, RPO, and RTO evidence have completed.
 
 ## Update and rollback
 

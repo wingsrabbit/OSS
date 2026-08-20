@@ -290,8 +290,8 @@ test("two-host runbook preserves Provider-first startup and recovery claim bound
   assert.match(runbook, /linux\/amd64/u);
   assert.match(runbook, /pull_policy: never/u);
   assert.match(runbook, /--profile worker-dispatch up -d worker/u);
-  assert.match(runbook, /current reviewed restore executor accepts only `DemoLocal`/u);
-  assert.match(runbook, /Do not call the deployment a completed final RC/u);
+  assert.match(runbook, /tools\/lab-backup[.]mjs restore --profile TestA\|TestB/u);
+  assert.match(runbook, /Do not call the\s+deployment a completed final RC/u);
   assert.match(runbook, /no production data, real\s+Provider/u);
 });
 

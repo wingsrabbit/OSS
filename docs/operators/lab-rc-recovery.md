@@ -2,14 +2,14 @@
 
 > **NOT FOR PRODUCTION — MOCK PROVIDERS ONLY**
 
-This runbook covers release-candidate backup evidence, a non-executing restore plan, and a guarded
-blank-only `DemoLocal` restore executor for the disposable OpenSales System laboratory. It supports
+This runbook covers release-candidate backup evidence, a non-executing restore plan, and guarded
+blank-only host-profile and `DemoLocal` restore executors for the disposable OpenSales System laboratory. It supports
 the `TestA` Core/Staging profile, the `TestB` Provider Lab profile, a combined five-database `local`
 fixture profile, and the four-database `DemoLocal` launcher topology. It does not authorize a
 production deployment, remote-host access, DNS changes, vulnerability scanning, or destructive
 recovery against a populated database.
 
-The current recovery slice has four commands:
+The current recovery slice has five commands:
 
 - `create` makes encrypted logical PostgreSQL 18 dumps and encrypts the configuration/credential
   bundle supplied on stdin. It records an exact clean Git commit, schema history or Provider table
@@ -19,6 +19,9 @@ The current recovery slice has four commands:
   the decrypted configuration stream and never creates a plaintext verification artifact.
 - `restore-plan` verifies the archive and writes a gate file. It does not connect to PostgreSQL,
   decrypt configuration to disk, run `pg_restore`, start an application, or resume side effects.
+- `restore --profile TestA|TestB` deep-verifies the matching host-profile archive, preflights every
+  profile target while all are still blank, restores in manifest order, and records an atomic
+  resumable journal.
 - `restore-demo-local` deep-verifies a `DemoLocal` archive, refuses nonblank or overlapping
   PostgreSQL 18 targets, restores the four physical databases in manifest order, and records an
   atomic resumable journal. For a Core history containing Schema 024, it also applies the narrow
@@ -163,12 +166,13 @@ The plan command does not execute a restore. Never aim an improvised `pg_restore
 or schema-reset command at an existing database. Provision disposable blank databases and keep every
 API, Worker, Provider, callback, and scheduled job stopped.
 
-## Execute a blank DemoLocal database restore
+## Execute a blank database restore
 
-The reviewed executor accepts only a deep-verified four-database `DemoLocal` archive. It does not
-create databases, restore the configuration bundle, start processes, run migrations, or resume side
-effects. Provide four distinct disposable PostgreSQL 18 databases through the same component-scoped
-environment fields used for backup creation, plus the mode-`0600` age identity file.
+The reviewed executor accepts a deep-verified `TestA`, `TestB`, or four-database `DemoLocal` archive.
+It does not create databases, restore the configuration bundle, start processes, run migrations, or
+resume side effects. Provide a distinct disposable PostgreSQL 18 database for every component in the
+selected profile through the same component-scoped environment fields used for backup creation, plus
+the mode-`0600` age identity file.
 
 First use a new private journal directory for a read-only target preflight:
 
@@ -176,29 +180,36 @@ First use a new private journal directory for a read-only target preflight:
 set +x
 umask 077
 export LAB_RC_AGE_IDENTITY_FILE="$LAB_RC_PRIVATE_AGE_IDENTITY"
-node tools/lab-backup.mjs restore-demo-local \
+node tools/lab-backup.mjs restore \
+  --profile TestA \
   --archive "$LAB_RC_BACKUP_OUTPUT" \
   --journal "$LAB_RC_RESTORE_DRY_RUN_JOURNAL" \
   --dry-run
 ```
 
-The preflight deep-verifies every encrypted artifact and checks all four target databases before any
-restore begins. A target is blank only when it has no non-system schema and no relation, routine, or
-type in `public`. Each target connection identity must be distinct. A dry-run journal cannot be
-reused for execution; choose another new directory for the real disposable exercise:
+Use `--profile TestB` for a TestB archive. The selected profile must exactly match the archive
+manifest. The preflight deep-verifies every encrypted artifact and checks every profile target before
+any restore begins. A target is blank only when it has no non-system schema and no relation, routine,
+or type in `public`. Each target's server-side PostgreSQL system identifier plus database OID/name
+must be distinct, so alternate client service or DNS aliases cannot make one physical database count
+as multiple targets. A dry-run journal cannot be reused for execution; choose another new directory
+for the real disposable exercise:
 
 ```sh
-node tools/lab-backup.mjs restore-demo-local \
+node tools/lab-backup.mjs restore \
+  --profile TestA \
   --archive "$LAB_RC_BACKUP_OUTPUT" \
   --journal "$LAB_RC_RESTORE_JOURNAL"
 ```
 
-The executor restores Core, payment, shared provisioning/Provider Platform, and shared mail/mailbox
-in manifest order. Each `pg_restore` uses one transaction, stops on its first error, omits ownership,
-privileges, and tablespaces, and writes a mode-`0600` per-component log plus an atomic
+The `restore-demo-local` command remains the exact compatibility alias for a DemoLocal archive. The
+executor restores TestA Core, the four TestB Provider databases, or the four DemoLocal physical
+databases in manifest order. Each `pg_restore` uses one transaction, stops on its first error, omits
+ownership, privileges, and tablespaces, and writes a mode-`0600` per-component log plus an atomic
 `restore-state.json`. It then compares Core migration/attachment evidence and each Provider table
-inventory with the manifest. No connection field or age identity path is written to argv or the
-journal.
+inventory with the manifest. The journal records only the target database name and a connection-
+identity digest; no password, host, user, service file, raw child stderr, or age identity path is
+written to argv or the journal.
 
 PostgreSQL 18 logical restore can resolve the two Schema 024 `citext` email comparisons as `text`
 when replaying archive DDL with an empty search path. That is a case-sensitive semantic change, not
@@ -225,6 +236,9 @@ node tools/lab-backup.mjs restore-demo-local \
   --journal "$LAB_RC_RESTORE_JOURNAL" \
   --resume
 ```
+
+For TestA or TestB, resume with `restore --profile TestA|TestB` and the same exact profile, archive,
+and journal used for the original execution.
 
 A `pg_restore` command failure rolls back that component's restore transaction. A later manifest
 comparison or Schema 024 repair-gate failure happens after `pg_restore` committed, so that target is
@@ -285,5 +299,5 @@ git diff --check
 
 The fixture tests use fake `psql`, `pg_dump`, `pg_restore`, and `age` executables. They exercise
 TestA/TestB/DemoLocal inventory validation, encrypted artifact creation, shallow/deep verification,
-blank-only dry-run, ordered DemoLocal restore, the exact Schema 024 semantic repair gate, completed
-resume, and failure journaling without opening a network connection.
+blank-only dry-run, ordered TestA/TestB/DemoLocal restore, the exact Schema 024 semantic repair gate,
+completed resume, and failure journaling without opening a network connection.

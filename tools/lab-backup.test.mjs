@@ -22,6 +22,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import {
   LAB_WARNING,
+  LAB_PROFILE_RESTORE_FORMAT,
   MANIFEST_FORMAT,
   DEMO_LOCAL_RESTORE_FORMAT,
   buildRestorePlan,
@@ -29,6 +30,7 @@ import {
   databaseEnvironment,
   normalizeProfile,
   restoreDemoLocal,
+  restoreProfile,
   validateManifest,
   verifyBackup,
 } from "./lab-backup.mjs";
@@ -55,10 +57,11 @@ function executable(path, body) {
 function fakeTools(directory, options = {}) {
   const bin = join(directory, "bin");
   const psqlTrace = join(directory, "psql-trace.jsonl");
+  const restoreTrace = join(directory, "restore-trace.jsonl");
   mkdirSync(bin);
   executable(
     join(bin, "psql"),
-    `const fs=require("node:fs");let sql="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>sql+=c);process.stdin.on("end",()=>{
+    `const fs=require("node:fs");const crypto=require("node:crypto");let sql="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>sql+=c);process.stdin.on("end",()=>{
       if(Object.keys(process.env).some(k=>k.includes("DATABASE_URL")||k.startsWith("LAB_RC_")))process.exit(12);
       if(process.argv.includes("--version")){console.log("psql (PostgreSQL) 18.2");return;}
       const repair=sql.includes("schema024_logical_restore_semantic_repair");
@@ -105,7 +108,12 @@ function fakeTools(directory, options = {}) {
         if(${JSON.stringify(options.failSchema024Repair ?? false)})process.exit(16);
         return;
       }
-      if(sql.includes("blank_database_object_count"))console.log((process.env.PGDATABASE||"fixture")+"\\t180002\\t"+(${JSON.stringify(options.nonBlankDatabase ?? "")}===(process.env.PGDATABASE||"")?"1":"0"));
+      if(sql.includes("blank_database_object_count")){
+        const database=process.env.PGDATABASE||"fixture";
+        const oid=Number.parseInt(crypto.createHash("sha256").update(database).digest("hex").slice(0,7),16);
+        fs.appendFileSync(${JSON.stringify(restoreTrace)},JSON.stringify({kind:"blank",database})+"\\n");
+        console.log(database+"\\t180002\\t7675964282726770433\\t"+oid+"\\t"+(${JSON.stringify(options.nonBlankDatabase ?? "")}===database?"1":"0"));
+      }
       else if(sql.includes("server_version_num"))console.log("180002");
       else if(sql.includes("schema_migrations"))console.log("021_stage_c_support_operations\\n022_stage_c_catalog_commerce_hardening\\n024_stage_c_identity_security");
       else if(sql.includes("support_ticket_attachments"))console.log(${JSON.stringify(options.invalidAttachment ? "2\t9\t1" : "2\t9\t0")});
@@ -122,10 +130,11 @@ function fakeTools(directory, options = {}) {
   );
   executable(
     join(bin, "pg_restore"),
-    `const restoring=process.argv.includes("--dbname=");
+    `const fs=require("node:fs");const restoring=process.argv.includes("--dbname=");
      if(Object.keys(process.env).some(k=>k.includes("DATABASE_URL")||k.startsWith("LAB_RC_")||(!restoring&&(k==="PGPASSWORD"||k==="PGPASSFILE"))))process.exit(12);
      if(process.argv.includes("--version")){console.log("pg_restore (PostgreSQL) 18.2");process.exit(0);}
      let data="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>data+=c);process.stdin.on("end",()=>{
+       if(restoring)fs.appendFileSync(${JSON.stringify(restoreTrace)},JSON.stringify({kind:"restore",database:process.env.PGDATABASE||""})+"\\n");
        if(!data.startsWith("PGDMP:"))process.exitCode=8;
        if(restoring&&${JSON.stringify(options.failRestoreDatabase ?? "")}===(process.env.PGDATABASE||"")){console.error("fixture restore failed");process.exitCode=7;}
      });`,
@@ -206,6 +215,36 @@ async function demoLocalBackupFixture(directory, toolOptions = {}) {
     stdin: [Buffer.from("private Demo-local restore fixture configuration")],
   });
   return { archive, env };
+}
+
+async function hostProfileBackupFixture(directory, profile) {
+  const archive = join(directory, "backup");
+  const identity = join(directory, "fixture-identity");
+  const toolEnv = fakeTools(directory);
+  const repositoryRoot = cleanRepository(directory);
+  const env = {
+    ...process.env,
+    ...toolEnv,
+    ...databaseEnv("LAB_RC_CORE", "testa_core_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_PAYMENT", "testb_payment_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_PROVISIONING", "testb_provisioning_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_MAIL", "testb_mail_restore_fixture"),
+    ...databaseEnv("LAB_RC_PROVIDER_PLATFORM", "testb_platform_restore_fixture"),
+    LAB_RC_AGE_IDENTITY_FILE: identity,
+  };
+  writeFileSync(identity, "AGE-SECRET-KEY-HOST-PROFILE-FIXTURE\n", { mode: 0o600 });
+  await createBackup({
+    profile,
+    output: archive,
+    recipient: "age1fixturefixturefixturefixturefixturefixturefixture",
+    configurationVersion: `${profile.toLowerCase()}-restore-config-fixture-1`,
+    credentialSetVersion: `${profile.toLowerCase()}-restore-credential-fixture-1`,
+    pausedAt: new Date(Date.now() - 1_000).toISOString(),
+    repositoryRoot,
+    env,
+    stdin: [Buffer.from(`private ${profile} restore fixture configuration`)],
+  });
+  return { archive, env, restoreTrace: join(directory, "restore-trace.jsonl") };
 }
 
 function manifest(profile = "TestA") {
@@ -439,7 +478,7 @@ test("DemoLocal blank restore stops on first fixture failure and preserves its j
     assert.equal(state.status, "failed");
     assert.deepEqual(state.completed, []);
     assert.equal(state.failed.id, "core");
-    assert.match(readFileSync(join(journal, state.failed.log), "utf8"), /fixture restore failed/);
+    assert.match(readFileSync(join(journal, state.failed.log), "utf8"), /pg_restore for core failed/);
     assert.equal(existsSync(join(journal, "02-provider-payment.log")), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -456,6 +495,126 @@ test("DemoLocal blank restore refuses a nonblank target before starting any rest
       /provider-payment restore target is not a blank database/,
     );
     assert.equal(existsSync(join(journal, "01-core.log")), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("TestA blank restore deep-verifies, preflights once, restores Core, and resumes complete", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-testa-restore-normal-"));
+  try {
+    const { archive, env, restoreTrace } = await hostProfileBackupFixture(directory, "TestA");
+    const journal = join(directory, "restore-journal");
+    const state = await restoreProfile({
+      profile: "TestA",
+      archive,
+      journal,
+      dryRun: false,
+      resume: false,
+      env,
+    });
+    assert.equal(state.format, LAB_PROFILE_RESTORE_FORMAT);
+    assert.equal(state.profile, "TestA");
+    assert.equal(state.status, "complete");
+    assert.deepEqual(state.completed.map(({ id }) => id), ["core"]);
+    assert.deepEqual(
+      readFileSync(restoreTrace, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      [
+        { kind: "blank", database: "testa_core_restore_fixture" },
+        { kind: "restore", database: "testa_core_restore_fixture" },
+      ],
+    );
+    assert.match(readFileSync(join(journal, "01-core.log"), "utf8"), /completed core restore and manifest comparison/);
+    const beforeResume = readFileSync(join(journal, "restore-state.json"), "utf8");
+    const resumed = await restoreProfile({
+      profile: "TestA",
+      archive,
+      journal,
+      dryRun: false,
+      resume: true,
+      env,
+    });
+    assert.equal(resumed.status, "complete");
+    assert.equal(readFileSync(join(journal, "restore-state.json"), "utf8"), beforeResume);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("TestB blank restore preflights every target before ordered Provider restores", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-testb-restore-normal-"));
+  try {
+    const { archive, env, restoreTrace } = await hostProfileBackupFixture(directory, "TestB");
+    const journal = join(directory, "restore-journal");
+    const state = await restoreProfile({
+      profile: "TestB",
+      archive,
+      journal,
+      dryRun: false,
+      resume: false,
+      env,
+    });
+    const databaseIds = [
+      "provider-payment",
+      "provider-provisioning",
+      "provider-mail",
+      "provider-platform",
+    ];
+    assert.equal(state.format, LAB_PROFILE_RESTORE_FORMAT);
+    assert.equal(state.profile, "TestB");
+    assert.equal(state.status, "complete");
+    assert.deepEqual(state.completed.map(({ id }) => id), databaseIds);
+    assert.equal(new Set(state.completed.map(({ targetIdentitySha256 }) => targetIdentitySha256)).size, 4);
+    assert.deepEqual(
+      readFileSync(restoreTrace, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      [
+        { kind: "blank", database: "testb_payment_restore_fixture" },
+        { kind: "blank", database: "testb_provisioning_restore_fixture" },
+        { kind: "blank", database: "testb_mail_restore_fixture" },
+        { kind: "blank", database: "testb_platform_restore_fixture" },
+        { kind: "restore", database: "testb_payment_restore_fixture" },
+        { kind: "restore", database: "testb_provisioning_restore_fixture" },
+        { kind: "restore", database: "testb_mail_restore_fixture" },
+        { kind: "restore", database: "testb_platform_restore_fixture" },
+      ],
+    );
+    for (const completed of state.completed) {
+      assert.match(
+        readFileSync(join(journal, completed.log), "utf8"),
+        new RegExp(`completed ${completed.id} restore and manifest comparison`),
+      );
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("TestA restore CLI selects the exact profile and completes a normal dry-run preflight", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "oss-testa-restore-cli-normal-"));
+  try {
+    const { archive, env } = await hostProfileBackupFixture(directory, "TestA");
+    const journal = join(directory, "restore-journal");
+    const result = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("./lab-backup.mjs", import.meta.url)),
+        "restore",
+        "--profile",
+        "TestA",
+        "--archive",
+        archive,
+        "--journal",
+        journal,
+        "--dry-run",
+      ],
+      { env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(result.stdout);
+    assert.equal(state.format, LAB_PROFILE_RESTORE_FORMAT);
+    assert.equal(state.profile, "TestA");
+    assert.equal(state.status, "dry-run-complete");
+    assert.deepEqual(state.completed, []);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

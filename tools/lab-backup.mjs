@@ -26,6 +26,7 @@ export const LAB_WARNING = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY";
 export const MANIFEST_FORMAT = "opensales-lab-rc-backup/v1";
 export const RESTORE_PLAN_FORMAT = "opensales-lab-rc-restore-plan/v1";
 export const DEMO_LOCAL_RESTORE_FORMAT = "opensales-lab-rc-demo-local-restore/v1";
+export const LAB_PROFILE_RESTORE_FORMAT = "opensales-lab-rc-profile-restore/v1";
 
 const DATABASES = Object.freeze({
   core: Object.freeze({
@@ -505,6 +506,15 @@ function inspectBlankTarget(binary, database, env) {
     `SELECT pg_catalog.current_database(),
             pg_catalog.current_setting('server_version_num'),
             (
+              SELECT control.system_identifier::text
+              FROM pg_catalog.pg_control_system() AS control
+            ),
+            (
+              SELECT database_catalog.oid::text
+              FROM pg_catalog.pg_database AS database_catalog
+              WHERE database_catalog.datname = pg_catalog.current_database()
+            ),
+            (
               SELECT pg_catalog.count(*)
               FROM pg_catalog.pg_namespace n
               WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'public')
@@ -527,25 +537,24 @@ function inspectBlankTarget(binary, database, env) {
             ) AS blank_database_object_count;`,
     env,
   );
-  const [databaseName, serverVersion, objectCount] = (rows[0] ?? "").split("\t");
+  const [databaseName, serverVersion, systemIdentifier, databaseOid, objectCount] =
+    (rows[0] ?? "").split("\t");
   const serverVersionNumber = Number.parseInt(serverVersion ?? "", 10);
-  if (!databaseName || !Number.isInteger(serverVersionNumber) || !/^\d+$/.test(objectCount ?? "")) {
+  if (
+    !databaseName ||
+    !Number.isInteger(serverVersionNumber) ||
+    !/^\d+$/.test(systemIdentifier ?? "") ||
+    !/^\d+$/.test(databaseOid ?? "") ||
+    !/^\d+$/.test(objectCount ?? "")
+  ) {
     fail(`blank target inspection returned an invalid result for ${database.id}`);
   }
   if (serverVersionNumber < 180000 || serverVersionNumber >= 190000) {
     fail(`${database.id} restore target must run PostgreSQL 18`);
   }
   if (objectCount !== "0") fail(`${database.id} restore target is not a blank database`);
-  const connection = databaseEnvironment(database, env);
   const targetIdentitySha256 = createHash("sha256")
-    .update([
-      connection.PGSERVICE ?? "",
-      connection.PGSERVICEFILE ?? "",
-      connection.PGHOST ?? "",
-      connection.PGHOSTADDR ?? "",
-      connection.PGPORT ?? "",
-      databaseName,
-    ].join("\0"))
+    .update([systemIdentifier, databaseOid, databaseName].join("\0"))
     .digest("hex");
   return { databaseName, serverVersionNumber, targetIdentitySha256 };
 }
@@ -1133,18 +1142,22 @@ function writeRestoreState(path, state) {
   renameSync(partial, path);
 }
 
-function validateRestoreState(state, manifestSha256) {
+function restoreStateFormat(profile) {
+  return profile === "DemoLocal" ? DEMO_LOCAL_RESTORE_FORMAT : LAB_PROFILE_RESTORE_FORMAT;
+}
+
+function validateRestoreState(state, manifestSha256, profile) {
   if (!state || typeof state !== "object" || Array.isArray(state)) fail("restore journal state is invalid");
   assertExactKeys(
     state,
     ["format", "warning", "manifestSha256", "profile", "status", "dryRun", "startedAt", "updatedAt", "completed", "failed"],
     "restore journal state",
   );
-  if (state.format !== DEMO_LOCAL_RESTORE_FORMAT || state.warning !== LAB_WARNING) {
+  if (state.format !== restoreStateFormat(profile) || state.warning !== LAB_WARNING) {
     fail("restore journal format or warning is invalid");
   }
-  if (state.profile !== "DemoLocal" || state.manifestSha256 !== manifestSha256) {
-    fail("restore journal does not match this verified DemoLocal archive");
+  if (state.profile !== profile || state.manifestSha256 !== manifestSha256) {
+    fail(`restore journal does not match this verified ${profile} archive`);
   }
   if (!["ready", "running", "failed", "complete", "dry-run-complete"].includes(state.status)) {
     fail("restore journal status is invalid");
@@ -1152,7 +1165,7 @@ function validateRestoreState(state, manifestSha256) {
   parseIso(state.startedAt, "restore journal startedAt");
   parseIso(state.updatedAt, "restore journal updatedAt");
   if (!Array.isArray(state.completed)) fail("restore journal completed steps are invalid");
-  const expectedIds = PROFILES.DemoLocal.map(({ id }) => id);
+  const expectedIds = PROFILES[profile].map(({ id }) => id);
   for (let index = 0; index < state.completed.length; index += 1) {
     const completed = state.completed[index];
     assertExactKeys(completed, ["id", "databaseName", "serverVersionNumber", "targetIdentitySha256", "completedAt", "log"], "completed restore step");
@@ -1180,25 +1193,23 @@ function appendRestoreLog(path, message) {
   writeFileSync(path, `${new Date().toISOString()} ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" });
 }
 
-async function restoreEncryptedDatabase({ binaries, archive, database, identityFile, logPath, env }) {
+async function restoreEncryptedDatabase({ binaries, archive, database, identityFile, env }) {
   const identityFd = openIdentity(identityFile);
-  const logFd = openSync(logPath, "a", 0o600);
   let decrypt;
   let restore;
   try {
     decrypt = spawn(
       binaries.age,
       ["--decrypt", "--identity", "-", resolveArtifact(archive, database.artifact)],
-      { env: safeProcessEnvironment(env), stdio: [identityFd, "pipe", logFd] },
+      { env: safeProcessEnvironment(env), stdio: [identityFd, "pipe", "ignore"] },
     );
     restore = spawn(
       binaries.pgRestore,
       ["--dbname=", "--exit-on-error", "--single-transaction", "--no-owner", "--no-privileges", "--no-tablespaces", "--no-password"],
-      { env: databaseEnvironment(DATABASES[database.id], env), stdio: ["pipe", "ignore", logFd] },
+      { env: databaseEnvironment(DATABASES[database.id], env), stdio: ["pipe", "ignore", "ignore"] },
     );
   } finally {
     closeSync(identityFd);
-    closeSync(logFd);
   }
   restore.stdin.on("error", () => {});
   decrypt.stdout.pipe(restore.stdin);
@@ -1226,13 +1237,17 @@ function assertRestoredInspection(expected, actual) {
   }
 }
 
-export async function restoreDemoLocal(options) {
-  if (process.version !== "v24.18.0") fail("DemoLocal restore requires the repository-pinned Node.js 24.18.0");
+export async function restoreProfile(options) {
+  const profile = normalizeProfile(options.profile);
+  if (!["TestA", "TestB", "DemoLocal"].includes(profile)) {
+    fail("blank restore executor accepts only TestA, TestB, or DemoLocal");
+  }
+  if (process.version !== "v24.18.0") fail(`${profile} restore requires the repository-pinned Node.js 24.18.0`);
   const archive = resolve(options.archive);
   const verification = await verifyBackup({ archive, deep: true, env: options.env });
   const manifest = validateManifest(JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8")));
-  if (manifest.profile !== "DemoLocal" || manifest.databases.length !== 4) {
-    fail("blank restore executor accepts only a verified four-database DemoLocal manifest");
+  if (manifest.profile !== profile || manifest.databases.length !== PROFILES[profile].length) {
+    fail(`blank restore executor requires a verified ${profile} manifest`);
   }
   if (verification.status !== "verified" || verification.deep !== "passed") {
     fail("blank restore executor requires deep verification to pass");
@@ -1245,15 +1260,19 @@ export async function restoreDemoLocal(options) {
     if (!existsSync(statePath) || !lstatSync(statePath).isFile() || lstatSync(statePath).isSymbolicLink()) {
       fail("resume requires a regular non-symlink restore-state.json");
     }
-    state = validateRestoreState(JSON.parse(readFileSync(statePath, "utf8")), verification.manifestSha256);
+    state = validateRestoreState(
+      JSON.parse(readFileSync(statePath, "utf8")),
+      verification.manifestSha256,
+      profile,
+    );
     if (state.dryRun || state.status === "dry-run-complete") fail("a dry-run journal cannot be resumed as a restore");
     if (state.status === "complete") return state;
   } else {
     state = {
-      format: DEMO_LOCAL_RESTORE_FORMAT,
+      format: restoreStateFormat(profile),
       warning: LAB_WARNING,
       manifestSha256: verification.manifestSha256,
-      profile: "DemoLocal",
+      profile,
       status: "ready",
       dryRun: options.dryRun === true,
       startedAt,
@@ -1267,7 +1286,7 @@ export async function restoreDemoLocal(options) {
   const binaries = binaryNames(options.env);
   for (const [binary, label] of [[binaries.psql, "psql"], [binaries.pgRestore, "pg_restore"]]) {
     if (!/^\S.*PostgreSQL\)? 18(?:\.|\s|$)/.test(commandVersion(binary, label, options.env))) {
-      fail(`${label} must be PostgreSQL 18 for DemoLocal restore`);
+      fail(`${label} must be PostgreSQL 18 for ${profile} restore`);
     }
   }
   commandVersion(binaries.age, "age", options.env);
@@ -1279,7 +1298,7 @@ export async function restoreDemoLocal(options) {
   for (const database of pending) {
     const target = inspectBlankTarget(binaries.psql, DATABASES[database.id], options.env);
     if (completedTargets.has(target.targetIdentitySha256) || targets.some(({ targetIdentitySha256 }) => targetIdentitySha256 === target.targetIdentitySha256)) {
-      fail("each DemoLocal component requires a distinct blank target database");
+      fail(`each ${profile} component requires a distinct blank target database`);
     }
     targets.push({ id: database.id, ...target });
   }
@@ -1307,7 +1326,6 @@ export async function restoreDemoLocal(options) {
         archive,
         database,
         identityFile: options.env.LAB_RC_AGE_IDENTITY_FILE,
-        logPath,
         env: options.env,
       });
       const restoredInspection = inspectDatabase(
@@ -1360,6 +1378,10 @@ export async function restoreDemoLocal(options) {
   state.failed = null;
   writeRestoreState(statePath, state);
   return state;
+}
+
+export async function restoreDemoLocal(options) {
+  return restoreProfile({ ...options, profile: "DemoLocal" });
 }
 
 export function buildRestorePlan(manifest, verifiedAt = new Date().toISOString(), manifestSha256) {
@@ -1461,6 +1483,11 @@ verify --archive DIR [--deep]
 restore-plan --archive DIR --output FILE
   Writes a non-executing restore plan whose Worker and Provider side effects remain disabled.
 
+restore --profile TestA|TestB --archive DIR --journal DIR [--dry-run|--resume]
+  Deep-verifies the matching host-profile archive, requires distinct blank PostgreSQL 18 targets,
+  and restores them sequentially with single-transaction pg_restore. Target libpq fields come from
+  the matching LAB_RC_<COMPONENT>_PG* environment variables. LAB_RC_AGE_IDENTITY_FILE is required.
+
 restore-demo-local --archive DIR --journal DIR [--dry-run|--resume]
   Deep-verifies one four-database DemoLocal archive, requires distinct blank PostgreSQL 18 targets,
   and restores them sequentially with single-transaction pg_restore. Target libpq fields come from
@@ -1506,6 +1533,23 @@ async function main(argv = process.argv.slice(2)) {
     const manifest = JSON.parse(readFileSync(join(archive, "manifest.json"), "utf8"));
     jsonFile(output, buildRestorePlan(manifest, new Date().toISOString(), verification.manifestSha256));
     process.stdout.write("restore plan written; Worker dispatch and Provider mutation remain disabled\n");
+    return;
+  }
+  if (command === "restore") {
+    if (values["dry-run"] === true && values.resume === true) fail("--dry-run and --resume are mutually exclusive");
+    const profile = normalizeProfile(requireOption(values, "profile"));
+    if (profile !== "TestA" && profile !== "TestB") {
+      fail("restore --profile accepts only TestA or TestB");
+    }
+    const state = await restoreProfile({
+      profile,
+      archive: requireOption(values, "archive"),
+      journal: requireOption(values, "journal"),
+      dryRun: values["dry-run"] === true,
+      resume: values.resume === true,
+      env: process.env,
+    });
+    process.stdout.write(`${JSON.stringify(state, null, 2)}\n`);
     return;
   }
   if (command === "restore-demo-local") {
