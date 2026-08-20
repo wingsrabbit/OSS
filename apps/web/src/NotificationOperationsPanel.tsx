@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api.js";
 
 type Locale = "en" | "zh-CN";
@@ -74,6 +74,17 @@ const emptySnapshot: Snapshot = {
   retryAudit: [],
 };
 
+type AccessScopeToken = Readonly<{
+  key: string;
+  generation: number;
+}>;
+
+type AccessScopeState = {
+  key: string;
+  generation: number;
+  mounted: boolean;
+};
+
 function dateTime(value: string | null, locale: Locale): string {
   if (!value) return "—";
   return new Date(value).toLocaleString(locale === "zh-CN" ? "zh-CN" : "en-US");
@@ -105,25 +116,72 @@ export function NotificationOperationsPanel({
   const [reason, setReason] = useState("");
   const [pendingOutboxId, setPendingOutboxId] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    if (!active || !canRead) {
-      setSnapshot(emptySnapshot);
-      return;
-    }
-    setSnapshot(await api<Snapshot>("/api/v1/admin/notification-operations"));
-  }, [active, canRead]);
+  const scopeKey = JSON.stringify([accessFingerprint, active, canRead, canRetry]);
+  const accessScope = useRef<AccessScopeState>({
+    key: scopeKey,
+    generation: 0,
+    mounted: false,
+  });
+  if (accessScope.current.key !== scopeKey) {
+    accessScope.current = {
+      key: scopeKey,
+      generation: accessScope.current.generation + 1,
+      mounted: accessScope.current.mounted,
+    };
+  }
 
-  useEffect(() => {
-    void refresh().catch((caught: unknown) =>
-      onError(caught instanceof Error ? caught.message : "Notification Operations is unavailable"),
-    );
-  }, [accessFingerprint, onError, refresh]);
+  const captureScope = useCallback(
+    (): AccessScopeToken => ({
+      key: accessScope.current.key,
+      generation: accessScope.current.generation,
+    }),
+    [],
+  );
+  const scopeIsCurrent = useCallback(
+    (scope: AccessScopeToken): boolean =>
+      accessScope.current.mounted &&
+      accessScope.current.key === scope.key &&
+      accessScope.current.generation === scope.generation,
+    [],
+  );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    accessScope.current.mounted = true;
+    setSnapshot(emptySnapshot);
     setPassword("");
     setReason("");
     setPendingOutboxId(null);
-  }, [accessFingerprint, canRetry]);
+    return () => {
+      accessScope.current = {
+        key: accessScope.current.key,
+        generation: accessScope.current.generation + 1,
+        mounted: false,
+      };
+    };
+  }, [scopeKey]);
+
+  const refresh = useCallback(async (scope: AccessScopeToken): Promise<boolean> => {
+    if (!scopeIsCurrent(scope) || !active || !canRead) return false;
+    let nextSnapshot: Snapshot;
+    try {
+      nextSnapshot = await api<Snapshot>("/api/v1/admin/notification-operations");
+    } catch (caught) {
+      if (!scopeIsCurrent(scope)) return false;
+      throw caught;
+    }
+    if (!scopeIsCurrent(scope)) return false;
+    setSnapshot(nextSnapshot);
+    return true;
+  }, [active, canRead, scopeIsCurrent]);
+
+  useEffect(() => {
+    const scope = captureScope();
+    if (!active || !canRead || !scopeIsCurrent(scope)) return;
+    void refresh(scope).catch((caught: unknown) => {
+      if (!scopeIsCurrent(scope)) return;
+      onError(caught instanceof Error ? caught.message : "Notification Operations is unavailable");
+    });
+  }, [active, canRead, captureScope, onError, refresh, scopeIsCurrent, scopeKey]);
 
   const templates = useMemo(
     () =>
@@ -141,7 +199,11 @@ export function NotificationOperationsPanel({
   );
 
   async function retry(delivery: Delivery): Promise<void> {
+    const scope = captureScope();
     if (
+      !scopeIsCurrent(scope) ||
+      !active ||
+      !canRead ||
       !canRetry ||
       !delivery.retryable ||
       !delivery.jobUpdatedAt ||
@@ -149,40 +211,59 @@ export function NotificationOperationsPanel({
       reason.trim().length < 3 ||
       pendingOutboxId
     ) return;
+    const submittedPassword = password;
+    const submittedReason = reason.trim();
     setPendingOutboxId(delivery.outboxId);
     try {
-      await api("/api/v1/auth/reauth", {
-        method: "POST",
-        body: JSON.stringify({ password }),
-      });
-      await api(`/api/v1/admin/notification-operations/${delivery.outboxId}/retry`, {
-        method: "POST",
-        body: JSON.stringify({
-          reason: reason.trim(),
-          expectedJobUpdatedAt: delivery.jobUpdatedAt,
-        }),
-      });
+      try {
+        await api("/api/v1/auth/reauth", {
+          method: "POST",
+          body: JSON.stringify({ password: submittedPassword }),
+        });
+      } catch (caught) {
+        if (!scopeIsCurrent(scope)) return;
+        throw caught;
+      }
+      if (!scopeIsCurrent(scope)) return;
+      try {
+        await api(`/api/v1/admin/notification-operations/${delivery.outboxId}/retry`, {
+          method: "POST",
+          body: JSON.stringify({
+            reason: submittedReason,
+            expectedJobUpdatedAt: delivery.jobUpdatedAt,
+          }),
+        });
+      } catch (caught) {
+        if (!scopeIsCurrent(scope)) return;
+        throw caught;
+      }
+      if (!scopeIsCurrent(scope)) return;
       setPassword("");
       setReason("");
+      setPendingOutboxId(null);
       onNotice(
         locale === "zh-CN"
           ? "通知重试事实已提交；Worker 将追加一个新的投递 attempt。"
           : "Notification retry committed; the Worker will append one new delivery attempt.",
       );
       try {
-        await refresh();
+        const refreshed = await refresh(scope);
+        if (!refreshed || !scopeIsCurrent(scope)) return;
       } catch (caught) {
+        if (!scopeIsCurrent(scope)) return;
         const detail = caught instanceof Error ? caught.message : "Notification Operations is unavailable";
         onError(
           locale === "zh-CN"
             ? `重试已提交，但队列刷新失败：${detail}`
             : `Retry committed, but the queue refresh failed: ${detail}`,
         );
+        return;
       }
     } catch (caught) {
+      if (!scopeIsCurrent(scope)) return;
       onError(caught instanceof Error ? caught.message : "Notification retry failed");
     } finally {
-      setPendingOutboxId(null);
+      if (scopeIsCurrent(scope)) setPendingOutboxId(null);
     }
   }
 

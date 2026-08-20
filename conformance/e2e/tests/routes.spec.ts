@@ -241,6 +241,24 @@ async function installMockApi(
       });
       return;
     }
+    if (request.method() === "GET" && path === "/api/v1/admin/notification-operations") {
+      await route.fulfill({
+        json: {
+          summary: {
+            attentionCount: 0,
+            failedCount: 0,
+            unknownCount: 0,
+            manualCount: 0,
+            retryableCount: 0,
+            oldestTask: null,
+          },
+          queue: [],
+          history: [],
+          retryAudit: [],
+        },
+      });
+      return;
+    }
     if (request.method() === "GET" && path === "/api/v1/admin/catalog") {
       await route.fulfill({
         json: {

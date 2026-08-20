@@ -466,7 +466,8 @@ function expectedMethods(path: string): ReadonlySet<string> | null {
   if (
     path === "/api/v1/catalog" ||
     path === "/api/v1/legal/current" ||
-    path === "/api/v1/content"
+    path === "/api/v1/content" ||
+    path === "/api/v1/support/departments"
   ) {
     return new Set(["GET"]);
   }
@@ -650,6 +651,13 @@ function requestContractError(fact: RequestFact): string | null {
       [...params.keys()].length !== 1 ||
       !["en", "zh-CN"].includes(params.get("locale") ?? "")
     ) return "expected exactly one supported locale query parameter";
+  } else if (fact.path === "/api/v1/support/departments") {
+    const keys = [...params.keys()];
+    if (
+      keys.length !== 1 ||
+      keys[0] !== "audience" ||
+      params.get("audience") !== "presales"
+    ) return "expected the Presales department audience query";
   } else if (fact.path === "/api/v1/admin/client-accounts") {
     const keys = [...params.keys()];
     if (
@@ -773,6 +781,10 @@ async function installApi(
       await route.fulfill({ json: { items: [] } });
       return;
     }
+    if (path === "/api/v1/support/departments") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
     if (path === "/api/v1/admin/content") {
       await route.fulfill({ json: { entries: [], revisions: [], legalDocuments: [] } });
       return;
@@ -802,9 +814,30 @@ async function installApi(
       });
       return;
     }
+    if (path === "/api/v1/admin/notification-operations") {
+      await route.fulfill({
+        json: {
+          summary: {
+            attentionCount: 0,
+            failedCount: 0,
+            unknownCount: 0,
+            manualCount: 0,
+            retryableCount: 0,
+            oldestTask: null,
+          },
+          queue: [],
+          history: [],
+          retryAudit: [],
+        },
+      });
+      return;
+    }
     if (
       path === "/api/v1/admin/manual-fulfillment" ||
       path === "/api/v1/admin/tickets" ||
+      path === "/api/v1/admin/tickets/staff-options" ||
+      path === "/api/v1/admin/support/departments" ||
+      path === "/api/v1/admin/presales/inquiries" ||
       path === "/api/v1/admin/billing/renewals" ||
       path === "/api/v1/admin/services/cancellations" ||
       path === "/api/v1/admin/funds/unclaimed" ||

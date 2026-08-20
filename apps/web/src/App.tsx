@@ -46,6 +46,7 @@ import { ContentHub } from "./ContentHub.js";
 import { ContentOperationsPanel } from "./ContentOperationsPanel.js";
 import { LegalHub } from "./LegalHub.js";
 import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
+import { NotificationOperationsPanel } from "./NotificationOperationsPanel.js";
 import { EmailChangePage, PasswordRecoveryPage, SecurityPanel } from "./SecurityPanel.js";
 import { SupportOperationsPanel } from "./SupportOperationsPanel.js";
 
@@ -124,6 +125,7 @@ const ADMIN_ENTRY_PERMISSIONS = [
   "catalog.read",
   "catalog.supply.manage",
   "content.read",
+  "notifications.read",
   "quotes.manage",
   "quotes.read",
   "services.manual_fulfillment",
@@ -1090,6 +1092,8 @@ export function App() {
   const canManagePromotions = staffPermissionGranted("catalog.promotions.manage");
   const canReadQuotes = staffPermissionGranted("quotes.read");
   const canManageQuotes = staffPermissionGranted("quotes.manage");
+  const canReadNotificationOperations = staffPermissionGranted("notifications.read");
+  const canRetryNotificationOperations = staffPermissionGranted("notifications.retry");
   const canManageStaffTickets =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
@@ -5007,6 +5011,18 @@ export function App() {
             canPromotionsManage={canManagePromotions}
             canQuotesRead={canReadQuotes}
             canQuotesManage={canManageQuotes}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canReadNotificationOperations && (
+          <NotificationOperationsPanel
+            active={route === "/admin"}
+            locale={locale}
+            canRead={canReadNotificationOperations}
+            canRetry={canRetryNotificationOperations}
+            accessFingerprint={staffAccessFingerprint}
             onNotice={showTicketNotice}
             onError={showTicketError}
           />

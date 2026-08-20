@@ -401,6 +401,26 @@ async function installMockApi(
         headers: authenticatedHeaders,
         json: { entries: [], revisions: [], legalDocuments: [] },
       });
+    } else if (
+      url.pathname === "/api/v1/admin/notification-operations" &&
+      request.method() === "GET"
+    ) {
+      await route.fulfill({
+        headers: authenticatedHeaders,
+        json: {
+          summary: {
+            attentionCount: 0,
+            failedCount: 0,
+            unknownCount: 0,
+            manualCount: 0,
+            retryableCount: 0,
+            oldestTask: null,
+          },
+          queue: [],
+          history: [],
+          retryAudit: [],
+        },
+      });
     } else {
       await route.fulfill({ status: 501, json: { error: `Unexpected mock API request: ${request.method()} ${url.pathname}` } });
       throw new Error(`Unexpected mock API request: ${request.method()} ${url.pathname}`);

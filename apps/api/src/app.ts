@@ -35,6 +35,7 @@ import { registerClientAccountRoutes } from "./routes-client-accounts.js";
 import { registerCustomerHistoryRoutes } from "./routes-customer-history.js";
 import { registerOrderRoutes } from "./routes-orders.js";
 import { registerManualReceiptOutflowRoutes } from "./routes-manual-receipt-outflows.js";
+import { registerNotificationOperationRoutes } from "./routes-notification-operations.js";
 import { registerPaymentMethodRoutes } from "./routes-payment-methods.js";
 import { registerProviderEventRoutes } from "./routes-provider-events.js";
 import { registerRefundRoutes } from "./routes-refunds.js";
@@ -290,6 +291,7 @@ export async function buildApp(
   await registerServiceOperationRoutes(app, pool, config);
   await registerTicketRoutes(app, pool, config);
   await registerSupportOperationRoutes(app, pool, config);
+  await registerNotificationOperationRoutes(app, pool, config);
   await registerContentRoutes(app, pool, config);
   await registerProviderEventRoutes(app, pool, config);
 
