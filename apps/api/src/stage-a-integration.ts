@@ -237,6 +237,7 @@ const deadlockBaseline = await corePool.query<{ deadlocks: string }>(
 );
 const initialDeadlocks = deadlockBaseline.rows[0]?.deadlocks ?? "0";
 let cookie = "";
+const configuredSessionCookieName = process.env.SESSION_COOKIE_NAME ?? "oss_session";
 const accountContextVersionByCookie = new Map<string, string>();
 
 function sessionContextHeaders(): Record<string, string> {
@@ -252,8 +253,13 @@ function sessionContextHeaders(): Record<string, string> {
 }
 
 function rememberSessionContext(response: Response): void {
-  const setCookie = response.headers.get("set-cookie");
-  if (setCookie) cookie = setCookie.split(";", 1)[0] ?? "";
+  const setCookie = response.headers
+    .getSetCookie()
+    .find((candidate) => candidate.startsWith(`${configuredSessionCookieName}=`));
+  if (setCookie) {
+    const pair = setCookie.split(";", 1)[0] ?? "";
+    cookie = pair === `${configuredSessionCookieName}=` ? "" : pair;
+  }
   const accountContextVersion = response.headers.get(
     "x-oss-account-context-version",
   );
