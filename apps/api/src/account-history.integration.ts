@@ -49,6 +49,26 @@ function responseJson<T>(response: Readonly<{ body: string }>): T {
   return JSON.parse(response.body) as T;
 }
 
+async function waitForDatabaseConnectionsToClose(timeoutMilliseconds = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (true) {
+    const connections = await admin.query<{ count: string }>(
+      `SELECT pg_catalog.count(*)::text AS count
+       FROM pg_catalog.pg_stat_activity
+       WHERE datname = $1`,
+      [databaseName],
+    );
+    const count = Number(connections.rows[0]?.count ?? "0");
+    if (count === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Account History database still has ${count} connection(s) after pool shutdown`,
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 function assertCursorPreservesPostgresMicroseconds(cursor: string, label: string): void {
   const decoded = JSON.parse(
     Buffer.from(cursor, "base64url").toString("utf8"),
@@ -1826,14 +1846,33 @@ try {
       ` panelPermissions=passed permissionRevocation=passed\n`,
   );
 } finally {
-  if (app) await app.close().catch(() => undefined);
-  if (pool) await pool.end().catch(() => undefined);
-  await admin.query(
-    `SELECT pg_catalog.pg_terminate_backend(pid)
-     FROM pg_catalog.pg_stat_activity
-     WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()`,
-    [databaseName],
-  ).catch(() => undefined);
-  await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`).catch(() => undefined);
-  await admin.end().catch(() => undefined);
+  const cleanupErrors: unknown[] = [];
+  try {
+    await app?.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await pool?.end();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await waitForDatabaseConnectionsToClose();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await admin.end();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Account History integration cleanup failed");
+  }
 }
