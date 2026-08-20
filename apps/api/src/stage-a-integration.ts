@@ -4833,6 +4833,9 @@ await request(
   { method: "POST", body: JSON.stringify({ token: replacementToken }) },
   200,
 );
+const recoveryMe = await request<{ id: string; clientAccountId: string }>(
+  "/api/v1/auth/me",
+);
 
 for (const invalidPrincipal of ["4999", "500001"]) {
   const invalidQuote = await rawCoreRequest("/api/v1/billing/add-funds/quotes", {
@@ -5160,7 +5163,6 @@ assert.match(
   /does not match the Add Funds snapshot/,
 );
 
-const recoveryMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_add_funds_security()
   RETURNS trigger
