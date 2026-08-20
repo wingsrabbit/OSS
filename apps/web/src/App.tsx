@@ -47,6 +47,8 @@ import { ContentOperationsPanel } from "./ContentOperationsPanel.js";
 import { LegalHub } from "./LegalHub.js";
 import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
 import { NotificationOperationsPanel } from "./NotificationOperationsPanel.js";
+import { NotificationPreferencesPanel } from "./NotificationPreferencesPanel.js";
+import { NotificationTemplateRegistryPanel } from "./NotificationTemplateRegistryPanel.js";
 import { EmailChangePage, PasswordRecoveryPage, SecurityPanel } from "./SecurityPanel.js";
 import { SupportOperationsPanel } from "./SupportOperationsPanel.js";
 
@@ -126,6 +128,7 @@ const ADMIN_ENTRY_PERMISSIONS = [
   "catalog.supply.manage",
   "content.read",
   "notifications.read",
+  "notifications.templates.read",
   "quotes.manage",
   "quotes.read",
   "services.manual_fulfillment",
@@ -1060,6 +1063,14 @@ export function App() {
   const canReadCustomerHistory = canReadCustomerAccount;
   const canReadCustomerNotificationHistory =
     canReadCustomerAccount && accountPermissionGranted("account.history.read");
+  const canReadNotificationPreferences =
+    me?.verification.email === "passed" && me.restrictions.user === false;
+  const canWriteNotificationPreferences = canReadNotificationPreferences;
+  const notificationPreferenceAccessFingerprint = [
+    me?.id ?? "",
+    canReadNotificationPreferences ? "read" : "no-read",
+    canWriteNotificationPreferences ? "write" : "no-write",
+  ].join("\u0001");
   const canUseCustomerSupport = canReadCustomerAccount;
   const canWriteCustomerSupport =
     canUseCustomerSupport && accountPermissionGranted("support.tickets.write");
@@ -1115,6 +1126,10 @@ export function App() {
   const canManageContent =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("content.manage"));
+  const canReadNotificationTemplates = staffPermissionGranted("notifications.templates.read");
+  const canCreateNotificationTemplates = staffPermissionGranted("notifications.templates.create");
+  const canPublishNotificationTemplates = staffPermissionGranted("notifications.templates.publish");
+  const canRetireNotificationTemplates = staffPermissionGranted("notifications.templates.retire");
   const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
   const canViewAccount360 =
     eligibleStaff &&
@@ -4913,6 +4928,18 @@ export function App() {
           />
         )}
 
+        {route === "/customer" && sessionResolved && me && (
+          <NotificationPreferencesPanel
+            active={route === "/customer"}
+            locale={locale}
+            accessFingerprint={notificationPreferenceAccessFingerprint}
+            canRead={canReadNotificationPreferences}
+            canWrite={canWriteNotificationPreferences}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
         {route === "/customer" && sessionResolved && canReadCustomerHistory && me?.context && (
           <AccountAccessPanel
             active={route === "/customer"}
@@ -5108,6 +5135,18 @@ export function App() {
           accessFingerprint={staffAccessFingerprint}
           onNotice={showContentNotice}
           onError={showContentError}
+        />
+
+        <NotificationTemplateRegistryPanel
+          active={route === "/admin" && sessionResolved && canReadNotificationTemplates}
+          locale={locale}
+          canRead={canReadNotificationTemplates}
+          canCreate={canCreateNotificationTemplates}
+          canPublish={canPublishNotificationTemplates}
+          canRetire={canRetireNotificationTemplates}
+          accessFingerprint={staffAccessFingerprint}
+          onNotice={showTicketNotice}
+          onError={showTicketError}
         />
 
         {route === "/customer" &&

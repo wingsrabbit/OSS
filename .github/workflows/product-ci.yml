@@ -253,6 +253,12 @@ jobs:
       - name: Verify Schema 026 native history, authority bindings, and application gate
         run: pnpm --filter @opensales/api test:integration:schema-026-native
 
+      - name: Verify Schema 027 native history, bilingual registry, and application gate
+        run: pnpm --filter @opensales/api test:integration:schema-027-native
+
+      - name: Run notification preferences and versioned templates PostgreSQL 18 journey
+        run: pnpm --filter @opensales/api test:integration:notification-preferences-templates
+
       - name: Run Service cancellation authority PostgreSQL 18 and API journey
         run: pnpm --filter @opensales/api test:integration:service-cancellation-authority
 

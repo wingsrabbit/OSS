@@ -544,6 +544,50 @@ export async function runDemoSmoke({
   const identity = syntheticIdentity("customer");
   const registeredCustomer = await registerAndVerify({ session, identity, timeoutMs });
   const registration = registeredCustomer.registration;
+  const notificationPreferences = await session.request(
+    "/api/v1/customer/notification-preferences",
+  );
+  assert.equal(notificationPreferences.channel, "email");
+  assert.equal(notificationPreferences.categories.length, 6);
+  assert.ok(
+    notificationPreferences.categories
+      .filter((category) => category.mandatory)
+      .every((category) => category.enabled === true),
+    "Required notification categories must remain enabled",
+  );
+  const supportPreference = notificationPreferences.categories.find(
+    (category) => category.category === "support",
+  );
+  assert.ok(supportPreference && !supportPreference.mandatory);
+  const supportDisabled = await session.request(
+    "/api/v1/customer/notification-preferences/support/email",
+    {
+      method: "PUT",
+      body: JSON.stringify({ enabled: false, expectedVersion: supportPreference.version }),
+    },
+  );
+  assert.equal(supportDisabled.enabled, false);
+  const supportEnabled = await session.request(
+    "/api/v1/customer/notification-preferences/support/email",
+    {
+      method: "PUT",
+      body: JSON.stringify({ enabled: true, expectedVersion: supportDisabled.version }),
+    },
+  );
+  assert.equal(supportEnabled.enabled, true);
+
+  const templateRegistry = await administratorAccess.session.request(
+    "/api/v1/admin/notification-templates",
+  );
+  assert.equal(templateRegistry.events.length, 7);
+  assert.ok(
+    templateRegistry.events.every(
+      (event) =>
+        event.locales.some((entry) => entry.locale === "en") &&
+        event.locales.some((entry) => entry.locale === "zh-CN"),
+    ),
+    "Every seeded notification event must expose English and Chinese channels",
+  );
   const customerContent = await session.request("/api/v1/customer/content?locale=zh-CN");
   assert.ok(
     customerContent.items.some((item) => item.kind === "knowledge_base"),
@@ -644,6 +688,15 @@ export async function runDemoSmoke({
     },
     supportTicket,
     manualReceiptOutflow,
+    notifications: {
+      categoryCount: notificationPreferences.categories.length,
+      requiredCategories: notificationPreferences.categories
+        .filter((category) => category.mandatory)
+        .map((category) => category.category),
+      supportPreferenceVersion: supportEnabled.version,
+      templateEventCount: templateRegistry.events.length,
+      locales: ["en", "zh-CN"],
+    },
   };
 }
 
