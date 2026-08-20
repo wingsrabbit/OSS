@@ -270,8 +270,8 @@ jobs:
           ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
         run: pnpm --filter @opensales/api test:integration:account-history
 
-      - name: Run account context PostgreSQL and API journey
-        run: pnpm --filter @opensales/api test:integration:account-context
+      - name: Run account context normal-only PostgreSQL and public API journey
+        run: pnpm --filter @opensales/api test:integration:account-context-normal
 
       - name: Mechanically inspect Unicode multi-page invoice PDF
         shell: bash

@@ -27,6 +27,7 @@
     "test:integration:service-cancellation-authority": "node dist/service-cancellation-authority.integration.js",
     "test:integration:account-history": "node dist/account-history.integration.js",
     "test:integration:account-context": "node dist/account-context.integration.js",
+    "test:integration:account-context-normal": "node dist/account-context-normal.integration.js",
     "test:integration:catalog-commerce": "node dist/catalog-commerce.integration.js",
     "test:integration:catalog-fulfillment": "node dist/catalog-fulfillment.integration.js",
     "test:integration:catalog-automation-policy": "node dist/catalog-automation-policy.integration.js",
