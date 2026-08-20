@@ -50,6 +50,7 @@ const config: Config = {
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-manual-receipt-payment-hook",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-manual-receipt-provision-hook",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 

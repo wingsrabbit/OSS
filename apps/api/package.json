@@ -20,6 +20,7 @@
     "test:integration:tickets": "node dist/tickets.integration.js",
     "test:integration:support-operations": "node dist/support-operations.integration.js",
     "test:integration:support-operations-normal": "node dist/support-operations-normal.integration.js",
+    "test:integration:notification-operations": "node dist/notification-operations.integration.js",
     "test:integration:service-operations": "node dist/service-operations.integration.js",
     "test:integration:service-cancellation-authority": "node dist/service-cancellation-authority.integration.js",
     "test:integration:account-history": "node dist/account-history.integration.js",

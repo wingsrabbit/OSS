@@ -55,6 +55,7 @@ const config: Config = {
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-ticket-payment-hook-000000000",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-ticket-provision-hook-0000000",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 

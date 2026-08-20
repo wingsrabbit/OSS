@@ -4,6 +4,7 @@ name: opensales-laboratory
 
 x-core-env: &core-env
   OSS_ENV: ${OSS_ENV:-development}
+  NOTIFICATION_MAX_ATTEMPTS: ${NOTIFICATION_MAX_ATTEMPTS:-3}
   OSS_PUBLIC_URL: ${OSS_PUBLIC_URL:-http://localhost:8080}
   WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
   MOCK_MAILBOX_URL: http://mailbox-gateway:8082

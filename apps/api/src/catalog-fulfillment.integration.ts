@@ -50,6 +50,7 @@ const config: Config = {
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-catalog-fulfillment-payment-secret",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-catalog-fulfillment-provisioning-secret",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 

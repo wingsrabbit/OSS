@@ -43,6 +43,7 @@ const lifecycleSemaphoreFile = join(lifecycleLockDirectory, "lifecycle.lock");
 const lifecycleOwnerFile = join(lifecycleLockDirectory, "owner.json");
 const logsDir = join(runtimeDir, "logs");
 const ownerRole = "oss_demo_owner";
+const notificationMaxAttempts = "3";
 const processNames = Object.freeze([
   "provider-payment",
   "provider-provisioning",
@@ -376,6 +377,7 @@ function commonCoreEnvironment(config) {
     OSS_PUBLIC_URL: `http://127.0.0.1:${config.ports.web}`,
     WEB_ORIGIN: `http://127.0.0.1:${config.ports.web}`,
     SESSION_COOKIE_NAME: "oss_demo_session",
+    NOTIFICATION_MAX_ATTEMPTS: notificationMaxAttempts,
     LAB_MAILBOX_ENABLED: "true",
     LAB_MAILBOX_TOKEN: config.secrets.mailboxToken,
     MOCK_MAILBOX_URL: `http://127.0.0.1:${config.ports.mailbox}`,
@@ -394,7 +396,7 @@ function commonCoreEnvironment(config) {
   };
 }
 
-function apiEnvironment(config) {
+export function apiEnvironment(config) {
   return {
     ...commonCoreEnvironment(config),
     DATABASE_URL: postgresUrl(
@@ -418,6 +420,7 @@ export function workerEnvironment(config) {
       config.secrets.workerDatabasePassword,
     ),
     DATABASE_RUNTIME_ROLE: "oss_worker",
+    NOTIFICATION_MAX_ATTEMPTS: notificationMaxAttempts,
     MOCK_PAYMENT_PROVIDER_URL: `http://127.0.0.1:${config.ports.payment}`,
     MOCK_PROVISIONING_PROVIDER_URL: `http://127.0.0.1:${config.ports.provisioning}`,
     MOCK_PROVIDER_PLATFORM_URL: `http://127.0.0.1:${config.ports.provisioning}`,

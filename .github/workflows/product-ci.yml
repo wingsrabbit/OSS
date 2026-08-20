@@ -119,6 +119,7 @@ jobs:
       MOCK_PROVISION_SCENARIO: timeout_existing
       JOB_LOCK_TIMEOUT_SECONDS: "2"
       GLOBAL_RATE_LIMIT_MAX: "1000"
+      NOTIFICATION_MAX_ATTEMPTS: "3"
       LAB_MAILBOX_ENABLED: "true"
     steps:
       - name: Check out source
@@ -149,6 +150,9 @@ jobs:
 
       - name: Run Identity notification PostgreSQL 18 and Mock Mail journey
         run: pnpm --filter @opensales/worker test:integration:identity-notification
+
+      - name: Run Notification Operations PostgreSQL 18 journey
+        run: pnpm --filter @opensales/api test:integration:notification-operations
 
       - name: Run Mock Mail result reconciliation integration
         run: pnpm --filter @opensales/mock-lab test:integration:mail

@@ -51,6 +51,7 @@ const config: Config = {
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-account-context-payment-hook",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-account-context-provisioning-hook",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 

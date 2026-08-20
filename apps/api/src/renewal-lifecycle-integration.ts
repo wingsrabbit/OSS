@@ -36,6 +36,7 @@ function buildIntegrationConfig(sessionCookieName = "oss_renewal_integration_ses
     API_HOST: "127.0.0.1",
     API_PORT: 3000,
     GLOBAL_RATE_LIMIT_MAX: 10_000,
+    NOTIFICATION_MAX_ATTEMPTS: 3,
     SESSION_COOKIE_NAME: sessionCookieName,
     SESSION_TTL_HOURS: 24,
     VERIFICATION_TTL_MINUTES: 30,

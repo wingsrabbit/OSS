@@ -18,6 +18,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   acquireAdvisoryFileLock,
+  apiEnvironment,
   classifyLifecycleLockOwner,
   cleanupExactPendingProcess,
   evaluatePendingProcessRecovery,
@@ -125,8 +126,8 @@ test("legacy Demo config gains independent identity and Provider platform secret
   assert.deepEqual(generated, [null, 32], "an upgraded config must not rotate either secret");
 });
 
-test("Demo Worker receives the public identity origin and encrypted-secret key", () => {
-  const environment = workerEnvironment({
+test("Demo API and Worker share the notification budget and Worker receives identity settings", () => {
+  const config = {
     ports: {
       api: 30_001,
       web: 51_731,
@@ -146,10 +147,22 @@ test("Demo Worker receives the public identity origin and encrypted-secret key",
       paymentWebhookSecret: "synthetic-payment-webhook-secret",
       provisioningWebhookSecret: "synthetic-provisioning-webhook-secret",
     },
+  };
+  const environment = workerEnvironment(config);
+  const api = apiEnvironment({
+    ...config,
+    secrets: {
+      ...config.secrets,
+      apiDatabasePassword: "synthetic-api-db-password",
+      mailboxToken: "synthetic-mailbox-token",
+      paymentMethodTokenLookupKey: "synthetic-payment-method-lookup-key",
+    },
   });
   assert.equal(environment.OSS_PUBLIC_URL, "http://127.0.0.1:51731");
   assert.equal(environment.IDENTITY_SECRET_KEY, "synthetic-identity-secret-key");
   assert.equal(environment.IDENTITY_SECRET_KEY_VERSION, "1");
+  assert.equal(environment.NOTIFICATION_MAX_ATTEMPTS, "3");
+  assert.equal(api.NOTIFICATION_MAX_ATTEMPTS, environment.NOTIFICATION_MAX_ATTEMPTS);
   assert.equal(
     environment.MOCK_PROVIDER_PLATFORM_TOKEN,
     "synthetic-provider-platform-token",
