@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { assertRuntimeDatabaseRoleSafe } from "@opensales/core";
+import { validateCatalogOptionSchema } from "@opensales/core/commerce";
 import { loadConfig } from "./config.js";
 import {
   createPool,
@@ -12,6 +13,8 @@ type SeedProduct = {
   group: string;
   en: string;
   zh: string;
+  descriptionEn?: string;
+  descriptionZh?: string;
   fulfillment: "automatic" | "review" | "manual" | "quote";
   overdueAction: "automatic" | "manual" | "none";
   cancellationMode: "self_service" | "authenticated_ticket" | "manual_review" | "disabled";
@@ -26,6 +29,7 @@ type SeedProduct = {
   monthlyMinor?: number;
   setupMinor?: number;
   oneTimeMinor?: number;
+  billingCycles?: ReadonlyArray<"monthly" | "quarterly" | "semiannual" | "annual">;
   optionSchema?: unknown[];
 };
 
@@ -98,6 +102,49 @@ const products: SeedProduct[] = [
     cancellationMode: "self_service",
     cancellationExecutionMode: "manual",
     monthlyMinor: 3_000,
+    descriptionEn:
+      "Fixed-commit IP Transit. Choose Static Route or post-payment manual BGP. BGP requires a publicly registered ASN; only the purchased Default Route is supplied, never Full Route.",
+    descriptionZh:
+      "固定 Commit 的 IP Transit。可选择 Static Route，或付款后人工开通 BGP。BGP 仅接受公开注册 ASN；只提供已购买的 Default Route，不提供 Full Route。",
+    optionSchema: [
+      {
+        code: "routing_method",
+        type: "select",
+        required: true,
+        label: { en: "Routing method", "zh-CN": "路由方式" },
+        values: [
+          { value: "static_route", label: { en: "Static Route", "zh-CN": "静态路由" } },
+          {
+            value: "manual_bgp",
+            label: { en: "Manual BGP after payment", "zh-CN": "付款后人工开通 BGP" },
+          },
+        ],
+      },
+      {
+        code: "public_asn",
+        type: "text",
+        required: true,
+        minLength: 3,
+        maxLength: 15,
+        label: { en: "Publicly registered ASN", "zh-CN": "公开注册 ASN" },
+        visibleWhen: { code: "routing_method", equals: "manual_bgp" },
+      },
+      {
+        code: "route_scope",
+        type: "radio",
+        required: true,
+        label: { en: "Route scope", "zh-CN": "路由范围" },
+        values: [
+          {
+            value: "default_route_only",
+            label: {
+              en: "Purchased Default Route only (no Full Route)",
+              "zh-CN": "仅提供已购买的 Default Route（不提供 Full Route）",
+            },
+          },
+        ],
+      },
+    ],
   },
   {
     id: "hkbgp-cn-ip-transit",
@@ -109,6 +156,49 @@ const products: SeedProduct[] = [
     cancellationMode: "self_service",
     cancellationExecutionMode: "manual",
     monthlyMinor: 100_000,
+    descriptionEn:
+      "Fixed-commit IP Transit. Choose Static Route or post-payment manual BGP. BGP requires a publicly registered ASN; only the purchased Default Route is supplied, never Full Route.",
+    descriptionZh:
+      "固定 Commit 的 IP Transit。可选择 Static Route，或付款后人工开通 BGP。BGP 仅接受公开注册 ASN；只提供已购买的 Default Route，不提供 Full Route。",
+    optionSchema: [
+      {
+        code: "routing_method",
+        type: "select",
+        required: true,
+        label: { en: "Routing method", "zh-CN": "路由方式" },
+        values: [
+          { value: "static_route", label: { en: "Static Route", "zh-CN": "静态路由" } },
+          {
+            value: "manual_bgp",
+            label: { en: "Manual BGP after payment", "zh-CN": "付款后人工开通 BGP" },
+          },
+        ],
+      },
+      {
+        code: "public_asn",
+        type: "text",
+        required: true,
+        minLength: 3,
+        maxLength: 15,
+        label: { en: "Publicly registered ASN", "zh-CN": "公开注册 ASN" },
+        visibleWhen: { code: "routing_method", equals: "manual_bgp" },
+      },
+      {
+        code: "route_scope",
+        type: "radio",
+        required: true,
+        label: { en: "Route scope", "zh-CN": "路由范围" },
+        values: [
+          {
+            value: "default_route_only",
+            label: {
+              en: "Purchased Default Route only (no Full Route)",
+              "zh-CN": "仅提供已购买的 Default Route（不提供 Full Route）",
+            },
+          },
+        ],
+      },
+    ],
   },
   {
     id: "equinix-hk2-colocation",
@@ -123,18 +213,37 @@ const products: SeedProduct[] = [
     cancellationRequirementKey: "termrat.colocation.termination-ready.v1",
     overdueDelayMode: "exact_hours",
     overdueDelayValue: 72,
-    monthlyMinor: 0,
+    monthlyMinor: 25_000,
+    billingCycles: ["monthly"],
+    descriptionEn:
+      "Quote-required Equinix HK2 colocation, starting at approximately USD 250/month. Customer-initiated cross-connect is free; TermRat-initiated cross-connect is USD 300 one-time plus USD 300/month.",
+    descriptionZh:
+      "需要报价的 Equinix HK2 托管，起价约 USD 250/月。客户发起的 XC 免费；TermRat 发起的 XC 为 USD 300 一次性加 USD 300/月。",
     optionSchema: [
       {
         code: "space",
         type: "select",
         required: true,
-        values: ["1U", "2U", "4U", "8U", "half_rack", "full_rack", "over_2U_custom"],
+        label: { en: "Rack space", "zh-CN": "机位空间" },
+        values: [
+          "1U",
+          "2U",
+          "4U",
+          "8U",
+          { value: "half_rack", label: { en: "Half Rack", "zh-CN": "半柜" } },
+          { value: "full_rack", label: { en: "Full Rack", "zh-CN": "整柜" } },
+          {
+            value: "over_2U_custom",
+            label: { en: "Equipment over 2U — separate quote", "zh-CN": "超过 2U 的设备——单独报价" },
+          },
+        ],
       },
       {
         code: "power_kva",
         type: "quantity",
         required: true,
+        step: 0.5,
+        label: { en: "Power (kVA)", "zh-CN": "电力（kVA）" },
         dependencies: {
           "1U": { min: 0.5 },
           "2U": { min: 0.5 },
@@ -143,6 +252,37 @@ const products: SeedProduct[] = [
           half_rack: { min: 2 },
           full_rack: { min: 4 },
         },
+      },
+      {
+        code: "custom_equipment_details",
+        type: "textarea",
+        required: true,
+        minLength: 10,
+        maxLength: 2000,
+        label: { en: "Equipment details for separate quote", "zh-CN": "单独报价所需设备详情" },
+        visibleWhen: { code: "space", equals: "over_2U_custom" },
+      },
+      {
+        code: "cross_connect",
+        type: "radio",
+        required: true,
+        label: { en: "Cross-connect", "zh-CN": "交叉连接（XC）" },
+        values: [
+          { value: "none", label: { en: "No cross-connect", "zh-CN": "不需要 XC" } },
+          {
+            value: "customer_initiated",
+            label: { en: "Customer-initiated XC — no charge", "zh-CN": "客户发起 XC——不收费" },
+          },
+          {
+            value: "termrat_initiated",
+            label: {
+              en: "TermRat-initiated XC — USD 300 one-time + USD 300/month",
+              "zh-CN": "TermRat 发起 XC——USD 300 一次性 + USD 300/月",
+            },
+            oneTimeMinor: 30_000,
+            recurringMinor: 30_000,
+          },
+        ],
       },
     ],
   },
@@ -156,8 +296,34 @@ const products: SeedProduct[] = [
     cancellationMode: "disabled",
     cancellationExecutionMode: "manual",
     repeatable: true,
-    hidden: true,
+    hidden: false,
     oneTimeMinor: 10_000,
+    descriptionEn:
+      "USD 100 per repeatable request. Each unit covers one clearly described request with a normal scope of up to two hours of on-site work; larger work needs a separate request and approval.",
+    descriptionZh:
+      "每次可重复购买的请求为 USD 100。每个 unit 对应一个说明清楚的请求，正常范围最多两小时现场工作；更大范围需要单独请求和确认。",
+    optionSchema: [
+      {
+        code: "request_instructions",
+        type: "textarea",
+        required: true,
+        minLength: 10,
+        maxLength: 2000,
+        label: { en: "Request instructions", "zh-CN": "请求说明" },
+      },
+      {
+        code: "scope",
+        type: "radio",
+        required: true,
+        label: { en: "Normal request scope", "zh-CN": "正常请求范围" },
+        values: [
+          {
+            value: "up_to_two_hours",
+            label: { en: "One request, up to two hours on-site", "zh-CN": "一个请求，最多两小时现场工作" },
+          },
+        ],
+      },
+    ],
   },
   {
     id: "gsl-inbound",
@@ -169,10 +335,16 @@ const products: SeedProduct[] = [
     cancellationMode: "self_service",
     cancellationExecutionMode: "manual",
     monthlyMinor: 0,
+    billingCycles: ["monthly"],
+    descriptionEn:
+      "Fixed-commit GSL Inbound. Minimum 100 Mbps; each unit is 100 Mbps at USD 47/month, fulfilled manually or by a capable Mock Provider.",
+    descriptionZh:
+      "固定 Commit 的 GSL Inbound。最低 100 Mbps；每个 unit 为 100 Mbps，价格 USD 47/月，由人工或具备能力的 Mock Provider 履约。",
     optionSchema: [
       {
         code: "bandwidth_units",
         type: "quantity",
+        required: true,
         label: { en: "100 Mbps units", "zh-CN": "100 Mbps 单位" },
         min: 1,
         step: 1,
@@ -184,6 +356,14 @@ const products: SeedProduct[] = [
 
 function cyclePrice(monthlyMinor: number, months: number): number {
   return monthlyMinor * months;
+}
+
+for (const product of products) {
+  validateCatalogOptionSchema(product.optionSchema ?? []);
+}
+if (process.argv.includes("--validate-only")) {
+  console.log("Synthetic TermRat Catalog configuration is valid.");
+  process.exit(0);
 }
 
 const config = loadConfig();
@@ -302,8 +482,12 @@ await transaction(pool, async (client) => {
         product.group,
         { en: product.en, "zh-CN": product.zh },
         {
-          en: `${product.en} — synthetic TermRat laboratory configuration.`,
-          "zh-CN": `${product.zh} — TermRat 合成实验室配置。`,
+          en:
+            product.descriptionEn ??
+            `${product.en} — synthetic TermRat laboratory configuration.`,
+          "zh-CN":
+            product.descriptionZh ??
+            `${product.zh} — TermRat 合成实验室配置。`,
         },
         product.fulfillment,
         product.repeatable ?? false,
@@ -404,15 +588,23 @@ await transaction(pool, async (client) => {
       ],
     );
 
+    const recurringCycleMonths = {
+      monthly: 1,
+      quarterly: 3,
+      semiannual: 6,
+      annual: 12,
+    } as const;
     const prices =
       product.oneTimeMinor !== undefined
         ? [["one_time", product.oneTimeMinor, 0, 0]]
-        : [
-            ["monthly", 0, product.setupMinor ?? 0, product.monthlyMinor ?? 0],
-            ["quarterly", 0, product.setupMinor ?? 0, cyclePrice(product.monthlyMinor ?? 0, 3)],
-            ["semiannual", 0, product.setupMinor ?? 0, cyclePrice(product.monthlyMinor ?? 0, 6)],
-            ["annual", 0, product.setupMinor ?? 0, cyclePrice(product.monthlyMinor ?? 0, 12)],
-          ];
+        : (product.billingCycles ?? ["monthly", "quarterly", "semiannual", "annual"]).map(
+            (cycle) => [
+              cycle,
+              0,
+              product.setupMinor ?? 0,
+              cyclePrice(product.monthlyMinor ?? 0, recurringCycleMonths[cycle]),
+            ],
+          );
 
     for (const [cycle, oneTime, setup, recurring] of prices) {
       const currentPrice = await client.query<{
@@ -487,6 +679,16 @@ await transaction(pool, async (client) => {
         );
       }
     }
+
+    await client.query(
+      `UPDATE product_prices
+       SET active = false,
+           valid_until = COALESCE(valid_until, pg_catalog.transaction_timestamp())
+       WHERE product_id = $1
+         AND active
+         AND NOT (billing_cycle = ANY($2::text[]))`,
+      [product.id, prices.map(([cycle]) => cycle)],
+    );
   }
 });
 
