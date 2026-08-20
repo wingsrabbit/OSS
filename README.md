@@ -13,17 +13,36 @@ Current project version: `0.1.1`.
 
 ## What a laboratory user can do now
 
-The first runnable vertical slice is implemented:
+The current work-in-progress laboratory build includes runnable, real-page
+workflows across customer, Staff, Core, Worker, and Mock Provider boundaries:
 
-- a visitor can browse the synthetic TermRat product configuration and see
-  one-time, setup, and recurring prices by billing cycle;
+- a visitor can browse the versioned synthetic TermRat catalog, configure all
+  supported option types, preview exact one-time/setup/recurring pricing, and
+  submit a Presales inquiry;
 - a customer can register, sign in while still unverified, receive a
   one-time verification link through the Mock Mail Provider, and verify the
   account;
+- a User can switch between authorized Client Accounts while stale account or
+  authorization context is rejected, manage Account access and Contacts, and
+  view immutable business, notification, and Unicode invoice history;
 - an unverified or restricted account is rejected by the server when it tries
   to order or start a payment;
-- an eligible customer can accept versioned laboratory Terms/AUP, submit a
-  price-snapshotted order, and receive a distinct invoice and pending service;
+- an eligible customer can accept versioned laboratory Terms/AUP, apply an
+  eligible Promotion, optionally grant Marketing Consent, submit a
+  price-snapshotted order or accept an immutable Quote, and receive a distinct
+  invoice and pending service;
+- independently permissioned Staff pages manage Catalog revisions, prices,
+  supply, Promotions, Quotes, Provider automation policy, Client Account 360,
+  Support/Presales, Content/Legal, Service operations, Identity recovery, and
+  notification delivery operations;
+- customers and Staff use full Support ticket fields, public replies, internal
+  notes, assignment/routing/status history, department revisions, and ordinary
+  attachment upload/list/delete; attachment download remains unavailable;
+- published bilingual Content and Legal revisions retain immutable history,
+  deterministic zh-CN to English fallback, and a persisted User locale;
+- identity flows cover current Sessions, MFA/TOTP, API keys, recovery codes,
+  account recovery, recent reauthentication, and Mock Mail delivery without
+  exposing one-time material in Staff history;
 - the customer can run Mock payment success, failure, cancellation, timeout,
   duplicate, and out-of-order scenarios;
 - a settled payment creates one balanced journal and invoice allocation before
@@ -58,6 +77,9 @@ The first runnable vertical slice is implemented:
   snapshots stay visible as non-additive history;
 - automatic products create one stable Provider operation; a timeout becomes
   `unknown`/`confirming` and is reconciled instead of creating a second resource;
+- the public Provider surface publishes six capability contracts, generated
+  schemas/OpenAPI, a TypeScript SDK, examples, all fourteen mutation actions,
+  and a normal install/pause/resume/credential-rotation/limit/revoke lifecycle;
 - a service becomes Active only after a Ready for Service fact, and its term
   starts at that time.
 
@@ -66,10 +88,12 @@ Provider Operation, Refund, and Service as separate facts. It never presents
 payment success as service activation, or a refund as implicit cancellation.
 
 This code is protected by strict TypeScript checks, production builds, and
-PostgreSQL exact-money/state journeys. The two-VPS deployment, remaining billing
-lifecycle, customer operations, plugin developer journey, and recovery drills
-are not yet complete, so this version is not the final Laboratory Release
-Candidate.
+PostgreSQL exact-money/state journeys. A consistent Demo backup/restore and
+Schema 018 forward-upgrade/rollback rehearsal, notification template and User
+preference work, ordinary Support attachment download, bulk exports, account
+deletion/anonymization, remaining Service credential/usage workflows, two-VPS
+deployment, and final release evidence are not yet complete. This version is
+therefore not the final Laboratory Release Candidate.
 
 ## Quick start
 
