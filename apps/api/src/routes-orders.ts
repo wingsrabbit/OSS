@@ -390,6 +390,13 @@ export async function registerOrderRoutes(
       cancellation_last_error: string | null;
       cancellation_operation_status: string | null;
       cancellation_operation_attempt_count: number | null;
+      cancellation_provider_attempt_id: string | null;
+      cancellation_provider_dispatched_at: Date | null;
+      cancellation_reconciliation_query_count: number | null;
+      cancellation_unresolved_reconciliation_count: number | null;
+      cancellation_latest_provider_outcome: "succeeded" | "failed" | null;
+      cancellation_latest_provider_source: "callback" | "reconciliation" | null;
+      cancellation_latest_provider_occurred_at: Date | null;
       payment_status: string | null;
       provider_operation_status: string | null;
     }>(
@@ -420,6 +427,19 @@ export async function registerOrderRoutes(
          cancellation_execution.last_error AS cancellation_last_error,
          cancellation_operation.status AS cancellation_operation_status,
          cancellation_operation.attempt_count AS cancellation_operation_attempt_count,
+         cancellation_provider_attempt.id AS cancellation_provider_attempt_id,
+         cancellation_provider_attempt.dispatched_at AS cancellation_provider_dispatched_at,
+         cancellation_execution.reconciliation_query_count
+           AS cancellation_reconciliation_query_count,
+         (
+           SELECT count(*)::integer
+           FROM service_cancellation_reconciliation_observations observation
+           WHERE observation.execution_id = cancellation_execution.id
+         ) AS cancellation_unresolved_reconciliation_count,
+         cancellation_latest_result.outcome AS cancellation_latest_provider_outcome,
+         cancellation_latest_result.observation_source AS cancellation_latest_provider_source,
+         cancellation_latest_result.provider_occurred_at
+           AS cancellation_latest_provider_occurred_at,
          pay.status AS payment_status,
          provision.status AS provider_operation_status
        FROM orders o
@@ -432,6 +452,16 @@ export async function registerOrderRoutes(
          ON cancellation_operation.subject_type = 'service_cancellation_execution'
         AND cancellation_operation.subject_id = cancellation_execution.id
         AND cancellation_operation.kind = 'resource_terminate'
+       LEFT JOIN service_cancellation_provider_attempts cancellation_provider_attempt
+         ON cancellation_provider_attempt.provider_operation_id = cancellation_operation.id
+        AND cancellation_provider_attempt.execution_id = cancellation_execution.id
+       LEFT JOIN LATERAL (
+         SELECT result.outcome, result.observation_source, result.provider_occurred_at
+         FROM service_cancellation_provider_results result
+         WHERE result.provider_operation_id = cancellation_operation.id
+         ORDER BY result.provider_occurred_at DESC, result.created_at DESC, result.id DESC
+         LIMIT 1
+       ) cancellation_latest_result ON true
        JOIN invoice_allocation_totals alloc ON alloc.invoice_id = i.id
        LEFT JOIN LATERAL (
          SELECT COALESCE(sum(amount_minor), 0) AS amount_minor
@@ -497,6 +527,20 @@ export async function registerOrderRoutes(
                   ? {
                       status: row.cancellation_operation_status,
                       attempts: row.cancellation_operation_attempt_count ?? 0,
+                      attemptId: row.cancellation_provider_attempt_id,
+                      dispatchedAt:
+                        row.cancellation_provider_dispatched_at?.toISOString() ?? null,
+                      reconcileQueries: row.cancellation_reconciliation_query_count ?? 0,
+                      unresolvedReconcileQueries:
+                        row.cancellation_unresolved_reconciliation_count ?? 0,
+                      latestResult: row.cancellation_latest_provider_outcome
+                        ? {
+                            outcome: row.cancellation_latest_provider_outcome,
+                            source: row.cancellation_latest_provider_source,
+                            occurredAt:
+                              row.cancellation_latest_provider_occurred_at?.toISOString() ?? null,
+                          }
+                        : null,
                     }
                   : null,
               }

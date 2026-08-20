@@ -64,7 +64,10 @@ try {
     safe: true,
     blockers: [],
   });
-  assert.deepEqual(await assertSchemaCompatible(pool), native);
+  await assert.rejects(
+    assertSchemaCompatible(pool),
+    /027_stage_c_notification_templates_preferences.*028_stage_c_cancellation_provider_evidence/,
+  );
   assert.equal(
     schema027CatalogDigest(await schema027CatalogFingerprintInput(pool)),
     SCHEMA_027_CATALOG_DIGEST,

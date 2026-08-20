@@ -80,6 +80,7 @@ const resourceActionEventSchema = z.object({
 
 const resourceTerminationEventSchema = z.object({
   eventId: z.string().min(1).max(160),
+  reconciliationQueryId: z.uuid().optional(),
   providerOperationId: z.uuid(),
   callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   serviceId: z.uuid(),
@@ -2498,11 +2499,13 @@ export async function registerProviderEventRoutes(
         operation_stable_key: string;
         operation_attempt_count: number;
         operation_provider_occurred_at: Date | null;
+        provider_attempt_id: string | null;
         execution_id: string;
         execution_provider_installation_id: string | null;
         execution_status: string;
         execution_version: number;
         execution_provider_occurred_at: Date | null;
+        reconciliation_query_count: number;
         request_id: string;
         effective_at: Date;
         service_id: string;
@@ -2516,11 +2519,13 @@ export async function registerProviderEventRoutes(
                 operation.stable_key AS operation_stable_key,
                 operation.attempt_count AS operation_attempt_count,
                 operation.provider_occurred_at AS operation_provider_occurred_at,
+                provider_attempt.id AS provider_attempt_id,
                 execution.id AS execution_id,
                 execution.provider_installation_id AS execution_provider_installation_id,
                 execution.status AS execution_status,
                 execution.version AS execution_version,
                 execution.provider_occurred_at AS execution_provider_occurred_at,
+                execution.reconciliation_query_count,
                 cancellation_request.id AS request_id,
                 cancellation_request.effective_at,
                 service.id AS service_id,
@@ -2533,6 +2538,9 @@ export async function registerProviderEventRoutes(
          JOIN service_cancellation_requests cancellation_request
            ON cancellation_request.id = execution.cancellation_request_id
          JOIN services service ON service.id = execution.service_id
+         LEFT JOIN service_cancellation_provider_attempts provider_attempt
+           ON provider_attempt.provider_operation_id = operation.id
+          AND provider_attempt.execution_id = execution.id
          WHERE operation.id = $1`,
         [body.providerOperationId],
       );
@@ -2573,7 +2581,7 @@ export async function registerProviderEventRoutes(
       ) {
         return { rejected: true, reason: "invalid_operation_capability" };
       }
-      if (state.operation_attempt_count === 0) {
+      if (state.operation_attempt_count !== 1 || !state.provider_attempt_id) {
         return { rejected: true, reason: "provider_operation_not_started" };
       }
 
@@ -2589,12 +2597,60 @@ export async function registerProviderEventRoutes(
         return { rejected: true, reason: "event_id_conflict" };
       }
 
+      const inboxResult = await client.query<{ id: string }>(
+        `SELECT id
+         FROM provider_inbox
+         WHERE provider_installation_id = $1 AND external_event_id = $2
+         FOR UPDATE`,
+        [MOCK_PROVISIONING_INSTALLATION_ID, body.eventId],
+      );
+      const providerInboxId = inboxResult.rows[0]?.id;
+      if (!providerInboxId) throw new Error("Cancellation Provider inbox fact disappeared");
+
       const occurredAt = new Date(body.occurredAt);
+      const observationSource = body.eventId.startsWith(
+        `reconcile:resource-termination:${state.operation_id}:`,
+      )
+        ? "reconciliation"
+        : "callback";
+      await client.query(
+        `INSERT INTO service_cancellation_provider_results(
+           id, attempt_id, execution_id, cancellation_request_id, service_id,
+           provider_operation_id, provider_inbox_id, provider_installation_id,
+           reconciliation_query_id, observation_source, outcome, external_resource_id,
+           provider_occurred_at, result_snapshot
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+         )`,
+        [
+          randomUUID(),
+          state.provider_attempt_id,
+          state.execution_id,
+          state.request_id,
+          state.service_id,
+          state.operation_id,
+          providerInboxId,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          body.reconciliationQueryId ?? null,
+          observationSource,
+          body.status,
+          body.externalResourceId,
+          occurredAt,
+          {
+            status: body.status,
+            serviceId: body.serviceId,
+            externalResourceId: body.externalResourceId,
+            occurredAt: body.occurredAt,
+            reconciliationQueryId: body.reconciliationQueryId ?? null,
+          },
+        ],
+      );
+
       const enqueueQueryOnly = async (reason: string) => {
         await client.query(
           `UPDATE provider_operations
            SET status = 'unknown', last_error = $2, updated_at = now()
-           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+           WHERE id = $1 AND status <> 'succeeded'`,
           [state.operation_id, reason],
         );
         if (state.execution_status === "processing") {
@@ -2614,7 +2670,30 @@ export async function registerProviderEventRoutes(
         await client.query(
           `INSERT INTO durable_jobs(job_type, unique_key, payload)
            VALUES ('service.cancellation.reconcile', $1, $2)
-           ON CONFLICT (job_type, unique_key) DO NOTHING`,
+           ON CONFLICT (job_type, unique_key) DO UPDATE
+             SET payload = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.payload
+                   ELSE EXCLUDED.payload
+                 END,
+                 status = CASE
+                   WHEN durable_jobs.status = 'manual' THEN 'manual'
+                   WHEN durable_jobs.status = 'running' THEN 'running'
+                   ELSE 'pending'
+                 END,
+                 available_at = CASE
+                   WHEN durable_jobs.status IN ('manual', 'running')
+                     THEN durable_jobs.available_at
+                   ELSE EXCLUDED.available_at
+                 END,
+                 locked_at = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_at
+                   ELSE NULL
+                 END,
+                 locked_by = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_by
+                   ELSE NULL
+                 END,
+                 updated_at = now()`,
           [
             state.operation_stable_key,
             {

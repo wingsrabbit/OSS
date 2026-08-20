@@ -189,7 +189,19 @@ type OrderDetail = {
       effectiveAt: string;
       result: Record<string, unknown>;
       lastError: string | null;
-      providerOperation: { status: string; attempts: number } | null;
+      providerOperation: {
+        status: string;
+        attempts: number;
+        attemptId: string | null;
+        dispatchedAt: string | null;
+        reconcileQueries: number;
+        unresolvedReconcileQueries: number;
+        latestResult: {
+          outcome: "succeeded" | "failed";
+          source: "callback" | "reconciliation" | null;
+          occurredAt: string | null;
+        } | null;
+      } | null;
     } | null;
   };
 };
@@ -246,9 +258,26 @@ type AdminCancellationItem = {
   executionVersion: number;
   serviceVersion: number;
   lastError: string | null;
-  providerOperation: { status: string; attempts: number } | null;
-  job: { status: string; lastError: string | null };
+  providerOperation: {
+    status: string;
+    attempts: number;
+    attemptId: string | null;
+    dispatchedAt: string | null;
+    reconcileQueries: number;
+    unresolvedReconcileQueries: number;
+    latestResult: {
+      outcome: "succeeded" | "failed";
+      source: "callback" | "reconciliation" | null;
+      occurredAt: string | null;
+    } | null;
+  } | null;
+  job: {
+    type: "service.cancellation.due" | "service.cancellation.reconcile";
+    status: string;
+    lastError: string | null;
+  };
   interventionRequired: boolean;
+  completionAllowed: boolean;
 };
 
 function cancellationStatusLabel(
@@ -3170,7 +3199,7 @@ export function App() {
   async function completeCycleEndCancellation(item: AdminCancellationItem) {
     if (
       !canUseFullAdminRoute ||
-      !item.interventionRequired ||
+      !item.completionAllowed ||
       cancellationCompletionReason.trim().length < 10 ||
       cancellationCompletionPendingId
     ) {
@@ -6010,13 +6039,30 @@ export function App() {
                           {item.serviceStatus}
                         </span>
                         <span>
-                          {locale === "zh-CN" ? "到期任务" : "Due job"} {item.job.status}
+                          {item.job.type === "service.cancellation.reconcile"
+                            ? locale === "zh-CN"
+                              ? "对账任务"
+                              : "Reconcile job"
+                            : locale === "zh-CN"
+                              ? "到期任务"
+                              : "Due job"}{" "}
+                          {item.job.status}
                           {item.providerOperation
-                            ? ` · Provider ${item.providerOperation.status}/${item.providerOperation.attempts}`
+                            ? ` · Provider ${item.providerOperation.status}/${item.providerOperation.attempts} · GET ${item.providerOperation.reconcileQueries}/3 · unresolved ${item.providerOperation.unresolvedReconcileQueries}`
                             : locale === "zh-CN"
                               ? " · 无 Provider 操作"
                               : " · no Provider operation"}
                         </span>
+                        {item.providerOperation?.attemptId && (
+                          <span data-testid="admin-cancellation-provider-evidence">
+                            {locale === "zh-CN" ? "不可变尝试" : "Immutable attempt"}: {item.providerOperation.attemptId}
+                            {item.providerOperation.latestResult
+                              ? ` · ${item.providerOperation.latestResult.source} ${item.providerOperation.latestResult.outcome}`
+                              : locale === "zh-CN"
+                                ? " · 尚无终态结果事实"
+                                : " · no terminal result fact yet"}
+                          </span>
+                        )}
                         {item.interventionRequired && (
                           <>
                             <span data-testid="admin-cancellation-manual">
@@ -6027,6 +6073,7 @@ export function App() {
                             <button
                               className="primary"
                               disabled={
+                                !item.completionAllowed ||
                                 cancellationCompletionPendingId !== null ||
                                 adminPassword.length === 0 ||
                                 cancellationCompletionReason.trim().length < 10
@@ -6038,8 +6085,12 @@ export function App() {
                                   ? "正在记录终止…"
                                   : "Recording termination…"
                                 : locale === "zh-CN"
-                                  ? "确认人工终止"
-                                  : "Confirm manual termination"}
+                                  ? item.completionAllowed
+                                    ? "确认人工终止"
+                                    : "等待精确 Provider 证据"
+                                  : item.completionAllowed
+                                    ? "Confirm manual termination"
+                                    : "Await exact Provider evidence"}
                             </button>
                           </>
                         )}
@@ -7424,10 +7475,18 @@ export function App() {
                     ? "不会生成下一张续费发票；此操作不会自动退款。"
                     : "No new renewal invoice will be generated. This action does not issue a refund."}
                 </span>
+                {order.service.cancellation.providerOperation?.attemptId && (
+                  <span data-testid="customer-cancellation-provider-evidence">
+                    {locale === "zh-CN" ? "不可变 Provider 尝试已记录" : "Immutable Provider attempt recorded"}
+                    {order.service.cancellation.providerOperation.latestResult
+                      ? ` · ${order.service.cancellation.providerOperation.latestResult.source} ${order.service.cancellation.providerOperation.latestResult.outcome}`
+                      : ""}
+                  </span>
+                )}
                 <span>
                   {locale === "zh-CN" ? "执行方式" : "Delivery"}: {cancellationExecutionLabel(order.service.cancellation.executionMode, locale)}
                   {order.service.cancellation.providerOperation
-                    ? ` · Provider ${order.service.cancellation.providerOperation.status}/${order.service.cancellation.providerOperation.attempts}`
+                    ? ` · Provider ${order.service.cancellation.providerOperation.status}/${order.service.cancellation.providerOperation.attempts} · GET ${order.service.cancellation.providerOperation.reconcileQueries}/3 · unresolved ${order.service.cancellation.providerOperation.unresolvedReconcileQueries}`
                     : locale === "zh-CN"
                       ? " · 不会自动调用 Provider"
                       : " · no automatic Provider mutation"}

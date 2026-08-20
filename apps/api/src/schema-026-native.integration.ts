@@ -446,7 +446,7 @@ try {
     assert.deepEqual(history.rows[0]?.versions, [...EXPECTED_SCHEMA_026_HISTORY]);
     await assert.rejects(
       assertSchemaCompatible(pool),
-      /026_stage_c_service_cancellation_authority.*027_stage_c_notification_templates_preferences/,
+      /026_stage_c_service_cancellation_authority.*028_stage_c_cancellation_provider_evidence/,
     );
 
     for (const statement of [

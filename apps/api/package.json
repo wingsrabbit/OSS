@@ -35,6 +35,8 @@
     "test:integration:schema-025-native": "node dist/schema-025-native.integration.js",
     "test:integration:schema-026-native": "node dist/schema-026-native.integration.js",
     "test:integration:schema-027-native": "node dist/schema-027-native.integration.js",
+    "test:integration:schema-028-native": "node dist/schema-028-native.integration.js",
+    "test:integration:cancellation-provider-evidence-normal": "node dist/cancellation-provider-evidence-normal.integration.js",
     "test:integration:identity-security": "node dist/identity-security.integration.js",
     "test:integration:content-operations": "node dist/content-operations.integration.js",
     "test:integration:database-role-boundary": "node dist/database-role-boundary.integration.js",

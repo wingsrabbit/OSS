@@ -798,6 +798,16 @@ export async function registerServiceRoutes(
       last_error: string | null;
       provider_operation_status: string | null;
       provider_attempt_count: number | null;
+      provider_attempt_id: string | null;
+      provider_dispatched_at: Date | null;
+      reconciliation_query_count: number;
+      unresolved_reconciliation_count: number;
+      latest_provider_outcome: "succeeded" | "failed" | null;
+      latest_provider_observation_source: "callback" | "reconciliation" | null;
+      latest_provider_occurred_at: Date | null;
+      has_failed_provider_result: boolean;
+      has_succeeded_provider_result: boolean;
+      job_type: "service.cancellation.due" | "service.cancellation.reconcile";
       job_status: string;
       job_last_error: string | null;
     }>(
@@ -816,6 +826,28 @@ export async function registerServiceRoutes(
               execution.last_error,
               operation.status AS provider_operation_status,
               operation.attempt_count AS provider_attempt_count,
+              provider_attempt.id AS provider_attempt_id,
+              provider_attempt.dispatched_at AS provider_dispatched_at,
+              execution.reconciliation_query_count,
+              (
+                SELECT count(*)::integer
+                FROM service_cancellation_reconciliation_observations observation
+                WHERE observation.execution_id = execution.id
+              ) AS unresolved_reconciliation_count,
+              latest_result.outcome AS latest_provider_outcome,
+              latest_result.observation_source AS latest_provider_observation_source,
+              latest_result.provider_occurred_at AS latest_provider_occurred_at,
+              EXISTS (
+                SELECT 1 FROM service_cancellation_provider_results result
+                WHERE result.provider_operation_id = operation.id
+                  AND result.outcome = 'failed'
+              ) AS has_failed_provider_result,
+              EXISTS (
+                SELECT 1 FROM service_cancellation_provider_results result
+                WHERE result.provider_operation_id = operation.id
+                  AND result.outcome = 'succeeded'
+              ) AS has_succeeded_provider_result,
+              job.job_type,
               job.status AS job_status,
               job.last_error AS job_last_error
        FROM service_cancellation_requests cancellation_request
@@ -824,13 +856,31 @@ export async function registerServiceRoutes(
        JOIN services service ON service.id = cancellation_request.service_id
        JOIN client_accounts account ON account.id = service.client_account_id
        JOIN order_items item ON item.id = service.order_item_id
-       JOIN durable_jobs job
-         ON job.job_type = 'service.cancellation.due'
-        AND job.unique_key = 'service-cancellation:' || cancellation_request.id::text || ':terminate'
+       JOIN LATERAL (
+         SELECT candidate.job_type, candidate.status, candidate.last_error
+         FROM durable_jobs candidate
+         WHERE candidate.job_type IN (
+           'service.cancellation.due', 'service.cancellation.reconcile'
+         )
+           AND candidate.unique_key =
+             'service-cancellation:' || cancellation_request.id::text || ':terminate'
+         ORDER BY (candidate.job_type = 'service.cancellation.reconcile') DESC
+         LIMIT 1
+       ) job ON true
        LEFT JOIN provider_operations operation
          ON operation.subject_type = 'service_cancellation_execution'
         AND operation.subject_id = execution.id
         AND operation.kind = 'resource_terminate'
+       LEFT JOIN service_cancellation_provider_attempts provider_attempt
+         ON provider_attempt.provider_operation_id = operation.id
+        AND provider_attempt.execution_id = execution.id
+       LEFT JOIN LATERAL (
+         SELECT result.outcome, result.observation_source, result.provider_occurred_at
+         FROM service_cancellation_provider_results result
+         WHERE result.provider_operation_id = operation.id
+         ORDER BY result.provider_occurred_at DESC, result.created_at DESC, result.id DESC
+         LIMIT 1
+       ) latest_result ON true
        ORDER BY cancellation_request.effective_at, cancellation_request.created_at`,
     );
     return {
@@ -853,10 +903,40 @@ export async function registerServiceRoutes(
           ? {
               status: row.provider_operation_status,
               attempts: row.provider_attempt_count ?? 0,
+              attemptId: row.provider_attempt_id,
+              dispatchedAt: row.provider_dispatched_at?.toISOString() ?? null,
+              reconcileQueries: row.reconciliation_query_count,
+              unresolvedReconcileQueries: row.unresolved_reconciliation_count,
+              latestResult: row.latest_provider_outcome
+                ? {
+                    outcome: row.latest_provider_outcome,
+                    source: row.latest_provider_observation_source,
+                    occurredAt: row.latest_provider_occurred_at?.toISOString() ?? null,
+                  }
+                : null,
             }
           : null,
-        job: { status: row.job_status, lastError: row.job_last_error },
-        interventionRequired: row.execution_status === "manual",
+        job: {
+          type: row.job_type,
+          status: row.job_status,
+          lastError: row.job_last_error,
+        },
+        interventionRequired: row.execution_status === "manual" || row.job_status === "manual",
+        completionAllowed:
+          row.execution_status === "manual" &&
+          (row.execution_mode === "manual"
+            ? row.provider_operation_status === null &&
+              row.provider_attempt_id === null &&
+              row.execution_result.providerCalled === false &&
+              row.execution_result.preflightFailure === true &&
+              row.execution_result.preflightReason === "provider_automation_unavailable"
+            : Boolean(row.provider_attempt_id) &&
+              !row.has_succeeded_provider_result &&
+              ((row.provider_operation_status === "unknown" &&
+                row.reconciliation_query_count === 3 &&
+                row.unresolved_reconciliation_count === 3) ||
+                (row.provider_operation_status === "failed" &&
+                  row.has_failed_provider_result))),
       })),
     };
   });
@@ -972,6 +1052,12 @@ export async function registerServiceRoutes(
           service_version: number;
           provider_operation_status: string | null;
           provider_attempt_count: number | null;
+          provider_attempt_id: string | null;
+          reconciliation_query_count: number;
+          unresolved_reconciliation_count: number;
+          execution_result: Record<string, unknown>;
+          has_failed_provider_result: boolean;
+          has_succeeded_provider_result: boolean;
         }>(
           `SELECT execution.execution_mode,
                   execution.status AS execution_status,
@@ -980,7 +1066,25 @@ export async function registerServiceRoutes(
                   service.status AS service_status,
                   service.version AS service_version,
                   operation.status AS provider_operation_status,
-                  operation.attempt_count AS provider_attempt_count
+                  operation.attempt_count AS provider_attempt_count,
+                  provider_attempt.id AS provider_attempt_id,
+                  execution.reconciliation_query_count,
+                  (
+                    SELECT count(*)::integer
+                    FROM service_cancellation_reconciliation_observations observation
+                    WHERE observation.execution_id = execution.id
+                  ) AS unresolved_reconciliation_count,
+                  execution.result AS execution_result,
+                  EXISTS (
+                    SELECT 1 FROM service_cancellation_provider_results result
+                    WHERE result.provider_operation_id = operation.id
+                      AND result.outcome = 'failed'
+                  ) AS has_failed_provider_result,
+                  EXISTS (
+                    SELECT 1 FROM service_cancellation_provider_results result
+                    WHERE result.provider_operation_id = operation.id
+                      AND result.outcome = 'succeeded'
+                  ) AS has_succeeded_provider_result
            FROM service_cancellation_executions execution
            JOIN service_cancellation_requests request
              ON request.id = execution.cancellation_request_id
@@ -989,6 +1093,9 @@ export async function registerServiceRoutes(
              ON operation.subject_type = 'service_cancellation_execution'
             AND operation.subject_id = execution.id
             AND operation.kind = 'resource_terminate'
+           LEFT JOIN service_cancellation_provider_attempts provider_attempt
+             ON provider_attempt.provider_operation_id = operation.id
+            AND provider_attempt.execution_id = execution.id
            WHERE execution.id = $1`,
           [params.executionId],
         );
@@ -1019,14 +1126,31 @@ export async function registerServiceRoutes(
           state.execution_mode === "manual"
             ? "manual_delivery"
             : "provider_reconciliation_takeover";
-        if (
+        const manualDeliveryReady =
+          state.execution_mode === "manual" &&
+          state.provider_operation_status === null &&
+          state.provider_attempt_id === null &&
+          state.execution_result.providerCalled === false &&
+          state.execution_result.preflightFailure === true &&
+          state.execution_result.preflightReason === "provider_automation_unavailable";
+        const automaticUnknownReady =
           state.execution_mode === "automatic" &&
-          (!state.provider_operation_status ||
-            !["unknown", "failed", "succeeded"].includes(state.provider_operation_status) ||
-            (state.provider_attempt_count ?? 0) < 1)
-        ) {
+          state.provider_operation_status === "unknown" &&
+          state.provider_attempt_count === 1 &&
+          Boolean(state.provider_attempt_id) &&
+          state.reconciliation_query_count === 3 &&
+          state.unresolved_reconciliation_count === 3 &&
+          !state.has_succeeded_provider_result;
+        const automaticFailedReady =
+          state.execution_mode === "automatic" &&
+          state.provider_operation_status === "failed" &&
+          state.provider_attempt_count === 1 &&
+          Boolean(state.provider_attempt_id) &&
+          state.has_failed_provider_result &&
+          !state.has_succeeded_provider_result;
+        if (!manualDeliveryReady && !automaticUnknownReady && !automaticFailedReady) {
           throw requestError(
-            "Automatic termination has no Provider evidence safe for manual takeover",
+            "Cancellation has no exact manual-delivery or Provider reconciliation evidence safe for Staff completion",
             409,
             "PROVIDER_RECONCILIATION_REQUIRED",
           );
@@ -1042,6 +1166,14 @@ export async function registerServiceRoutes(
           serviceStatus: "terminated",
           takeoverKind,
           providerCalled: false,
+          providerOutcome:
+            state.execution_mode === "automatic" ? state.provider_operation_status : null,
+          providerAttemptId: state.provider_attempt_id,
+          reconcileQueries: state.reconciliation_query_count,
+          unresolvedReconcileQueries: state.unresolved_reconciliation_count,
+          expectedExecutionVersion: body.expectedExecutionVersion,
+          expectedServiceVersion: body.expectedServiceVersion,
+          targetClientAccountId: pointer.client_account_id,
           completedAt: completedAt.toISOString(),
         };
         await client.query(
@@ -1049,9 +1181,9 @@ export async function registerServiceRoutes(
              id, execution_id, service_id, staff_user_id, staff_session_id,
              staff_client_account_id, takeover_kind, expected_execution_version,
              expected_service_version, reason, idempotency_key,
-             request_fingerprint, result, created_at
+             request_fingerprint, result, completed_at, created_at
            ) VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14
            )`,
           [
             actionId,
