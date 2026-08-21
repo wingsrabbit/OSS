@@ -356,6 +356,8 @@ export function SupportOperationsPanel({
   const [queuePriority, setQueuePriority] = useState("");
   const [queueAssignee, setQueueAssignee] = useState("");
   const [assignment, setAssignment] = useState("");
+  const [staffReauthPassword, setStaffReauthPassword] = useState("");
+  const [staffFactorCode, setStaffFactorCode] = useState("");
   const [staffTicketReason, setStaffTicketReason] = useState("");
   const [staffTicketReplyText, setStaffTicketReplyText] = useState("");
   const [staffAttachment, setStaffAttachment] = useState<File | null>(null);
@@ -398,6 +400,18 @@ export function SupportOperationsPanel({
     setPending(true);
     let value: T;
     try {
+      if (mode === "staff" && staffReauthPassword.length > 0) {
+        await api("/api/v1/auth/reauth", {
+          method: "POST",
+          body: JSON.stringify({
+            password: staffReauthPassword,
+            ...(staffFactorCode.trim() ? { factorCode: staffFactorCode.trim() } : {}),
+          }),
+        });
+        if (!mounted.current) return;
+        setStaffReauthPassword("");
+        setStaffFactorCode("");
+      }
       value = await plan.request(idempotencyKey);
     } catch (error) {
       if (!mounted.current) return;
@@ -1031,6 +1045,14 @@ export function SupportOperationsPanel({
     {staffAccountContext && <p className="notice" data-testid="staff-support-account-context">
       {tr("Fixed Client Account", "已固定客户账户")}: {staffAccountContext.name} · {staffAccountContext.id}
     </p>}
+    <fieldset><legend>{tr("Staff reauthentication", "客服人员重新认证")}</legend>
+      <p className="muted">{tr(
+        "Enter credentials before a protected Support action when no current 15-minute grant is available.",
+        "当前没有有效的 15 分钟授权时，请在受保护的客服操作前输入认证信息。",
+      )}</p>
+      <label>{tr("Support password confirmation", "客服操作密码确认")}<input type="password" autoComplete="current-password" value={staffReauthPassword} onChange={(event) => setStaffReauthPassword(event.target.value)} disabled={pending} /></label>
+      <label>{tr("Support TOTP or recovery code", "客服操作 TOTP 或恢复码")}<input autoComplete="one-time-code" value={staffFactorCode} onChange={(event) => setStaffFactorCode(event.target.value)} disabled={pending} /></label>
+    </fieldset>
     <fieldset><legend>{tr("Queue filters", "队列筛选")}</legend>
       <label>{tr("Status", "状态")}<select aria-label={tr("Queue status", "队列状态")} value={queueStatus} onChange={(event) => setQueueStatus(event.target.value)}><option value="">{tr("All", "全部")}</option>{["awaiting_staff", "awaiting_customer", "closed"].map((item) => <option key={item}>{item}</option>)}</select></label>
       <label>{tr("Department", "部门")}<select aria-label={tr("Queue department", "队列部门")} value={queueDepartment} onChange={(event) => setQueueDepartment(event.target.value)}><option value="">{tr("All", "全部")}</option>{departments.map((item) => <option key={item.code} value={item.code}>{item.currentRevision?.name ?? item.name ?? item.code}</option>)}</select></label>

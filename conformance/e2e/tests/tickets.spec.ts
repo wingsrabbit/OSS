@@ -64,6 +64,7 @@ test("customer and staff complete a public ticket conversation while internal no
   const staffThread = staffPanel.getByTestId("staff-ticket-thread");
   await expect(staffThread).toContainText(subject);
 
+  await staffPanel.getByLabel("Support password confirmation").fill(staffPassword);
   await staffThread.getByLabel("Staff ticket message").fill(internalNote);
   await staffThread.getByRole("button", { name: "Save internal note" }).click();
   await expect(staffThread.locator('[data-visibility="internal"]')).toContainText(internalNote);

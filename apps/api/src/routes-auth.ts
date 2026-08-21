@@ -1618,6 +1618,7 @@ export async function registerAuthRoutes(
       "renewal-renewal-created-v1",
       "renewal-pre-due-v1",
       "renewal-overdue-first-v1",
+      "renewal-reminder-v2",
       "support-ticket-reply-v1",
       "service-cancellation-scheduled-v1",
     ]);

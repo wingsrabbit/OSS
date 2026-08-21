@@ -2478,8 +2478,14 @@ async function runPrepareBrowser(): Promise<void> {
     staff.userId,
     await passwordHash(staffPassword),
   ]);
-  const fixture = await createService(account.owner, true, "browser");
-  const manualFixture = await createService(account.owner, false, "browser-manual");
+  const browserTermSeconds = 10 * 365 * 24 * 60 * 60;
+  const fixture = await createService(account.owner, true, "browser", browserTermSeconds);
+  const manualFixture = await createService(
+    account.owner,
+    false,
+    "browser-manual",
+    browserTermSeconds,
+  );
   const manualInitial = await list(account.owner, manualFixture.serviceId);
   const manualRequest = await requestCustomerOperation(
     account.owner,

@@ -125,7 +125,7 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   await expect(renewal).toContainText("due $0.00");
 
   await renewalSection.getByRole("button", { name: "Open my Mock Provider mailbox" }).click();
-  await expect(renewalSection.getByText("Renewal invoice created", { exact: true })).toBeVisible({
+  await expect(renewalSection.getByText("Renewal billing update", { exact: true })).toBeVisible({
     timeout: 15_000,
   });
   await expect(renewalSection.getByText(/delivered/).first()).toBeVisible();

@@ -367,6 +367,9 @@ test("Staff Support component filters, assigns, routes, separates internal notes
       postedPaths.push(url.pathname);
       const body = request.postDataJSON() as Record<string, unknown>;
       postedBodies.push({ path: url.pathname, body });
+      if (url.pathname === "/api/v1/auth/reauth") {
+        return fulfill(route, { expiresAt: "2026-08-20T12:15:00.000Z", fixedWindowMinutes: 15 });
+      }
       if (url.pathname.endsWith("/assignments")) {
         assignmentAttempts += 1;
         if (assignmentAttempts === 1) {
@@ -431,7 +434,11 @@ test("Staff Support component filters, assigns, routes, separates internal notes
   await expect(page.getByLabel("Support error")).toContainText("Reauthentication required");
   const saveAssignment = detail.getByRole("button", { name: "Save assignment" });
   await expect(saveAssignment).toBeEnabled();
+  await panel.getByLabel("Support password confirmation").fill("Synthetic-Support-Password!");
   await saveAssignment.click();
+  await expect.poll(
+    () => postedBodies.find((item) => item.path === "/api/v1/auth/reauth")?.body,
+  ).toEqual({ password: "Synthetic-Support-Password!" });
   await expect.poll(() => postedBodies.filter((item) => item.path.endsWith("/assignments")).length).toBe(2);
   const assignmentBodies = postedBodies.filter((item) => item.path.endsWith("/assignments"));
   expect(assignmentBodies).toHaveLength(2);
