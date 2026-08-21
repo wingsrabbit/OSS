@@ -1830,13 +1830,23 @@ test("changing Staff principal during reversal reauth prevents the old principal
 for (const accessChange of ["principal", "revocation"] as const) {
   test(`a delayed ticket reply cannot survive Staff ${accessChange}`, async ({ page }) => {
     let changed = false;
+    let replyReleased = false;
+    let scopedReadsAfterReplyRelease = 0;
     const reply = barrier();
     const ticket = staffTicketDetail("Account Alpha ticket", "01");
     const messagePath = `/api/v1/admin/tickets/${ticket.ticket.id}/messages`;
-    const requests = await installApi(
+    await installApi(
       page,
       ["accounts.view", "support.tickets.manage"],
       async (path, route) => {
+        if (
+          replyReleased &&
+          path === "/api/v1/admin/tickets" &&
+          route.request().method() === "GET" &&
+          new URL(route.request().url()).search === `?clientAccountId=${accountA}`
+        ) {
+          scopedReadsAfterReplyRelease += 1;
+        }
         if (path === "/api/v1/auth/me") {
           const permissions = changed && accessChange === "revocation"
             ? ["accounts.view"]
@@ -1901,22 +1911,24 @@ for (const accessChange of ["principal", "revocation"] as const) {
     changed = true;
     await account360.getByRole("button", { name: "Refresh Staff access" }).click();
     await expect(page.getByTestId("staff-ticket-thread")).toHaveCount(0);
-    const scopedReadsBeforeRelease = requests.filter((request) =>
-      request.method === "GET" &&
-      request.path === "/api/v1/admin/tickets" &&
-      request.query === `?clientAccountId=${accountA}`
-    ).length;
+    if (accessChange === "principal") {
+      await expect(page.getByTestId("staff-ticket-list")
+        .getByRole("button", { name: /Account Alpha ticket/ })).toBeVisible();
+    } else {
+      await expect(page.getByTestId("staff-ticket-list")).toHaveCount(0);
+    }
     const replyResponse = page.waitForResponse((response) =>
       new URL(response.url()).pathname === messagePath,
     );
+    replyReleased = true;
     reply.release();
-    await replyResponse;
+    const completedReplyResponse = await replyResponse;
+    await completedReplyResponse.finished();
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
 
-    expect(requests.filter((request) =>
-      request.method === "GET" &&
-      request.path === "/api/v1/admin/tickets" &&
-      request.query === `?clientAccountId=${accountA}`
-    )).toHaveLength(scopedReadsBeforeRelease);
+    expect(scopedReadsAfterReplyRelease).toBe(0);
     await expect(page.getByText("Public reply sent.", { exact: true })).toHaveCount(0);
     await expect(page.locator(".notice.error")).toHaveCount(0);
   });
