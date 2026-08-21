@@ -10,9 +10,9 @@ import {
   schema023CatalogFingerprintInput,
 } from "@opensales/core/schema-022-023-native-compatibility";
 import {
-  EXPECTED_SCHEMA_028_HISTORY,
-  SCHEMA_028,
-} from "@opensales/core/schema-027-028-native-compatibility";
+  EXPECTED_SCHEMA_029_HISTORY,
+  SCHEMA_029,
+} from "@opensales/core/schema-028-029-native-compatibility";
 import pg from "pg";
 import { digestToken, passwordHash } from "./auth.js";
 
@@ -1310,9 +1310,9 @@ async function runSchemaGate(): Promise<void> {
   );
   assert.deepEqual(
     history.rows.map((row) => row.version),
-    [...EXPECTED_SCHEMA_028_HISTORY],
+    [...EXPECTED_SCHEMA_029_HISTORY],
   );
-  assert.equal(history.rows.at(-1)?.version, SCHEMA_028);
+  assert.equal(history.rows.at(-1)?.version, SCHEMA_029);
 }
 
 async function runTimeout(): Promise<void> {

@@ -15,6 +15,7 @@ import { digestToken } from "./auth.js";
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
 import {
+  assertSchemaCompatible,
   holdSchema028ApplicationGuard,
   runMigrations,
   transaction,
@@ -730,7 +731,7 @@ try {
   await saveSchema027FailedAttemptWithoutResult(pool, savedFailedWithoutResult);
   await saveSchema027KnownUnsentPreflight(pool, savedKnownUnsent);
   const savedManualAction = await seedCompletedSchema027ManualCancellation(pool);
-  await runMigrations(pool);
+  await runMigrations(pool, { throughVersion: SCHEMA_028 });
 
   const native = await assertSchema028NativeSafe(pool);
   assert.deepEqual(native, {
@@ -749,6 +750,10 @@ try {
   assert.equal(
     schema028CatalogDigest(await schema028CatalogFingerprintInput(pool)),
     SCHEMA_028_CATALOG_DIGEST,
+  );
+  await assert.rejects(
+    assertSchemaCompatible(pool),
+    /028_stage_c_cancellation_provider_evidence.*029_stage_c_service_password_changes/,
   );
   const forward = await pool.query<{
     operation_status: string;

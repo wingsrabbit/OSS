@@ -66,7 +66,7 @@ try {
   });
   await assert.rejects(
     assertSchemaCompatible(pool),
-    /027_stage_c_notification_templates_preferences.*028_stage_c_cancellation_provider_evidence/,
+    /027_stage_c_notification_templates_preferences.*029_stage_c_service_password_changes/,
   );
   assert.equal(
     schema027CatalogDigest(await schema027CatalogFingerprintInput(pool)),
