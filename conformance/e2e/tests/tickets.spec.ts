@@ -92,5 +92,7 @@ test("customer and staff complete a public ticket conversation while internal no
   await customerThread.getByLabel("Customer ticket reply").fill(customerReply);
   await customerThread.getByRole("button", { name: "Send reply" }).click();
   await expect(customerThread).toContainText(customerReply);
-  await expect(customerThread).toContainText("awaiting staff");
+  await expect(customerThread.getByTestId("support-ticket-history")).toContainText(
+    "awaiting_customer → awaiting_staff",
+  );
 });
