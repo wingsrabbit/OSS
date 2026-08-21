@@ -37,6 +37,7 @@ import {
 import {
   assertSeparatedDemoRoles,
   DemoSession,
+  runServiceOperationsSmoke,
   runSupportTicketSmoke,
 } from "./demo-smoke.mjs";
 
@@ -1122,4 +1123,78 @@ test("ticket smoke fails if the customer response exposes the internal note", as
     }),
     /internal note leaked into the customer ticket view/,
   );
+});
+
+test("service operation smoke records Stop, Start, and Reboot terminal facts", async () => {
+  const serviceId = "10000000-0000-4000-8000-000000000001";
+  const requestIds = [
+    "20000000-0000-4000-8000-000000000001",
+    "20000000-0000-4000-8000-000000000002",
+    "20000000-0000-4000-8000-000000000003",
+  ];
+  const facts = [];
+  let resourceState = "running";
+  let resourceRevision = 1;
+  const requestedActions = [];
+  const customerSession = {
+    async request(path, init, expectedStatus) {
+      assert.equal(path, `/api/v1/services/${serviceId}/operations`);
+      if (init?.method === "POST") {
+        assert.equal(expectedStatus, 201);
+        const body = JSON.parse(init.body);
+        const expectedAction = ["stop", "start", "reboot"][requestedActions.length];
+        assert.equal(body.action, expectedAction);
+        assert.equal(body.expectedServiceVersion, 1);
+        assert.equal(body.expectedResourceRevision, resourceRevision);
+        requestedActions.push(body.action);
+        resourceState = body.action === "stop" ? "stopped" : "running";
+        resourceRevision += 1;
+        const requestId = requestIds[facts.length];
+        facts.unshift({
+          requestId,
+          action: body.action,
+          executionMode: "automatic",
+          status: "succeeded",
+          resultingResourceState: resourceState,
+          revision: 2,
+        });
+        return {
+          requestId,
+          serviceId,
+          action: body.action,
+          executionMode: "automatic",
+          status: "queued",
+          replayed: false,
+        };
+      }
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        service: {
+          id: serviceId,
+          status: "active",
+          version: 1,
+          resourceState,
+          resourceRevision,
+          availableActions: resourceState === "stopped" ? ["start"] : ["stop", "reboot"],
+        },
+        items: facts,
+      };
+    },
+  };
+
+  const result = await runServiceOperationsSmoke({
+    customerSession,
+    serviceId,
+    timeoutMs: 1_000,
+  });
+  assert.deepEqual(requestedActions, ["stop", "start", "reboot"]);
+  assert.deepEqual(result.requests.map((request) => request.requestId), requestIds);
+  assert.deepEqual(result.requests.map((request) => request.status), [
+    "succeeded",
+    "succeeded",
+    "succeeded",
+  ]);
+  assert.equal(result.finalServiceStatus, "active");
+  assert.equal(result.finalResourceState, "running");
+  assert.equal(result.finalResourceRevision, 4);
 });

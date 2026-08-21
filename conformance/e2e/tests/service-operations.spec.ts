@@ -353,6 +353,71 @@ async function runPreparedFixtureJourney(
     "停止 · 成功 · 自动",
   );
 
+  const runNextAutomaticOperation = async (
+    action: "start" | "reboot",
+    buttonName: "启动" | "重启",
+    expectedResourceState: "running",
+  ): Promise<string> => {
+    const responsePromise = page.waitForResponse(
+      (response) => response.request().method() === "POST" &&
+        new URL(response.url()).pathname.endsWith("/operations"),
+    );
+    await customerPanel.getByRole("button", { name: buttonName, exact: true }).click();
+    const response = await responsePromise;
+    const body = await response.json() as {
+      requestId: string;
+      action: "start" | "reboot";
+      executionMode: "automatic" | "manual";
+      status: string;
+      replayed: boolean;
+    };
+    expect(response.status(), JSON.stringify(body)).toBe(201);
+    expect(body).toMatchObject({
+      action,
+      executionMode: "automatic",
+      status: "queued",
+      replayed: false,
+    });
+    expect(body.requestId).toMatch(/^[0-9a-f-]{36}$/);
+
+    await processPreparedOperation(body.requestId);
+    await expect.poll(
+      async () => page.evaluate(async ({ serviceId, requestId }) => {
+        const operationResponse = await fetch(`/api/v1/services/${serviceId}/operations`);
+        if (!operationResponse.ok) return null;
+        const operationBody = await operationResponse.json() as {
+          service: { resourceState: string | null };
+          items: Array<{ requestId: string; status: string }>;
+        };
+        const status = operationBody.items.find((item) => item.requestId === requestId)?.status;
+        return status === "succeeded" ? operationBody.service.resourceState : null;
+      }, { serviceId: prepared.fixture.serviceId, requestId: body.requestId }),
+      { timeout: 30_000 },
+    ).toBe(expectedResourceState);
+    await customerPanel.getByRole("button", { name: "刷新", exact: true }).click();
+    await expect(customerPanel).toContainText("资源 运行中");
+    return body.requestId;
+  };
+
+  const startRequestId = await runNextAutomaticOperation("start", "启动", "running");
+  await expect(customerPanel.getByTestId("service-operation-timeline")).toContainText(
+    "启动 · 成功 · 自动",
+  );
+  const rebootRequestId = await runNextAutomaticOperation("reboot", "重启", "running");
+  const automaticRequestIds = [committedRequestId, startRequestId, rebootRequestId];
+  expect(new Set(automaticRequestIds).size).toBe(3);
+  const customerTimeline = customerPanel.getByTestId("service-operation-timeline");
+  await expect(customerTimeline).toContainText("重启 · 成功 · 自动");
+  for (const requestId of automaticRequestIds) {
+    await expect(customerTimeline).toContainText(requestId);
+  }
+  await expect(customerTimeline.locator(".manual-item")).toHaveCount(3);
+
+  await page.getByRole("button", { name: "English" }).click();
+  await expect(customerTimeline).toContainText("Stop · succeeded · automatic");
+  await expect(customerTimeline).toContainText("Start · succeeded · automatic");
+  await expect(customerTimeline).toContainText("Reboot · succeeded · automatic");
+
   const coreDatabaseUrl = process.env.DATABASE_URL;
   const providerDatabaseUrl = process.env.PROVIDER_DATABASE_URL;
   expect(coreDatabaseUrl).toBeTruthy();
@@ -360,18 +425,24 @@ async function runPreparedFixtureJourney(
   const corePool = new pg.Pool({ connectionString: coreDatabaseUrl });
   const providerPool = new pg.Pool({ connectionString: providerDatabaseUrl });
   try {
-    const operation = await corePool.query<{ id: string }>(
-      `SELECT id::text FROM provider_operations
-        WHERE subject_type = 'service_resource_operation' AND subject_id = $1`,
-      [committedRequestId],
+    const operations = await corePool.query<{ id: string; subject_id: string }>(
+      `SELECT id::text, subject_id
+         FROM provider_operations
+        WHERE subject_type = 'service_resource_operation'
+          AND subject_id = ANY($1::uuid[])
+        ORDER BY subject_id`,
+      [automaticRequestIds],
     );
-    assertSingleRow(operation.rowCount);
-    const providerCalls = await providerPool.query<{ create_calls: number }>(
-      "SELECT create_calls FROM mock_contract_operations WHERE operation_id = $1",
-      [operation.rows[0]!.id],
+    expect(operations.rowCount).toBe(3);
+    const providerCalls = await providerPool.query<{ operation_id: string; create_calls: number }>(
+      `SELECT operation_id, create_calls
+         FROM mock_contract_operations
+        WHERE operation_id = ANY($1::uuid[])
+        ORDER BY operation_id`,
+      [operations.rows.map((operation) => operation.id)],
     );
-    assertSingleRow(providerCalls.rowCount);
-    expect(providerCalls.rows[0]!.create_calls).toBe(1);
+    expect(providerCalls.rowCount).toBe(3);
+    expect(providerCalls.rows.every((row) => row.create_calls === 1)).toBe(true);
   } finally {
     await Promise.all([corePool.end(), providerPool.end()]);
   }
@@ -399,4 +470,32 @@ async function runPreparedFixtureJourney(
     return body.items.find((item) => item.requestId === requestId && item.serviceId === serviceId)?.status;
   }, { serviceId: prepared.manualFixture.serviceId, requestId: prepared.manualRequest.requestId });
   expect(completed).toBe("succeeded");
+
+  const staffAutomaticFacts = await page.evaluate(async ({ serviceId, requestIds }) => {
+    const response = await fetch("/api/v1/admin/service-operations?status=all");
+    if (!response.ok) return [];
+    const body = await response.json() as {
+      items: Array<{
+        requestId: string;
+        serviceId: string;
+        action: string;
+        executionMode: string;
+        status: string;
+      }>;
+    };
+    return body.items
+      .filter((item) => item.serviceId === serviceId && requestIds.includes(item.requestId))
+      .map((item) => ({
+        requestId: item.requestId,
+        action: item.action,
+        executionMode: item.executionMode,
+        status: item.status,
+      }))
+      .sort((left, right) => left.action.localeCompare(right.action));
+  }, { serviceId: prepared.fixture.serviceId, requestIds: automaticRequestIds });
+  expect(staffAutomaticFacts).toEqual([
+    { requestId: rebootRequestId, action: "reboot", executionMode: "automatic", status: "succeeded" },
+    { requestId: startRequestId, action: "start", executionMode: "automatic", status: "succeeded" },
+    { requestId: committedRequestId, action: "stop", executionMode: "automatic", status: "succeeded" },
+  ]);
 }

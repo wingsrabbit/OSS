@@ -451,6 +451,101 @@ async function runManualReceiptOutflowSmoke({
   };
 }
 
+export async function runServiceOperationsSmoke({
+  customerSession,
+  serviceId,
+  timeoutMs,
+}) {
+  const steps = [
+    { action: "stop", expectedResourceState: "stopped" },
+    { action: "start", expectedResourceState: "running" },
+    { action: "reboot", expectedResourceState: "running" },
+  ];
+  const requests = [];
+
+  for (const step of steps) {
+    const before = await customerSession.request(
+      `/api/v1/services/${serviceId}/operations`,
+    );
+    assert.equal(before.warning, LAB_WARNING);
+    assert.equal(before.service.id, serviceId);
+    assert.equal(before.service.status, "active");
+    assert.ok(
+      before.service.availableActions.includes(step.action),
+      `${step.action} is not available for Demo service ${serviceId}`,
+    );
+
+    const created = await customerSession.request(
+      `/api/v1/services/${serviceId}/operations`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          action: step.action,
+          expectedServiceVersion: before.service.version,
+          expectedResourceRevision: before.service.resourceRevision,
+          idempotencyKey: `${step.action}-${randomUUID()}`,
+        }),
+      },
+      201,
+    );
+    assert.match(created.requestId, /^[0-9a-f-]{36}$/);
+    assert.equal(created.serviceId, serviceId);
+    assert.equal(created.action, step.action);
+    assert.equal(created.executionMode, "automatic");
+    assert.equal(created.status, "queued");
+    assert.equal(created.replayed, false);
+
+    const terminal = await waitFor(
+      `Demo ${step.action} operation ${created.requestId}`,
+      () => customerSession.request(`/api/v1/services/${serviceId}/operations`),
+      (value) => {
+        const fact = value.items.find((item) => item.requestId === created.requestId);
+        return fact?.status === "succeeded" &&
+          value.service.resourceState === step.expectedResourceState;
+      },
+      timeoutMs,
+    );
+    const terminalFact = terminal.items.find(
+      (item) => item.requestId === created.requestId,
+    );
+    assert.ok(terminalFact, `Demo ${step.action} terminal fact is missing`);
+    assert.equal(terminalFact.action, step.action);
+    assert.equal(terminalFact.executionMode, "automatic");
+    assert.equal(terminalFact.resultingResourceState, step.expectedResourceState);
+    requests.push({
+      requestId: created.requestId,
+      action: step.action,
+      status: terminalFact.status,
+      resultingResourceState: terminalFact.resultingResourceState,
+      resultRevision: terminalFact.revision,
+      resourceRevision: terminal.service.resourceRevision,
+    });
+  }
+
+  assert.equal(new Set(requests.map((request) => request.requestId)).size, steps.length);
+  const final = await customerSession.request(
+    `/api/v1/services/${serviceId}/operations`,
+  );
+  for (const request of requests) {
+    assert.ok(
+      final.items.some(
+        (item) => item.requestId === request.requestId && item.status === "succeeded",
+      ),
+      `Demo service timeline is missing ${request.action} request ${request.requestId}`,
+    );
+  }
+  assert.equal(final.service.status, "active");
+  assert.equal(final.service.resourceState, "running");
+
+  return {
+    serviceId,
+    requests,
+    finalServiceStatus: final.service.status,
+    finalResourceState: final.service.resourceState,
+    finalResourceRevision: final.service.resourceRevision,
+  };
+}
+
 export async function runDemoSmoke({
   baseUrl = "http://127.0.0.1:5173",
   bootstrapToken,
@@ -648,6 +743,12 @@ export async function runDemoSmoke({
   );
   assert.ok(activeOrder.service.activatedAt, "Active service has no Ready-for-Service time");
 
+  const serviceOperations = await runServiceOperationsSmoke({
+    customerSession: session,
+    serviceId: activeOrder.service.id,
+    timeoutMs,
+  });
+
   const supportTicket = await runSupportTicketSmoke({
     customerSession: session,
     administrator: administratorAccess,
@@ -686,6 +787,7 @@ export async function runDemoSmoke({
       serviceStatus: activeOrder.service.status,
       readyForServiceAt: activeOrder.service.activatedAt,
     },
+    serviceOperations,
     supportTicket,
     manualReceiptOutflow,
     notifications: {
