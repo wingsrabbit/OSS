@@ -5274,6 +5274,20 @@ const revocationClient = await corePool.connect();
 try {
   await revocationClient.query("BEGIN");
   await revocationClient.query(
+    `SELECT id
+     FROM users
+     WHERE id = $1
+     FOR UPDATE`,
+    [recoveryMe.id],
+  );
+  await revocationClient.query(
+    `SELECT id
+     FROM client_accounts
+     WHERE id = $1
+     FOR UPDATE`,
+    [recoveryMe.clientAccountId],
+  );
+  await revocationClient.query(
     `SELECT role
      FROM client_memberships
      WHERE user_id = $1 AND client_account_id = $2
@@ -5291,15 +5305,15 @@ try {
     occurredAt: new Date().toISOString(),
   });
   await waitFor(
-    "Add Funds callback to wait on the Membership authorization lock",
+    "Add Funds callback to wait on the User authorization lock",
     async () => {
       const blocked = await corePool.query<{ count: string }>(
         `SELECT count(*)::text AS count
          FROM pg_stat_activity
-         WHERE datname = current_database()
-           AND pid <> pg_backend_pid()
+         WHERE application_name = 'opensales-api'
+           AND state = 'active'
            AND wait_event_type = 'Lock'
-           AND query LIKE '%FROM client_memberships%'`,
+           AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
       );
       return Number(blocked.rows[0]?.count ?? "0");
     },
