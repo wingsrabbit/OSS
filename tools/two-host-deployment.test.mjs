@@ -96,6 +96,15 @@ test("local Compose uses the independent Provider Platform service and database"
   assert.equal(provisioning.environment.MOCK_PROVIDER_PLATFORM_TOKEN, undefined);
   assert.equal(provisioning.environment.MOCK_PROVIDER_PUBLIC_BASE_URL, undefined);
   assert.ok(platform.environment.MOCK_PROVIDER_PLATFORM_TOKEN);
+  assert.ok(platform.environment.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY);
+  assert.equal(
+    platform.environment.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION,
+    "${MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION:-1}",
+  );
+  assert.equal(
+    platform.environment.MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS,
+    "${MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS:-}",
+  );
   assert.match(platform.environment.PROVIDER_DATABASE_URL, /@provider-platform-db:5432\/provider_platform$/u);
   assert.equal(
     compose.services["provider-mailbox"].depends_on["provider-mail"].condition,
@@ -206,6 +215,9 @@ test("TestB Compose owns exactly four Provider databases and five isolated Provi
     undefined,
   );
   assert.ok(compose.services["provider-platform"].environment.MOCK_PROVIDER_PLATFORM_TOKEN);
+  assert.ok(
+    compose.services["provider-platform"].environment.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY,
+  );
   assert.match(
     compose.services["provider-platform"].environment.PROVIDER_DATABASE_URL,
     /@provider-platform-db:5432\/provider_platform$/u,
@@ -330,6 +342,9 @@ test("Docker Compose renders both projects without pulling or contacting a daemo
     MOCK_PROVISIONING_PROVIDER_TOKEN: credentialFixture("provisioning-provider"),
     MOCK_MAIL_PROVIDER_TOKEN: credentialFixture("mail-provider"),
     MOCK_PROVIDER_PLATFORM_TOKEN: credentialFixture("provider-platform"),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: Buffer.alloc(32, 4).toString("base64url"),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: "1",
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: "",
     LAB_MAILBOX_TOKEN: credentialFixture("mailbox"),
     MOCK_PAYMENT_WEBHOOK_SECRET: credentialFixture("payment-webhook"),
     MOCK_PROVISIONING_WEBHOOK_SECRET: credentialFixture("provisioning-webhook"),

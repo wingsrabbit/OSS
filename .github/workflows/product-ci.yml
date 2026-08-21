@@ -119,6 +119,9 @@ jobs:
       MOCK_PROVISIONING_PROVIDER_TOKEN: ci-only-provision-token-000000000000000
       MOCK_MAIL_PROVIDER_TOKEN: ci-only-mail-token-00000000000000000000
       MOCK_PROVIDER_PLATFORM_TOKEN: ci-only-provider-platform-token-00000000
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: "1"
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: ""
       LAB_MAILBOX_TOKEN: ci-only-mailbox-token-000000000000000000
       PROVIDER_OPERATION_CAPABILITY_SECRET: ci-only-operation-capability-secret-000000
       PAYMENT_METHOD_TOKEN_KEY: FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU
@@ -261,6 +264,9 @@ jobs:
 
       - name: Verify Schema 028 native Provider evidence history, catalog, and application gate
         run: pnpm --filter @opensales/api test:integration:schema-028-native
+
+      - name: Run Schema 029 Service password change PostgreSQL, Worker, and Mock Provider journey
+        run: pnpm --filter @opensales/api test:integration:service-password-changes
 
       - name: Run notification preferences and versioned templates PostgreSQL 18 journey
         run: pnpm --filter @opensales/api test:integration:notification-preferences-templates

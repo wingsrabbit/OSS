@@ -117,14 +117,21 @@ test("legacy Demo config gains independent identity and Provider platform secret
   const generated = [];
   const tokenFactory = (bytes) => {
     generated.push(bytes ?? null);
-    return bytes === 32 ? "synthetic-identity-key" : "synthetic-platform-token";
+    if (bytes !== 32) return "synthetic-platform-token";
+    return generated.length === 2
+      ? Buffer.alloc(32, 7).toString("base64url")
+      : Buffer.alloc(32, 8).toString("base64url");
   };
   assert.equal(upgradeExistingDemoConfig(config, tokenFactory), true);
-  assert.deepEqual(generated, [null, 32]);
+  assert.deepEqual(generated, [null, 32, 32]);
   assert.equal(config.secrets.providerPlatformToken, "synthetic-platform-token");
-  assert.equal(config.secrets.identitySecretKey, "synthetic-identity-key");
+  assert.equal(
+    config.secrets.providerRequestFingerprintKey,
+    Buffer.alloc(32, 7).toString("base64url"),
+  );
+  assert.equal(config.secrets.identitySecretKey, Buffer.alloc(32, 8).toString("base64url"));
   assert.equal(upgradeExistingDemoConfig(config, tokenFactory), false);
-  assert.deepEqual(generated, [null, 32], "an upgraded config must not rotate either secret");
+  assert.deepEqual(generated, [null, 32, 32], "an upgraded config must not rotate any secret");
 });
 
 test("Demo API and Worker share the notification budget and Worker receives identity settings", () => {

@@ -154,6 +154,30 @@ export function decryptIdentitySecret(
   return Buffer.concat([decipher.update(payload), decipher.final()]).toString("utf8");
 }
 
+/**
+ * Produces a keyed, domain-separated digest for comparing a secret-bearing
+ * idempotent intent without retaining the secret itself. The digest is not an
+ * authentication credential and must never be returned to a caller.
+ */
+export function digestIdentitySecret(
+  plaintext: string,
+  purpose: string,
+  subjectId: string,
+  keyring: IdentitySecretKeyring,
+  keyVersion = keyring.activeVersion,
+): Readonly<{ digest: string; keyVersion: number }> {
+  if (!plaintext || plaintext.length > 20_000 || !purpose || !subjectId) {
+    throw new Error("Identity secret digest input is invalid");
+  }
+  return {
+    digest: createHmac("sha256", keyForVersion(keyring, keyVersion))
+      .update(`opensales:identity-secret-digest:v1:${keyVersion}:${purpose}:${subjectId}\0`, "utf8")
+      .update(plaintext, "utf8")
+      .digest("hex"),
+    keyVersion,
+  };
+}
+
 export function canonicalCustomerApiKeyScopes(
   scopes: readonly string[],
 ): readonly CustomerApiKeyScope[] {

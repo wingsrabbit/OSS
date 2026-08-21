@@ -201,7 +201,7 @@ export async function assertSchema028CatalogShape(
   );
 }
 
-async function assertSchema028EvidenceState(
+export async function assertSchema028EvidenceState(
   database: RollbackPreflightQueryable,
 ): Promise<void> {
   const result = await database.query(

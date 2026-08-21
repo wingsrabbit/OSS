@@ -10,6 +10,7 @@ import {
   createCustomerApiKey,
   createIdentitySecretKeyring,
   decryptIdentitySecret,
+  digestIdentitySecret,
   digestCustomerApiKey,
   digestRecoveryCode,
   encryptIdentitySecret,
@@ -29,6 +30,22 @@ test("TOTP matches the RFC 6238 SHA-1 vector and verifies only the fixed window"
   assert.deepEqual(base32Decode(secret), Buffer.from("12345678901234567890", "ascii"));
   assert.throws(() => base32Decode(`${secret}=`));
   assert.throws(() => base32Decode("MZ"));
+});
+
+test("identity secret digests are keyed, versioned, and domain separated", () => {
+  const current = randomBytes(32).toString("base64url");
+  const previous = randomBytes(32).toString("base64url");
+  const keyring = createIdentitySecretKeyring(2, current, `1:${previous}`);
+  const first = digestIdentitySecret("synthetic-password", "service-password", "service-1", keyring);
+  const repeated = digestIdentitySecret("synthetic-password", "service-password", "service-1", keyring);
+  const prior = digestIdentitySecret("synthetic-password", "service-password", "service-1", keyring, 1);
+  assert.deepEqual(first, repeated);
+  assert.match(first.digest, /^[0-9a-f]{64}$/);
+  assert.notEqual(first.digest, prior.digest);
+  assert.notEqual(
+    first.digest,
+    digestIdentitySecret("synthetic-password", "service-password", "service-2", keyring).digest,
+  );
 });
 
 test("identity secret envelopes bind version, purpose, and subject", () => {

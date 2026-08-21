@@ -14,10 +14,14 @@ import {
 
 const databaseUrl = process.env.PROVIDER_DATABASE_URL;
 const token = process.env.MOCK_PROVIDER_PLATFORM_TOKEN;
+const requestFingerprintKey = process.env.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY;
 const expectedDatabaseName = process.env.PROVIDER_CONFORMANCE_DATABASE_NAME;
 if (!databaseUrl) throw new Error("PROVIDER_DATABASE_URL is required");
 if (!token || token.length < 32) {
   throw new Error("MOCK_PROVIDER_PLATFORM_TOKEN must contain at least 32 synthetic characters");
+}
+if (!requestFingerprintKey || !/^[A-Za-z0-9_-]{43}$/u.test(requestFingerprintKey)) {
+  throw new Error("MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY must be a canonical 32-byte base64url key");
 }
 if (expectedDatabaseName) {
   const parsedDatabaseName = decodeURIComponent(new URL(databaseUrl).pathname.replace(/^\//, ""));
@@ -61,6 +65,9 @@ async function startProvider(): Promise<{ child: ChildProcess; output: () => str
       ...process.env,
       PROVIDER_DATABASE_URL: databaseUrl,
       MOCK_PROVIDER_PLATFORM_TOKEN: token,
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: requestFingerprintKey,
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: "1",
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: "",
       // Public Provider contract conformance owns its synthetic resource lifecycle.
       // Keep the legacy provisioning store out of this isolated adapter run.
       MOCK_PROVISIONING_PROVIDER_TOKEN: undefined,

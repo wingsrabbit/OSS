@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ApiError, api } from "./api.js";
 import type { Locale } from "./CustomerBusinessHistory.js";
 
@@ -31,14 +31,35 @@ type OperationsResponse = {
   }>;
 };
 
+type PasswordChangesResponse = {
+  warning: string;
+  service: {
+    id: string;
+    productName: string;
+    status: string;
+    version: number;
+    resourceRevision: number;
+    canChangePassword: boolean;
+  };
+  items: Array<{
+    requestId: string;
+    action: "change_password";
+    actorType?: "user" | "staff";
+    status: string;
+    revision: number;
+    detail?: string | null;
+    updatedAt: string;
+  }>;
+};
+
 const volatileIntentKeys = new Map<string, string>();
 
-function intentStorageKey(endpoint: string, intent: string): string {
-  return `opensales:service-operation-intent:v1:${endpoint}:${intent}`;
+function intentStorageKey(scopeKey: string, endpoint: string, intent: string): string {
+  return `opensales:service-operation-intent:v2:${scopeKey}:${endpoint}:${intent}`;
 }
 
-function stableIntentKey(endpoint: string, intent: string): string {
-  const storageKey = intentStorageKey(endpoint, intent);
+function stableIntentKey(scopeKey: string, endpoint: string, intent: string): string {
+  const storageKey = intentStorageKey(scopeKey, endpoint, intent);
   try {
     const stored = window.localStorage.getItem(storageKey);
     if (stored) return stored;
@@ -54,13 +75,17 @@ function stableIntentKey(endpoint: string, intent: string): string {
   }
 }
 
-function clearIntentKey(endpoint: string, intent: string): void {
-  const storageKey = intentStorageKey(endpoint, intent);
-  volatileIntentKeys.delete(storageKey);
+function clearIntentKey(scopeKey: string, endpoint: string, intent: string, expectedKey: string): void {
+  const storageKey = intentStorageKey(scopeKey, endpoint, intent);
+  if (volatileIntentKeys.get(storageKey) === expectedKey) {
+    volatileIntentKeys.delete(storageKey);
+  }
   try {
-    window.localStorage.removeItem(storageKey);
+    if (window.localStorage.getItem(storageKey) === expectedKey) {
+      window.localStorage.removeItem(storageKey);
+    }
   } catch {
-    // Memory fallback was already cleared.
+    // The matching memory fallback was already cleared.
   }
 }
 
@@ -69,12 +94,31 @@ function isDefinitiveBusinessRejection(error: unknown): boolean {
     ![408, 425, 429].includes(error.status);
 }
 
+type AccessScopeToken = Readonly<{
+  key: string;
+  generation: number;
+}>;
+
+type AccessScopeState = {
+  key: string;
+  generation: number;
+  mounted: boolean;
+};
+
+type ActiveIntent = {
+  scope: AccessScopeToken;
+  endpoint: string;
+  intent: string;
+  idempotencyKey: string;
+  mutationDispatched: boolean;
+};
+
 export function ServiceOperationsPanel({
   endpoint,
   canManage,
   locale,
   staff = false,
-  additionalReauthFields,
+  accessFingerprint,
   onNotice,
   onError,
 }: {
@@ -82,18 +126,56 @@ export function ServiceOperationsPanel({
   canManage: boolean;
   locale: Locale;
   staff?: boolean;
-  additionalReauthFields?: () => Readonly<Record<string, unknown>>;
+  accessFingerprint: string;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
 }) {
   const [data, setData] = useState<OperationsResponse | null>(null);
+  const [passwordChanges, setPasswordChanges] = useState<PasswordChangesResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [password, setPassword] = useState("");
-  const [reason, setReason] = useState(
-    locale === "zh-CN" ? "已核验的日常资源操作" : "Verified daily resource operation",
-  );
+  const [factorCode, setFactorCode] = useState("");
+  const [newServicePassword, setNewServicePassword] = useState("");
+  const [confirmServicePassword, setConfirmServicePassword] = useState("");
   const zh = locale === "zh-CN";
+  const defaultReason = zh ? "已核验的日常资源操作" : "Verified daily resource operation";
+  const [reason, setReason] = useState(defaultReason);
+  const passwordChangeEndpoint = endpoint.replace(/\/operations$/, "/password-changes");
+  const scopeKey = JSON.stringify([accessFingerprint, endpoint, canManage, staff]);
+  const accessScope = useRef<AccessScopeState>({
+    key: scopeKey,
+    generation: 0,
+    mounted: false,
+  });
+  if (accessScope.current.key !== scopeKey) {
+    accessScope.current = {
+      key: scopeKey,
+      generation: accessScope.current.generation + 1,
+      mounted: accessScope.current.mounted,
+    };
+  }
+  const activeIntent = useRef<ActiveIntent | null>(null);
+  const refreshGeneration = useRef(0);
+  const onNoticeRef = useRef(onNotice);
+  const onErrorRef = useRef(onError);
+  onNoticeRef.current = onNotice;
+  onErrorRef.current = onError;
+
+  const captureScope = useCallback(
+    (): AccessScopeToken => ({
+      key: accessScope.current.key,
+      generation: accessScope.current.generation,
+    }),
+    [],
+  );
+  const scopeIsCurrent = useCallback(
+    (scope: AccessScopeToken): boolean =>
+      accessScope.current.mounted &&
+      accessScope.current.key === scope.key &&
+      accessScope.current.generation === scope.generation,
+    [],
+  );
   const actionLabel = (action: Action): string => ({
     start: zh ? "启动" : "Start",
     stop: zh ? "停止" : "Stop",
@@ -124,103 +206,323 @@ export function ServiceOperationsPanel({
     return labels[reasonCode]?.[zh ? 1 : 0] ?? null;
   };
 
-  async function refresh(): Promise<void> {
+  const refresh = useCallback(async (scope: AccessScopeToken): Promise<boolean> => {
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope)) return false;
+    const requestGeneration = ++refreshGeneration.current;
     setLoading(true);
     try {
-      setData(await api<OperationsResponse>(endpoint));
+      const [operations, changes] = await Promise.all([
+        api<OperationsResponse>(endpoint),
+        api<PasswordChangesResponse>(passwordChangeEndpoint),
+      ]);
+      if (!scopeIsCurrent(scope) || refreshGeneration.current !== requestGeneration) return false;
+      setData(operations);
+      setPasswordChanges(changes);
+      return true;
     } catch (caught) {
-      onError(
+      if (!scopeIsCurrent(scope) || refreshGeneration.current !== requestGeneration) return false;
+      onErrorRef.current(
         caught instanceof Error
           ? `${zh ? "无法加载服务操作" : "Service operations could not be loaded"}: ${caught.message}`
           : zh ? "无法加载服务操作" : "Service operations could not be loaded",
       );
+      return false;
     } finally {
-      setLoading(false);
+      if (scopeIsCurrent(scope) && refreshGeneration.current === requestGeneration) {
+        setLoading(false);
+      }
     }
-  }
+  }, [endpoint, passwordChangeEndpoint, scopeIsCurrent, scopeKey, zh]);
+
+  useLayoutEffect(() => {
+    accessScope.current.mounted = true;
+    refreshGeneration.current += 1;
+    setData(null);
+    setPasswordChanges(null);
+    setLoading(false);
+    setPending(null);
+    setPassword("");
+    setFactorCode("");
+    setNewServicePassword("");
+    setConfirmServicePassword("");
+    setReason(defaultReason);
+    return () => {
+      const intent = activeIntent.current;
+      if (intent && !intent.mutationDispatched) {
+        clearIntentKey(intent.scope.key, intent.endpoint, intent.intent, intent.idempotencyKey);
+      }
+      activeIntent.current = null;
+      refreshGeneration.current += 1;
+      accessScope.current = {
+        key: accessScope.current.key,
+        generation: accessScope.current.generation + 1,
+        mounted: false,
+      };
+    };
+  }, [scopeKey]);
 
   useEffect(() => {
-    void refresh();
-  }, [endpoint]);
+    const scope = captureScope();
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope)) return;
+    void refresh(scope);
+  }, [captureScope, refresh, scopeIsCurrent, scopeKey]);
 
-  async function reauthenticate(): Promise<void> {
-    if (!staff) return;
-    if (!password) {
-      throw new Error(zh ? "Staff 服务操作前请重新输入密码" : "Re-enter your password before a Staff service operation");
+  function beginIntent(
+    scope: AccessScopeToken,
+    intentEndpoint: string,
+    intent: string,
+  ): ActiveIntent {
+    const started = {
+      scope,
+      endpoint: intentEndpoint,
+      intent,
+      idempotencyKey: stableIntentKey(scope.key, intentEndpoint, intent),
+      mutationDispatched: false,
+    };
+    activeIntent.current = started;
+    return started;
+  }
+
+  function finishIntent(started: ActiveIntent, clear: boolean): void {
+    if (clear) {
+      clearIntentKey(started.scope.key, started.endpoint, started.intent, started.idempotencyKey);
     }
-    await api("/api/v1/auth/reauth", {
-      method: "POST",
-      body: JSON.stringify({ password, ...additionalReauthFields?.() }),
-    });
+    if (activeIntent.current === started) activeIntent.current = null;
+  }
+
+  function validateReauthenticationInput(required: boolean): boolean {
+    if (!required || password.length > 0 || factorCode.trim().length === 0) return true;
+    onErrorRef.current(
+      zh
+        ? "TOTP 或恢复码必须与当前密码一起提交。"
+        : "A TOTP or recovery code must be submitted with the current password.",
+    );
+    return false;
+  }
+
+  async function reauthenticate(
+    scope: AccessScopeToken,
+    required: boolean,
+    submittedPassword: string,
+    submittedFactorCode: string,
+  ): Promise<boolean> {
+    if (!required || submittedPassword.length === 0) return scopeIsCurrent(scope);
+    try {
+      await api("/api/v1/auth/reauth", {
+        method: "POST",
+        body: JSON.stringify({
+          password: submittedPassword,
+          ...(submittedFactorCode ? { factorCode: submittedFactorCode } : {}),
+        }),
+      });
+    } catch (caught) {
+      if (!scopeIsCurrent(scope)) return false;
+      throw caught;
+    }
+    if (!scopeIsCurrent(scope)) return false;
+    setPassword("");
+    setFactorCode("");
+    return true;
+  }
+
+  async function changeServicePassword(): Promise<void> {
+    const scope = captureScope();
+    if (
+      scope.key !== scopeKey ||
+      !scopeIsCurrent(scope) ||
+      !canManage ||
+      !passwordChanges?.service.canChangePassword ||
+      pending
+    ) return;
+    if (!newServicePassword || newServicePassword.length < 12) {
+      onErrorRef.current(zh ? "新服务密码至少需要 12 个字符。" : "The new service password must contain at least 12 characters.");
+      return;
+    }
+    if (newServicePassword !== confirmServicePassword) {
+      onErrorRef.current(zh ? "两次输入的新服务密码不一致。" : "The new service password confirmation does not match.");
+      return;
+    }
+    if (!validateReauthenticationInput(true)) return;
+    const submittedPassword = password;
+    const submittedFactorCode = factorCode.trim();
+    const submittedServicePassword = newServicePassword;
+    const submittedReason = reason;
+    const expectedServiceVersion = passwordChanges.service.version;
+    const expectedResourceRevision = passwordChanges.service.resourceRevision;
+    const intent = "change-password";
+    const started = beginIntent(scope, passwordChangeEndpoint, intent);
+    setPending(intent);
+    try {
+      if (!await reauthenticate(scope, true, submittedPassword, submittedFactorCode)) {
+        finishIntent(started, true);
+        return;
+      }
+      if (!scopeIsCurrent(scope)) {
+        finishIntent(started, true);
+        return;
+      }
+      started.mutationDispatched = true;
+      try {
+        await api(passwordChangeEndpoint, {
+          method: "POST",
+          body: JSON.stringify({
+            expectedServiceVersion,
+            expectedResourceRevision,
+            idempotencyKey: started.idempotencyKey,
+            newPassword: submittedServicePassword,
+            ...(staff ? { reason: submittedReason } : {}),
+          }),
+        });
+      } catch (caught) {
+        if (isDefinitiveBusinessRejection(caught)) finishIntent(started, true);
+        if (!scopeIsCurrent(scope)) return;
+        throw caught;
+      }
+      finishIntent(started, true);
+      if (!scopeIsCurrent(scope)) return;
+      setPassword("");
+      setFactorCode("");
+      setNewServicePassword("");
+      setConfirmServicePassword("");
+      if (!await refresh(scope) || !scopeIsCurrent(scope)) return;
+      onNoticeRef.current(
+        zh
+          ? "服务密码变更已安全排队；新密码不会出现在历史记录中。"
+          : "The service password change was safely queued; the new password will not appear in history.",
+      );
+    } catch (caught) {
+      if (!started.mutationDispatched) finishIntent(started, true);
+      if (!scopeIsCurrent(scope)) return;
+      onErrorRef.current(
+        caught instanceof Error
+          ? `${zh ? "服务密码变更失败" : "Service password change failed"}: ${caught.message}`
+          : zh ? "服务密码变更失败" : "Service password change failed",
+      );
+    } finally {
+      if (activeIntent.current === started) activeIntent.current = null;
+      if (scopeIsCurrent(scope)) setPending(null);
+    }
   }
 
   async function run(action: Action): Promise<void> {
-    if (!data || pending) return;
+    const scope = captureScope();
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !canManage || !data || pending) return;
+    if (!validateReauthenticationInput(staff)) return;
+    const submittedPassword = password;
+    const submittedFactorCode = factorCode.trim();
+    const submittedReason = reason;
+    const expectedServiceVersion = data.service.version;
+    const expectedResourceRevision = data.service.resourceRevision;
+    const started = beginIntent(scope, endpoint, action);
     setPending(action);
-    const idempotencyKey = stableIntentKey(endpoint, action);
     try {
-      await reauthenticate();
-      await api(endpoint, {
-        method: "POST",
-        body: JSON.stringify({
-          action,
-          expectedServiceVersion: data.service.version,
-          expectedResourceRevision: data.service.resourceRevision,
-          idempotencyKey,
-          ...(staff ? { reason } : {}),
-        }),
-      });
-      clearIntentKey(endpoint, action);
+      if (!await reauthenticate(scope, staff, submittedPassword, submittedFactorCode)) {
+        finishIntent(started, true);
+        return;
+      }
+      if (!scopeIsCurrent(scope)) {
+        finishIntent(started, true);
+        return;
+      }
+      started.mutationDispatched = true;
+      try {
+        await api(endpoint, {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            expectedServiceVersion,
+            expectedResourceRevision,
+            idempotencyKey: started.idempotencyKey,
+            ...(staff ? { reason: submittedReason } : {}),
+          }),
+        });
+      } catch (caught) {
+        if (isDefinitiveBusinessRejection(caught)) finishIntent(started, true);
+        if (!scopeIsCurrent(scope)) return;
+        throw caught;
+      }
+      finishIntent(started, true);
+      if (!scopeIsCurrent(scope)) return;
       setPassword("");
-      await refresh();
-      onNotice(
+      setFactorCode("");
+      if (!await refresh(scope) || !scopeIsCurrent(scope)) return;
+      onNoticeRef.current(
         zh
           ? `${actionLabel(action)}已持久排队，或已进入 Staff 人工处理。`
           : `${actionLabel(action)} was durably queued or moved to Staff manual fallback.`,
       );
     } catch (caught) {
-      if (isDefinitiveBusinessRejection(caught)) clearIntentKey(endpoint, action);
-      onError(
+      if (!started.mutationDispatched) finishIntent(started, true);
+      if (!scopeIsCurrent(scope)) return;
+      onErrorRef.current(
         caught instanceof Error
           ? `${zh ? "服务操作失败" : "Service operation failed"}: ${caught.message}`
           : zh ? "服务操作失败" : "Service operation failed",
       );
     } finally {
-      setPending(null);
+      if (activeIntent.current === started) activeIntent.current = null;
+      if (scopeIsCurrent(scope)) setPending(null);
     }
   }
 
   async function completeManual(requestId: string): Promise<void> {
-    if (!data || pending) return;
-    setPending(requestId);
+    const scope = captureScope();
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !staff || !canManage || !data || pending) return;
+    if (!validateReauthenticationInput(true)) return;
+    const submittedPassword = password;
+    const submittedFactorCode = factorCode.trim();
+    const submittedReason = reason;
+    const expectedServiceVersion = data.service.version;
+    const expectedResourceRevision = data.service.resourceRevision;
     const intent = `manual-${requestId}`;
-    const idempotencyKey = stableIntentKey(endpoint, intent);
+    const started = beginIntent(scope, endpoint, intent);
+    setPending(requestId);
     try {
-      await reauthenticate();
-      await api(`/api/v1/admin/service-operations/${requestId}/complete-manual`, {
-        method: "POST",
-        body: JSON.stringify({
-          expectedServiceVersion: data.service.version,
-          expectedResourceRevision: data.service.resourceRevision,
-          reason,
-          idempotencyKey,
-        }),
-      });
-      clearIntentKey(endpoint, intent);
+      if (!await reauthenticate(scope, true, submittedPassword, submittedFactorCode)) {
+        finishIntent(started, true);
+        return;
+      }
+      if (!scopeIsCurrent(scope)) {
+        finishIntent(started, true);
+        return;
+      }
+      started.mutationDispatched = true;
+      try {
+        await api(`/api/v1/admin/service-operations/${requestId}/complete-manual`, {
+          method: "POST",
+          body: JSON.stringify({
+            expectedServiceVersion,
+            expectedResourceRevision,
+            reason: submittedReason,
+            idempotencyKey: started.idempotencyKey,
+          }),
+        });
+      } catch (caught) {
+        if (isDefinitiveBusinessRejection(caught)) finishIntent(started, true);
+        if (!scopeIsCurrent(scope)) return;
+        throw caught;
+      }
+      finishIntent(started, true);
+      if (!scopeIsCurrent(scope)) return;
       setPassword("");
-      await refresh();
-      onNotice(zh ? "已记录服务操作的人工完成事实。" : "Manual service operation completion was recorded.");
+      setFactorCode("");
+      if (!await refresh(scope) || !scopeIsCurrent(scope)) return;
+      onNoticeRef.current(zh ? "已记录服务操作的人工完成事实。" : "Manual service operation completion was recorded.");
     } catch (caught) {
-      if (isDefinitiveBusinessRejection(caught)) clearIntentKey(endpoint, intent);
-      onError(
+      if (!started.mutationDispatched) finishIntent(started, true);
+      if (!scopeIsCurrent(scope)) return;
+      onErrorRef.current(
         caught instanceof Error
           ? `${zh ? "人工完成失败" : "Manual completion failed"}: ${caught.message}`
           : zh ? "人工完成失败" : "Manual completion failed",
       );
     } finally {
-      setPending(null);
+      if (activeIntent.current === started) activeIntent.current = null;
+      if (scopeIsCurrent(scope)) setPending(null);
     }
   }
+
+  const factorRequiresPassword = password.length === 0 && factorCode.trim().length > 0;
 
   return (
     <section className="service-operations" data-testid={staff ? "staff-service-operations" : "customer-service-operations"}>
@@ -233,7 +535,7 @@ export function ServiceOperationsPanel({
               : "Power state is independent from billing suspension, cancellation and termination."}
           </p>
         </div>
-        <button disabled={loading} onClick={() => void refresh()}>
+        <button disabled={loading} onClick={() => void refresh(captureScope())}>
           {loading ? (zh ? "刷新中…" : "Refreshing…") : (zh ? "刷新" : "Refresh")}
         </button>
       </div>
@@ -247,14 +549,42 @@ export function ServiceOperationsPanel({
           </p>
           {staff && canManage && (
             <div className="manual-fields">
+              <p className="muted">
+                {zh
+                  ? "已有有效的 15 分钟授权时，密码与 TOTP / 恢复码都可留空；否则输入当前密码，并在已启用时输入 TOTP 或一次性恢复码。"
+                  : "Leave both fields blank to reuse a current 15-minute grant. Otherwise enter the current password and, when enabled, a TOTP or one-time recovery code."}
+              </p>
               <label>
                 {zh ? "Staff 操作原因" : "Staff reason"}
-                <input value={reason} onChange={(event) => setReason(event.target.value)} minLength={10} />
+                <input value={reason} onChange={(event) => setReason(event.target.value)} minLength={10} disabled={pending !== null} />
               </label>
               <label>
-                {zh ? "密码确认" : "Password confirmation"}
-                <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" />
+                {zh ? "Staff 当前密码确认" : "Staff current password"}
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="current-password"
+                  disabled={pending !== null}
+                />
               </label>
+              <label>
+                {zh ? "Staff TOTP 或恢复码" : "Staff TOTP or recovery code"}
+                <input
+                  value={factorCode}
+                  onChange={(event) => setFactorCode(event.target.value)}
+                  autoComplete="one-time-code"
+                  aria-invalid={factorRequiresPassword}
+                  disabled={pending !== null}
+                />
+              </label>
+              {factorRequiresPassword && (
+                <p className="notice error" data-testid="service-operation-factor-requires-password">
+                  {zh
+                    ? "请输入当前密码，或清空 TOTP / 恢复码以复用现有授权。"
+                    : "Enter the current password, or clear the TOTP / recovery code to reuse the current grant."}
+                </p>
+              )}
             </div>
           )}
           {canManage && (
@@ -289,6 +619,91 @@ export function ServiceOperationsPanel({
               </div>
             ))}
           </div>
+          {passwordChanges && (
+            <div className="manual-list" data-testid="service-password-change-panel">
+              <h4>{zh ? "服务密码" : "Service password"}</h4>
+              <p className="muted">
+                {zh
+                  ? "已有有效的 15 分钟授权时可留空重新认证字段；否则输入当前密码，并在已启用时输入 TOTP 或一次性恢复码。新服务密码只会在 Worker 内存中解密并发送给 Mock Provider，不会显示在历史记录。"
+                  : "Leave reauthentication fields blank to reuse a current 15-minute grant. Otherwise enter the current password and, when enabled, a TOTP or one-time recovery code. The new service password is decrypted only in Worker memory for the Mock Provider and is never displayed in history."}
+              </p>
+              {canManage && passwordChanges.service.canChangePassword && (
+                <div className="manual-fields">
+                  {!staff && (
+                    <label>
+                      {zh ? "当前账户密码确认" : "Current account password"}
+                      <input
+                        type="password"
+                        value={password}
+                        onChange={(event) => setPassword(event.target.value)}
+                        autoComplete="current-password"
+                        disabled={pending !== null}
+                      />
+                    </label>
+                  )}
+                  {!staff && (
+                    <label>
+                      {zh ? "TOTP 或恢复码" : "TOTP or recovery code"}
+                      <input
+                        value={factorCode}
+                        onChange={(event) => setFactorCode(event.target.value)}
+                        autoComplete="one-time-code"
+                        aria-invalid={factorRequiresPassword}
+                        disabled={pending !== null}
+                      />
+                    </label>
+                  )}
+                  {!staff && factorRequiresPassword && (
+                    <p className="notice error" data-testid="service-password-factor-requires-password">
+                      {zh
+                        ? "请输入当前密码，或清空 TOTP / 恢复码以复用现有授权。"
+                        : "Enter the current password, or clear the TOTP / recovery code to reuse the current grant."}
+                    </p>
+                  )}
+                  <label>
+                    {zh ? "新服务密码" : "New service password"}
+                    <input
+                      type="password"
+                      value={newServicePassword}
+                      onChange={(event) => setNewServicePassword(event.target.value)}
+                      minLength={12}
+                      maxLength={128}
+                      autoComplete="new-password"
+                      disabled={pending !== null}
+                    />
+                  </label>
+                  <label>
+                    {zh ? "确认新服务密码" : "Confirm new service password"}
+                    <input
+                      type="password"
+                      value={confirmServicePassword}
+                      onChange={(event) => setConfirmServicePassword(event.target.value)}
+                      minLength={12}
+                      maxLength={128}
+                      autoComplete="new-password"
+                      disabled={pending !== null}
+                    />
+                  </label>
+                  <button disabled={pending !== null} onClick={() => void changeServicePassword()}>
+                    {pending === "change-password"
+                      ? (zh ? "正在排队…" : "Queueing…")
+                      : (zh ? "变更服务密码" : "Change service password")}
+                  </button>
+                </div>
+              )}
+              {passwordChanges.items.length === 0 && (
+                <p className="muted">{zh ? "尚无密码变更事实。" : "No password-change facts yet."}</p>
+              )}
+              {passwordChanges.items.map((item) => (
+                <div className="manual-item" key={item.requestId}>
+                  <strong>{zh ? "变更密码" : "Change password"} · {statusLabel(item.status)}</strong>
+                  <span>{new Date(item.updatedAt).toLocaleString(locale)}</span>
+                  {staff && item.detail && <span>{item.detail}</span>}
+                  <span className="mono">{item.requestId}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </>
       )}
     </section>

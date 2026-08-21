@@ -4937,6 +4937,7 @@ export function App() {
             active={route === "/customer"}
             canReadHistory={canReadCustomerHistory}
             canManageServices={canManageServices}
+            accessFingerprint={customerCommerceAccessFingerprint}
             clientAccountId={me.clientAccountId}
             locale={locale}
             onNotice={showTicketNotice}

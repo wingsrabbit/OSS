@@ -65,6 +65,10 @@ The profiles have separate database credentials:
 - TestB receives only its four Provider database passwords.
 - The five Mock bearer credentials, mailbox credential, and two callback signing secrets are paired
   deliberately across the exact consumers on the two hosts.
+- The Provider request-fingerprint HMAC key is Provider-only. Rotate its version independently of the
+  Platform bearer token and retain every old `version:key` entry for the Provider database and all
+  recoverable backups. The bounded keyring permits at most 32 lifetime versions; it has no automatic
+  retirement path.
 
 `CORE_PUBLIC_URL`, `PROVIDER_BASE_URL`, and `CORE_CALLBACK_URL` must be reviewed HTTPS origins whose
 certificates match the configured names. Mount the certificate and key through the Compose secret

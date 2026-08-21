@@ -111,6 +111,10 @@ export function upgradeExistingDemoConfig(config, tokenFactory = secureToken) {
     config.secrets.providerPlatformToken = tokenFactory();
     changed = true;
   }
+  if (!config.secrets.providerRequestFingerprintKey) {
+    config.secrets.providerRequestFingerprintKey = tokenFactory(32);
+    changed = true;
+  }
   if (!config.secrets.identitySecretKey) {
     config.secrets.identitySecretKey = tokenFactory(32);
     changed = true;
@@ -137,6 +141,7 @@ function createConfig() {
       paymentProviderToken: secureToken(),
       provisioningProviderToken: secureToken(),
       providerPlatformToken: secureToken(),
+      providerRequestFingerprintKey: secureToken(32),
       mailProviderToken: secureToken(),
       mailboxToken: secureToken(),
       providerOperationCapabilitySecret: secureToken(),
@@ -467,6 +472,9 @@ function providerEnvironment(config, kind) {
       PROVIDER_DATABASE_URL: postgresUrl(config, "provisioning_provider"),
       MOCK_PROVISIONING_PROVIDER_TOKEN: config.secrets.provisioningProviderToken,
       MOCK_PROVIDER_PLATFORM_TOKEN: config.secrets.providerPlatformToken,
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: config.secrets.providerRequestFingerprintKey,
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: "1",
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: "",
       MOCK_PROVIDER_PUBLIC_BASE_URL: `http://127.0.0.1:${config.ports.provisioning}`,
       MOCK_PROVISIONING_WEBHOOK_SECRET: config.secrets.provisioningWebhookSecret,
     };

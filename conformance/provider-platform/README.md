@@ -28,6 +28,7 @@ Build the contracts, SDK, Mock Lab, and this package, then run:
 PROVIDER_DATABASE_URL=postgresql://... \
 PROVIDER_CONFORMANCE_DATABASE_NAME=provider \
 MOCK_PROVIDER_PLATFORM_TOKEN=replace-with-a-synthetic-32-byte-token \
+MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY=__SET_EXACTLY_32_BYTES_AS_BASE64URL__ \
 node conformance/provider-platform/dist/mock-lab.integration.js
 ```
 

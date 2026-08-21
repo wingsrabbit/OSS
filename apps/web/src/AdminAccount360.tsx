@@ -638,6 +638,7 @@ export function AdminAccount360({
                         <ServiceOperationsPanel
                           endpoint={`/api/v1/admin/client-accounts/${data.account.id}/services/${service.id}/operations`}
                           canManage={canManageServiceOperations}
+                          accessFingerprint={`${accessFingerprint}:${data.account.id}:${service.id}:${canManageServiceOperations ? "manage" : "read"}`}
                           locale={locale}
                           staff
                           onNotice={onNotice}

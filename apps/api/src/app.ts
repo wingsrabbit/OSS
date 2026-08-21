@@ -10,7 +10,7 @@ import type { Config } from "./config.js";
 import {
   assertPaymentMethodTokenKeyringsCompatible,
   createPool,
-  holdSchema028ApplicationGuard,
+  holdSchema029ApplicationGuard,
   holdPaymentMethodTokenRegistryExtensionGuard,
   type DatabasePool,
 } from "./database.js";
@@ -42,6 +42,7 @@ import { registerRefundRoutes } from "./routes-refunds.js";
 import { registerRenewalRoutes } from "./routes-renewals.js";
 import { registerServiceRoutes } from "./routes-services.js";
 import { registerServiceOperationRoutes } from "./routes-service-operations.js";
+import { registerServicePasswordChangeRoutes } from "./routes-service-password-changes.js";
 import { registerTicketRoutes } from "./routes-tickets.js";
 import { registerSupportOperationRoutes } from "./routes-support-operations.js";
 import { registerIdentitySecurityRoutes } from "./routes-identity-security.js";
@@ -130,10 +131,10 @@ export async function buildApp(
   try {
     if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
       throw new Error(
-        "Schema 028 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
+        "Schema 029 API refuses the legacy 016-to-017 rollback bridge; use the matching historical application binary or migrate forward",
       );
     }
-    releaseSchemaRollbackGuard = await holdSchema028ApplicationGuard(pool);
+    releaseSchemaRollbackGuard = await holdSchema029ApplicationGuard(pool);
     releaseTokenRegistryGuard = providedPool
       ? null
       : await holdPaymentMethodTokenRegistryExtensionGuard(pool);
@@ -290,6 +291,7 @@ export async function buildApp(
   await registerRenewalRoutes(app, pool, config);
   await registerServiceRoutes(app, pool, config);
   await registerServiceOperationRoutes(app, pool, config);
+  await registerServicePasswordChangeRoutes(app, pool, config);
   await registerTicketRoutes(app, pool, config);
   await registerSupportOperationRoutes(app, pool, config);
   await registerNotificationOperationRoutes(app, pool, config);

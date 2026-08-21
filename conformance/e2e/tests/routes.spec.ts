@@ -305,6 +305,30 @@ async function installMockApi(
     if (
       request.method() === "GET" &&
       (
+        /^\/api\/v1\/services\/[0-9a-f-]+\/password-changes$/u.test(path) ||
+        /^\/api\/v1\/admin\/client-accounts\/[0-9a-f-]+\/services\/[0-9a-f-]+\/password-changes$/u.test(path)
+      )
+    ) {
+      const serviceId = path.split("/").at(-2) ?? "";
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          service: {
+            id: serviceId,
+            productName: "Synthetic route service",
+            status: "active",
+            version: 1,
+            resourceRevision: 0,
+            canChangePassword: true,
+          },
+          items: [],
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === "GET" &&
+      (
         /^\/api\/v1\/services\/[0-9a-f-]+\/operations$/u.test(path) ||
         /^\/api\/v1\/admin\/client-accounts\/[0-9a-f-]+\/services\/[0-9a-f-]+\/operations$/u.test(path)
       )
@@ -1482,6 +1506,621 @@ test("customer history restores independent facts, detail query and invoice PDF"
   await expect(trace).toContainText(renewalId);
   await expect(trace).toContainText(cancellationId);
   await expect(trace).toContainText("Synthetic linked support");
+});
+
+test("customer changes a Mock service password through password and MFA reauthentication without retaining it in UI history", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000002";
+  const orderId = "00000000-0000-4000-8000-000000000901";
+  const serviceId = "00000000-0000-4000-8000-000000000902";
+  const requestId = "00000000-0000-4000-8000-000000000903";
+  const occurredAt = "2026-08-21T06:00:00.000Z";
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [],
+    productName: "Synthetic password-change plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-21T06:00:00.000Z",
+    version: 1,
+    cancellation: null,
+  };
+  const newPassword = `${"B".repeat(18)}!029`;
+  const currentPassword = `${"A".repeat(18)}!029`;
+  const sensitiveRequestOrder: string[] = [];
+  let reauthBody: Record<string, unknown> = {};
+  let postedBody: Record<string, unknown> = {};
+  let passwordChangeItems: Array<Record<string, unknown>> = [];
+  let rejectNextReauthentication = true;
+
+  await installMockApi(page, mockViewer({ email: "service-password-change@example.invalid" }), {
+    intercept: async (path, route) => {
+      const method = route.request().method();
+      if (path === "/api/v1/auth/reauth" && method === "POST") {
+        sensitiveRequestOrder.push("reauth");
+        reauthBody = route.request().postDataJSON() as Record<string, unknown>;
+        if (rejectNextReauthentication) {
+          rejectNextReauthentication = false;
+          await route.fulfill({ status: 401, json: { error: "Synthetic MFA reauthentication failed" } });
+          return true;
+        }
+        return false;
+      }
+      if (path === "/api/v1/customer/business-history") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Synthetic password-change account" },
+            orders: [],
+            invoices: [],
+            payments: [],
+            credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+            refunds: [],
+            services: [service],
+            renewals: [],
+            cancellations: [],
+            tickets: [],
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/customer/services/${serviceId}`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: { ...service, externalResourceId: `mock-resource-${serviceId}` },
+            order: {
+              id: orderId,
+              status: "completed",
+              currency: "USD",
+              totalMinor: "100",
+              submittedAt: occurredAt,
+            },
+            invoices: [],
+            payments: [],
+            periods: [],
+            renewals: [],
+            cancellation: null,
+            tickets: [],
+            trace: {
+              orderId,
+              invoiceIds: [],
+              paymentIds: [],
+              renewalIds: [],
+              cancellationRequestId: null,
+              ticketIds: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "GET") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: {
+              id: serviceId,
+              productName: service.productName,
+              status: "active",
+              version: 1,
+              resourceRevision: 0,
+              canChangePassword: passwordChangeItems.length === 0,
+            },
+            items: passwordChangeItems,
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "POST") {
+        sensitiveRequestOrder.push("password-change");
+        postedBody = route.request().postDataJSON() as Record<string, unknown>;
+        passwordChangeItems = [{
+          requestId,
+          action: "change_password",
+          status: "queued",
+          revision: 0,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        }];
+        await route.fulfill({
+          status: 201,
+          json: {
+            requestId,
+            serviceId,
+            action: "change_password",
+            status: "queued",
+            serviceVersion: 1,
+            resourceRevision: 0,
+            createdAt: occurredAt,
+            replayed: false,
+          },
+        });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  await page.getByTestId("history-service").click();
+  await expect(page).toHaveURL(new RegExp(`service=${serviceId}`));
+  const panel = page.getByTestId("customer-service-operations");
+  const passwordPanel = panel.getByTestId("service-password-change-panel");
+  await expect(passwordPanel.getByRole("heading", { name: "Service password" })).toBeVisible();
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("TOTP or recovery code").fill("029029");
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await expect(passwordPanel.getByTestId("service-password-factor-requires-password")).toBeVisible();
+  expect(sensitiveRequestOrder).toEqual([]);
+
+  await passwordPanel.getByLabel("Current account password").fill(currentPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await expect(page.locator("main > .notice.error")).toContainText("Synthetic MFA reauthentication failed");
+  expect(sensitiveRequestOrder).toEqual(["reauth"]);
+  await expect(passwordPanel.getByLabel("Current account password")).toHaveValue(currentPassword);
+  await expect(passwordPanel.getByLabel("TOTP or recovery code")).toHaveValue("029029");
+  await expect(passwordPanel.getByLabel("New service password", { exact: true })).toHaveValue(newPassword);
+  await expect(passwordPanel.getByLabel("Confirm new service password", { exact: true })).toHaveValue(newPassword);
+
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+
+  await expect(page.locator("main > .notice")).toContainText(
+    "The service password change was safely queued; the new password will not appear in history.",
+  );
+  expect(sensitiveRequestOrder).toEqual(["reauth", "reauth", "password-change"]);
+  expect(reauthBody).toEqual({
+    password: currentPassword,
+    factorCode: "029029",
+  });
+  expect(postedBody).toMatchObject({
+    expectedServiceVersion: 1,
+    expectedResourceRevision: 0,
+    newPassword,
+  });
+  expect(String(postedBody.idempotencyKey)).toMatch(/^change-password-/u);
+  await expect(passwordPanel.getByLabel("Current account password")).toHaveCount(0);
+  await expect(passwordPanel.getByLabel("New service password", { exact: true })).toHaveCount(0);
+  await expect(passwordPanel).toContainText(`${requestId}`);
+  await expect(passwordPanel).not.toContainText(newPassword);
+  const storedBrowserState = await page.evaluate(() => JSON.stringify({
+    localStorage: { ...window.localStorage },
+    sessionStorage: { ...window.sessionStorage },
+  }));
+  expect(storedBrowserState).not.toContain(newPassword);
+});
+
+async function openCustomerPasswordChangeSurface(
+  page: Page,
+  hooks: {
+    reauthenticate?: (route: Route) => Promise<void>;
+    changePassword?: (route: Route) => Promise<void>;
+  } = {},
+) {
+  const accountId = "00000000-0000-4000-8000-000000000912";
+  const orderId = "00000000-0000-4000-8000-000000000913";
+  const serviceId = "00000000-0000-4000-8000-000000000914";
+  const requestId = "00000000-0000-4000-8000-000000000915";
+  const occurredAt = "2026-08-21T07:00:00.000Z";
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [],
+    productName: "Synthetic password barrier plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-21T07:00:00.000Z",
+    version: 1,
+    cancellation: null,
+  };
+  const state = {
+    reauthenticationBodies: [] as Record<string, unknown>[],
+    mutationBodies: [] as Record<string, unknown>[],
+    passwordChangeGetCount: 0,
+    items: [] as Array<Record<string, unknown>>,
+  };
+
+  await installMockApi(page, mockViewer({ email: "service-password-barrier@example.invalid" }), {
+    intercept: async (path, route) => {
+      const method = route.request().method();
+      if (path === "/api/v1/auth/reauth" && method === "POST") {
+        state.reauthenticationBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+        if (hooks.reauthenticate) {
+          await hooks.reauthenticate(route);
+        } else {
+          await route.fulfill({
+            json: {
+              expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+              fixedWindowMinutes: 15,
+            },
+          });
+        }
+        return true;
+      }
+      if (path === "/api/v1/customer/business-history") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Synthetic password barrier account" },
+            orders: [],
+            invoices: [],
+            payments: [],
+            credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+            refunds: [],
+            services: [service],
+            renewals: [],
+            cancellations: [],
+            tickets: [],
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/customer/services/${serviceId}`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: { ...service, externalResourceId: `mock-resource-${serviceId}` },
+            order: {
+              id: orderId,
+              status: "completed",
+              currency: "USD",
+              totalMinor: "100",
+              submittedAt: occurredAt,
+            },
+            invoices: [],
+            payments: [],
+            periods: [],
+            renewals: [],
+            cancellation: null,
+            tickets: [],
+            trace: {
+              orderId,
+              invoiceIds: [],
+              paymentIds: [],
+              renewalIds: [],
+              cancellationRequestId: null,
+              ticketIds: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "GET") {
+        state.passwordChangeGetCount += 1;
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: {
+              id: serviceId,
+              productName: service.productName,
+              status: "active",
+              version: 1,
+              resourceRevision: 0,
+              canChangePassword: state.items.length === 0,
+            },
+            items: state.items,
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "POST") {
+        state.mutationBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+        if (hooks.changePassword) {
+          await hooks.changePassword(route);
+        } else {
+          state.items = [{
+            requestId,
+            action: "change_password",
+            status: "queued",
+            revision: 0,
+            updatedAt: occurredAt,
+          }];
+          await route.fulfill({
+            status: 201,
+            json: {
+              requestId,
+              serviceId,
+              action: "change_password",
+              status: "queued",
+              serviceVersion: 1,
+              resourceRevision: 0,
+              createdAt: occurredAt,
+              replayed: false,
+            },
+          });
+        }
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/customer");
+  await page.getByTestId("history-service").click();
+  const panel = page.getByTestId("customer-service-operations");
+  const passwordPanel = panel.getByTestId("service-password-change-panel");
+  await expect(passwordPanel.getByRole("heading", { name: "Service password" })).toBeVisible();
+  return { panel, passwordPanel, serviceId, state };
+}
+
+test("customer reuses a current fresh grant without sending a redundant reauthentication request", async ({ page }) => {
+  const { passwordPanel, state } = await openCustomerPasswordChangeSurface(page);
+  const newPassword = `${"G".repeat(18)}!029`;
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+
+  await expect(page.locator("main > .notice")).toContainText(
+    "The service password change was safely queued; the new password will not appear in history.",
+  );
+  expect(state.reauthenticationBodies).toEqual([]);
+  expect(state.mutationBodies).toHaveLength(1);
+  expect(state.mutationBodies[0]).toMatchObject({ newPassword });
+});
+
+test("leaving while service-password reauthentication is pending sends no mutation or late UI effects", async ({ page }) => {
+  let releaseReauthentication!: () => void;
+  let markReauthenticationStarted!: () => void;
+  let markReauthenticationFulfilled!: () => void;
+  const reauthenticationGate = new Promise<void>((resolve) => { releaseReauthentication = resolve; });
+  const reauthenticationStarted = new Promise<void>((resolve) => { markReauthenticationStarted = resolve; });
+  const reauthenticationFulfilled = new Promise<void>((resolve) => { markReauthenticationFulfilled = resolve; });
+  const { passwordPanel, state } = await openCustomerPasswordChangeSurface(page, {
+    reauthenticate: async (route) => {
+      markReauthenticationStarted();
+      await reauthenticationGate;
+      await route.fulfill({
+        json: {
+          expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+          fixedWindowMinutes: 15,
+        },
+      });
+      markReauthenticationFulfilled();
+    },
+  });
+  const initialRefreshCount = state.passwordChangeGetCount;
+  const newPassword = `${"Q".repeat(18)}!029`;
+  const currentPassword = `${"U".repeat(18)}!029`;
+  await passwordPanel.getByLabel("Current account password").fill(currentPassword);
+  await passwordPanel.getByLabel("TOTP or recovery code").fill("123456");
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await reauthenticationStarted;
+
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseReauthentication();
+  await reauthenticationFulfilled;
+  await page.waitForTimeout(50);
+
+  expect(state.reauthenticationBodies).toHaveLength(1);
+  expect(state.mutationBodies).toEqual([]);
+  expect(state.passwordChangeGetCount).toBe(initialRefreshCount);
+  await expect(page.locator("main > .notice")).toHaveCount(0);
+  const storedIntent = await page.evaluate(() => Object.entries(window.localStorage)
+    .filter(([key]) => key.includes("service-operation-intent") && key.includes("change-password")));
+  expect(storedIntent).toEqual([]);
+});
+
+test("leaving after a service-password POST preserves an unknown intent and suppresses late notice and refresh", async ({ page }) => {
+  let releaseMutation!: () => void;
+  let markMutationStarted!: () => void;
+  let markMutationFinished!: () => void;
+  const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve; });
+  const mutationStarted = new Promise<void>((resolve) => { markMutationStarted = resolve; });
+  const mutationFinished = new Promise<void>((resolve) => { markMutationFinished = resolve; });
+  const { passwordPanel, state } = await openCustomerPasswordChangeSurface(page, {
+    changePassword: async (route) => {
+      markMutationStarted();
+      await mutationGate;
+      await route.abort("connectionfailed");
+      markMutationFinished();
+    },
+  });
+  const initialRefreshCount = state.passwordChangeGetCount;
+  const newPassword = `${"N".repeat(18)}!029`;
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await mutationStarted;
+  const submittedIntent = String(state.mutationBodies[0]?.idempotencyKey ?? "");
+  expect(submittedIntent).toMatch(/^change-password-/u);
+
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseMutation();
+  await mutationFinished;
+  await page.waitForTimeout(50);
+
+  expect(state.reauthenticationBodies).toEqual([]);
+  expect(state.mutationBodies).toHaveLength(1);
+  expect(state.passwordChangeGetCount).toBe(initialRefreshCount);
+  await expect(page.locator("main > .notice")).toHaveCount(0);
+  const storedIntentValues = await page.evaluate(() => Object.entries(window.localStorage)
+    .filter(([key]) => key.includes("service-operation-intent") && key.includes("change-password"))
+    .map(([, value]) => value));
+  expect(storedIntentValues).toEqual([submittedIntent]);
+});
+
+test("Staff changes a service password through password and MFA reauthentication", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000922";
+  const orderId = "00000000-0000-4000-8000-000000000923";
+  const serviceId = "00000000-0000-4000-8000-000000000924";
+  const requestId = "00000000-0000-4000-8000-000000000925";
+  const occurredAt = "2026-08-21T08:00:00.000Z";
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [],
+    productName: "Synthetic Staff password-change plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-21T08:00:00.000Z",
+    version: 1,
+    cancellation: null,
+  };
+  const newPassword = `${"F".repeat(18)}!029`;
+  const currentPassword = `${"I".repeat(18)}!029`;
+  let reauthenticationBody: Record<string, unknown> = {};
+  let mutationBody: Record<string, unknown> = {};
+  let passwordChangeItems: Array<Record<string, unknown>> = [];
+
+  await installMockApi(
+    page,
+    mockViewer({
+      email: "service-password-staff@example.invalid",
+      permissions: ["accounts.view", "services.read", "services.operations_manage"],
+    }),
+    {
+      intercept: async (path, route) => {
+        const method = route.request().method();
+        if (path === "/api/v1/auth/reauth" && method === "POST") {
+          reauthenticationBody = route.request().postDataJSON() as Record<string, unknown>;
+          return false;
+        }
+        if (path === "/api/v1/admin/client-accounts") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              items: [{
+                id: accountId,
+                name: "Synthetic Staff password account",
+                owner: { userId: accountId, email: "staff-password-owner@example.invalid", emailVerifiedAt: occurredAt },
+                restrictedAt: null,
+                activeMemberCount: 1,
+                createdAt: occurredAt,
+              }],
+              hasMore: false,
+              nextCursor: null,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic Staff password account", createdAt: occurredAt, restrictedAt: null },
+              owner: {
+                userId: accountId,
+                email: "staff-password-owner@example.invalid",
+                emailVerifiedAt: occurredAt,
+                restrictedAt: null,
+              },
+              memberships: [],
+              restrictions: [],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/services`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic Staff password account" },
+              items: [service],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/cancellations`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic Staff password account" },
+              items: [],
+            },
+          });
+          return true;
+        }
+        const passwordChangePath = `/api/v1/admin/client-accounts/${accountId}/services/${serviceId}/password-changes`;
+        if (path === passwordChangePath && method === "GET") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              service: {
+                id: serviceId,
+                productName: service.productName,
+                status: "active",
+                version: 1,
+                resourceRevision: 0,
+                canChangePassword: passwordChangeItems.length === 0,
+              },
+              items: passwordChangeItems,
+            },
+          });
+          return true;
+        }
+        if (path === passwordChangePath && method === "POST") {
+          mutationBody = route.request().postDataJSON() as Record<string, unknown>;
+          passwordChangeItems = [{
+            requestId,
+            action: "change_password",
+            actorType: "staff",
+            status: "queued",
+            revision: 0,
+            updatedAt: occurredAt,
+          }];
+          await route.fulfill({
+            status: 201,
+            json: {
+              requestId,
+              serviceId,
+              action: "change_password",
+              status: "queued",
+              serviceVersion: 1,
+              resourceRevision: 0,
+              createdAt: occurredAt,
+              replayed: false,
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  const account360 = page.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill(accountId);
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByTestId("account360-search-results")
+    .getByRole("button", { name: /Synthetic Staff password account/ })
+    .click();
+  const serviceDetails = account360.getByTestId("account360-services")
+    .locator("details")
+    .filter({ hasText: service.productName });
+  await serviceDetails.locator("summary").click();
+  const panel = serviceDetails.getByTestId("staff-service-operations");
+  const passwordPanel = panel.getByTestId("service-password-change-panel");
+  await panel.getByLabel("Staff current password").fill(currentPassword);
+  await panel.getByLabel("Staff TOTP or recovery code").fill("654321");
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+
+  await expect(page.locator("main > .notice")).toContainText(
+    "The service password change was safely queued; the new password will not appear in history.",
+  );
+  expect(reauthenticationBody).toEqual({
+    password: currentPassword,
+    factorCode: "654321",
+  });
+  expect(mutationBody).toMatchObject({
+    expectedServiceVersion: 1,
+    expectedResourceRevision: 0,
+    newPassword,
+    reason: "Verified daily resource operation",
+  });
+  await expect(passwordPanel).toContainText(requestId);
+  await expect(passwordPanel).not.toContainText(newPassword);
 });
 
 test("failed customer history refresh reports only the error and never a success notice", async ({ page }) => {

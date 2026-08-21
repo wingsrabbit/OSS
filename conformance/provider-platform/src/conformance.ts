@@ -32,6 +32,8 @@ export const mockReliabilityScenarios = [
 
 export type MockReliabilityScenario = (typeof mockReliabilityScenarios)[number];
 
+const syntheticPasswordChangeValue = "p".repeat(24);
+
 export interface ConformanceTarget {
   baseUrl: string;
   token: string;
@@ -133,7 +135,7 @@ export function requestFor(
           planRef: action === "resource.change_plan" ? "synthetic-plan-v2" : "synthetic-plan",
           ...(action === "resource.create" ? {} : { externalResourceRef: "synthetic-existing-resource" }),
           ...(action === "resource.change_password"
-            ? { configuration: { requestedPasswordRef: "synthetic-credential-reference" } }
+            ? { configuration: { password: syntheticPasswordChangeValue } }
             : {}),
         },
       };
@@ -313,6 +315,9 @@ export async function runPublicProviderConformance(
       const firstResult = parseProviderOperationResult(first.body);
       assertFunctionalOutput(firstResult, action);
       assert.deepEqual(parseProviderOperationResult(replay.body), firstResult);
+      if (action === "resource.change_password") {
+        assert.equal(JSON.stringify([first.body, replay.body]).includes(syntheticPasswordChangeValue), false);
+      }
       const conflictingRequest: ProviderOperationRequest = {
         ...request,
         intentRef: `${request.intentRef}:conflict`,

@@ -64,6 +64,7 @@ function rowRecord(row: unknown): Record<string, unknown> {
 
 export async function schema023CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
+  input: Readonly<{ allowSchema029ServicePasswordExtensions?: boolean }> = {},
 ): Promise<string | null> {
   const result = await database.query(
     `WITH target_relations(name) AS (
@@ -189,7 +190,10 @@ export async function schema023CatalogFingerprintInput(
      SELECT value FROM fingerprint`,
   );
   const value = result.rows[0] ? rowRecord(result.rows[0]).value : null;
-  return typeof value === "string" ? value : null;
+  if (typeof value !== "string") return null;
+  return input.allowSchema029ServicePasswordExtensions === true
+    ? value.replace(", 'resource.change_password'::text", "")
+    : value;
 }
 
 export function schema023CatalogDigest(fingerprintInput: string | null): string | null {
@@ -294,7 +298,10 @@ export async function assertSchema023NativeSafe(
  */
 export async function assertSchema023FoundationCatalogShape(
   database: RollbackPreflightQueryable,
-  input: Readonly<{ allowSchema027NotificationTemplateExtensions?: boolean }> = {},
+  input: Readonly<{
+    allowSchema027NotificationTemplateExtensions?: boolean;
+    allowSchema029ServicePasswordExtensions?: boolean;
+  }> = {},
 ): Promise<void> {
   const schema017Shape = await schema017CatalogFingerprintInput(database, {
     expectedMigrationHistory: EXPECTED_SCHEMA_019_HISTORY,
@@ -322,5 +329,12 @@ export async function assertSchema023FoundationCatalogShape(
   });
   await assertSchema021CatalogShape(database);
   await assertSchema022CatalogShape(database);
-  await assertSchema023CatalogShape(database);
+  assertSchema023CatalogDigest(
+    schema023CatalogDigest(
+      await schema023CatalogFingerprintInput(database, {
+        allowSchema029ServicePasswordExtensions:
+          input.allowSchema029ServicePasswordExtensions === true,
+      }),
+    ),
+  );
 }

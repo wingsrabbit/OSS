@@ -4,7 +4,10 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import Fastify from "fastify";
 import pg from "pg";
 import { z } from "zod";
-import { registerProviderPlatformRoutes } from "./provider-platform.js";
+import {
+  createProviderRequestFingerprintKeyring,
+  registerProviderPlatformRoutes,
+} from "./provider-platform.js";
 
 const config = z
   .object({
@@ -13,6 +16,9 @@ const config = z
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32).optional(),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32).optional(),
     MOCK_PROVIDER_PLATFORM_TOKEN: z.string().min(32).optional(),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/u).optional(),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: z.coerce.number().int().positive().default(1),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: z.string().default(""),
     MOCK_PROVIDER_PUBLIC_BASE_URL: z.url().optional(),
     LAB_MAILBOX_TOKEN: z.string().min(32).optional(),
     MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32).optional(),
@@ -534,6 +540,7 @@ const app = Fastify({
         "req.headers.x-oss-signature",
         "req.body.providerPaymentMethodToken",
         "req.body.savedPaymentMethod.providerToken",
+        "req.body.input.configuration.password",
       ],
       censor: "[REDACTED]",
     },
@@ -580,11 +587,21 @@ app.addHook("onRequest", async (request, reply) => {
 });
 
 if (config.MOCK_PROVIDER_PLATFORM_TOKEN) {
+  if (!config.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY) {
+    throw new Error(
+      "MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY is required when the Provider Platform is enabled",
+    );
+  }
   await registerProviderPlatformRoutes(app, pool, {
     publicBaseUrl:
       config.MOCK_PROVIDER_PUBLIC_BASE_URL ??
       `http://127.0.0.1:${config.PROVIDER_PORT}`,
     authoritativeProvisioningResources: Boolean(config.MOCK_PROVISIONING_PROVIDER_TOKEN),
+    requestFingerprintKeyring: createProviderRequestFingerprintKeyring(
+      config.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION,
+      config.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY,
+      config.MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS,
+    ),
   });
 }
 

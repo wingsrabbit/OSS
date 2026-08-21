@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import {
@@ -39,6 +39,66 @@ export const mockProviderScenarios = [
 
 export type MockProviderScenario = (typeof mockProviderScenarios)[number];
 
+const requestFingerprintKeyPattern = /^[A-Za-z0-9_-]{43}$/u;
+const passwordRequestFingerprintPattern = /^password-hmac-sha256-v1:([1-9]\d*):[0-9a-f]{64}$/u;
+
+export interface ProviderRequestFingerprintKeyring {
+  activeVersion: number;
+  keys: ReadonlyMap<number, Buffer>;
+}
+
+function decodeRequestFingerprintKey(value: string): Buffer {
+  if (!requestFingerprintKeyPattern.test(value)) {
+    throw new Error("Mock Provider request fingerprint keys must be canonical 32-byte base64url values");
+  }
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.length !== 32 || decoded.toString("base64url") !== value) {
+    throw new Error("Mock Provider request fingerprint keys must be canonical 32-byte base64url values");
+  }
+  return decoded;
+}
+
+export function createProviderRequestFingerprintKeyring(
+  activeVersion: number,
+  activeKey: string,
+  previousKeys = "",
+): ProviderRequestFingerprintKeyring {
+  if (!Number.isSafeInteger(activeVersion) || activeVersion < 1) {
+    throw new Error("Mock Provider request fingerprint key version must be a positive safe integer");
+  }
+  const keys = new Map<number, Buffer>([[activeVersion, decodeRequestFingerprintKey(activeKey)]]);
+  const materials = new Set([activeKey]);
+  const previousEntries = previousKeys === "" ? [] : previousKeys.split(",");
+  if (previousEntries.length > 31) {
+    throw new Error("Mock Provider request fingerprint keyring supports at most 32 lifetime versions");
+  }
+  for (const entry of previousEntries) {
+    const separator = entry.indexOf(":");
+    const versionText = separator === -1 ? "" : entry.slice(0, separator);
+    const keyText = separator === -1 ? "" : entry.slice(separator + 1);
+    if (!/^[1-9]\d*$/u.test(versionText)) {
+      throw new Error("Mock Provider previous request fingerprint keys must use version:key entries");
+    }
+    const version = Number(versionText);
+    if (!Number.isSafeInteger(version) || version >= activeVersion || keys.has(version)) {
+      throw new Error("Mock Provider previous request fingerprint key versions must be unique and older than active");
+    }
+    if (materials.has(keyText)) {
+      throw new Error("Mock Provider request fingerprint key material must be unique across versions");
+    }
+    keys.set(version, decodeRequestFingerprintKey(keyText));
+    materials.add(keyText);
+  }
+  return { activeVersion, keys };
+}
+
+export function passwordRequestFingerprintKeyVersion(fingerprint: string): number | undefined {
+  const match = passwordRequestFingerprintPattern.exec(fingerprint);
+  if (!match?.[1]) return undefined;
+  const version = Number(match[1]);
+  return Number.isSafeInteger(version) ? version : undefined;
+}
+
 const operationParamsSchema = z.object({
   capability: z.enum(providerCapabilities),
   operationId: z.uuid(),
@@ -61,9 +121,157 @@ interface StoredEvent {
   event_json: ProviderEvent;
 }
 
+interface PasswordChangeStorageRow {
+  operation_id: string;
+  request_json: unknown;
+  request_fingerprint: string;
+  scenario: MockProviderScenario;
+}
+
+function passwordChangeRequest(
+  request: ProviderOperationRequest,
+): request is ProviderOperationRequest & {
+  capability: "provisioning";
+  action: "resource.change_password";
+} {
+  return request.capability === "provisioning" && request.action === "resource.change_password";
+}
+
+export function redactedStoredRequest(request: ProviderOperationRequest): ProviderOperationRequest {
+  if (!passwordChangeRequest(request)) return request;
+  const configuration = request.input.configuration;
+  if (
+    !configuration ||
+    Object.keys(configuration).length !== 1 ||
+    !Object.hasOwn(configuration, "password")
+  ) {
+    throw new Error("Mock password change requires exactly one transient password field");
+  }
+  const password = configuration?.password;
+  if (typeof password !== "string" || password.length < 12 || password.length > 128) {
+    throw new Error("Mock password change requires a valid transient password");
+  }
+  return {
+    ...request,
+    input: {
+      ...request.input,
+      configuration: {
+        password: "[REDACTED]",
+      },
+    },
+  };
+}
+
+function storedPasswordValue(requestJson: unknown): unknown {
+  if (!requestJson || typeof requestJson !== "object" || Array.isArray(requestJson)) return undefined;
+  const input = (requestJson as Record<string, unknown>).input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const configuration = (input as Record<string, unknown>).configuration;
+  if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)) {
+    return undefined;
+  }
+  return (configuration as Record<string, unknown>).password;
+}
+
+function requestJsonWithPassword(requestJson: unknown, password: string): unknown {
+  const root = requestJson as Record<string, unknown>;
+  const input = root.input as Record<string, unknown>;
+  const configuration = input.configuration as Record<string, unknown>;
+  return {
+    ...root,
+    input: {
+      ...input,
+      configuration: { ...configuration, password },
+    },
+  };
+}
+
+function parseStoredPasswordChangeRequest(requestJson: unknown): ProviderOperationRequest & {
+  capability: "provisioning";
+  action: "resource.change_password";
+} {
+  let request: ProviderOperationRequest;
+  try {
+    request = parseProviderOperationRequest(requestJson);
+  } catch {
+    throw new Error("Mock Provider legacy password-change request cannot be upgraded safely");
+  }
+  if (!passwordChangeRequest(request)) {
+    throw new Error("Mock Provider legacy password-change request cannot be upgraded safely");
+  }
+  return request;
+}
+
+export async function upgradeLegacyPasswordChangeRequest(
+  requestJson: unknown,
+  scenario: MockProviderScenario,
+  requestFingerprintKeyring: ProviderRequestFingerprintKeyring,
+): Promise<
+  | Readonly<{ requestJson: ProviderOperationRequest; requestFingerprint: string }>
+  | undefined
+> {
+  const password = storedPasswordValue(requestJson);
+  if (password === "[REDACTED]") {
+    const request = parseStoredPasswordChangeRequest(
+      requestJsonWithPassword(requestJson, "R".repeat(20)),
+    );
+    try {
+      redactedStoredRequest(request);
+    } catch {
+      throw new Error("Mock Provider legacy password-change request cannot be upgraded safely");
+    }
+    return undefined;
+  }
+  if (typeof password !== "string") {
+    throw new Error("Mock Provider legacy password-change request cannot be upgraded safely");
+  }
+  const request = parseStoredPasswordChangeRequest(requestJson);
+  try {
+    return {
+      requestJson: redactedStoredRequest(request),
+      requestFingerprint: await providerPersistenceFingerprint(
+        request,
+        scenario,
+        requestFingerprintKeyring,
+      ),
+    };
+  } catch {
+    throw new Error("Mock Provider legacy password-change request cannot be upgraded safely");
+  }
+}
+
 export interface ProviderPlatformConfig {
   publicBaseUrl: string;
   authoritativeProvisioningResources?: boolean;
+  requestFingerprintKeyring: ProviderRequestFingerprintKeyring;
+}
+
+export async function providerPersistenceFingerprint(
+  request: ProviderOperationRequest,
+  scenario: MockProviderScenario,
+  requestFingerprintKeyring: ProviderRequestFingerprintKeyring,
+  keyVersion = requestFingerprintKeyring.activeVersion,
+): Promise<string> {
+  const storedRequest = redactedStoredRequest(request);
+  const redactedFingerprint = await providerRequestFingerprint(storedRequest);
+  if (!passwordChangeRequest(request)) return `${redactedFingerprint}:${scenario}`;
+
+  const requestFingerprintKey = requestFingerprintKeyring.keys.get(keyVersion);
+  if (!requestFingerprintKey) {
+    throw new Error("Mock Provider stored request fingerprint key version is unavailable");
+  }
+  const password = request.input.configuration?.password;
+  if (typeof password !== "string" || password.length < 12 || password.length > 128) {
+    throw new Error("Mock password change requires a valid transient password");
+  }
+  return `password-hmac-sha256-v1:${keyVersion}:${createHmac("sha256", requestFingerprintKey)
+    .update("opensales-mock-provider-password-request:v1\0", "utf8")
+    .update(redactedFingerprint, "utf8")
+    .update("\0", "utf8")
+    .update(scenario, "utf8")
+    .update("\0", "utf8")
+    .update(password, "utf8")
+    .digest("hex")}`;
 }
 
 function succeededOutput(request: ProviderOperationRequest): ProviderOperationOutput {
@@ -292,7 +500,71 @@ export async function registerProviderPlatformRoutes(
       last_operation_id uuid NOT NULL UNIQUE REFERENCES mock_contract_operations(operation_id),
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS mock_contract_password_change_facts (
+      operation_id uuid PRIMARY KEY REFERENCES mock_contract_operations(operation_id),
+      service_ref text NOT NULL,
+      external_resource_ref text NOT NULL,
+      changed_at timestamptz NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
+
+  const storageClient = await pool.connect();
+  try {
+    await storageClient.query("BEGIN");
+    await storageClient.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended('mock-provider-platform-storage-v1', 0))",
+    );
+    const passwordRows = await storageClient.query<PasswordChangeStorageRow>(`
+      SELECT operation_id, request_json, request_fingerprint, scenario
+      FROM mock_contract_operations
+      WHERE capability = 'provisioning'
+        AND action = 'resource.change_password'
+      ORDER BY operation_id
+      FOR UPDATE
+    `);
+    for (const row of passwordRows.rows) {
+      const upgraded = await upgradeLegacyPasswordChangeRequest(
+        row.request_json,
+        row.scenario,
+        config.requestFingerprintKeyring,
+      );
+      if (upgraded) {
+        await storageClient.query(
+          `UPDATE mock_contract_operations
+           SET request_json = $2::jsonb,
+               request_fingerprint = $3,
+               updated_at = now()
+           WHERE operation_id = $1`,
+          [
+            row.operation_id,
+            JSON.stringify(upgraded.requestJson),
+            upgraded.requestFingerprint,
+          ],
+        );
+        continue;
+      }
+      const keyVersion = passwordRequestFingerprintKeyVersion(row.request_fingerprint);
+      if (keyVersion === undefined || !config.requestFingerprintKeyring.keys.has(keyVersion)) {
+        throw new Error(
+          `Mock Provider stored password-change fingerprint for operation ${row.operation_id} cannot be verified`,
+        );
+      }
+    }
+    await storageClient.query("COMMIT");
+  } catch (error) {
+    try {
+      await storageClient.query("ROLLBACK");
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        "Mock Provider password-change storage upgrade and rollback both failed",
+      );
+    }
+    throw error;
+  } finally {
+    storageClient.release();
+  }
 
   const manifest = createMockProviderManifest(config.publicBaseUrl);
 
@@ -308,7 +580,14 @@ export async function registerProviderPlatformRoutes(
       return reply.code(400).send({ error: "Idempotency-Key must equal body.operationId" });
     }
     const scenario = scenarioSchema.parse(request.headers["x-oss-lab-scenario"] ?? "normal");
-    const fingerprint = `${await providerRequestFingerprint(body)}:${scenario}`;
+    let storedRequest: ProviderOperationRequest;
+    try {
+      storedRequest = redactedStoredRequest(body);
+    } catch {
+      return reply.code(400).send({
+        error: "resource.change_password requires exactly one valid transient password field",
+      });
+    }
     const client = await pool.connect();
     let operation: StoredOperation | undefined;
     let replayed = false;
@@ -327,6 +606,24 @@ export async function registerProviderPlatformRoutes(
         [body.operationId],
       );
       operation = existing.rows[0];
+      const storedPasswordKeyVersion = operation && passwordChangeRequest(body)
+        ? passwordRequestFingerprintKeyVersion(operation.request_fingerprint)
+        : undefined;
+      if (
+        storedPasswordKeyVersion !== undefined &&
+        !config.requestFingerprintKeyring.keys.has(storedPasswordKeyVersion)
+      ) {
+        await client.query("ROLLBACK");
+        return reply.code(503).send({
+          error: "stored request fingerprint key version is unavailable",
+        });
+      }
+      const fingerprint = await providerPersistenceFingerprint(
+        body,
+        scenario,
+        config.requestFingerprintKeyring,
+        storedPasswordKeyVersion ?? config.requestFingerprintKeyring.activeVersion,
+      );
       if (operation) {
         if (operation.request_fingerprint !== fingerprint) {
           await client.query("ROLLBACK");
@@ -358,7 +655,7 @@ export async function registerProviderPlatformRoutes(
         if (
           config.authoritativeProvisioningResources === true &&
           body.capability === "provisioning" &&
-          ["resource.start", "resource.stop", "resource.reboot"].includes(body.action)
+          ["resource.start", "resource.stop", "resource.reboot", "resource.change_password"].includes(body.action)
         ) {
           const input: ProvisioningInput = body.input;
           if (!input.externalResourceRef) {
@@ -387,9 +684,11 @@ export async function registerProviderPlatformRoutes(
             return reply.code(404).send({ error: "authoritative Mock resource not found" });
           }
           const eligible = authoritativeResource.resource_state === "active" && (
-            body.action === "resource.start"
-              ? authoritativeResource.power_state === "stopped"
-              : authoritativeResource.power_state === "running"
+            body.action === "resource.change_password"
+              ? true
+              : body.action === "resource.start"
+                ? authoritativeResource.power_state === "stopped"
+                : authoritativeResource.power_state === "running"
           );
           if (!eligible) {
             await client.query("ROLLBACK");
@@ -419,7 +718,7 @@ export async function registerProviderPlatformRoutes(
             body.operationId,
             body.capability,
             body.action,
-            JSON.stringify(body),
+            JSON.stringify(storedRequest),
             fingerprint,
             scenario,
             JSON.stringify(initialResult),
@@ -430,8 +729,26 @@ export async function registerProviderPlatformRoutes(
         if (!operation) throw new Error("Mock Provider operation insert returned no row");
 
         if (
-          authoritativeResource &&
+          body.capability === "provisioning" &&
+          body.action === "resource.change_password" &&
           finalResult.status === "succeeded"
+        ) {
+          const input: ProvisioningInput = body.input;
+          if (!input.externalResourceRef) {
+            throw new Error("Mock password change lost its external resource binding");
+          }
+          await client.query(
+            `INSERT INTO mock_contract_password_change_facts(
+               operation_id, service_ref, external_resource_ref, changed_at
+             ) VALUES ($1, $2, $3, $4)`,
+            [body.operationId, input.serviceRef, input.externalResourceRef, finalResult.observedAt],
+          );
+        }
+
+        if (
+          authoritativeResource &&
+          finalResult.status === "succeeded" &&
+          body.action !== "resource.change_password"
         ) {
           await client.query(
             `UPDATE mock_resource_operations
@@ -454,8 +771,10 @@ export async function registerProviderPlatformRoutes(
             "resource.start",
             "resource.stop",
             "resource.reboot",
+            "resource.change_password",
             "resource.terminate",
-          ].includes(body.action)
+          ].includes(body.action) &&
+          body.action !== "resource.change_password"
         ) {
           const output = finalResult.output as {
             externalResourceRef: string;

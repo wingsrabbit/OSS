@@ -22,9 +22,9 @@ import {
 } from "@opensales/core/provider-token-vault";
 import { createIdentitySecretKeyring } from "@opensales/core/identity-security";
 import {
-  assertSchema028NativeSafe,
-  SCHEMA_028_APPLICATION_GUARD,
-} from "@opensales/core/schema-027-028-native-compatibility";
+  assertSchema029NativeSafe,
+  SCHEMA_029_APPLICATION_GUARD,
+} from "@opensales/core/schema-028-029-native-compatibility";
 import pg from "pg";
 import { z } from "zod";
 import { ensureScheduledBillingJob } from "./billing-scheduler.js";
@@ -50,6 +50,14 @@ import {
   recoverStaleServiceOperationJobs,
   type ServiceOperationJob,
 } from "./service-operations.js";
+import {
+  isServicePasswordChangeLeaseLostError,
+  persistUnexpectedServicePasswordChangeFailure,
+  processServicePasswordChangeReconcile,
+  processServicePasswordChangeStart,
+  recoverStaleServicePasswordChangeJobs,
+  type ServicePasswordChangeJob,
+} from "./service-password-changes.js";
 import {
   IdentityNotificationLeaseLostError,
   persistUnexpectedIdentityNotificationFailure,
@@ -142,6 +150,15 @@ const serviceOperationRuntimeConfig = {
   staleLockSeconds: config.JOB_LOCK_TIMEOUT_SECONDS,
 } as const;
 
+const servicePasswordChangeRuntimeConfig = {
+  ...serviceOperationRuntimeConfig,
+  keyring: createIdentitySecretKeyring(
+    config.IDENTITY_SECRET_KEY_VERSION ?? 1,
+    config.IDENTITY_SECRET_KEY,
+    config.IDENTITY_SECRET_PREVIOUS_KEYS,
+  ),
+} as const;
+
 const identityNotificationRuntimeConfig = {
   workerId: config.WORKER_ID,
   providerUrl: config.MOCK_MAIL_PROVIDER_URL,
@@ -174,7 +191,7 @@ const pool = new pg.Pool({
   application_name: "opensales-worker",
 });
 let schemaCompatibilityGuard: pg.PoolClient | null = null;
-const schemaCompatibilityGuardName = SCHEMA_028_APPLICATION_GUARD;
+const schemaCompatibilityGuardName = SCHEMA_029_APPLICATION_GUARD;
 let tokenRegistryGuard: pg.PoolClient | null = null;
 
 async function releaseWorkerGuard(
@@ -7804,6 +7821,20 @@ async function processJob(job: Job): Promise<void> {
   if (job.job_type === "service.operation.reconcile") {
     return processServiceOperationReconcile(pool, job as ServiceOperationJob, serviceOperationRuntimeConfig);
   }
+  if (job.job_type === "service.password_change.start") {
+    return processServicePasswordChangeStart(
+      pool,
+      job as ServicePasswordChangeJob,
+      servicePasswordChangeRuntimeConfig,
+    );
+  }
+  if (job.job_type === "service.password_change.reconcile") {
+    return processServicePasswordChangeReconcile(
+      pool,
+      job as ServicePasswordChangeJob,
+      servicePasswordChangeRuntimeConfig,
+    );
+  }
   throw new Error(`Unsupported job type: ${job.job_type}`);
 }
 
@@ -7820,7 +7851,7 @@ let cleanupFailure: unknown;
 try {
   if (config.OSS_SCHEMA_ROLLBACK_BRIDGE === "016-to-017") {
     throw new Error(
-      "Schema 028 Worker refuses the legacy 016-to-017 rollback bridge; use the matching historical worker binary or migrate forward",
+      "Schema 029 Worker refuses the legacy 016-to-017 rollback bridge; use the matching historical worker binary or migrate forward",
     );
   }
   await assertRuntimeDatabaseRoleSafe(
@@ -7843,7 +7874,7 @@ try {
       query: async (text: string, values?: unknown[]) =>
         schemaCompatibilityGuard!.query(text, values),
     };
-    await assertSchema028NativeSafe(queryable);
+    await assertSchema029NativeSafe(queryable);
     await schemaCompatibilityGuard.query("COMMIT");
   } catch (error) {
     await schemaCompatibilityGuard.query("ROLLBACK").catch(() => undefined);
@@ -7944,7 +7975,11 @@ let nextBillingScheduleAt = 0;
         (await recoverStaleRefundJobs()) +
         (await recoverStaleServiceActionJobs()) +
         (await recoverStaleCancellationJobs()) +
-        (await recoverStaleServiceOperationJobs(pool, serviceOperationRuntimeConfig));
+        (await recoverStaleServiceOperationJobs(pool, serviceOperationRuntimeConfig)) +
+        (await recoverStaleServicePasswordChangeJobs(
+          pool,
+          servicePasswordChangeRuntimeConfig,
+        ));
       if (recovered > 0) {
         console.warn("recovered stale durable jobs", { count: recovered });
       }
@@ -8027,6 +8062,30 @@ let nextBillingScheduleAt = 0;
         if (isServiceOperationLeaseLostError(persistenceError)) continue;
         console.error(
           "failed to persist service operation failure; stale-job recovery will reconcile it",
+          { jobId: job.id },
+        );
+      }
+      continue;
+    }
+    if (
+      job.job_type === "service.password_change.start" ||
+      job.job_type === "service.password_change.reconcile"
+    ) {
+      console.error("service password-change job entered its safe failure reconciler", {
+        jobId: job.id,
+        jobType: job.job_type,
+      });
+      try {
+        await persistUnexpectedServicePasswordChangeFailure(
+          pool,
+          job as ServicePasswordChangeJob,
+          servicePasswordChangeRuntimeConfig,
+          error,
+        );
+      } catch (persistenceError) {
+        if (isServicePasswordChangeLeaseLostError(persistenceError)) continue;
+        console.error(
+          "failed to persist password-change failure; stale-job recovery will reconcile it",
           { jobId: job.id },
         );
       }

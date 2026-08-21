@@ -209,6 +209,7 @@ export function CustomerBusinessHistory({
   active,
   canReadHistory,
   canManageServices,
+  accessFingerprint,
   clientAccountId,
   locale,
   onNotice,
@@ -217,6 +218,7 @@ export function CustomerBusinessHistory({
   active: boolean;
   canReadHistory: boolean;
   canManageServices: boolean;
+  accessFingerprint: string;
   clientAccountId: string | null;
   locale: Locale;
   onNotice: (message: string) => void;
@@ -592,6 +594,7 @@ export function CustomerBusinessHistory({
               <ServiceOperationsPanel
                 endpoint={`/api/v1/services/${serviceDetail.service.id}/operations`}
                 canManage={canManageServices}
+                accessFingerprint={`${accessFingerprint}:${serviceDetail.service.id}:${canManageServices ? "manage" : "read"}`}
                 locale={locale}
                 onNotice={onNotice}
                 onError={onError}

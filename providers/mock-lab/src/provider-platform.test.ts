@@ -6,12 +6,18 @@ import {
   PROVIDER_CONTRACT_VERSION,
   PROVIDER_TRANSPORT_VERSION,
   type AntiAbuseChallengeOperationRequest,
+  type ProvisioningOperationRequest,
   type TaxOperationRequest,
   type VerificationOperationRequest,
 } from "@opensales/provider-contracts";
 import {
+  createProviderRequestFingerprintKeyring,
   createMockProviderManifest,
   createMockProviderOperationResult,
+  passwordRequestFingerprintKeyVersion,
+  providerPersistenceFingerprint,
+  redactedStoredRequest,
+  upgradeLegacyPasswordChangeRequest,
 } from "./provider-platform.js";
 
 const base = {
@@ -30,6 +36,124 @@ test("Mock Provider manifest exposes all six versioned functional capabilities",
   );
   assert.equal(manifest.license.identifier, "Apache-2.0");
   assert.equal(manifest.lifecycle.uninstallRequiresNoUnknownOperations, true);
+});
+
+test("Mock password changes redact the transient password before durable history", () => {
+  const transientPassword = "p".repeat(20);
+  const request: ProvisioningOperationRequest = {
+    ...base,
+    capability: "provisioning",
+    action: "resource.change_password",
+    input: {
+      serviceRef: "service-1",
+      planRef: "plan-1",
+      externalResourceRef: "mock-resource-1",
+      configuration: { password: transientPassword },
+    },
+  };
+  const stored = redactedStoredRequest(request);
+  assert.equal((stored as ProvisioningOperationRequest).input.configuration?.password, "[REDACTED]");
+  assert.equal(JSON.stringify(stored).includes(transientPassword), false);
+  assert.equal(request.input.configuration?.password, transientPassword);
+  assert.throws(() =>
+    redactedStoredRequest({
+      ...request,
+      input: { ...request.input, configuration: { password: "short" } },
+    }),
+  );
+  assert.throws(() =>
+    redactedStoredRequest({
+      ...request,
+      input: {
+        ...request.input,
+        configuration: {
+          password: transientPassword,
+          passwordConfirmation: transientPassword,
+        },
+      },
+    }),
+  );
+});
+
+test("Mock password-change replay fingerprints bind the exact transient password across key rotation", async () => {
+  const firstPassword = `${"a".repeat(16)}-first`;
+  const secondPassword = `${"b".repeat(16)}-second`;
+  const request: ProvisioningOperationRequest = {
+    ...base,
+    capability: "provisioning",
+    action: "resource.change_password",
+    input: {
+      serviceRef: "service-1",
+      planRef: "plan-1",
+      externalResourceRef: "mock-resource-1",
+      configuration: { password: firstPassword },
+    },
+  };
+  const firstKey = Buffer.alloc(32, 1).toString("base64url");
+  const secondKey = Buffer.alloc(32, 2).toString("base64url");
+  const firstKeyring = createProviderRequestFingerprintKeyring(1, firstKey);
+  const rotatedKeyring = createProviderRequestFingerprintKeyring(2, secondKey, `1:${firstKey}`);
+  const first = await providerPersistenceFingerprint(request, "normal", firstKeyring);
+  const storedVersion = passwordRequestFingerprintKeyVersion(first);
+  assert.equal(storedVersion, 1);
+  const replay = await providerPersistenceFingerprint(
+    request,
+    "normal",
+    rotatedKeyring,
+    storedVersion,
+  );
+  const changed = await providerPersistenceFingerprint(
+    {
+      ...request,
+      input: {
+        ...request.input,
+        configuration: { password: secondPassword },
+      },
+    },
+    "normal",
+    rotatedKeyring,
+    storedVersion,
+  );
+  const nextOperation = await providerPersistenceFingerprint(request, "normal", rotatedKeyring);
+
+  assert.match(first, /^password-hmac-sha256-v1:1:[0-9a-f]{64}$/);
+  assert.match(nextOperation, /^password-hmac-sha256-v1:2:[0-9a-f]{64}$/);
+  assert.equal(replay, first);
+  assert.notEqual(changed, first);
+  assert.notEqual(nextOperation, first);
+  assert.equal(first.includes(firstPassword), false);
+  assert.equal(changed.includes(secondPassword), false);
+  assert.throws(() => createProviderRequestFingerprintKeyring(2, secondKey, `1:${secondKey}`));
+
+  const upgraded = await upgradeLegacyPasswordChangeRequest(request, "normal", firstKeyring);
+  assert.ok(upgraded);
+  assert.equal(
+    (upgraded.requestJson as ProvisioningOperationRequest).input.configuration?.password,
+    "[REDACTED]",
+  );
+  assert.equal(JSON.stringify(upgraded.requestJson).includes(firstPassword), false);
+  assert.match(upgraded.requestFingerprint, /^password-hmac-sha256-v1:1:[0-9a-f]{64}$/);
+  assert.equal(
+    await upgradeLegacyPasswordChangeRequest(upgraded.requestJson, "normal", firstKeyring),
+    undefined,
+  );
+  await assert.rejects(
+    upgradeLegacyPasswordChangeRequest(
+      {
+        ...upgraded.requestJson,
+        input: {
+          ...upgraded.requestJson.input,
+          configuration: {
+            password: "[REDACTED]",
+            passwordConfirmation: firstPassword,
+          },
+        },
+      },
+      "normal",
+      firstKeyring,
+    ),
+    /cannot be upgraded safely/u,
+  );
 });
 
 test("Verification Mock returns functional evidence rather than Core state", () => {

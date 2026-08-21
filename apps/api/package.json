@@ -24,6 +24,7 @@
     "test:integration:notification-operations": "node dist/notification-operations.integration.js",
     "test:integration:notification-preferences-templates": "node dist/notification-preferences-templates.integration.js",
     "test:integration:service-operations": "node dist/service-operations.integration.js",
+    "test:integration:service-password-changes": "node dist/service-password-changes.integration.js",
     "test:integration:service-cancellation-authority": "node dist/service-cancellation-authority.integration.js",
     "test:integration:account-history": "node dist/account-history.integration.js",
     "test:integration:account-context": "node dist/account-context.integration.js",
