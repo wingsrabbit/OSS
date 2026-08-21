@@ -2386,6 +2386,26 @@ assert.equal(activeManual.service.status, "active");
 assert.equal(activeManual.service.activatedAt, activeManual.service.termStart);
 
 const staffMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
+async function setStaffPermissions(permissions: readonly string[]): Promise<void> {
+  const client = await corePool.connect();
+  let transactionOpen = false;
+  try {
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [staffMe.id]);
+    await client.query(
+      `UPDATE staff_members
+       SET permissions = $2::jsonb, updated_at = now()
+       WHERE user_id = $1`,
+      [staffMe.id, JSON.stringify(permissions)],
+    );
+    await client.query("COMMIT");
+    transactionOpen = false;
+  } finally {
+    if (transactionOpen) await client.query("ROLLBACK");
+    client.release();
+  }
+}
 const creditAdjustmentKey = randomUUID();
 const creditAdjustmentBody = {
   direction: "increase",
@@ -9158,12 +9178,7 @@ const refundsBeforePermissionProbes = await corePool.query<{ count: string }>(
      AND source_fund_receipt_id = $1`,
   [primaryUnclaimed.receiptId],
 );
-await corePool.query(
-  `UPDATE staff_members
-   SET permissions = $2::jsonb, updated_at = now()
-   WHERE user_id = $1`,
-  [staffMe.id, JSON.stringify(["billing.unclaimed_manage"])],
-);
+await setStaffPermissions(["billing.unclaimed_manage"]);
 await request(
   "/api/v1/auth/reauth",
   { method: "POST", body: JSON.stringify({ password }) },
@@ -9177,12 +9192,7 @@ const missingRefundManage = await rawCoreRequest(
   },
 );
 assert.equal(missingRefundManage.status, 403);
-await corePool.query(
-  `UPDATE staff_members
-   SET permissions = $2::jsonb, updated_at = now()
-   WHERE user_id = $1`,
-  [staffMe.id, JSON.stringify(["billing.refund_manage"])],
-);
+await setStaffPermissions(["billing.refund_manage"]);
 await request(
   "/api/v1/auth/reauth",
   { method: "POST", body: JSON.stringify({ password }) },
@@ -9207,12 +9217,7 @@ assert.equal(
   refundsAfterPermissionProbes.rows[0]?.count,
   refundsBeforePermissionProbes.rows[0]?.count,
 );
-await corePool.query(
-  `UPDATE staff_members
-   SET permissions = '["*"]'::jsonb, updated_at = now()
-   WHERE user_id = $1`,
-  [staffMe.id],
-);
+await setStaffPermissions(["*"]);
 await request(
   "/api/v1/auth/reauth",
   { method: "POST", body: JSON.stringify({ password }) },
@@ -9268,12 +9273,7 @@ try {
     attempt_count: 0,
     job_status: "pending",
   });
-  await corePool.query(
-    `UPDATE staff_members
-     SET permissions = $2::jsonb, updated_at = now()
-     WHERE user_id = $1`,
-    [staffMe.id, JSON.stringify(["billing.refund_manage"])],
-  );
+  await setStaffPermissions(["billing.refund_manage"]);
   await request(
     "/api/v1/auth/reauth",
     { method: "POST", body: JSON.stringify({ password }) },
@@ -9336,12 +9336,7 @@ try {
   );
   assert.equal(revokedProviderCreates.rows[0]?.count, "0");
 } finally {
-  await corePool.query(
-    `UPDATE staff_members
-     SET permissions = '["*"]'::jsonb, updated_at = now()
-     WHERE user_id = $1`,
-    [staffMe.id],
-  );
+  await setStaffPermissions(["*"]);
   await dropRefundStartDelay();
 }
 await request(
