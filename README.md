@@ -37,7 +37,9 @@ workflows across customer, Staff, Core, Worker, and Mock Provider boundaries:
   notification delivery operations;
 - customers and Staff use full Support ticket fields, public replies, internal
   notes, assignment/routing/status history, department revisions, and ordinary
-  attachment upload/list/delete; attachment download remains unavailable;
+  attachment upload/list/delete plus backend-authorized ordinary download;
+  unavailable attachments have no download action, and no scanning or safety
+  conclusion is claimed;
 - published bilingual Content and Legal revisions retain immutable history,
   deterministic zh-CN to English fallback, and a persisted User locale;
 - identity flows cover current Sessions, MFA/TOTP, API keys, recovery codes,
@@ -91,11 +93,13 @@ This code is protected by strict TypeScript checks, production builds, and
 PostgreSQL exact-money/state journeys. Notification templates and User
 preferences are implemented, and isolated blank TestA/TestB archive restores
 have been rehearsed through Schema 028. A consistent backup and exact rollback
-of the currently running Schema 018 Demo, ordinary Support attachment download,
-bulk exports, account deletion/anonymization, remaining Service credential and
-usage workflows, prebuilt digest-bound images, the actual two-VPS deployment and
-TLS evidence, and final release evidence are not yet complete. This version is
-therefore not the final Laboratory Release Candidate.
+of the currently running Schema 018 Demo, bulk exports, account
+deletion/anonymization, remaining Service credential and usage workflows,
+prebuilt digest-bound images, the actual two-VPS deployment and TLS evidence,
+and final release evidence are not yet complete. Ordinary Support attachment
+download is available only when the existing backend authorization contract
+permits it; this repository does not claim that an attachment was scanned or
+safe. This version is therefore not the final Laboratory Release Candidate.
 
 ## Quick start
 
@@ -110,7 +114,9 @@ Provider processes on loopback, creates distinct synthetic Staff and customer
 accounts with separate authenticated sessions, and proves the Stage A happy
 path through an Active service, a service-linked support ticket whose Staff
 internal note stays customer-hidden, plus one Provider-free manual
-receipt/original-source outflow:
+receipt/original-source outflow. The smoke journey also performs Stop, Start,
+and Reboot on its newly activated automatic Service, waits for each terminal
+Mock Provider fact, and records the final active/running state:
 
 ```bash
 node tools/demo-local.mjs up
