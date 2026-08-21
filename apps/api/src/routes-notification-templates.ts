@@ -10,7 +10,9 @@ import {
 } from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
-import { requireStaffActionLocked, requireStaffPermission } from "./routes-admin.js";
+import { requestFingerprint } from "./idempotency.js";
+import { requireStaffPermission } from "./routes-admin.js";
+import { executeStaffActionIntent } from "./staff-action-intents.js";
 
 const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
 const localeSchema = z.enum(["en", "zh-CN"]);
@@ -34,6 +36,7 @@ const revisionParams = z.object({
   revisionId: canonicalUuid,
 }).strict();
 const revisionBody = z.object({
+  intentId: canonicalUuid,
   locale: localeSchema,
   subjectTemplate: z.string().trim().min(1).max(240),
   bodyTemplate: z.string().min(1).max(20_000).refine(
@@ -43,6 +46,7 @@ const revisionBody = z.object({
   reason: reasonSchema,
 }).strict();
 const publicationBody = z.object({
+  intentId: canonicalUuid,
   reason: reasonSchema,
   expectedChannelVersion: decimalVersion,
 }).strict();
@@ -396,76 +400,88 @@ export async function registerNotificationTemplateRoutes(
       const user = await requireSessionIdentity(request, pool, config);
       const params = eventParams.parse(request.params);
       const body = revisionBody.parse(request.body);
-      const created = await transaction(pool, async (client) => {
-        const grantId = await requireStaffActionLocked(
-          client,
-          user,
-          "notifications.templates.create",
-        );
-        const event = await client.query<{
-          allowed_variables: unknown;
-          required_variables: unknown;
-        }>(
-          `SELECT event.allowed_variables, event.required_variables
-           FROM public.notification_template_events event
-           JOIN public.notification_template_channels channel
-             ON channel.event_type = event.event_type AND channel.locale = $2
-           WHERE event.event_type = $1
-           FOR UPDATE OF channel`,
-          [params.eventType, body.locale],
-        );
-        const definition = event.rows[0];
-        if (!definition) {
-          throw Object.assign(new Error("Notification template event was not found"), {
-            statusCode: 404,
-          });
-        }
-        assertTemplateContract(
-          body,
-          definition.allowed_variables,
-          definition.required_variables,
-        );
-        const sequence = await client.query<{ next_revision: string }>(
-          `SELECT (COALESCE(pg_catalog.max(revision_number), 0) + 1)::text AS next_revision
-           FROM public.notification_template_revisions
-           WHERE event_type = $1 AND locale = $2`,
-          [params.eventType, body.locale],
-        );
-        const nextRevision = sequence.rows[0]?.next_revision;
-        if (!nextRevision) throw new Error("Unable to allocate notification revision");
-        const key = revisionKey(params.eventType, nextRevision);
-        const inserted = await client.query<{ id: string }>(
-          `INSERT INTO public.notification_template_revisions(
-             event_type, locale, revision_key, revision_number,
-             provider_template_ref, subject_template, body_template,
-             actor_source, created_by_staff_user_id,
-             created_reauth_grant_id, creation_reason
-           ) VALUES ($1, $2, $3, $4, $3, $5, $6, 'staff', $7, $8, $9)
-           RETURNING id::text`,
-          [
-            params.eventType,
-            body.locale,
-            key,
-            nextRevision,
-            body.subjectTemplate,
-            body.bodyTemplate,
-            user.userId,
-            grantId,
-            body.reason,
-          ],
-        );
-        const revisionId = inserted.rows[0]?.id;
-        if (!revisionId) throw new Error("Unable to create notification template revision");
-        return {
-          eventType: params.eventType,
-          revisionId,
-          revisionKey: key,
-          revisionNumber: nextRevision,
-          locale: body.locale,
-          status: "draft" as const,
-        };
+      const fingerprint = requestFingerprint("admin.notification-template-revision.create:v1", {
+        eventType: params.eventType,
+        locale: body.locale,
+        subjectTemplate: body.subjectTemplate,
+        bodyTemplate: body.bodyTemplate,
+        reason: body.reason,
       });
-      return reply.code(201).send(created);
+      const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+        user,
+        permission: "notifications.templates.create",
+        intentId: body.intentId,
+        action: "notification.template-revision.create",
+        requestFingerprint: fingerprint,
+        execute: async (grantId) => {
+          const event = await client.query<{
+            allowed_variables: unknown;
+            required_variables: unknown;
+          }>(
+            `SELECT event.allowed_variables, event.required_variables
+             FROM public.notification_template_events event
+             JOIN public.notification_template_channels channel
+               ON channel.event_type = event.event_type AND channel.locale = $2
+             WHERE event.event_type = $1
+             FOR UPDATE OF channel`,
+            [params.eventType, body.locale],
+          );
+          const definition = event.rows[0];
+          if (!definition) {
+            throw Object.assign(new Error("Notification template event was not found"), {
+              statusCode: 404,
+            });
+          }
+          assertTemplateContract(
+            body,
+            definition.allowed_variables,
+            definition.required_variables,
+          );
+          const sequence = await client.query<{ next_revision: string }>(
+            `SELECT (COALESCE(pg_catalog.max(revision_number), 0) + 1)::text AS next_revision
+             FROM public.notification_template_revisions
+             WHERE event_type = $1 AND locale = $2`,
+            [params.eventType, body.locale],
+          );
+          const nextRevision = sequence.rows[0]?.next_revision;
+          if (!nextRevision) throw new Error("Unable to allocate notification revision");
+          const key = revisionKey(params.eventType, nextRevision);
+          const inserted = await client.query<{ id: string }>(
+            `INSERT INTO public.notification_template_revisions(
+               event_type, locale, revision_key, revision_number,
+               provider_template_ref, subject_template, body_template,
+               actor_source, created_by_staff_user_id,
+               created_reauth_grant_id, creation_reason
+             ) VALUES ($1, $2, $3, $4, $3, $5, $6, 'staff', $7, $8, $9)
+             RETURNING id::text`,
+            [
+              params.eventType,
+              body.locale,
+              key,
+              nextRevision,
+              body.subjectTemplate,
+              body.bodyTemplate,
+              user.userId,
+              grantId,
+              body.reason,
+            ],
+          );
+          const revisionId = inserted.rows[0]?.id;
+          if (!revisionId) throw new Error("Unable to create notification template revision");
+          return {
+            statusCode: 201,
+            body: {
+              eventType: params.eventType,
+              revisionId,
+              revisionKey: key,
+              revisionNumber: nextRevision,
+              locale: body.locale,
+              status: "draft" as const,
+            },
+          };
+        },
+      }));
+      return reply.code(outcome.statusCode).send(outcome.body);
     },
   );
 
@@ -475,12 +491,19 @@ export async function registerNotificationTemplateRoutes(
       const user = await requireSessionIdentity(request, pool, config);
       const params = revisionParams.parse(request.params);
       const body = publicationBody.parse(request.body);
-      const outcome = await transaction(pool, async (client) => {
-        const grantId = await requireStaffActionLocked(
-          client,
-          user,
-          "notifications.templates.publish",
-        );
+      const fingerprint = requestFingerprint("admin.notification-template-revision.publish:v1", {
+        eventType: params.eventType,
+        revisionId: params.revisionId,
+        reason: body.reason,
+        expectedChannelVersion: body.expectedChannelVersion,
+      });
+      const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+        user,
+        permission: "notifications.templates.publish",
+        intentId: body.intentId,
+        action: "notification.template-revision.publish",
+        requestFingerprint: fingerprint,
+        execute: async (grantId) => {
         const target = await client.query<{
           locale: "en" | "zh-CN";
           revision_key: string;
@@ -530,12 +553,15 @@ export async function registerNotificationTemplateRoutes(
         if (!current) throw new Error("Notification template channel is missing");
         if (current.current_revision_id === params.revisionId) {
           return {
-            eventType: params.eventType,
-            revisionId: params.revisionId,
-            revisionKey: revision.revision_key,
-            locale: revision.locale,
-            channelVersion: current.version,
-            replayed: true,
+            statusCode: 200,
+            body: {
+              eventType: params.eventType,
+              revisionId: params.revisionId,
+              revisionKey: revision.revision_key,
+              locale: revision.locale,
+              channelVersion: current.version,
+              replayed: true,
+            },
           };
         }
         if (current.version !== body.expectedChannelVersion) {
@@ -591,16 +617,20 @@ export async function registerNotificationTemplateRoutes(
             ],
           );
         }
-        return {
-          eventType: params.eventType,
-          revisionId: params.revisionId,
-          revisionKey: revision.revision_key,
-          locale: revision.locale,
-          channelVersion: nextVersion,
-          replayed: false,
-        };
-      });
-      return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+          return {
+            statusCode: 201,
+            body: {
+              eventType: params.eventType,
+              revisionId: params.revisionId,
+              revisionKey: revision.revision_key,
+              locale: revision.locale,
+              channelVersion: nextVersion,
+              replayed: false,
+            },
+          };
+        },
+      }));
+      return reply.code(outcome.statusCode).send(outcome.body);
     },
   );
 
@@ -610,12 +640,19 @@ export async function registerNotificationTemplateRoutes(
       const user = await requireSessionIdentity(request, pool, config);
       const params = revisionParams.parse(request.params);
       const body = publicationBody.parse(request.body);
-      const outcome = await transaction(pool, async (client) => {
-        const grantId = await requireStaffActionLocked(
-          client,
-          user,
-          "notifications.templates.retire",
-        );
+      const fingerprint = requestFingerprint("admin.notification-template-revision.retire:v1", {
+        eventType: params.eventType,
+        revisionId: params.revisionId,
+        reason: body.reason,
+        expectedChannelVersion: body.expectedChannelVersion,
+      });
+      const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+        user,
+        permission: "notifications.templates.retire",
+        intentId: body.intentId,
+        action: "notification.template-revision.retire",
+        requestFingerprint: fingerprint,
+        execute: async (grantId) => {
         const target = await client.query<{
           locale: "en" | "zh-CN";
           revision_key: string;
@@ -652,11 +689,14 @@ export async function registerNotificationTemplateRoutes(
         if (!current) throw new Error("Notification template channel is missing");
         if (revision.retired) {
           return {
-            eventType: params.eventType,
-            revisionId: params.revisionId,
-            locale: revision.locale,
-            channelVersion: current.version,
-            replayed: true,
+            statusCode: 200,
+            body: {
+              eventType: params.eventType,
+              revisionId: params.revisionId,
+              locale: revision.locale,
+              channelVersion: current.version,
+              replayed: true,
+            },
           };
         }
         if (current.version !== body.expectedChannelVersion) {
@@ -694,15 +734,19 @@ export async function registerNotificationTemplateRoutes(
            ) VALUES ($1, 'staff', $2, $3, $4)`,
           [params.revisionId, user.userId, grantId, body.reason],
         );
-        return {
-          eventType: params.eventType,
-          revisionId: params.revisionId,
-          locale: revision.locale,
-          channelVersion: nextVersion,
-          replayed: false,
-        };
-      });
-      return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+          return {
+            statusCode: 201,
+            body: {
+              eventType: params.eventType,
+              revisionId: params.revisionId,
+              locale: revision.locale,
+              channelVersion: nextVersion,
+              replayed: false,
+            },
+          };
+        },
+      }));
+      return reply.code(outcome.statusCode).send(outcome.body);
     },
   );
 }

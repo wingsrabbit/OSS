@@ -542,6 +542,7 @@ test("an older draft cannot be offered after a newer locale revision is publishe
 test("Staff template writes accept MFA once and reuse the current grant for later facts", async ({ page }) => {
   let stage: "initial" | "draft" | "published" | "retired" = "initial";
   const mutationBodies: Array<{ path: string; body: unknown }> = [];
+  const mutationIntentIds: string[] = [];
   let reauthCount = 0;
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -558,7 +559,15 @@ test("Staff template writes accept MFA once and reuse the current grant for late
       return fulfill(route, { expiresAt: "2026-08-20T09:15:00.000Z" });
     }
     if (request.method() === "POST") {
-      mutationBodies.push({ path, body: request.postDataJSON() });
+      const { intentId, ...body } = request.postDataJSON() as Record<string, unknown>;
+      expect(intentId).toEqual(expect.stringMatching(/^[0-9a-f-]{36}$/u));
+      expect(
+        Object.keys(body).some((key) =>
+          new Set(["password", "factorcode", "recoverycode", "secret", "token", "totp"])
+            .has(key.toLowerCase())),
+      ).toBe(false);
+      mutationIntentIds.push(String(intentId));
+      mutationBodies.push({ path, body });
       if (path.endsWith("/revisions")) stage = "draft";
       else if (path.endsWith("/publish")) stage = "published";
       else if (path.endsWith("/retire")) stage = "retired";
@@ -602,6 +611,7 @@ test("Staff template writes accept MFA once and reuse the current grant for late
   await expect(panel.getByTestId("notification-template-locale-zh-CN")).toContainText("fallback");
 
   expect(reauthCount).toBe(1);
+  expect(new Set(mutationIntentIds).size).toBe(3);
   expect(mutationBodies).toEqual([
     {
       path: `/api/v1/admin/notification-templates/${eventType}/revisions`,
@@ -796,6 +806,107 @@ test("real App Staff mounts only the read-authorized notification template regis
   await expect(page.getByTestId("notification-operations")).toHaveCount(0);
   expect(registryGets).toBeGreaterThanOrEqual(1);
   expect(customerPreferenceRequests).toBe(0);
+  expect(unexpected).toEqual([]);
+});
+
+test("real App reuses one template intent after a committed response is lost", async ({ page }) => {
+  const viewer = realAppViewer([
+    "notifications.templates.read",
+    "notifications.templates.create",
+  ]);
+  let stage: "initial" | "draft" = "initial";
+  const protectedBodies: Array<Record<string, unknown>> = [];
+  const committedIntents = new Set<string>();
+  let logicalRevisionFacts = 0;
+  let reauthPosts = 0;
+  const unexpected: string[] = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "GET" && path === "/api/v1/admin/notification-templates") {
+      await route.fulfill({ headers: sessionHeaders, json: registry(stage) });
+      return;
+    }
+    if (request.method() === "POST" && path === "/api/v1/auth/reauth") {
+      reauthPosts += 1;
+      expect(request.postDataJSON()).toEqual({
+        password: "Synthetic-Template-Password!",
+        factorCode: "template-recovery-ambiguous",
+      });
+      await route.fulfill({
+        headers: sessionHeaders,
+        json: { expiresAt: "2026-08-20T09:15:00.000Z" },
+      });
+      return;
+    }
+    if (
+      request.method() === "POST" &&
+      path === `/api/v1/admin/notification-templates/${eventType}/revisions`
+    ) {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      protectedBodies.push(body);
+      expect(body.intentId).toEqual(expect.stringMatching(/^[0-9a-f-]{36}$/u));
+      expect(
+        Object.keys(body).some((key) =>
+          ["password", "factorcode", "recoverycode", "secret", "token", "totp"]
+            .includes(key.toLowerCase())),
+      ).toBe(false);
+      const intentId = String(body.intentId);
+      if (!committedIntents.has(intentId)) {
+        committedIntents.add(intentId);
+        logicalRevisionFacts += 1;
+        stage = "draft";
+      }
+      if (protectedBodies.length === 1) {
+        await route.abort("connectionfailed");
+      } else {
+        await route.fulfill({
+          status: 201,
+          headers: sessionHeaders,
+          json: {
+            eventType,
+            revisionId: draftRevisionId,
+            revisionKey: "invoice-issued-v2",
+            revisionNumber: "2",
+          },
+        });
+      }
+      return;
+    }
+    if (await fulfillRealAppShell(route, viewer)) return;
+    unexpected.push(`${request.method()} ${path}`);
+    await route.fulfill({
+      status: 500,
+      headers: sessionHeaders,
+      json: { error: `Unexpected ${path}` },
+    });
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("notification-template-registry");
+  const create = panel.getByTestId("notification-template-create");
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Template-Password!");
+  await panel.getByLabel("Template TOTP or recovery code").fill("template-recovery-ambiguous");
+  await create.getByLabel("Template locale").selectOption("zh-CN");
+  await create.getByLabel("Subject template").fill("发票 {{invoiceNumber}} 已就绪");
+  await create.getByLabel("Body template").fill(
+    "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n发票已可供查看。",
+  );
+  await create.getByLabel("Creation reason").fill("Preserve one normal template intent");
+  await create.getByRole("button", { name: "Create immutable draft" }).click();
+
+  await expect(page.locator("main > .notice.error")).toBeVisible();
+  await expect(create.getByLabel("Subject template")).toHaveValue(
+    "发票 {{invoiceNumber}} 已就绪",
+  );
+  await create.getByRole("button", { name: "Create immutable draft" }).click();
+  await expect(create.getByLabel("Subject template")).toHaveValue("");
+  await expect(panel.getByText("invoice-issued-v2")).toBeVisible();
+
+  expect(reauthPosts).toBe(1);
+  expect(protectedBodies).toHaveLength(2);
+  expect(protectedBodies[1]).toEqual(protectedBodies[0]);
+  expect(logicalRevisionFacts).toBe(1);
   expect(unexpected).toEqual([]);
 });
 

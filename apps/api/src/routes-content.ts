@@ -18,10 +18,9 @@ import {
   type DatabaseClient,
   type DatabasePool,
 } from "./database.js";
-import {
-  requireStaffActionLocked,
-  requireStaffPermission,
-} from "./routes-admin.js";
+import { requireStaffPermission } from "./routes-admin.js";
+import { requestFingerprint } from "./idempotency.js";
+import { executeStaffActionIntent } from "./staff-action-intents.js";
 
 const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
 const localeSchema = z.enum(["en", "zh-CN"]);
@@ -35,6 +34,7 @@ const slugSchema = z
 const reasonSchema = z.string().trim().min(1).max(1_000);
 const contentBodySchema = z
   .object({
+    intentId: canonicalUuid,
     locale: localeSchema,
     title: z.string().trim().min(1).max(200),
     summary: z.string().max(1_000).default(""),
@@ -52,6 +52,7 @@ const entrySchema = contentBodySchema
   .strict();
 const legalRevisionSchema = z
   .object({
+    intentId: canonicalUuid,
     kind: legalKindSchema,
     locale: localeSchema,
     version: z.string().trim().min(1).max(64),
@@ -60,7 +61,7 @@ const legalRevisionSchema = z
     reason: reasonSchema,
   })
   .strict();
-const publicationSchema = z.object({ reason: reasonSchema }).strict();
+const publicationSchema = z.object({ intentId: canonicalUuid, reason: reasonSchema }).strict();
 const contentQuerySchema = z
   .object({
     locale: z.string().optional(),
@@ -467,263 +468,368 @@ export async function registerContentRoutes(
   app.post("/api/v1/admin/content/entries", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const body = entrySchema.parse(request.body);
-    const created = await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      const entry = await client.query<{ id: string }>(
-        `INSERT INTO public.content_entries(
-           slug, kind, audience, created_source,
-           created_by_staff_user_id, created_reauth_grant_id
-         ) VALUES ($1, $2, $3, 'staff', $4, $5)
-         RETURNING id`,
-        [body.slug, body.kind, body.audience, user.userId, grantId],
-      );
-      const entryId = entry.rows[0]?.id;
-      if (!entryId) throw new Error("Unable to create Content entry");
-      await client.query(
-        `INSERT INTO public.content_channels(entry_id, locale)
-         VALUES ($1, 'en'), ($1, 'zh-CN')`,
-        [entryId],
-      );
-      const revision = await client.query<{ id: string; revision: string }>(
-        `INSERT INTO public.content_revisions(
-           entry_id, locale, revision, title, summary, body, status_level,
-           created_source, created_by_staff_user_id, created_reauth_grant_id,
-           creation_reason
-         ) VALUES ($1, $2, 1, $3, $4, $5, $6, 'staff', $7, $8, $9)
-         RETURNING id, revision::text`,
-        [
-          entryId,
-          body.locale,
-          body.title,
-          body.summary,
-          body.body,
-          body.statusLevel,
-          user.userId,
-          grantId,
-          body.reason,
-        ],
-      );
-      return { entryId, revision: revision.rows[0] };
+    const fingerprint = requestFingerprint("admin.content-entry.create:v1", {
+      slug: body.slug,
+      kind: body.kind,
+      audience: body.audience,
+      locale: body.locale,
+      title: body.title,
+      summary: body.summary,
+      body: body.body,
+      statusLevel: body.statusLevel,
+      reason: body.reason,
     });
-    return reply.code(201).send(created);
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.entry.create",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const entry = await client.query<{ id: string }>(
+          `INSERT INTO public.content_entries(
+             slug, kind, audience, created_source,
+             created_by_staff_user_id, created_reauth_grant_id
+           ) VALUES ($1, $2, $3, 'staff', $4, $5)
+           RETURNING id`,
+          [body.slug, body.kind, body.audience, user.userId, grantId],
+        );
+        const entryId = entry.rows[0]?.id;
+        if (!entryId) throw new Error("Unable to create Content entry");
+        await client.query(
+          `INSERT INTO public.content_channels(entry_id, locale)
+           VALUES ($1, 'en'), ($1, 'zh-CN')`,
+          [entryId],
+        );
+        const revision = await client.query<{ id: string; revision: string }>(
+          `INSERT INTO public.content_revisions(
+             entry_id, locale, revision, title, summary, body, status_level,
+             created_source, created_by_staff_user_id, created_reauth_grant_id,
+             creation_reason
+           ) VALUES ($1, $2, 1, $3, $4, $5, $6, 'staff', $7, $8, $9)
+           RETURNING id, revision::text`,
+          [
+            entryId,
+            body.locale,
+            body.title,
+            body.summary,
+            body.body,
+            body.statusLevel,
+            user.userId,
+            grantId,
+            body.reason,
+          ],
+        );
+        const revisionFact = revision.rows[0];
+        if (!revisionFact) throw new Error("Unable to create Content revision");
+        return { statusCode: 201, body: { entryId, revision: revisionFact } };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 
   app.post("/api/v1/admin/content/entries/:entryId/revisions", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const params = z.object({ entryId: canonicalUuid }).parse(request.params);
     const body = contentBodySchema.parse(request.body);
-    const created = await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      const channel = await client.query<{ revision_sequence: string }>(
-        `SELECT revision_sequence::text
-         FROM public.content_channels
-         WHERE entry_id = $1 AND locale = $2
-         FOR UPDATE`,
-        [params.entryId, body.locale],
-      );
-      const sequence = channel.rows[0]?.revision_sequence;
-      if (sequence === undefined) {
-        throw Object.assign(new Error("Content entry not found"), { statusCode: 404 });
-      }
-      const revision = await client.query<{ id: string; revision: string }>(
-        `INSERT INTO public.content_revisions(
-           entry_id, locale, revision, title, summary, body, status_level,
-           created_source, created_by_staff_user_id, created_reauth_grant_id,
-           creation_reason
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'staff', $8, $9, $10)
-         RETURNING id, revision::text`,
-        [
-          params.entryId,
-          body.locale,
-          (BigInt(sequence) + 1n).toString(),
-          body.title,
-          body.summary,
-          body.body,
-          body.statusLevel,
-          user.userId,
-          grantId,
-          body.reason,
-        ],
-      );
-      return { entryId: params.entryId, ...revision.rows[0] };
+    const fingerprint = requestFingerprint("admin.content-revision.create:v1", {
+      entryId: params.entryId,
+      locale: body.locale,
+      title: body.title,
+      summary: body.summary,
+      body: body.body,
+      statusLevel: body.statusLevel,
+      reason: body.reason,
     });
-    return reply.code(201).send(created);
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.revision.create",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const channel = await client.query<{ revision_sequence: string }>(
+          `SELECT revision_sequence::text
+           FROM public.content_channels
+           WHERE entry_id = $1 AND locale = $2
+           FOR UPDATE`,
+          [params.entryId, body.locale],
+        );
+        const sequence = channel.rows[0]?.revision_sequence;
+        if (sequence === undefined) {
+          throw Object.assign(new Error("Content entry not found"), { statusCode: 404 });
+        }
+        const revision = await client.query<{ id: string; revision: string }>(
+          `INSERT INTO public.content_revisions(
+             entry_id, locale, revision, title, summary, body, status_level,
+             created_source, created_by_staff_user_id, created_reauth_grant_id,
+             creation_reason
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'staff', $8, $9, $10)
+           RETURNING id, revision::text`,
+          [
+            params.entryId,
+            body.locale,
+            (BigInt(sequence) + 1n).toString(),
+            body.title,
+            body.summary,
+            body.body,
+            body.statusLevel,
+            user.userId,
+            grantId,
+            body.reason,
+          ],
+        );
+        const revisionFact = revision.rows[0];
+        if (!revisionFact) throw new Error("Unable to create Content revision");
+        return {
+          statusCode: 201,
+          body: { entryId: params.entryId, ...revisionFact },
+        };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 
   app.post("/api/v1/admin/content/revisions/:revisionId/publication", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const params = z.object({ revisionId: canonicalUuid }).parse(request.params);
     const body = publicationSchema.parse(request.body);
-    const outcome = await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      return publishContentRevision(client, {
-        revisionId: params.revisionId,
-        actorUserId: user.userId,
-        reauthGrantId: grantId,
-        reason: body.reason,
-      });
+    const fingerprint = requestFingerprint("admin.content-revision.publish:v1", {
+      revisionId: params.revisionId,
+      reason: body.reason,
     });
-    return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.revision.publish",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const result = await publishContentRevision(client, {
+          revisionId: params.revisionId,
+          actorUserId: user.userId,
+          reauthGrantId: grantId,
+          reason: body.reason,
+        });
+        return { statusCode: result.replayed ? 200 : 201, body: result };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 
   app.post("/api/v1/admin/content/revisions/:revisionId/retirement", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const params = z.object({ revisionId: canonicalUuid }).parse(request.params);
     const body = publicationSchema.parse(request.body);
-    await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      const target = await client.query<{ entry_id: string; locale: ContentLocale }>(
-        `SELECT revision.entry_id, revision.locale
-         FROM public.content_revisions revision
-         WHERE revision.id = $1`,
-        [params.revisionId],
-      );
-      const revision = target.rows[0];
-      if (!revision) {
-        throw Object.assign(new Error("Content revision not found"), { statusCode: 404 });
-      }
-      const channel = await client.query<{ current_revision_id: string | null }>(
-        `SELECT current_revision_id
-         FROM public.content_channels
-         WHERE entry_id = $1 AND locale = $2
-         FOR UPDATE`,
-        [revision.entry_id, revision.locale],
-      );
-      if (channel.rows[0]?.current_revision_id !== params.revisionId) {
-        throw Object.assign(new Error("Only current Content can be retired"), {
-          statusCode: 409,
-        });
-      }
-      await client.query(
-        `SELECT id
-         FROM public.content_revisions
-         WHERE id = $1 AND entry_id = $2 AND locale = $3
-         FOR SHARE`,
-        [params.revisionId, revision.entry_id, revision.locale],
-      );
-      await client.query(
-        `INSERT INTO public.content_revision_retirements(
-           revision_id, actor_source, actor_staff_user_id,
-           reauth_grant_id, reason
-         ) VALUES ($1, 'staff', $2, $3, $4)`,
-        [params.revisionId, user.userId, grantId, body.reason],
-      );
-      await client.query(
-        `UPDATE public.content_channels
-         SET current_revision_id = NULL
-         WHERE entry_id = $1 AND locale = $2`,
-        [revision.entry_id, revision.locale],
-      );
+    const fingerprint = requestFingerprint("admin.content-revision.retire:v1", {
+      revisionId: params.revisionId,
+      reason: body.reason,
     });
-    return reply.code(201).send({ revisionId: params.revisionId, retired: true });
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.revision.retire",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const target = await client.query<{ entry_id: string; locale: ContentLocale }>(
+          `SELECT revision.entry_id, revision.locale
+           FROM public.content_revisions revision
+           WHERE revision.id = $1`,
+          [params.revisionId],
+        );
+        const revision = target.rows[0];
+        if (!revision) {
+          throw Object.assign(new Error("Content revision not found"), { statusCode: 404 });
+        }
+        const channel = await client.query<{ current_revision_id: string | null }>(
+          `SELECT current_revision_id
+           FROM public.content_channels
+           WHERE entry_id = $1 AND locale = $2
+           FOR UPDATE`,
+          [revision.entry_id, revision.locale],
+        );
+        if (channel.rows[0]?.current_revision_id !== params.revisionId) {
+          throw Object.assign(new Error("Only current Content can be retired"), {
+            statusCode: 409,
+          });
+        }
+        await client.query(
+          `SELECT id
+           FROM public.content_revisions
+           WHERE id = $1 AND entry_id = $2 AND locale = $3
+           FOR SHARE`,
+          [params.revisionId, revision.entry_id, revision.locale],
+        );
+        await client.query(
+          `INSERT INTO public.content_revision_retirements(
+             revision_id, actor_source, actor_staff_user_id,
+             reauth_grant_id, reason
+           ) VALUES ($1, 'staff', $2, $3, $4)`,
+          [params.revisionId, user.userId, grantId, body.reason],
+        );
+        await client.query(
+          `UPDATE public.content_channels
+           SET current_revision_id = NULL
+           WHERE entry_id = $1 AND locale = $2`,
+          [revision.entry_id, revision.locale],
+        );
+        return {
+          statusCode: 201,
+          body: { revisionId: params.revisionId, retired: true },
+        };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 
   app.post("/api/v1/admin/legal/documents", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const body = legalRevisionSchema.parse(request.body);
-    const created = await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      const channel = await client.query<{ revision_sequence: string }>(
-        `SELECT revision_sequence::text
-         FROM public.legal_document_channels
-         WHERE kind = $1 AND locale = $2
-         FOR UPDATE`,
-        [body.kind, body.locale],
-      );
-      const sequence = channel.rows[0]?.revision_sequence;
-      if (sequence === undefined) throw new Error("Legal document channel is missing");
-      const result = await client.query<{ id: string; revision: string }>(
-        `INSERT INTO public.legal_documents(
-           kind, locale, version, title, body, revision, created_source,
-           created_by_staff_user_id, created_reauth_grant_id, creation_reason
-         ) VALUES ($1, $2, $3, $4, $5, $6, 'staff', $7, $8, $9)
-         RETURNING id, revision::text`,
-        [
-          body.kind,
-          body.locale,
-          body.version,
-          body.title,
-          body.body,
-          (BigInt(sequence) + 1n).toString(),
-          user.userId,
-          grantId,
-          body.reason,
-        ],
-      );
-      return result.rows[0];
+    const fingerprint = requestFingerprint("admin.legal-revision.create:v1", {
+      kind: body.kind,
+      locale: body.locale,
+      version: body.version,
+      title: body.title,
+      body: body.body,
+      reason: body.reason,
     });
-    return reply.code(201).send(created);
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.legal-revision.create",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const channel = await client.query<{ revision_sequence: string }>(
+          `SELECT revision_sequence::text
+           FROM public.legal_document_channels
+           WHERE kind = $1 AND locale = $2
+           FOR UPDATE`,
+          [body.kind, body.locale],
+        );
+        const sequence = channel.rows[0]?.revision_sequence;
+        if (sequence === undefined) throw new Error("Legal document channel is missing");
+        const result = await client.query<{ id: string; revision: string }>(
+          `INSERT INTO public.legal_documents(
+             kind, locale, version, title, body, revision, created_source,
+             created_by_staff_user_id, created_reauth_grant_id, creation_reason
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'staff', $7, $8, $9)
+           RETURNING id, revision::text`,
+          [
+            body.kind,
+            body.locale,
+            body.version,
+            body.title,
+            body.body,
+            (BigInt(sequence) + 1n).toString(),
+            user.userId,
+            grantId,
+            body.reason,
+          ],
+        );
+        const legalFact = result.rows[0];
+        if (!legalFact) throw new Error("Unable to create legal document revision");
+        return { statusCode: 201, body: legalFact };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 
   app.post("/api/v1/admin/legal/documents/:documentId/publication", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const params = z.object({ documentId: canonicalUuid }).parse(request.params);
     const body = publicationSchema.parse(request.body);
-    const outcome = await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      return publishLegalDocument(client, {
-        documentId: params.documentId,
-        actorUserId: user.userId,
-        reauthGrantId: grantId,
-        reason: body.reason,
-      });
+    const fingerprint = requestFingerprint("admin.legal-revision.publish:v1", {
+      documentId: params.documentId,
+      reason: body.reason,
     });
-    return reply.code(outcome.replayed ? 200 : 201).send(outcome);
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.legal-revision.publish",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const result = await publishLegalDocument(client, {
+          documentId: params.documentId,
+          actorUserId: user.userId,
+          reauthGrantId: grantId,
+          reason: body.reason,
+        });
+        return { statusCode: result.replayed ? 200 : 201, body: result };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 
   app.post("/api/v1/admin/legal/documents/:documentId/retirement", async (request, reply) => {
     const user = await requireSessionIdentity(request, pool, config);
     const params = z.object({ documentId: canonicalUuid }).parse(request.params);
     const body = publicationSchema.parse(request.body);
-    await transaction(pool, async (client) => {
-      const grantId = await requireStaffActionLocked(client, user, "content.manage");
-      const target = await client.query<{ kind: string; locale: ContentLocale }>(
-        `SELECT kind, locale FROM public.legal_documents WHERE id = $1`,
-        [params.documentId],
-      );
-      const document = target.rows[0];
-      if (!document) {
-        throw Object.assign(new Error("Legal document revision not found"), { statusCode: 404 });
-      }
-      const channel = await client.query<{ current_document_id: string | null }>(
-        `SELECT current_document_id
-         FROM public.legal_document_channels
-         WHERE kind = $1 AND locale = $2
-         FOR UPDATE`,
-        [document.kind, document.locale],
-      );
-      if (channel.rows[0]?.current_document_id !== params.documentId) {
-        throw Object.assign(new Error("Only the current legal document can be retired"), {
-          statusCode: 409,
-        });
-      }
-      await client.query(
-        `SELECT id
-         FROM public.legal_documents
-         WHERE id = $1 AND kind = $2 AND locale = $3
-         FOR SHARE`,
-        [params.documentId, document.kind, document.locale],
-      );
-      if (document.locale === "en") {
-        throw Object.assign(
-          new Error("The required English legal fallback can only be replaced by publishing a newer revision"),
-          { statusCode: 409, code: "LEGAL_ENGLISH_FALLBACK_REQUIRED" },
-        );
-      }
-      await client.query(
-        `INSERT INTO public.legal_document_retirements(
-           document_id, actor_source, actor_staff_user_id,
-           reauth_grant_id, reason
-         ) VALUES ($1, 'staff', $2, $3, $4)`,
-        [params.documentId, user.userId, grantId, body.reason],
-      );
-      await client.query(
-        `UPDATE public.legal_document_channels
-         SET current_document_id = NULL
-         WHERE kind = $1 AND locale = $2`,
-        [document.kind, document.locale],
-      );
+    const fingerprint = requestFingerprint("admin.legal-revision.retire:v1", {
+      documentId: params.documentId,
+      reason: body.reason,
     });
-    return reply.code(201).send({ documentId: params.documentId, retired: true });
+    const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+      user,
+      permission: "content.manage",
+      intentId: body.intentId,
+      action: "content.legal-revision.retire",
+      requestFingerprint: fingerprint,
+      execute: async (grantId) => {
+        const target = await client.query<{ kind: string; locale: ContentLocale }>(
+          `SELECT kind, locale FROM public.legal_documents WHERE id = $1`,
+          [params.documentId],
+        );
+        const document = target.rows[0];
+        if (!document) {
+          throw Object.assign(new Error("Legal document revision not found"), { statusCode: 404 });
+        }
+        const channel = await client.query<{ current_document_id: string | null }>(
+          `SELECT current_document_id
+           FROM public.legal_document_channels
+           WHERE kind = $1 AND locale = $2
+           FOR UPDATE`,
+          [document.kind, document.locale],
+        );
+        if (channel.rows[0]?.current_document_id !== params.documentId) {
+          throw Object.assign(new Error("Only the current legal document can be retired"), {
+            statusCode: 409,
+          });
+        }
+        await client.query(
+          `SELECT id
+           FROM public.legal_documents
+           WHERE id = $1 AND kind = $2 AND locale = $3
+           FOR SHARE`,
+          [params.documentId, document.kind, document.locale],
+        );
+        if (document.locale === "en") {
+          throw Object.assign(
+            new Error("The required English legal fallback can only be replaced by publishing a newer revision"),
+            { statusCode: 409, code: "LEGAL_ENGLISH_FALLBACK_REQUIRED" },
+          );
+        }
+        await client.query(
+          `INSERT INTO public.legal_document_retirements(
+             document_id, actor_source, actor_staff_user_id,
+             reauth_grant_id, reason
+           ) VALUES ($1, 'staff', $2, $3, $4)`,
+          [params.documentId, user.userId, grantId, body.reason],
+        );
+        await client.query(
+          `UPDATE public.legal_document_channels
+           SET current_document_id = NULL
+           WHERE kind = $1 AND locale = $2`,
+          [document.kind, document.locale],
+        );
+        return {
+          statusCode: 201,
+          body: { documentId: params.documentId, retired: true },
+        };
+      },
+    }));
+    return reply.code(outcome.statusCode).send(outcome.body);
   });
 }

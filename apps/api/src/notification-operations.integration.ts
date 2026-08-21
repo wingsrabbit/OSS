@@ -487,6 +487,7 @@ try {
         url: `/api/v1/admin/notification-operations/${fixture.outboxId}/retry`,
         headers: cookieFor(staff),
         payload: {
+          intentId: randomUUID(),
           reason: "Normal product retry eligibility review",
           expectedJobUpdatedAt,
         },
@@ -549,6 +550,7 @@ try {
       url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
       headers: cookieFor(reader),
       payload: {
+        intentId: randomUUID(),
         reason: "Synthetic reader must not retry",
         expectedJobUpdatedAt: failedDelivery.jobUpdatedAt,
       },
@@ -568,6 +570,7 @@ try {
       url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
       headers: cookieFor(retryOnly),
       payload: {
+        intentId: randomUUID(),
         reason: "Synthetic stale retry",
         expectedJobUpdatedAt: "2020-01-01T00:00:00.000000Z",
       },
@@ -602,6 +605,7 @@ try {
       url: `/api/v1/admin/notification-operations/${identityOutboxId}/retry`,
       headers: cookieFor(manager),
       payload: {
+        intentId: randomUUID(),
         reason: "Identity recovery remains in its dedicated workflow",
         expectedJobUpdatedAt: identityDelivery.jobUpdatedAt,
       },
@@ -632,6 +636,7 @@ try {
       url: `/api/v1/admin/notification-operations/${budgetTwoAtOne.outboxId}/retry`,
       headers: cookieFor(manager),
       payload: {
+        intentId: randomUUID(),
         reason: "Budget two permits attempt one recovery",
         expectedJobUpdatedAt: twoAtOne.jobUpdatedAt,
       },
@@ -655,6 +660,7 @@ try {
       url: `/api/v1/admin/notification-operations/${budgetThreeAtTwo.outboxId}/retry`,
       headers: cookieFor(manager),
       payload: {
+        intentId: randomUUID(),
         reason: "Budget three permits attempt two recovery",
         expectedJobUpdatedAt: threeAtTwo.jobUpdatedAt,
       },
@@ -668,14 +674,17 @@ try {
       "NOTIFICATION_RETRY_NOT_ALLOWED",
     );
 
+    const retryIntentId = randomUUID();
+    const retryPayload = {
+      intentId: retryIntentId,
+      reason: "Recipient facts were reviewed; schedule one normal retry",
+      expectedJobUpdatedAt: failedDelivery.jobUpdatedAt,
+    };
     const retried = await appThree.inject({
       method: "POST",
       url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
       headers: cookieFor(retryOnly),
-      payload: {
-        reason: "Recipient facts were reviewed; schedule one normal retry",
-        expectedJobUpdatedAt: failedDelivery.jobUpdatedAt,
-      },
+      payload: retryPayload,
     });
     assert.equal(retried.statusCode, 201, retried.body);
     assert.deepEqual(
@@ -685,6 +694,67 @@ try {
         jobStatus: json<{ jobStatus: string }>(retried).jobStatus,
       },
       { outboxId: failed.outboxId, failedAttemptNumber: 1, jobStatus: "pending" },
+    );
+
+    const exactRetryReplay = await appThree.inject({
+      method: "POST",
+      url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
+      headers: cookieFor(retryOnly),
+      payload: retryPayload,
+    });
+    assert.equal(exactRetryReplay.statusCode, retried.statusCode, exactRetryReplay.body);
+    assert.deepEqual(json(exactRetryReplay), json(retried));
+
+    await pool.query(
+      `UPDATE public.reauth_grants
+       SET invalidated_at = pg_catalog.clock_timestamp()
+       WHERE user_id = $1 AND invalidated_at IS NULL`,
+      [retryOnly.userId],
+    );
+    const replayWithoutCurrentGrant = await appThree.inject({
+      method: "POST",
+      url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
+      headers: cookieFor(retryOnly),
+      payload: retryPayload,
+    });
+    assert.equal(replayWithoutCurrentGrant.statusCode, 403, replayWithoutCurrentGrant.body);
+    assert.equal(
+      json<{ code: string }>(replayWithoutCurrentGrant).code,
+      "STAFF_AUTHORIZATION_REQUIRED",
+    );
+    await pool.query(
+      `INSERT INTO public.reauth_grants(user_id, session_id, expires_at)
+       SELECT $1, session.id, pg_catalog.clock_timestamp() + interval '10 minutes'
+       FROM public.sessions session
+       WHERE session.user_id = $1
+         AND session.revoked_at IS NULL
+         AND session.expires_at > pg_catalog.clock_timestamp()
+       ORDER BY session.created_at DESC, session.id DESC
+       LIMIT 1`,
+      [retryOnly.userId],
+    );
+    const replayWithRestoredGrant = await appThree.inject({
+      method: "POST",
+      url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
+      headers: cookieFor(retryOnly),
+      payload: retryPayload,
+    });
+    assert.equal(replayWithRestoredGrant.statusCode, retried.statusCode, replayWithRestoredGrant.body);
+    assert.deepEqual(json(replayWithRestoredGrant), json(retried));
+
+    const conflictingRetryReplay = await appThree.inject({
+      method: "POST",
+      url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
+      headers: cookieFor(retryOnly),
+      payload: {
+        ...retryPayload,
+        reason: "A changed reason must be a different logical intent",
+      },
+    });
+    assert.equal(conflictingRetryReplay.statusCode, 409, conflictingRetryReplay.body);
+    assert.equal(
+      json<{ code: string }>(conflictingRetryReplay).code,
+      "STAFF_ACTION_INTENT_CONFLICT",
     );
 
     const durableFact = await pool.query<{
@@ -713,12 +783,35 @@ try {
       unlocked: true,
       audit_count: "1",
     });
+    const retryIntentLedger = await pool.query<{
+      count: string;
+      metadata: Record<string, unknown>;
+    }>(
+      `SELECT pg_catalog.count(*)::text AS count,
+              pg_catalog.min(metadata::text)::jsonb AS metadata
+       FROM public.audit_events
+       WHERE actor_type = 'staff'
+         AND actor_id = $1
+         AND target_type = 'staff_action_intent'
+         AND target_id = $2`,
+      [retryOnly.userId, retryIntentId],
+    );
+    assert.equal(retryIntentLedger.rows[0]?.count, "1");
+    assert.deepEqual(
+      Object.keys(retryIntentLedger.rows[0]?.metadata ?? {}).sort(),
+      ["requestFingerprint", "responseBody", "responseStatus"],
+    );
+    assert.doesNotMatch(
+      JSON.stringify(retryIntentLedger.rows[0]?.metadata ?? {}).toLowerCase(),
+      /password|factorcode|recoverycode|secret|token|totp/,
+    );
 
     const duplicate = await appThree.inject({
       method: "POST",
       url: `/api/v1/admin/notification-operations/${failed.outboxId}/retry`,
       headers: cookieFor(retryOnly),
       payload: {
+        intentId: randomUUID(),
         reason: "Synthetic duplicate click",
         expectedJobUpdatedAt: failedDelivery.jobUpdatedAt,
       },

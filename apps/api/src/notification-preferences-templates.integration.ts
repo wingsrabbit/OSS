@@ -584,6 +584,7 @@ try {
       url: "/api/v1/admin/notification-templates/notification.email_verification_requested/revisions",
       headers,
       payload: {
+        intentId: randomUUID(),
         locale: "en",
         subjectTemplate: "Verification message",
         bodyTemplate:
@@ -602,6 +603,7 @@ try {
       url: `/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions/${supportEnglishChannel!.currentRevisionId}/retire`,
       headers,
       payload: {
+        intentId: randomUUID(),
         reason: "Prove the English fallback cannot be removed",
         expectedChannelVersion: supportEnglishChannel!.channelVersion,
       },
@@ -617,6 +619,7 @@ try {
       url: "/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions",
       headers,
       payload: {
+        intentId: randomUUID(),
         locale: "zh-CN",
         subjectTemplate: "支持工单回复：{{ticketSubject}}",
         bodyTemplate:
@@ -632,17 +635,20 @@ try {
     }>(createdOlderRevision);
     assert.equal(olderDraft.revisionNumber, "2");
 
+    const newerRevisionIntentId = randomUUID();
+    const newerRevisionPayload = {
+      intentId: newerRevisionIntentId,
+      locale: "zh-CN",
+      subjectTemplate: "支持工单最新回复：{{ticketSubject}}",
+      bodyTemplate:
+        "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n工单：{{ticketId}}\n\n最新回复：{{ticketMessage}}",
+      reason: "Create the newer reviewed Chinese support revision",
+    };
     const createdNewerRevision = await app.inject({
       method: "POST",
       url: "/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions",
       headers,
-      payload: {
-        locale: "zh-CN",
-        subjectTemplate: "支持工单最新回复：{{ticketSubject}}",
-        bodyTemplate:
-          "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY\n\n工单：{{ticketId}}\n\n最新回复：{{ticketMessage}}",
-        reason: "Create the newer reviewed Chinese support revision",
-      },
+      payload: newerRevisionPayload,
     });
     assert.equal(createdNewerRevision.statusCode, 201, createdNewerRevision.body);
     const newerDraft = json<{
@@ -652,11 +658,69 @@ try {
     }>(createdNewerRevision);
     assert.equal(newerDraft.revisionNumber, "3");
 
+    const replayedNewerRevision = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions",
+      headers,
+      payload: newerRevisionPayload,
+    });
+    assert.equal(
+      replayedNewerRevision.statusCode,
+      createdNewerRevision.statusCode,
+      replayedNewerRevision.body,
+    );
+    assert.equal(replayedNewerRevision.body, createdNewerRevision.body);
+    const conflictingNewerRevision = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions",
+      headers,
+      payload: {
+        ...newerRevisionPayload,
+        subjectTemplate: "同一 intent 不可承载不同模板",
+      },
+    });
+    assert.equal(conflictingNewerRevision.statusCode, 409, conflictingNewerRevision.body);
+    assert.equal(
+      json<{ code: string }>(conflictingNewerRevision).code,
+      "STAFF_ACTION_INTENT_CONFLICT",
+    );
+    const newerRevisionFacts = await pool.query<{
+      revision_count: string;
+      ledger_count: string;
+      metadata: Record<string, unknown>;
+    }>(
+      `SELECT
+         (SELECT pg_catalog.count(*)::text
+          FROM public.notification_template_revisions revision
+          WHERE revision.id = $1) AS revision_count,
+         pg_catalog.count(*)::text AS ledger_count,
+         pg_catalog.min(event.metadata::text)::jsonb AS metadata
+       FROM public.audit_events event
+       WHERE event.actor_type = 'staff'
+         AND event.actor_id = $2
+         AND event.target_type = 'staff_action_intent'
+         AND event.target_id = $3`,
+      [newerDraft.revisionId, principal.userId, newerRevisionIntentId],
+    );
+    assert.deepEqual(
+      {
+        revisionCount: newerRevisionFacts.rows[0]?.revision_count,
+        ledgerCount: newerRevisionFacts.rows[0]?.ledger_count,
+        metadataKeys: Object.keys(newerRevisionFacts.rows[0]?.metadata ?? {}).sort(),
+      },
+      {
+        revisionCount: "1",
+        ledgerCount: "1",
+        metadataKeys: ["requestFingerprint", "responseBody", "responseStatus"],
+      },
+    );
+
     const published = await app.inject({
       method: "POST",
       url: `/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions/${newerDraft.revisionId}/publish`,
       headers,
       payload: {
+        intentId: randomUUID(),
         reason: "Publish the reviewed Chinese support revision",
         expectedChannelVersion: supportChineseChannel!.channelVersion,
       },
@@ -676,6 +740,7 @@ try {
       url: `/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions/${newerDraft.revisionId}/publish`,
       headers,
       payload: {
+        intentId: randomUUID(),
         reason: "Publish the reviewed Chinese support revision",
         expectedChannelVersion: supportChineseChannel!.channelVersion,
       },
@@ -688,6 +753,7 @@ try {
       url: `/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions/${olderDraft.revisionId}/publish`,
       headers,
       payload: {
+        intentId: randomUUID(),
         reason: "A newer revision must not be replaced by this older draft",
         expectedChannelVersion: "2",
       },
@@ -887,6 +953,7 @@ try {
       url: `/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions/${newerDraft.revisionId}/retire`,
       headers,
       payload: {
+        intentId: randomUUID(),
         reason: "Retire the current Chinese support revision to use English fallback",
         expectedChannelVersion: "2",
       },
@@ -898,6 +965,7 @@ try {
       url: `/api/v1/admin/notification-templates/notification.support_ticket_reply_requested/revisions/${newerDraft.revisionId}/retire`,
       headers,
       payload: {
+        intentId: randomUUID(),
         reason: "Retire the current Chinese support revision to use English fallback",
         expectedChannelVersion: "2",
       },

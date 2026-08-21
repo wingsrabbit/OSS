@@ -9,6 +9,11 @@ import {
   useState,
 } from "react";
 import { api } from "./api.js";
+import {
+  clearStaffActionIntent,
+  staffActionIntent,
+  type StaffActionIntent,
+} from "./staff-action-intents.js";
 
 type Locale = "en" | "zh-CN";
 type Entry = Readonly<{
@@ -85,6 +90,7 @@ export function ContentOperationsPanel({
   const [password, setPassword] = useState("");
   const [factorCode, setFactorCode] = useState("");
   const [pending, setPending] = useState(false);
+  const actionIntents = useRef(new Map<string, StaffActionIntent>());
   const scopeKey = JSON.stringify([accessFingerprint, active, canRead, canManage]);
   const accessScope = useRef<AccessScopeState>({
     key: scopeKey,
@@ -149,6 +155,7 @@ export function ContentOperationsPanel({
     setPassword("");
     setFactorCode("");
     setPending(false);
+    actionIntents.current.clear();
     return () => {
       refreshGeneration.current += 1;
       accessScope.current = {
@@ -190,6 +197,8 @@ export function ContentOperationsPanel({
       );
       return false;
     }
+    const intentSlot = path;
+    const intentId = staffActionIntent(actionIntents.current, intentSlot, { path, body });
     setPending(true);
     try {
       if (submittedPassword.length > 0) {
@@ -211,7 +220,11 @@ export function ContentOperationsPanel({
       }
       if (!scopeIsCurrent(scope)) return false;
       try {
-        await api(path, { method: "POST", body: JSON.stringify(body) });
+        await api(path, {
+          method: "POST",
+          body: JSON.stringify({ ...body, intentId }),
+        });
+        clearStaffActionIntent(actionIntents.current, intentSlot, intentId);
       } catch (caught) {
         if (!scopeIsCurrent(scope)) return false;
         throw caught;

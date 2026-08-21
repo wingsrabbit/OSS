@@ -2,6 +2,11 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api.js";
+import {
+  clearStaffActionIntent,
+  staffActionIntent,
+  type StaffActionIntent,
+} from "./staff-action-intents.js";
 
 type Locale = "en" | "zh-CN";
 type Delivery = Readonly<{
@@ -116,6 +121,7 @@ export function NotificationOperationsPanel({
   const [factorCode, setFactorCode] = useState("");
   const [reason, setReason] = useState("");
   const [pendingOutboxId, setPendingOutboxId] = useState<string | null>(null);
+  const actionIntents = useRef(new Map<string, StaffActionIntent>());
 
   const scopeKey = JSON.stringify([accessFingerprint, active, canRead, canRetry]);
   const accessScope = useRef<AccessScopeState>({
@@ -153,6 +159,7 @@ export function NotificationOperationsPanel({
     setFactorCode("");
     setReason("");
     setPendingOutboxId(null);
+    actionIntents.current.clear();
     return () => {
       accessScope.current = {
         key: accessScope.current.key,
@@ -223,6 +230,16 @@ export function NotificationOperationsPanel({
       );
       return;
     }
+    const path = `/api/v1/admin/notification-operations/${delivery.outboxId}/retry`;
+    const businessBody = {
+      reason: submittedReason,
+      expectedJobUpdatedAt: delivery.jobUpdatedAt,
+    };
+    const intentSlot = `retry:${delivery.outboxId}`;
+    const intentId = staffActionIntent(actionIntents.current, intentSlot, {
+      path,
+      body: businessBody,
+    });
     setPendingOutboxId(delivery.outboxId);
     try {
       if (submittedPassword.length > 0) {
@@ -244,13 +261,11 @@ export function NotificationOperationsPanel({
       }
       if (!scopeIsCurrent(scope)) return;
       try {
-        await api(`/api/v1/admin/notification-operations/${delivery.outboxId}/retry`, {
+        await api(path, {
           method: "POST",
-          body: JSON.stringify({
-            reason: submittedReason,
-            expectedJobUpdatedAt: delivery.jobUpdatedAt,
-          }),
+          body: JSON.stringify({ ...businessBody, intentId }),
         });
+        clearStaffActionIntent(actionIntents.current, intentSlot, intentId);
       } catch (caught) {
         if (!scopeIsCurrent(scope)) return;
         throw caught;

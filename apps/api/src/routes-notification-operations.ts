@@ -9,10 +9,9 @@ import {
   type DatabaseClient,
   type DatabasePool,
 } from "./database.js";
-import {
-  requireStaffActionLocked,
-  requireStaffPermission,
-} from "./routes-admin.js";
+import { requestFingerprint } from "./idempotency.js";
+import { requireStaffPermission } from "./routes-admin.js";
+import { executeStaffActionIntent } from "./staff-action-intents.js";
 
 const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
 const retryParams = z.object({ outboxId: canonicalUuid }).strict();
@@ -21,6 +20,7 @@ const postgresTimestamp = z
   .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
 const retryBody = z
   .object({
+    intentId: canonicalUuid,
     reason: z.string().trim().min(3).max(1_000),
     expectedJobUpdatedAt: postgresTimestamp,
   })
@@ -510,106 +510,116 @@ export async function registerNotificationOperationRoutes(
       const user = await requireSessionIdentity(request, pool, config);
       const params = retryParams.parse(request.params);
       const body = retryBody.parse(request.body);
-      const result = await transaction(pool, async (client) => {
-        const reauthGrantId = await requireStaffActionLocked(
-          client,
-          user,
-          "notifications.retry",
-        );
-        const outbox = await client.query(
-          `SELECT id FROM public.outbox WHERE id = $1 FOR UPDATE`,
-          [params.outboxId],
-        );
-        if (outbox.rowCount !== 1) {
-          throw requestError("Notification delivery was not found", 404, "NOTIFICATION_NOT_FOUND");
-        }
-        const candidate = await lockRetryCandidate(client, params.outboxId);
-        if (!candidate) {
-          throw requestError(
-            "Notification delivery task is unavailable",
-            409,
-            "NOTIFICATION_RETRY_UNAVAILABLE",
+      const fingerprint = requestFingerprint("admin.notification-delivery.retry:v1", {
+        outboxId: params.outboxId,
+        reason: body.reason,
+        expectedJobUpdatedAt: body.expectedJobUpdatedAt,
+      });
+      const outcome = await transaction(pool, (client) => executeStaffActionIntent(client, {
+        user,
+        permission: "notifications.retry",
+        intentId: body.intentId,
+        action: "notification.delivery.retry",
+        requestFingerprint: fingerprint,
+        execute: async (reauthGrantId) => {
+          const outbox = await client.query(
+            `SELECT id FROM public.outbox WHERE id = $1 FOR UPDATE`,
+            [params.outboxId],
           );
-        }
-        if (candidate.job_updated_at !== body.expectedJobUpdatedAt) {
-          throw requestError(
-            "Notification delivery changed; refresh before retrying",
-            409,
-            "NOTIFICATION_RETRY_STALE",
-          );
-        }
-        if (
-          candidate.operation_status !== "failed" ||
-          candidate.fact_status !== "failed" ||
-          candidate.job_status !== "manual" ||
-          candidate.attempt_number >= config.NOTIFICATION_MAX_ATTEMPTS
-        ) {
-          throw requestError(
-            "Only a manual task with an explicit failed outcome and remaining attempt budget can retry",
-            409,
-            "NOTIFICATION_RETRY_NOT_ALLOWED",
-          );
-        }
-        const updated = await client.query<{ updated_at: string }>(
-          `UPDATE public.durable_jobs
-           SET status = 'pending',
-               attempts = 0,
-               available_at = pg_catalog.clock_timestamp(),
-               locked_at = NULL,
-               locked_by = NULL,
-               last_error = 'STAFF_NOTIFICATION_RETRY_REQUESTED',
-               updated_at = GREATEST(
-                 updated_at + interval '1 microsecond',
-                 pg_catalog.clock_timestamp()
-               )
-           WHERE id = $1
-             AND status = 'manual'
-             AND pg_catalog.to_char(
+          if (outbox.rowCount !== 1) {
+            throw requestError("Notification delivery was not found", 404, "NOTIFICATION_NOT_FOUND");
+          }
+          const candidate = await lockRetryCandidate(client, params.outboxId);
+          if (!candidate) {
+            throw requestError(
+              "Notification delivery task is unavailable",
+              409,
+              "NOTIFICATION_RETRY_UNAVAILABLE",
+            );
+          }
+          if (candidate.job_updated_at !== body.expectedJobUpdatedAt) {
+            throw requestError(
+              "Notification delivery changed; refresh before retrying",
+              409,
+              "NOTIFICATION_RETRY_STALE",
+            );
+          }
+          if (
+            candidate.operation_status !== "failed" ||
+            candidate.fact_status !== "failed" ||
+            candidate.job_status !== "manual" ||
+            candidate.attempt_number >= config.NOTIFICATION_MAX_ATTEMPTS
+          ) {
+            throw requestError(
+              "Only a manual task with an explicit failed outcome and remaining attempt budget can retry",
+              409,
+              "NOTIFICATION_RETRY_NOT_ALLOWED",
+            );
+          }
+          const updated = await client.query<{ updated_at: string }>(
+            `UPDATE public.durable_jobs
+             SET status = 'pending',
+                 attempts = 0,
+                 available_at = pg_catalog.clock_timestamp(),
+                 locked_at = NULL,
+                 locked_by = NULL,
+                 last_error = 'STAFF_NOTIFICATION_RETRY_REQUESTED',
+                 updated_at = GREATEST(
+                   updated_at + interval '1 microsecond',
+                   pg_catalog.clock_timestamp()
+                 )
+             WHERE id = $1
+               AND status = 'manual'
+               AND pg_catalog.to_char(
+                 updated_at AT TIME ZONE 'UTC',
+                 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+               ) = $2
+             RETURNING pg_catalog.to_char(
                updated_at AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
-             ) = $2
-           RETURNING pg_catalog.to_char(
-             updated_at AT TIME ZONE 'UTC',
-             'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
-           ) AS updated_at`,
-          [candidate.job_id, body.expectedJobUpdatedAt],
-        );
-        const updatedAt = updated.rows[0]?.updated_at;
-        if (!updatedAt) {
-          throw requestError(
-            "Notification delivery changed; refresh before retrying",
-            409,
-            "NOTIFICATION_RETRY_STALE",
+             ) AS updated_at`,
+            [candidate.job_id, body.expectedJobUpdatedAt],
           );
-        }
-        await client.query(
-          `INSERT INTO public.audit_events(
-             actor_type, actor_id, action, target_type, target_id, reason, metadata
-           ) VALUES (
-             'staff', $1, 'notification.retry_requested',
-             'notification_outbox', $2, $3, $4
-           )`,
-          [
-            user.userId,
-            params.outboxId,
-            body.reason,
-            {
-              operationId: candidate.operation_id,
+          const updatedAt = updated.rows[0]?.updated_at;
+          if (!updatedAt) {
+            throw requestError(
+              "Notification delivery changed; refresh before retrying",
+              409,
+              "NOTIFICATION_RETRY_STALE",
+            );
+          }
+          await client.query(
+            `INSERT INTO public.audit_events(
+               actor_type, actor_id, action, target_type, target_id, reason, metadata
+             ) VALUES (
+               'staff', $1, 'notification.retry_requested',
+               'notification_outbox', $2, $3, $4
+             )`,
+            [
+              user.userId,
+              params.outboxId,
+              body.reason,
+              {
+                operationId: candidate.operation_id,
+                failedAttemptNumber: candidate.attempt_number,
+                durableJobId: candidate.job_id,
+                previousJobUpdatedAt: candidate.job_updated_at,
+                reauthGrantId,
+              },
+            ],
+          );
+          return {
+            statusCode: 201,
+            body: {
+              outboxId: params.outboxId,
               failedAttemptNumber: candidate.attempt_number,
-              durableJobId: candidate.job_id,
-              previousJobUpdatedAt: candidate.job_updated_at,
-              reauthGrantId,
+              jobStatus: "pending" as const,
+              jobUpdatedAt: updatedAt,
             },
-          ],
-        );
-        return {
-          outboxId: params.outboxId,
-          failedAttemptNumber: candidate.attempt_number,
-          jobStatus: "pending" as const,
-          jobUpdatedAt: updatedAt,
-        };
-      });
-      return reply.code(201).send(result);
+          };
+        },
+      }));
+      return reply.code(outcome.statusCode).send(outcome.body);
     },
   );
 }

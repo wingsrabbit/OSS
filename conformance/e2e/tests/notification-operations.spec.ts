@@ -11,6 +11,21 @@ const headers = {
   "X-OSS-Authorization-Epoch": "1",
 };
 
+function expectProtectedBusinessBody(
+  requestBody: Record<string, unknown>,
+  expectedBusinessBody: Record<string, unknown>,
+): string {
+  const { intentId, ...businessBody } = requestBody;
+  expect(intentId).toEqual(expect.stringMatching(/^[0-9a-f-]{36}$/u));
+  expect(businessBody).toEqual(expectedBusinessBody);
+  expect(
+    Object.keys(requestBody).some((key) =>
+      ["password", "factorcode", "recoverycode", "secret", "token", "totp"]
+        .includes(key.toLowerCase())),
+  ).toBe(false);
+  return String(intentId);
+}
+
 function viewer(
   permissions: string[],
   identity: Readonly<{ id: string; email: string }> = {
@@ -200,10 +215,13 @@ test("Staff sees the failed queue, immutable template/attempt history, and commi
       }
       expect(path).toBe(`/api/v1/admin/notification-operations/${outboxId}/retry`);
       expect(route.request().method()).toBe("POST");
-      expect(route.request().postDataJSON()).toEqual({
-        reason: "Recipient facts reviewed for one normal retry",
-        expectedJobUpdatedAt: jobUpdatedAt,
-      });
+      expectProtectedBusinessBody(
+        route.request().postDataJSON() as Record<string, unknown>,
+        {
+          reason: "Recipient facts reviewed for one normal retry",
+          expectedJobUpdatedAt: jobUpdatedAt,
+        },
+      );
       retryPosts += 1;
       retried = true;
       await route.fulfill({
@@ -244,6 +262,79 @@ test("Staff sees the failed queue, immutable template/attempt history, and commi
   await expect(panel.getByTestId("notification-retry-audit")).toContainText(
     "Recipient facts reviewed for one normal retry",
   );
+});
+
+test("real App replays one delivery intent after a committed response is lost", async ({ page }) => {
+  let retried = false;
+  let reauthPosts = 0;
+  let logicalRetryFacts = 0;
+  const committedIntents = new Set<string>();
+  const protectedBodies: Array<Record<string, unknown>> = [];
+  await routeApplication(page, {
+    permissions: ["notifications.read", "notifications.retry"],
+    onReauthRequest: async (route) => {
+      reauthPosts += 1;
+      expect(route.request().postDataJSON()).toEqual({
+        password: "Synthetic-Staff-Password!",
+        factorCode: "notification-recovery-ambiguous",
+      });
+      await route.fulfill({ headers, json: { expiresAt: "2026-08-20T08:15:00.000Z" } });
+    },
+    onNotificationRequest: async (route) => {
+      if (route.request().method() === "GET") {
+        await route.fulfill({ headers, json: snapshot(retried) });
+        return;
+      }
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      protectedBodies.push(body);
+      const intentId = expectProtectedBusinessBody(body, {
+        reason: "Recipient facts reviewed across an ambiguous response",
+        expectedJobUpdatedAt: jobUpdatedAt,
+      });
+      if (!committedIntents.has(intentId)) {
+        committedIntents.add(intentId);
+        logicalRetryFacts += 1;
+        retried = true;
+      }
+      if (protectedBodies.length === 1) {
+        await route.abort("connectionfailed");
+      } else {
+        await route.fulfill({
+          status: 201,
+          headers,
+          json: {
+            outboxId,
+            failedAttemptNumber: 1,
+            jobStatus: "pending",
+            jobUpdatedAt: "2026-08-20T08:01:00.000001Z",
+          },
+        });
+      }
+    },
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("notification-operations");
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Staff-Password!");
+  await panel.getByLabel("Notification TOTP or recovery code").fill(
+    "notification-recovery-ambiguous",
+  );
+  await panel.getByLabel("Retry reason").fill(
+    "Recipient facts reviewed across an ambiguous response",
+  );
+  await panel.getByRole("button", { name: "Controlled single retry" }).click();
+
+  await expect(page.locator(".notice.error")).toBeVisible();
+  await expect(panel.getByLabel("Retry reason")).toHaveValue(
+    "Recipient facts reviewed across an ambiguous response",
+  );
+  await panel.getByRole("button", { name: "Controlled single retry" }).click();
+
+  await expect(panel.getByTestId("notification-summary")).toContainText("Retryable: 0");
+  expect(reauthPosts).toBe(1);
+  expect(protectedBodies).toHaveLength(2);
+  expect(protectedBodies[1]).toEqual(protectedBodies[0]);
+  expect(logicalRetryFacts).toBe(1);
 });
 
 test("a current grant permits retry without another password while factor-only input is blocked", async ({ page }) => {

@@ -610,10 +610,13 @@ test("content.manage accepts MFA once and reuses the current grant for the next 
   ]);
 });
 
-test("all three immutable create forms reset only after success and never raise a page error", async ({ page }) => {
+test("immutable forms retain a stable intent across an ambiguous committed response", async ({ page }) => {
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   const mutations: string[] = [];
+  const legalBodies: Array<Record<string, unknown>> = [];
+  const committedLegalIntents = new Set<string>();
+  let logicalLegalFacts = 0;
   let legalAttempts = 0;
   await routeCommon(page, {
     permissions: ["content.read", "content.manage"],
@@ -653,12 +656,29 @@ test("all three immutable create forms reset only after success and never raise 
       if (route.request().method() === "POST" && path === "/api/v1/admin/legal/documents") {
         legalAttempts += 1;
         mutations.push(`${path}:${legalAttempts}`);
+        const requestBody = route.request().postDataJSON() as Record<string, unknown>;
+        legalBodies.push(requestBody);
+        expect(requestBody.intentId).toEqual(expect.stringMatching(/^[0-9a-f-]{36}$/u));
+        const forbiddenCredentialKeys = new Set(
+          [
+            "password",
+            "factorcode",
+            "recoverycode",
+            "secret",
+            "token",
+            "totp",
+          ],
+        );
+        expect(
+          Object.keys(requestBody).some((key) => forbiddenCredentialKeys.has(key.toLowerCase())),
+        ).toBe(false);
+        const intentId = String(requestBody.intentId);
+        if (!committedLegalIntents.has(intentId)) {
+          committedLegalIntents.add(intentId);
+          logicalLegalFacts += 1;
+        }
         if (legalAttempts === 1) {
-          await route.fulfill({
-            status: 409,
-            headers: establishedSessionHeaders,
-            json: { error: "Synthetic legal conflict", code: "CONTENT_CONFLICT" },
-          });
+          await route.abort("connectionfailed");
         } else {
           await route.fulfill({
             status: 201,
@@ -708,6 +728,9 @@ test("all three immutable create forms reset only after success and never raise 
     "/api/v1/admin/legal/documents:1",
     "/api/v1/admin/legal/documents:2",
   ]);
+  expect(legalBodies).toHaveLength(2);
+  expect(legalBodies[1]).toEqual(legalBodies[0]);
+  expect(logicalLegalFacts).toBe(1);
   expect(pageErrors).toEqual([]);
 });
 

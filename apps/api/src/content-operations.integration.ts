@@ -111,6 +111,7 @@ try {
 
   const managingStaff = await staff("manager", ["content.read", "content.manage"]);
   const readingStaff = await staff("reader", ["content.read"]);
+  const intentStaff = await staff("intent-manager", ["content.read", "content.manage"]);
   const app = Fastify({ logger: false });
   await app.register(cookie);
   app.setErrorHandler((error, _request, reply) => {
@@ -136,6 +137,9 @@ try {
     };
     const readerHeaders = {
       cookie: `${config.SESSION_COOKIE_NAME}=${readingStaff.token}`,
+    };
+    const intentHeaders = {
+      cookie: `${config.SESSION_COOKIE_NAME}=${intentStaff.token}`,
     };
 
     const persistedLocale = await app.inject({
@@ -219,7 +223,10 @@ try {
       method: "POST",
       url: `/api/v1/admin/legal/documents/${englishTermsDocumentId}/retirement`,
       headers: managerHeaders,
-      payload: { reason: "A required English fallback cannot be retired alone" },
+      payload: {
+        intentId: randomUUID(),
+        reason: "A required English fallback cannot be retired alone",
+      },
     });
     assert.equal(retireEnglishFallback.statusCode, 409, retireEnglishFallback.body);
     assert.equal(
@@ -264,6 +271,7 @@ try {
       url: "/api/v1/admin/legal/documents",
       headers: managerHeaders,
       payload: {
+        intentId: randomUUID(),
         kind: "terms",
         locale: "en",
         version: "mock-lab-v2",
@@ -278,7 +286,10 @@ try {
       method: "POST",
       url: `/api/v1/admin/legal/documents/${englishTermsReplacementId}/publication`,
       headers: managerHeaders,
-      payload: { reason: "Replace the required English fallback atomically" },
+      payload: {
+        intentId: randomUUID(),
+        reason: "Replace the required English fallback atomically",
+      },
     });
     assert.equal(
       publishEnglishTermsReplacement.statusCode,
@@ -330,6 +341,7 @@ try {
       url: "/api/v1/admin/content/entries",
       headers: readerHeaders,
       payload: {
+        intentId: randomUUID(),
         slug: "reader-must-not-write",
         kind: "announcement",
         audience: "public",
@@ -343,29 +355,76 @@ try {
     });
     assert.equal(readerDenied.statusCode, 403, readerDenied.body);
 
+    const contentEntryIntentId = randomUUID();
+    const contentEntryPayload = {
+      intentId: contentEntryIntentId,
+      slug: "fallback-proof",
+      kind: "announcement",
+      audience: "public",
+      locale: "en",
+      title: "English fallback proof",
+      summary: "Synthetic fallback",
+      body: "The zh-CN request resolves this immutable English revision.",
+      statusLevel: "information",
+      reason: "Exercise deterministic locale fallback",
+    };
     const created = await app.inject({
       method: "POST",
       url: "/api/v1/admin/content/entries",
-      headers: managerHeaders,
-      payload: {
-        slug: "fallback-proof",
-        kind: "announcement",
-        audience: "public",
-        locale: "en",
-        title: "English fallback proof",
-        summary: "Synthetic fallback",
-        body: "The zh-CN request resolves this immutable English revision.",
-        statusLevel: "information",
-        reason: "Exercise deterministic locale fallback",
-      },
+      headers: intentHeaders,
+      payload: contentEntryPayload,
     });
     assert.equal(created.statusCode, 201, created.body);
+    const exactReplay = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/content/entries",
+      headers: intentHeaders,
+      payload: contentEntryPayload,
+    });
+    assert.equal(exactReplay.statusCode, created.statusCode, exactReplay.body);
+    assert.equal(exactReplay.body, created.body);
+    const intentConflict = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/content/entries",
+      headers: intentHeaders,
+      payload: { ...contentEntryPayload, title: "Different request under the same intent" },
+    });
+    assert.equal(intentConflict.statusCode, 409, intentConflict.body);
+    assert.equal(json<{ code: string }>(intentConflict).code, "STAFF_ACTION_INTENT_CONFLICT");
+    const intentFacts = await pool.query<{ fact_count: string; metadata: Record<string, unknown> }>(
+      `SELECT pg_catalog.count(entry.id)::text AS fact_count,
+              pg_catalog.min(audit.metadata::text)::jsonb AS metadata
+       FROM public.content_entries entry
+       JOIN public.audit_events audit
+         ON audit.actor_type = 'staff'
+        AND audit.actor_id = $2
+        AND audit.target_type = 'staff_action_intent'
+        AND audit.target_id = $3
+       WHERE entry.slug = $1`,
+      ["fallback-proof", intentStaff.userId, contentEntryIntentId],
+    );
+    assert.equal(intentFacts.rows[0]?.fact_count, "1");
+    assert.deepEqual(
+      Object.keys(intentFacts.rows[0]?.metadata ?? {}).sort(),
+      ["requestFingerprint", "responseBody", "responseStatus"],
+    );
+    await pool.query(
+      `UPDATE public.staff_members SET permissions = $2 WHERE user_id = $1`,
+      [intentStaff.userId, JSON.stringify(["content.read"])],
+    );
+    const replayAfterPermissionRemoval = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/content/entries",
+      headers: intentHeaders,
+      payload: contentEntryPayload,
+    });
+    assert.equal(replayAfterPermissionRemoval.statusCode, 403, replayAfterPermissionRemoval.body);
     const createdBody = json<{ entryId: string; revision: { id: string } }>(created);
     const published = await app.inject({
       method: "POST",
       url: `/api/v1/admin/content/revisions/${createdBody.revision.id}/publication`,
       headers: managerHeaders,
-      payload: { reason: "Publish the reviewed fallback proof" },
+      payload: { intentId: randomUUID(), reason: "Publish the reviewed fallback proof" },
     });
     assert.equal(published.statusCode, 201, published.body);
 
@@ -385,6 +444,7 @@ try {
       url: `/api/v1/admin/content/entries/${createdBody.entryId}/revisions`,
       headers: managerHeaders,
       payload: {
+        intentId: randomUUID(),
         locale: "zh-CN",
         title: "中文版本证明",
         summary: "合成本地化版本",
@@ -399,7 +459,7 @@ try {
       method: "POST",
       url: `/api/v1/admin/content/revisions/${zhRevisionId}/publication`,
       headers: managerHeaders,
-      payload: { reason: "Publish reviewed zh-CN revision" },
+      payload: { intentId: randomUUID(), reason: "Publish reviewed zh-CN revision" },
     });
     assert.equal(zhPublished.statusCode, 201, zhPublished.body);
     const localized = await app.inject({
@@ -417,6 +477,7 @@ try {
       url: `/api/v1/admin/content/entries/${createdBody.entryId}/revisions`,
       headers: managerHeaders,
       payload: {
+        intentId: randomUUID(),
         locale: "en",
         title: "English fallback proof revision two",
         summary: "Second immutable revision",
@@ -439,7 +500,10 @@ try {
       method: "POST",
       url: `/api/v1/admin/content/revisions/${secondEnId}/publication`,
       headers: managerHeaders,
-      payload: { reason: "Publish reviewed second immutable revision" },
+      payload: {
+        intentId: randomUUID(),
+        reason: "Publish reviewed second immutable revision",
+      },
     });
     assert.equal(secondPublished.statusCode, 201, secondPublished.body);
     const afterPublish = await app.inject({
@@ -456,6 +520,7 @@ try {
       url: "/api/v1/admin/content/entries",
       headers: managerHeaders,
       payload: {
+        intentId: randomUUID(),
         slug: "retirement-proof",
         kind: "announcement",
         audience: "public",
@@ -480,7 +545,10 @@ try {
       method: "POST",
       url: `/api/v1/admin/content/revisions/${retirementProofRevisionId}/publication`,
       headers: managerHeaders,
-      payload: { reason: "Publish the retirement visibility proof" },
+      payload: {
+        intentId: randomUUID(),
+        reason: "Publish the retirement visibility proof",
+      },
     });
     assert.equal(retirementProofPublication.statusCode, 201, retirementProofPublication.body);
     const visiblePublication = await app.inject({
@@ -492,7 +560,10 @@ try {
       method: "POST",
       url: `/api/v1/admin/content/revisions/${retirementProofRevisionId}/retirement`,
       headers: managerHeaders,
-      payload: { reason: "Retire the current synthetic visibility proof" },
+      payload: {
+        intentId: randomUUID(),
+        reason: "Retire the current synthetic visibility proof",
+      },
     });
     assert.equal(retirementProofRetirement.statusCode, 201, retirementProofRetirement.body);
     const hiddenRetiredPublic = await app.inject({
@@ -512,6 +583,7 @@ try {
       url: "/api/v1/admin/content/entries",
       headers: managerHeaders,
       payload: {
+        intentId: randomUUID(),
         slug: "timestamp-proof",
         kind: "announcement",
         audience: "public",
@@ -830,6 +902,7 @@ try {
       url: "/api/v1/admin/content/entries",
       headers: managerHeaders,
       payload: {
+        intentId: randomUUID(),
         slug: "latest-reauth-grant",
         kind: "announcement",
         audience: "public",

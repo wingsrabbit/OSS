@@ -9,6 +9,11 @@ import {
   useState,
 } from "react";
 import { api } from "./api.js";
+import {
+  clearStaffActionIntent,
+  staffActionIntent,
+  type StaffActionIntent,
+} from "./staff-action-intents.js";
 
 type Locale = "en" | "zh-CN";
 
@@ -108,6 +113,7 @@ export function NotificationTemplateRegistryPanel({
   const [factorCode, setFactorCode] = useState("");
   const [actionReason, setActionReason] = useState("");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const actionIntents = useRef(new Map<string, StaffActionIntent>());
   const scopeKey = JSON.stringify([
     accessFingerprint,
     active,
@@ -205,6 +211,7 @@ export function NotificationTemplateRegistryPanel({
     setFactorCode("");
     setActionReason("");
     setPendingAction(null);
+    actionIntents.current.clear();
     return () => {
       refreshGeneration.current += 1;
       accessScope.current = {
@@ -246,6 +253,7 @@ export function NotificationTemplateRegistryPanel({
       );
       return false;
     }
+    const intentId = staffActionIntent(actionIntents.current, actionKey, { path, body });
     setPendingAction(actionKey);
     let committed = false;
     try {
@@ -268,7 +276,11 @@ export function NotificationTemplateRegistryPanel({
       }
       if (!scopeIsCurrent(scope)) return false;
       try {
-        await api(path, { method: "POST", body: JSON.stringify(body) });
+        await api(path, {
+          method: "POST",
+          body: JSON.stringify({ ...body, intentId }),
+        });
+        clearStaffActionIntent(actionIntents.current, actionKey, intentId);
       } catch (caught) {
         if (!scopeIsCurrent(scope)) return false;
         throw caught;
