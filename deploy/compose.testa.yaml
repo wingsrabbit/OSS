@@ -1,0 +1,216 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: opensales-testa
+
+x-bounded-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-10m}
+    max-file: "${CONTAINER_LOG_MAX_FILES:-3}"
+
+x-core-runtime: &core-runtime
+  image: ${CORE_RUNTIME_IMAGE:?required_digest_bound_core_runtime_image}
+  pull_policy: never
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: ${CORE_PIDS_LIMIT:-256}
+  logging: *bounded-logging
+
+x-core-env: &core-env
+  OSS_ENV: laboratory
+  OSS_LOG_LEVEL: ${OSS_LOG_LEVEL:-info}
+  OSS_PUBLIC_URL: ${CORE_PUBLIC_URL:?required_https_core_public_url}
+  WEB_ORIGIN: ${CORE_PUBLIC_URL:?required_https_core_public_url}
+  MOCK_MAILBOX_URL: ${PROVIDER_BASE_URL:?required_https_provider_base_url}
+  LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
+  PROVIDER_OPERATION_CAPABILITY_SECRET: ${PROVIDER_OPERATION_CAPABILITY_SECRET:?required}
+  PAYMENT_METHOD_TOKEN_KEY: ${PAYMENT_METHOD_TOKEN_KEY:?required}
+  PAYMENT_METHOD_TOKEN_KEY_VERSION: ${PAYMENT_METHOD_TOKEN_KEY_VERSION:-1}
+  PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: ${PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS:-}
+  PAYMENT_METHOD_TOKEN_LOOKUP_KEY: ${PAYMENT_METHOD_TOKEN_LOOKUP_KEY:?required}
+  PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: ${PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION:-1}
+  PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: ${PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS:-}
+  IDENTITY_SECRET_KEY: ${IDENTITY_SECRET_KEY:?required}
+  IDENTITY_SECRET_KEY_VERSION: ${IDENTITY_SECRET_KEY_VERSION:-1}
+  IDENTITY_SECRET_PREVIOUS_KEYS: ${IDENTITY_SECRET_PREVIOUS_KEYS:-}
+  OSS_SCHEMA_ROLLBACK_BRIDGE: ${OSS_SCHEMA_ROLLBACK_BRIDGE:-disabled}
+  MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
+  MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
+  NOTIFICATION_MAX_ATTEMPTS: ${NOTIFICATION_MAX_ATTEMPTS:-3}
+  GLOBAL_RATE_LIMIT_MAX: ${GLOBAL_RATE_LIMIT_MAX:-120}
+  LAB_MAILBOX_ENABLED: ${LAB_MAILBOX_ENABLED:-true}
+
+services:
+  core-db:
+    image: ${POSTGRES_IMAGE:?required_digest_bound_postgres_18_image}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: oss
+      POSTGRES_USER: oss_migrator
+      POSTGRES_PASSWORD: ${CORE_DATABASE_MIGRATOR_PASSWORD:?required}
+    volumes:
+      - core-db-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${CORE_DATABASE_HOST_PORT:-55432}:5432"
+    networks: [core-data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U oss_migrator -d oss"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    pids_limit: ${CORE_DATABASE_PIDS_LIMIT:-256}
+    mem_limit: ${CORE_DATABASE_MEMORY_LIMIT:-2g}
+    cpus: ${CORE_DATABASE_CPU_LIMIT:-1.5}
+    logging: *bounded-logging
+
+  seed:
+    <<: *core-runtime
+    restart: "no"
+    command: ["sh", "-c", "node apps/api/dist/migrate.js && node apps/api/dist/seed-termrat.js"]
+    environment:
+      <<: *core-env
+      DATABASE_URL: postgresql://oss_api:${CORE_DATABASE_API_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_api
+      MIGRATION_DATABASE_URL: postgresql://oss_migrator:${CORE_DATABASE_MIGRATOR_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_API_ROLE_PASSWORD: ${CORE_DATABASE_API_PASSWORD:?required}
+      DATABASE_WORKER_ROLE_PASSWORD: ${CORE_DATABASE_WORKER_PASSWORD:?required}
+    depends_on:
+      core-db:
+        condition: service_healthy
+    networks: [core-data]
+    mem_limit: ${SEED_MEMORY_LIMIT:-768m}
+    cpus: ${SEED_CPU_LIMIT:-1.0}
+
+  api:
+    <<: *core-runtime
+    command: [node, apps/api/dist/server.js]
+    environment:
+      <<: *core-env
+      DATABASE_URL: postgresql://oss_api:${CORE_DATABASE_API_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_api
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    networks: [core-data, core-app, core-egress]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
+    cpus: ${API_CPU_LIMIT:-1.0}
+
+  worker:
+    <<: *core-runtime
+    command: [node, apps/worker/dist/worker.js]
+    environment:
+      <<: *core-env
+      DATABASE_URL: postgresql://oss_worker:${CORE_DATABASE_WORKER_PASSWORD:?required}@core-db:5432/oss
+      DATABASE_RUNTIME_ROLE: oss_worker
+      CORE_INTERNAL_URL: http://api:3000
+      MOCK_PAYMENT_PROVIDER_URL: ${PROVIDER_BASE_URL:?required_https_provider_base_url}
+      MOCK_PROVISIONING_PROVIDER_URL: ${PROVIDER_BASE_URL:?required_https_provider_base_url}
+      MOCK_PROVIDER_PLATFORM_URL: ${PROVIDER_BASE_URL:?required_https_provider_base_url}
+      MOCK_MAIL_PROVIDER_URL: ${PROVIDER_BASE_URL:?required_https_provider_base_url}
+      MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
+      MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
+      MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
+      MOCK_PROVISION_SCENARIO: ${MOCK_PROVISION_SCENARIO:-success}
+      MOCK_RESOURCE_ACTION_SCENARIO: ${MOCK_RESOURCE_ACTION_SCENARIO:-success}
+      MOCK_SERVICE_OPERATION_SCENARIO: ${MOCK_SERVICE_OPERATION_SCENARIO:-normal}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [core-data, core-app, core-egress]
+    mem_limit: ${WORKER_MEMORY_LIMIT:-1g}
+    cpus: ${WORKER_CPU_LIMIT:-1.0}
+
+  callback-gateway:
+    image: ${CADDY_IMAGE:?required_digest_bound_caddy_image}
+    pull_policy: never
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile.callback:/etc/caddy/Caddyfile:ro
+    networks: [core-app]
+    read_only: true
+    tmpfs:
+      - /config:size=8m,mode=0700
+      - /data:size=16m,mode=0700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${GATEWAY_PIDS_LIMIT:-128}
+    mem_limit: ${GATEWAY_MEMORY_LIMIT:-256m}
+    cpus: ${GATEWAY_CPU_LIMIT:-0.5}
+    logging: *bounded-logging
+
+  web:
+    image: ${WEB_RUNTIME_IMAGE:?required_digest_bound_web_runtime_image}
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [core-app]
+    read_only: true
+    tmpfs:
+      - /config:size=8m,mode=0700
+      - /data:size=16m,mode=0700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${WEB_PIDS_LIMIT:-128}
+    mem_limit: ${WEB_MEMORY_LIMIT:-256m}
+    cpus: ${WEB_CPU_LIMIT:-0.5}
+    logging: *bounded-logging
+
+  core-edge:
+    image: ${CADDY_IMAGE:?required_digest_bound_caddy_image}
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      callback-gateway:
+        condition: service_started
+      web:
+        condition: service_started
+    ports:
+      - "${CORE_EDGE_BIND_ADDRESS:?required_approved_bind_address}:${CORE_HTTPS_PORT:-443}:8443"
+    volumes:
+      - ./Caddyfile.core-edge:/etc/caddy/Caddyfile:ro
+    secrets:
+      - core_tls_cert
+      - core_tls_key
+    networks: [core-app, core-ingress]
+    read_only: true
+    tmpfs:
+      - /config:size=8m,mode=0700
+      - /data:size=16m,mode=0700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${EDGE_PIDS_LIMIT:-128}
+    mem_limit: ${EDGE_MEMORY_LIMIT:-256m}
+    cpus: ${EDGE_CPU_LIMIT:-0.5}
+    logging: *bounded-logging
+
+volumes:
+  core-db-data:
+
+secrets:
+  core_tls_cert:
+    file: ${CORE_TLS_CERT_FILE:?required_private_tls_certificate_file}
+  core_tls_key:
+    file: ${CORE_TLS_KEY_FILE:?required_private_tls_key_file}
+
+networks:
+  core-data:
+    internal: true
+  core-app:
+    internal: true
+  core-egress:
+  core-ingress:

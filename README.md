@@ -148,6 +148,11 @@ network is separated from the Core data network.
 The repository deliberately has no default administrator password and no real
 Provider credential. Laboratory deployment secrets belong outside Git.
 
+`compose.yaml` remains the single-host local laboratory topology. It must not be
+split across Docker daemons. The digest-bound TestA/TestB deployment topology,
+gates, and Provider-first start order are documented in
+[`docs/operators/two-host-mock-rc-deployment.md`](docs/operators/two-host-mock-rc-deployment.md).
+
 ## Repository layout
 
 - `apps/api`: Fastify API, forward migration, authentication, checkout, finance,

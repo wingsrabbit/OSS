@@ -27,7 +27,7 @@ x-core-env: &core-env
 x-provider-base: &provider-base
   build:
     context: .
-    target: runtime
+    target: provider-runtime
   command: ["node", "providers/mock-lab/dist/server.js"]
   restart: unless-stopped
   read_only: true
@@ -135,7 +135,7 @@ services:
   seed:
     build:
       context: .
-      target: runtime
+      target: core-runtime
     command:
       [
         "sh",
@@ -159,7 +159,7 @@ services:
   api:
     build:
       context: .
-      target: runtime
+      target: core-runtime
     command: ["node", "apps/api/dist/server.js"]
     restart: unless-stopped
     environment:
@@ -191,7 +191,7 @@ services:
   worker:
     build:
       context: .
-      target: runtime
+      target: core-runtime
     command: ["node", "apps/worker/dist/worker.js"]
     restart: unless-stopped
     environment:
@@ -201,7 +201,7 @@ services:
       CORE_INTERNAL_URL: http://api:3000
       MOCK_PAYMENT_PROVIDER_URL: http://provider-payment:4000
       MOCK_PROVISIONING_PROVIDER_URL: http://provider-provisioning:4000
-      MOCK_PROVIDER_PLATFORM_URL: http://provider-provisioning:4000
+      MOCK_PROVIDER_PLATFORM_URL: http://provider-platform:4000
       MOCK_MAIL_PROVIDER_URL: http://provider-mail:4000
       MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
       MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
@@ -219,7 +219,9 @@ services:
         condition: service_healthy
       provider-mail:
         condition: service_healthy
-    networks: [core-data, core-app, payment-app, provisioning-app, mail-app]
+      provider-platform:
+        condition: service_healthy
+    networks: [core-data, core-app, payment-app, provisioning-app, mail-app, provider-platform-app]
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -266,8 +268,6 @@ services:
     environment:
       PROVIDER_DATABASE_URL: postgresql://provisioning_provider:${PROVISIONING_PROVIDER_DATABASE_PASSWORD:?required}@provider-provisioning-db:5432/provisioning_provider
       MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
-      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
-      MOCK_PROVIDER_PUBLIC_BASE_URL: http://provider-provisioning:4000
       MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
       CORE_CALLBACK_URL: http://callback-gateway:8081
     depends_on:
@@ -288,12 +288,21 @@ services:
 
   provider-mailbox:
     <<: *provider-base
+    command:
+      - sh
+      - -c
+      - >-
+        until node -e "fetch('http://provider-mail:4000/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))";
+        do sleep 1; done;
+        exec node providers/mock-lab/dist/server.js
     environment:
       PROVIDER_DATABASE_URL: postgresql://mail_provider:${MAIL_PROVIDER_DATABASE_PASSWORD:?required}@provider-mail-db:5432/mail_provider
       LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
       CORE_CALLBACK_URL: http://127.0.0.1
     depends_on:
       provider-mail-db:
+        condition: service_healthy
+      provider-mail:
         condition: service_healthy
     networks: [mail-data, mailbox-app]
 

@@ -51,6 +51,9 @@ jobs:
           test "$(pnpm --version)" = '11.14.0'
           pnpm install --frozen-lockfile
 
+      - name: Verify two-host Mock-only deployment contracts
+        run: node --test tools/two-host-deployment.test.mjs
+
       - name: Laboratory RC backup and restore-plan regressions
         run: node --test tools/lab-backup.test.mjs
 
