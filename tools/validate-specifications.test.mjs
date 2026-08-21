@@ -3719,7 +3719,12 @@ test("unknown source verification cannot be upgraded in place without a successo
       "source SRC-OBSERVATION-0001 verification cannot change in place from unknown to verified",
     );
   } finally {
-    rmSync(temporaryRoot, { recursive: true, force: true });
+    rmSync(temporaryRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 25,
+    });
   }
 });
 
