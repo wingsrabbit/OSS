@@ -5896,10 +5896,12 @@ try {
       const result = await corePool.query<{ waiting: string }>(
         `SELECT count(*)::text AS waiting
          FROM pg_stat_activity
-         WHERE application_name = 'opensales-api'
+         WHERE datname = current_database()
+           AND application_name = 'opensales-api'
            AND state = 'active'
            AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
+           AND query ILIKE '%FROM users%'
+           AND query ILIKE '%FOR UPDATE%'`,
       );
       return result.rows[0]?.waiting ?? "0";
     },
@@ -6077,10 +6079,12 @@ try {
         const result = await corePool.query<{ waiting: string }>(
           `SELECT count(*)::text AS waiting
            FROM pg_stat_activity
-           WHERE application_name = 'opensales-api'
+           WHERE datname = current_database()
+             AND application_name = 'opensales-api'
              AND state = 'active'
              AND wait_event_type = 'Lock'
-             AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
+             AND query ILIKE '%FROM users%'
+             AND query ILIKE '%FOR UPDATE%'`,
         );
         return result.rows[0]?.waiting ?? "0";
       },
@@ -10870,12 +10874,37 @@ const paidBeforeChargeback = await request<OrderDetail>(
 );
 assert.equal(paidBeforeChargeback.invoice.status, "paid");
 assert.equal(paidBeforeChargeback.invoice.creditAppliedMinor, "500");
-await corePool.query(
-  `UPDATE client_memberships
-   SET removed_at = now()
-   WHERE user_id = $1 AND client_account_id = $2`,
-  [chargebackMe.id, chargebackMe.clientAccountId],
-);
+const chargebackRemovalClient = await corePool.connect();
+try {
+  await chargebackRemovalClient.query("BEGIN");
+  await chargebackRemovalClient.query(
+    `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+    [chargebackMe.id],
+  );
+  await chargebackRemovalClient.query(
+    `SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE`,
+    [chargebackMe.clientAccountId],
+  );
+  await chargebackRemovalClient.query(
+    `SELECT user_id
+     FROM client_memberships
+     WHERE user_id = $1 AND client_account_id = $2
+     FOR UPDATE`,
+    [chargebackMe.id, chargebackMe.clientAccountId],
+  );
+  await chargebackRemovalClient.query(
+    `UPDATE client_memberships
+     SET removed_at = now()
+     WHERE user_id = $1 AND client_account_id = $2`,
+    [chargebackMe.id, chargebackMe.clientAccountId],
+  );
+  await chargebackRemovalClient.query("COMMIT");
+} catch (error) {
+  await chargebackRemovalClient.query("ROLLBACK").catch(() => undefined);
+  throw error;
+} finally {
+  chargebackRemovalClient.release();
+}
 
 const mockChargebackRequestId = randomUUID();
 const mockChargebackResponse = await fetch(
@@ -10939,22 +10968,53 @@ await waitFor(
   (result) => result.rows[0]?.count === "1",
   30_000,
 );
-await corePool.query(
-  `UPDATE client_memberships
-   SET removed_at = NULL
-   WHERE user_id = $1 AND client_account_id = $2`,
-  [chargebackMe.id, chargebackMe.clientAccountId],
-);
-await corePool.query(
-  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
-  [chargebackMe.clientAccountId, chargebackMe.id],
-);
-await corePool.query(
-  `UPDATE client_memberships
-   SET role = 'viewer', permissions = '[]'::jsonb
-   WHERE client_account_id = $1 AND user_id = $2`,
-  [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
-);
+const chargebackRestorationClient = await corePool.connect();
+try {
+  await chargebackRestorationClient.query("BEGIN");
+  await chargebackRestorationClient.query(
+    `SELECT id
+     FROM users
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id
+     FOR UPDATE`,
+    [[chargebackMe.id, chargebackAnchorOwnerUserId]],
+  );
+  await chargebackRestorationClient.query(
+    `SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE`,
+    [chargebackMe.clientAccountId],
+  );
+  await chargebackRestorationClient.query(
+    `SELECT user_id
+     FROM client_memberships
+     WHERE client_account_id = $1
+       AND user_id = ANY($2::uuid[])
+     ORDER BY user_id
+     FOR UPDATE`,
+    [chargebackMe.clientAccountId, [chargebackMe.id, chargebackAnchorOwnerUserId]],
+  );
+  await chargebackRestorationClient.query(
+    `UPDATE client_memberships
+     SET removed_at = NULL
+     WHERE user_id = $1 AND client_account_id = $2`,
+    [chargebackMe.id, chargebackMe.clientAccountId],
+  );
+  await chargebackRestorationClient.query(
+    `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+    [chargebackMe.clientAccountId, chargebackMe.id],
+  );
+  await chargebackRestorationClient.query(
+    `UPDATE client_memberships
+     SET role = 'viewer', permissions = '[]'::jsonb
+     WHERE client_account_id = $1 AND user_id = $2`,
+    [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
+  );
+  await chargebackRestorationClient.query("COMMIT");
+} catch (error) {
+  await chargebackRestorationClient.query("ROLLBACK").catch(() => undefined);
+  throw error;
+} finally {
+  chargebackRestorationClient.release();
+}
 await refreshAccountContext(chargebackMe.clientAccountId, false);
 const customerChargebackStatus = await waitFor(
   "settled Add Funds Chargeback customer status",
