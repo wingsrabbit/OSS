@@ -1299,7 +1299,9 @@ async function runNormal(): Promise<void> {
 }
 
 async function runSchemaGate(): Promise<void> {
-  const reviewedInput = await schema023CatalogFingerprintInput(core);
+  const reviewedInput = await schema023CatalogFingerprintInput(core, {
+    allowSchema029ServicePasswordExtensions: true,
+  });
   const reviewedDigest = schema023CatalogDigest(reviewedInput);
   assert.equal(reviewedDigest, SCHEMA_023_CATALOG_DIGEST);
   assert.doesNotThrow(() => assertSchema023CatalogDigest(reviewedDigest));
