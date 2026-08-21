@@ -500,14 +500,20 @@ async function listPasswordChanges(
     status: string;
     version: number;
     product_name: string;
+    external_resource_id: string | null;
     resource_revision: number;
+    cancellation_due: boolean;
     provider_installation_id: string | null;
     provider_enabled: boolean | null;
     binding_capabilities: unknown;
     current_capabilities: unknown;
   }>(
     `SELECT service.id, service.status, service.version, item.product_name,
+            service.external_resource_id,
             COALESCE(resource.resource_revision, 0) AS resource_revision,
+            service.cancellation_effective_at IS NOT NULL
+              AND service.cancellation_effective_at <= pg_catalog.clock_timestamp()
+              AS cancellation_due,
             binding.provider_installation_id,
             provider.enabled AS provider_enabled,
             binding.capability_snapshot AS binding_capabilities,
@@ -566,6 +572,8 @@ async function listPasswordChanges(
   const current = stringList(service.current_capabilities);
   const canChangePassword =
     service.status === "active" &&
+    !service.cancellation_due &&
+    service.external_resource_id !== null &&
     !unresolved &&
     service.provider_installation_id === MOCK_PROVISIONING_INSTALLATION_ID &&
     service.provider_enabled === true &&
