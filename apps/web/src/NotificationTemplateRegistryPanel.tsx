@@ -105,6 +105,7 @@ export function NotificationTemplateRegistryPanel({
   const [snapshot, setSnapshot] = useState<TemplateRegistrySnapshot>({ events: [] });
   const [loading, setLoading] = useState(false);
   const [password, setPassword] = useState("");
+  const [factorCode, setFactorCode] = useState("");
   const [actionReason, setActionReason] = useState("");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const scopeKey = JSON.stringify([
@@ -150,7 +151,10 @@ export function NotificationTemplateRegistryPanel({
     [],
   );
 
-  const refresh = useCallback(async (scope: AccessScopeToken): Promise<boolean> => {
+  const refresh = useCallback(async (
+    scope: AccessScopeToken,
+    reportFailure = true,
+  ): Promise<boolean> => {
     if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !active || !canRead) return false;
     const requestGeneration = ++refreshGeneration.current;
     setLoading(true);
@@ -169,6 +173,7 @@ export function NotificationTemplateRegistryPanel({
         !scopeIsCurrent(scope) ||
         refreshGeneration.current !== requestGeneration
       ) return false;
+      if (!reportFailure) throw caught;
       setSnapshot({ events: [] });
       onErrorRef.current(
         caught instanceof Error
@@ -197,6 +202,7 @@ export function NotificationTemplateRegistryPanel({
     setSnapshot({ events: [] });
     setLoading(false);
     setPassword("");
+    setFactorCode("");
     setActionReason("");
     setPendingAction(null);
     return () => {
@@ -219,6 +225,7 @@ export function NotificationTemplateRegistryPanel({
     actionKey: string,
     path: string,
     body: Record<string, unknown>,
+    authorized: boolean,
   ): Promise<boolean> {
     const scope = captureScope();
     if (
@@ -226,28 +233,70 @@ export function NotificationTemplateRegistryPanel({
       !scopeIsCurrent(scope) ||
       !active ||
       !canRead ||
-      password.length === 0 ||
+      !authorized ||
       pendingAction !== null
     ) return false;
+    const submittedPassword = password;
+    const submittedFactorCode = factorCode.trim();
+    if (submittedPassword.length === 0 && submittedFactorCode.length > 0) {
+      onErrorRef.current(
+        localeRef.current === "zh-CN"
+          ? "TOTP 或恢复码必须与当前密码一起提交。"
+          : "A TOTP or recovery code must be submitted with the current password.",
+      );
+      return false;
+    }
     setPendingAction(actionKey);
+    let committed = false;
     try {
-      await api("/api/v1/auth/reauth", {
-        method: "POST",
-        body: JSON.stringify({ password }),
-      });
+      if (submittedPassword.length > 0) {
+        try {
+          await api("/api/v1/auth/reauth", {
+            method: "POST",
+            body: JSON.stringify({
+              password: submittedPassword,
+              ...(submittedFactorCode ? { factorCode: submittedFactorCode } : {}),
+            }),
+          });
+        } catch (caught) {
+          if (!scopeIsCurrent(scope)) return false;
+          throw caught;
+        }
+        if (!scopeIsCurrent(scope)) return false;
+        setPassword("");
+        setFactorCode("");
+      }
       if (!scopeIsCurrent(scope)) return false;
-      await api(path, { method: "POST", body: JSON.stringify(body) });
+      try {
+        await api(path, { method: "POST", body: JSON.stringify(body) });
+      } catch (caught) {
+        if (!scopeIsCurrent(scope)) return false;
+        throw caught;
+      }
       if (!scopeIsCurrent(scope)) return false;
-      setPassword("");
+      committed = true;
       setActionReason("");
+      setPendingAction(null);
       onNoticeRef.current(
         localeRef.current === "zh-CN"
           ? "通知模板事实已提交。"
           : "Notification template fact committed.",
       );
-      const refreshed = await refresh(scope);
-      if (!scopeIsCurrent(scope)) return false;
-      return refreshed;
+      void refresh(scope, false)
+        .catch((caught: unknown) => {
+          if (!scopeIsCurrent(scope)) return;
+          const detail = caught instanceof Error
+            ? caught.message
+            : localeRef.current === "zh-CN"
+              ? "无法加载通知模板注册表"
+              : "Notification template registry could not be loaded";
+          onErrorRef.current(
+            localeRef.current === "zh-CN"
+              ? `通知模板事实已提交，但注册表刷新失败：${detail}`
+              : `Notification template fact committed, but registry refresh failed: ${detail}`,
+          );
+        });
+      return true;
     } catch (caught) {
       if (!scopeIsCurrent(scope)) return false;
       onErrorRef.current(
@@ -259,13 +308,14 @@ export function NotificationTemplateRegistryPanel({
       );
       return false;
     } finally {
-      if (scopeIsCurrent(scope)) setPendingAction(null);
+      if (!committed && scopeIsCurrent(scope)) setPendingAction(null);
     }
   }
 
   async function createRevision(event: FormEvent<HTMLFormElement>, templateEvent: TemplateEvent) {
     event.preventDefault();
     if (!canCreate) return;
+    const scope = captureScope();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const revisionLocale = String(form.get("locale"));
@@ -283,8 +333,9 @@ export function NotificationTemplateRegistryPanel({
       `create:${templateEvent.eventType}`,
       `/api/v1/admin/notification-templates/${encodeURIComponent(templateEvent.eventType)}/revisions`,
       { locale: revisionLocale, subjectTemplate, bodyTemplate, reason },
+      canCreate,
     );
-    if (committed) formElement.reset();
+    if (committed && scopeIsCurrent(scope)) formElement.reset();
   }
 
   async function changePublication(
@@ -313,12 +364,14 @@ export function NotificationTemplateRegistryPanel({
         reason: actionReason.trim(),
         expectedChannelVersion: channel.channelVersion,
       },
+      action === "publish" ? canPublish : canRetire,
     );
   }
 
   if (!active || !canRead) return null;
   const zh = locale === "zh-CN";
   const hasPublicationActions = canPublish || canRetire;
+  const factorRequiresPassword = password.length === 0 && factorCode.trim().length > 0;
 
   return (
     <section
@@ -337,15 +390,41 @@ export function NotificationTemplateRegistryPanel({
       </div>
 
       {(canCreate || hasPublicationActions) && (
-        <label>
-          {zh ? "当前密码确认" : "Current password confirmation"}
-          <input
-            type="password"
-            autoComplete="current-password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-          />
-        </label>
+        <fieldset>
+          <legend>{zh ? "Staff 重新认证" : "Staff reauthentication"}</legend>
+          <p className="muted">
+            {zh
+              ? "已有有效的 15 分钟授权时可留空；否则输入当前密码，并在已启用时输入 TOTP 或一次性恢复码。"
+              : "Leave both fields blank to reuse a current 15-minute grant. Otherwise enter the current password and, when enabled, a TOTP or one-time recovery code."}
+          </p>
+          <label>
+            {zh ? "当前密码确认" : "Current password confirmation"}
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              disabled={pendingAction !== null}
+            />
+          </label>
+          <label>
+            {zh ? "模板操作 TOTP 或恢复码" : "Template TOTP or recovery code"}
+            <input
+              autoComplete="one-time-code"
+              value={factorCode}
+              onChange={(event) => setFactorCode(event.target.value)}
+              aria-invalid={factorRequiresPassword}
+              disabled={pendingAction !== null}
+            />
+          </label>
+          {factorRequiresPassword && (
+            <p className="notice error" data-testid="notification-template-factor-requires-password">
+              {zh
+                ? "请输入当前密码，或清空 TOTP / 恢复码以复用现有授权。"
+                : "Enter the current password, or clear the TOTP / recovery code to reuse the current grant."}
+            </p>
+          )}
+        </fieldset>
       )}
 
       {hasPublicationActions && (
@@ -427,7 +506,7 @@ export function NotificationTemplateRegistryPanel({
                   </label>
                   <button
                     type="submit"
-                    disabled={pendingAction !== null || password.length === 0}
+                    disabled={pendingAction !== null || factorRequiresPassword}
                   >
                     {pendingAction === `create:${templateEvent.eventType}`
                       ? zh ? "正在创建…" : "Creating…"
@@ -460,7 +539,7 @@ export function NotificationTemplateRegistryPanel({
                           type="button"
                           disabled={
                             pendingAction !== null ||
-                            password.length === 0 ||
+                            factorRequiresPassword ||
                             actionReason.trim().length < 3
                           }
                           onClick={() => void changePublication(templateEvent, revision, "publish")}
@@ -483,7 +562,7 @@ export function NotificationTemplateRegistryPanel({
                           type="button"
                           disabled={
                             pendingAction !== null ||
-                            password.length === 0 ||
+                            factorRequiresPassword ||
                             actionReason.trim().length < 3
                           }
                           onClick={() => void changePublication(templateEvent, revision, "retire")}

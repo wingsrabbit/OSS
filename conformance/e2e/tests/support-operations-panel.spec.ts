@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 const accountId = "10000000-0000-4000-8000-000000000001";
 const ticketId = "20000000-0000-4000-8000-000000000001";
@@ -11,6 +12,8 @@ const staffId = "50000000-0000-4000-8000-000000000001";
 const departmentId = "60000000-0000-4000-8000-000000000001";
 const inquiryId = "70000000-0000-4000-8000-000000000001";
 const occurredAt = "2026-08-20T03:00:00.000Z";
+const customerDownloadBytes = Buffer.from("customer attachment bytes\n", "utf8");
+const staffDownloadBytes = Buffer.from("staff attachment bytes\n", "utf8");
 
 const sessionHeaders = {
   "X-OSS-Account-Context-Version": "1",
@@ -70,6 +73,7 @@ function customerDetail(attachmentVisible = true) {
       contentType: "text/plain",
       sizeBytes: 18,
       uploadedByType: "customer",
+      scanStatus: "clean",
       createdAt: occurredAt,
     }] : [],
     statusHistory: [{
@@ -218,6 +222,7 @@ async function routeCustomer(page: Page) {
         contentType: "text/plain",
         sizeBytes: 21,
         uploadedByType: "customer",
+        scanStatus: "pending",
         createdAt: occurredAt,
       }] : []),
     ],
@@ -236,6 +241,17 @@ async function routeCustomer(page: Page) {
     }
     if (request.method() === "GET" && url.pathname === `/api/v1/tickets/${ticketId}`) {
       return fulfill(route, currentDetail(), true);
+    }
+    if (
+      request.method() === "GET" &&
+      url.pathname === `/api/v1/tickets/${ticketId}/attachments/${attachmentId}`
+    ) {
+      return route.fulfill({
+        status: 200,
+        contentType: "text/plain",
+        headers: accountHeaders,
+        body: customerDownloadBytes,
+      });
     }
     if (request.method() === "POST" && url.pathname.endsWith("/replies")) {
       const body = request.postDataJSON() as Record<string, unknown>;
@@ -289,8 +305,14 @@ test("customer Support component shows fields, immutable history, ordinary attac
   await expect(detail.getByTestId("support-ticket-history")).toContainText("Ticket created");
   await expect(detail.getByTestId("support-ticket-history")).not.toContainText("customer@example.invalid");
   await expect(detail).toContainText("ordinary.txt");
-  await expect(detail.getByTestId("support-download-unavailable")).toBeVisible();
-  await expect(detail.getByRole("link")).toHaveCount(0);
+  await expect(detail).toContainText("Download available");
+  const downloadPromise = page.waitForEvent("download");
+  await detail.getByRole("button", { name: "Download ordinary.txt" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("ordinary.txt");
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  expect(await readFile(downloadPath!)).toEqual(customerDownloadBytes);
   await detail.getByRole("button", { name: "Delete" }).click();
   await expect(detail).not.toContainText("ordinary.txt");
   await detail.getByLabel("Customer ticket reply").fill("Customer browser reply");
@@ -303,8 +325,128 @@ test("customer Support component shows fields, immutable history, ordinary attac
   });
   await detail.getByRole("button", { name: "Upload attachment" }).click();
   await expect(detail).toContainText("customer-upload.txt");
+  await expect(detail.getByRole("button", { name: "Download customer-upload.txt" })).toHaveCount(0);
+  await expect(detail).toContainText("Download not available");
   expect(observed.postedBodies.every((body) => typeof body.idempotencyKey === "string")).toBe(true);
   await expect(detail.getByRole("button", { name: "Close ticket" })).toBeVisible();
+});
+
+test("only an attachment with existing download availability exposes the ordinary download action", async ({ page }) => {
+  const attachmentStates = [
+    { id: "40000000-0000-4000-8000-000000000002", filename: "second.txt", scanStatus: "pending" },
+    { id: "40000000-0000-4000-8000-000000000003", filename: "third.txt", scanStatus: "rejected" },
+    { id: "40000000-0000-4000-8000-000000000004", filename: "fourth.txt", scanStatus: "error" },
+  ] as const;
+  const detailResponse = {
+    ...customerDetail(),
+    attachments: [
+      ...customerDetail().attachments,
+      ...attachmentStates.map((item) => ({
+        ...item,
+        messageId: customerMessageId,
+        contentType: "text/plain",
+        sizeBytes: 1,
+        uploadedByType: "customer",
+        createdAt: occurredAt,
+      })),
+    ],
+  };
+  await page.route("**/api/v1/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/v1/tickets") return fulfill(route, { items: [ticket] }, true);
+    if (path === "/api/v1/tickets/service-options") return fulfill(route, { items: [] }, true);
+    if (path === "/api/v1/support/departments") return fulfill(route, { items: [department] }, true);
+    if (path === `/api/v1/tickets/${ticketId}`) return fulfill(route, detailResponse, true);
+    return route.fulfill({ status: 404, headers: accountHeaders, json: { error: "Not found" } });
+  });
+
+  await page.goto("/support-operations-harness.html?mode=customer");
+  const panel = page.getByRole("region", { name: "Customer support tickets" });
+  await panel.getByRole("button", { name: /Ordinary browser Support request/ }).click();
+  const detail = panel.getByTestId("customer-ticket-thread");
+  await expect(detail.getByRole("button", { name: /^Download / })).toHaveCount(1);
+  await expect(detail.locator("span").filter({ hasText: "Download available" })).toHaveCount(1);
+  await expect(detail.locator("span").filter({ hasText: "Download not available" })).toHaveCount(3);
+  for (const item of attachmentStates) {
+    await expect(detail.getByRole("button", { name: `Download ${item.filename}` })).toHaveCount(0);
+  }
+  await expect(detail).not.toContainText("deleted.txt");
+});
+
+test("a late response from a replaced identity cannot start an old attachment download", async ({ page }) => {
+  await routeCustomer(page);
+  let releaseDownload!: () => void;
+  let markDownloadStarted!: () => void;
+  const downloadGate = new Promise<void>((resolve) => { releaseDownload = resolve; });
+  const downloadStarted = new Promise<void>((resolve) => { markDownloadStarted = resolve; });
+  let downloadRequests = 0;
+  const replacementHeaders = {
+    "X-OSS-Account-Context-Version": "2",
+    "X-OSS-Authorization-Epoch": "2",
+    "X-OSS-Client-Account-Id": "10000000-0000-4000-8000-000000000002",
+  };
+  await page.route(`**/api/v1/tickets/${ticketId}/attachments/${attachmentId}`, async (route) => {
+    downloadRequests += 1;
+    if (downloadRequests === 1) {
+      markDownloadStarted();
+      await downloadGate;
+      await route.fulfill({
+        status: 200,
+        contentType: "text/plain",
+        headers: accountHeaders,
+        body: customerDownloadBytes,
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 404,
+      contentType: "application/json",
+      headers: replacementHeaders,
+      body: JSON.stringify({ error: "Attachment unavailable in the replacement identity" }),
+    });
+  });
+  await page.route("**/api/v1/auth/me", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: replacementHeaders,
+      body: JSON.stringify({
+        id: "10000000-0000-4000-8000-000000000099",
+        clientAccountId: replacementHeaders["X-OSS-Client-Account-Id"],
+        accountContextVersion: "2",
+      }),
+    });
+  });
+  const downloads: string[] = [];
+  page.on("download", (download) => downloads.push(download.suggestedFilename()));
+
+  await page.goto("/support-operations-harness.html?mode=customer");
+  const panel = page.getByRole("region", { name: "Customer support tickets" });
+  await panel.getByRole("button", { name: /Ordinary browser Support request/ }).click();
+  const downloadButton = panel.getByRole("button", { name: "Download ordinary.txt" });
+  await downloadButton.click();
+  await downloadStarted;
+  await page.evaluate(() => {
+    const channel = new BroadcastChannel("opensales-session-epoch-v1");
+    channel.postMessage({
+      type: "session-transition",
+      transitionId: "replacement-identity",
+      phase: "replace",
+    });
+    channel.close();
+  });
+  await expect.poll(() => page.evaluate(async () => {
+    const modulePath = "/src/api.ts";
+    const client = await import(modulePath);
+    return client.getAccountContextSnapshot().clientAccountId;
+  })).toBeNull();
+  releaseDownload();
+  await expect(page.getByLabel("Support error")).toContainText(
+    "Attachment unavailable in the replacement identity",
+  );
+  await expect(downloadButton).toBeEnabled();
+  expect(downloadRequests).toBe(2);
+  expect(downloads).toEqual([]);
 });
 
 test("Staff Support component filters, assigns, routes, separates internal notes, and exposes department and Presales operations", async ({ page }) => {
@@ -327,6 +469,7 @@ test("Staff Support component filters, assigns, routes, separates internal notes
         contentType: "text/plain",
         sizeBytes: 19,
         uploadedByType: "staff",
+        scanStatus: "pending",
         createdAt: occurredAt,
       }] : []),
     ],
@@ -353,6 +496,17 @@ test("Staff Support component filters, assigns, routes, separates internal notes
     }
     if (request.method() === "GET" && url.pathname === `/api/v1/admin/tickets/${ticketId}`) {
       return fulfill(route, currentStaffDetail());
+    }
+    if (
+      request.method() === "GET" &&
+      url.pathname === `/api/v1/admin/tickets/${ticketId}/attachments/${attachmentId}`
+    ) {
+      return route.fulfill({
+        status: 200,
+        contentType: "text/plain",
+        headers: sessionHeaders,
+        body: staffDownloadBytes,
+      });
     }
     if (request.method() === "GET" && url.pathname === `/api/v1/admin/presales/inquiries/${inquiryId}`) {
       return fulfill(route, currentPresalesDetail());
@@ -429,6 +583,13 @@ test("Staff Support component filters, assigns, routes, separates internal notes
   await expect(detail.getByTestId("support-ticket-history")).toContainText("Assignment");
   await expect(detail.getByTestId("support-ticket-history")).toContainText("Take ownership");
   await expect(detail.locator('[data-visibility="internal"]')).toContainText("Staff-only browser note");
+  const downloadPromise = page.waitForEvent("download");
+  await detail.getByRole("button", { name: "Download ordinary.txt" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("ordinary.txt");
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  expect(await readFile(downloadPath!)).toEqual(staffDownloadBytes);
   await detail.getByLabel("Operation reason").fill("Normal browser assignment update");
   await detail.getByRole("button", { name: "Save assignment" }).click();
   await expect(page.getByLabel("Support error")).toContainText("Reauthentication required");
@@ -458,6 +619,7 @@ test("Staff Support component filters, assigns, routes, separates internal notes
   });
   await detail.getByRole("button", { name: "Upload attachment" }).click();
   await expect(detail).toContainText("staff-upload.txt");
+  await expect(detail.getByRole("button", { name: "Download staff-upload.txt" })).toHaveCount(0);
   await detail.getByRole("button", { name: "Delete" }).last().click();
   await expect(detail).not.toContainText("staff-upload.txt");
 

@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { api } from "./api.js";
 
 type Locale = "en" | "zh-CN";
@@ -44,6 +51,19 @@ type Snapshot = Readonly<{
   legalDocuments: LegalRevision[];
 }>;
 
+const emptySnapshot: Snapshot = { entries: [], revisions: [], legalDocuments: [] };
+
+type AccessScopeToken = Readonly<{
+  key: string;
+  generation: number;
+}>;
+
+type AccessScopeState = {
+  key: string;
+  generation: number;
+  mounted: boolean;
+};
+
 export function ContentOperationsPanel({
   active,
   locale,
@@ -61,60 +81,167 @@ export function ContentOperationsPanel({
   onNotice: (message: string) => void;
   onError: (message: string) => void;
 }>) {
-  const [snapshot, setSnapshot] = useState<Snapshot>({ entries: [], revisions: [], legalDocuments: [] });
+  const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [password, setPassword] = useState("");
+  const [factorCode, setFactorCode] = useState("");
   const [pending, setPending] = useState(false);
+  const scopeKey = JSON.stringify([accessFingerprint, active, canRead, canManage]);
+  const accessScope = useRef<AccessScopeState>({
+    key: scopeKey,
+    generation: 0,
+    mounted: false,
+  });
+  if (accessScope.current.key !== scopeKey) {
+    accessScope.current = {
+      key: scopeKey,
+      generation: accessScope.current.generation + 1,
+      mounted: accessScope.current.mounted,
+    };
+  }
+  const refreshGeneration = useRef(0);
+  const localeRef = useRef(locale);
+  const onNoticeRef = useRef(onNotice);
+  const onErrorRef = useRef(onError);
+  localeRef.current = locale;
+  onNoticeRef.current = onNotice;
+  onErrorRef.current = onError;
 
-  const refresh = useCallback(async () => {
-    if (!active || !canRead) {
-      setSnapshot({ entries: [], revisions: [], legalDocuments: [] });
-      return;
+  const captureScope = useCallback(
+    (): AccessScopeToken => ({
+      key: accessScope.current.key,
+      generation: accessScope.current.generation,
+    }),
+    [],
+  );
+  const scopeIsCurrent = useCallback(
+    (scope: AccessScopeToken): boolean =>
+      accessScope.current.mounted &&
+      accessScope.current.key === scope.key &&
+      accessScope.current.generation === scope.generation,
+    [],
+  );
+
+  const refresh = useCallback(async (scope: AccessScopeToken): Promise<boolean> => {
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !active || !canRead) return false;
+    const requestGeneration = ++refreshGeneration.current;
+    let nextSnapshot: Snapshot;
+    try {
+      nextSnapshot = await api<Snapshot>("/api/v1/admin/content");
+    } catch (caught) {
+      if (
+        !scopeIsCurrent(scope) ||
+        refreshGeneration.current !== requestGeneration
+      ) return false;
+      throw caught;
     }
-    setSnapshot(await api<Snapshot>("/api/v1/admin/content"));
-  }, [active, canRead]);
+    if (
+      !scopeIsCurrent(scope) ||
+      refreshGeneration.current !== requestGeneration
+    ) return false;
+    setSnapshot(nextSnapshot);
+    return true;
+  }, [active, canRead, scopeIsCurrent, scopeKey]);
 
-  useEffect(() => {
-    void refresh().catch((caught: unknown) =>
-      onError(caught instanceof Error ? caught.message : "Content Operations is unavailable"),
-    );
-  }, [accessFingerprint, onError, refresh]);
-
-  useEffect(() => {
+  useLayoutEffect(() => {
+    accessScope.current.mounted = true;
+    refreshGeneration.current += 1;
+    setSnapshot(emptySnapshot);
     setPassword("");
-  }, [accessFingerprint, canManage]);
+    setFactorCode("");
+    setPending(false);
+    return () => {
+      refreshGeneration.current += 1;
+      accessScope.current = {
+        key: accessScope.current.key,
+        generation: accessScope.current.generation + 1,
+        mounted: false,
+      };
+    };
+  }, [scopeKey]);
+
+  useEffect(() => {
+    const scope = captureScope();
+    if (scope.key !== scopeKey || !scopeIsCurrent(scope) || !active || !canRead) return;
+    void refresh(scope).catch((caught: unknown) => {
+      if (!scopeIsCurrent(scope)) return;
+      onErrorRef.current(
+        caught instanceof Error ? caught.message : "Content Operations is unavailable",
+      );
+    });
+  }, [active, canRead, captureScope, refresh, scopeIsCurrent, scopeKey]);
 
   async function mutate(path: string, body: Record<string, unknown>): Promise<boolean> {
-    if (!canManage || password.length === 0) return false;
+    const scope = captureScope();
+    if (
+      scope.key !== scopeKey ||
+      !scopeIsCurrent(scope) ||
+      !active ||
+      !canRead ||
+      !canManage ||
+      pending
+    ) return false;
+    const submittedPassword = password;
+    const submittedFactorCode = factorCode.trim();
+    if (submittedPassword.length === 0 && submittedFactorCode.length > 0) {
+      onErrorRef.current(
+        localeRef.current === "zh-CN"
+          ? "TOTP 或恢复码必须与当前密码一起提交。"
+          : "A TOTP or recovery code must be submitted with the current password.",
+      );
+      return false;
+    }
     setPending(true);
     try {
-      await api("/api/v1/auth/reauth", {
-        method: "POST",
-        body: JSON.stringify({ password }),
-      });
-      await api(path, { method: "POST", body: JSON.stringify(body) });
-      setPassword("");
-      onNotice(locale === "zh-CN" ? "内容事实已提交。" : "Content fact committed.");
+      if (submittedPassword.length > 0) {
+        try {
+          await api("/api/v1/auth/reauth", {
+            method: "POST",
+            body: JSON.stringify({
+              password: submittedPassword,
+              ...(submittedFactorCode ? { factorCode: submittedFactorCode } : {}),
+            }),
+          });
+        } catch (caught) {
+          if (!scopeIsCurrent(scope)) return false;
+          throw caught;
+        }
+        if (!scopeIsCurrent(scope)) return false;
+        setPassword("");
+        setFactorCode("");
+      }
+      if (!scopeIsCurrent(scope)) return false;
       try {
-        await refresh();
+        await api(path, { method: "POST", body: JSON.stringify(body) });
       } catch (caught) {
+        if (!scopeIsCurrent(scope)) return false;
+        throw caught;
+      }
+      if (!scopeIsCurrent(scope)) return false;
+      onNoticeRef.current(
+        localeRef.current === "zh-CN" ? "内容事实已提交。" : "Content fact committed.",
+      );
+      void refresh(scope).catch((caught: unknown) => {
+        if (!scopeIsCurrent(scope)) return;
         const detail = caught instanceof Error ? caught.message : "Content Operations is unavailable";
-        onError(
-          locale === "zh-CN"
+        onErrorRef.current(
+          localeRef.current === "zh-CN"
             ? `内容事实已提交，但历史刷新失败：${detail}`
             : `Content fact committed, but history refresh failed: ${detail}`,
         );
-      }
+      });
       return true;
     } catch (caught) {
-      onError(caught instanceof Error ? caught.message : "Content mutation failed");
+      if (!scopeIsCurrent(scope)) return false;
+      onErrorRef.current(caught instanceof Error ? caught.message : "Content mutation failed");
       return false;
     } finally {
-      setPending(false);
+      if (scopeIsCurrent(scope)) setPending(false);
     }
   }
 
   async function createEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const scope = captureScope();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const committed = await mutate("/api/v1/admin/content/entries", {
@@ -128,11 +255,12 @@ export function ContentOperationsPanel({
       statusLevel: form.get("statusLevel"),
       reason: form.get("reason"),
     });
-    if (committed) formElement.reset();
+    if (committed && scopeIsCurrent(scope)) formElement.reset();
   }
 
   async function createContentRevision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const scope = captureScope();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const entryId = String(form.get("entryId") ?? "");
@@ -145,11 +273,12 @@ export function ContentOperationsPanel({
       statusLevel: form.get("statusLevel"),
       reason: form.get("reason"),
     });
-    if (committed) formElement.reset();
+    if (committed && scopeIsCurrent(scope)) formElement.reset();
   }
 
   async function createLegalRevision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const scope = captureScope();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const committed = await mutate("/api/v1/admin/legal/documents", {
@@ -160,10 +289,11 @@ export function ContentOperationsPanel({
       body: form.get("body"),
       reason: form.get("reason"),
     });
-    if (committed) formElement.reset();
+    if (committed && scopeIsCurrent(scope)) formElement.reset();
   }
 
   if (!active || !canRead) return null;
+  const factorRequiresPassword = password.length === 0 && factorCode.trim().length > 0;
   const uniqueEntries = [...new Map(snapshot.entries.map((entry) => [entry.id, entry])).values()];
   const entryById = new Map(snapshot.entries.map((entry) => [entry.id, entry]));
   const copy = locale === "zh-CN"
@@ -249,15 +379,41 @@ export function ContentOperationsPanel({
       </div>
 
       {canManage && (
-        <label>
-          {locale === "zh-CN" ? "当前密码确认" : "Current password confirmation"}
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-          />
-        </label>
+        <fieldset>
+          <legend>{locale === "zh-CN" ? "Staff 重新认证" : "Staff reauthentication"}</legend>
+          <p className="muted">
+            {locale === "zh-CN"
+              ? "已有有效的 15 分钟授权时可留空；否则输入当前密码，并在已启用时输入 TOTP 或一次性恢复码。"
+              : "Leave both fields blank to reuse a current 15-minute grant. Otherwise enter the current password and, when enabled, a TOTP or one-time recovery code."}
+          </p>
+          <label>
+            {locale === "zh-CN" ? "当前密码确认" : "Current password confirmation"}
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete="current-password"
+              disabled={pending}
+            />
+          </label>
+          <label>
+            {locale === "zh-CN" ? "内容操作 TOTP 或恢复码" : "Content TOTP or recovery code"}
+            <input
+              value={factorCode}
+              onChange={(event) => setFactorCode(event.target.value)}
+              autoComplete="one-time-code"
+              aria-invalid={factorRequiresPassword}
+              disabled={pending}
+            />
+          </label>
+          {factorRequiresPassword && (
+            <p className="notice error" data-testid="content-factor-requires-password">
+              {locale === "zh-CN"
+                ? "请输入当前密码，或清空 TOTP / 恢复码以复用现有授权。"
+                : "Enter the current password, or clear the TOTP / recovery code to reuse the current grant."}
+            </p>
+          )}
+        </fieldset>
       )}
 
       <div className="form-columns">
@@ -286,7 +442,7 @@ export function ContentOperationsPanel({
               <option value="resolved">{copy.resolved}</option>
             </select>
             <input name="reason" placeholder={copy.creationReason} required />
-            <button disabled={pending || password.length === 0}>{copy.createDraft}</button>
+            <button disabled={pending || factorRequiresPassword}>{copy.createDraft}</button>
           </form>
         )}
 
@@ -306,7 +462,7 @@ export function ContentOperationsPanel({
               <option value="resolved">{copy.resolved}</option>
             </select>
             <input name="reason" placeholder={copy.revisionReason} required />
-            <button disabled={pending || password.length === 0}>{copy.appendDraft}</button>
+            <button disabled={pending || factorRequiresPassword}>{copy.appendDraft}</button>
           </form>
         )}
 
@@ -319,7 +475,7 @@ export function ContentOperationsPanel({
             <input name="title" placeholder={copy.title} required />
             <textarea name="body" placeholder={copy.legalBody} required />
             <input name="reason" placeholder={copy.revisionReason} required />
-            <button disabled={pending || password.length === 0}>{copy.appendLegalDraft}</button>
+            <button disabled={pending || factorRequiresPassword}>{copy.appendLegalDraft}</button>
           </form>
         )}
       </div>
@@ -329,16 +485,16 @@ export function ContentOperationsPanel({
           <article className="product-card" key={revision.id}>
             <div><span className="mode" data-testid={`content-revision-context-${revision.id}`}>{entryContextLabel(revision.entry_id)} · {revision.locale} · r{revision.revision}</span><h3>{revision.title}</h3><p>{revision.summary}</p><p className="revision-body" data-testid={`content-revision-body-${revision.id}`}>{revision.body}</p></div>
             <small>{revision.published_at ? revision.retired_at ? locale === "zh-CN" ? "已退役" : "retired" : locale === "zh-CN" ? "已发布" : "published" : locale === "zh-CN" ? "草稿" : "draft"}</small>
-            {canManage && !revision.published_at && <button disabled={pending || password.length === 0} onClick={() => void mutate(`/api/v1/admin/content/revisions/${revision.id}/publication`, { reason: "Publish reviewed synthetic Content revision" })}>{copy.publish}</button>}
-            {canManage && revision.published_at && !revision.retired_at && <button disabled={pending || password.length === 0} onClick={() => void mutate(`/api/v1/admin/content/revisions/${revision.id}/retirement`, { reason: "Retire current synthetic Content revision" })}>{copy.retire}</button>}
+            {canManage && !revision.published_at && <button disabled={pending || factorRequiresPassword} onClick={() => void mutate(`/api/v1/admin/content/revisions/${revision.id}/publication`, { reason: "Publish reviewed synthetic Content revision" })}>{copy.publish}</button>}
+            {canManage && revision.published_at && !revision.retired_at && <button disabled={pending || factorRequiresPassword} onClick={() => void mutate(`/api/v1/admin/content/revisions/${revision.id}/retirement`, { reason: "Retire current synthetic Content revision" })}>{copy.retire}</button>}
           </article>
         ))}
         {snapshot.legalDocuments.map((document) => (
           <article className="product-card" key={document.id} data-testid={`legal-history-${document.id}`}>
             <div><span className="mode">{document.kind === "aup" ? "AUP" : document.kind === "terms" ? copy.terms : copy.privacy} · {document.locale} · r{document.revision}</span><h3>{document.title}</h3><p>{document.version}</p><p className="revision-body" data-testid={`legal-revision-body-${document.id}`}>{document.body}</p></div>
             <small>{document.current ? locale === "zh-CN" ? "当前版本" : "current" : document.retired_at ? locale === "zh-CN" ? "已退役" : "retired" : locale === "zh-CN" ? "草稿" : "draft"}</small>
-            {canManage && !document.published_at && <button disabled={pending || password.length === 0} onClick={() => void mutate(`/api/v1/admin/legal/documents/${document.id}/publication`, { reason: "Publish reviewed synthetic legal revision" })}>{copy.publish}</button>}
-            {canManage && document.current && <button disabled={pending || password.length === 0} onClick={() => void mutate(`/api/v1/admin/legal/documents/${document.id}/retirement`, { reason: "Retire current synthetic legal revision" })}>{copy.retire}</button>}
+            {canManage && !document.published_at && <button disabled={pending || factorRequiresPassword} onClick={() => void mutate(`/api/v1/admin/legal/documents/${document.id}/publication`, { reason: "Publish reviewed synthetic legal revision" })}>{copy.publish}</button>}
+            {canManage && document.current && <button disabled={pending || factorRequiresPassword} onClick={() => void mutate(`/api/v1/admin/legal/documents/${document.id}/retirement`, { reason: "Retire current synthetic legal revision" })}>{copy.retire}</button>}
           </article>
         ))}
       </div>

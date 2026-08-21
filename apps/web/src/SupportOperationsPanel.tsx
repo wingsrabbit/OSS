@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { api } from "./api.js";
+import { api, apiDownload } from "./api.js";
 
 type Locale = "en" | "zh-CN";
 type TicketStatus = "awaiting_staff" | "awaiting_customer" | "closed";
@@ -64,6 +64,7 @@ type Attachment = {
   contentType: string;
   sizeBytes: number;
   uploadedByType: "customer" | "staff";
+  scanStatus: "pending" | "clean" | "rejected" | "error";
   createdAt: string;
 };
 
@@ -282,11 +283,15 @@ function AttachmentList({
   attachments,
   canDelete,
   onDelete,
+  onDownload,
+  pending,
   locale,
 }: {
   attachments: Attachment[];
   canDelete: (attachment: Attachment) => boolean;
   onDelete: (attachment: Attachment) => void;
+  onDownload: (attachment: Attachment) => void;
+  pending: boolean;
   locale: Locale;
 }) {
   const tr = (en: string, zh: string) => locale === "zh-CN" ? zh : en;
@@ -298,18 +303,27 @@ function AttachmentList({
         {attachments.map((attachment) => (
           <li key={attachment.id}>
             {attachment.filename} · {attachment.sizeBytes} {tr("bytes", "字节")} · {attachment.uploadedByType}
+            {attachment.scanStatus === "clean" ? (
+              <>
+                <span className="muted"> · {tr("Download available", "可下载")}</span>
+                <button
+                  type="button"
+                  aria-label={`${tr("Download", "下载")} ${attachment.filename}`}
+                  disabled={pending}
+                  onClick={() => onDownload(attachment)}
+                >
+                  {tr("Download", "下载")}
+                </button>
+              </>
+            ) : (
+              <span className="muted"> · {tr("Download not available", "暂不可下载")}</span>
+            )}
             {canDelete(attachment) && (
-              <button type="button" onClick={() => onDelete(attachment)}>{tr("Delete", "删除")}</button>
+              <button type="button" disabled={pending} onClick={() => onDelete(attachment)}>{tr("Delete", "删除")}</button>
             )}
           </li>
         ))}
       </ul>
-      <p className="muted" data-testid="support-download-unavailable">
-        {tr(
-          "Normal attachment download is temporarily unavailable in this workspace.",
-          "此工作区暂不提供普通附件下载。",
-        )}
-      </p>
     </section>
   );
 }
@@ -332,8 +346,10 @@ export function SupportOperationsPanel({
   const [services, setServices] = useState<ServiceOption[]>([]);
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [customerDetail, setCustomerDetail] = useState<CustomerTicketDetail | null>(null);
+  const customerDetailRef = useRef<CustomerTicketDetail | null>(null);
   const [staffTickets, setStaffTickets] = useState<StaffTicketSummary[]>([]);
   const [staffDetail, setStaffDetail] = useState<StaffTicketDetail | null>(null);
+  const staffDetailRef = useRef<StaffTicketDetail | null>(null);
   const [staffOptions, setStaffOptions] = useState<StaffOption[]>([]);
   const [presales, setPresales] = useState<PresalesSummary[]>([]);
   const [presalesDetail, setPresalesDetail] = useState<PresalesDetail | null>(null);
@@ -384,6 +400,14 @@ export function SupportOperationsPanel({
       mutationIntents.current.clear();
     };
   }, []);
+
+  useEffect(() => {
+    customerDetailRef.current = customerDetail;
+  }, [customerDetail]);
+
+  useEffect(() => {
+    staffDetailRef.current = staffDetail;
+  }, [staffDetail]);
 
   function intentKeyFor(scope: string, payload: unknown): string {
     const fingerprint = JSON.stringify(payload);
@@ -657,6 +681,47 @@ export function SupportOperationsPanel({
     });
   }
 
+  async function downloadAttachment(
+    path: string,
+    item: Attachment,
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    if (pending) return;
+    setPending(true);
+    try {
+      const blob = await apiDownload(path);
+      if (!mounted.current || !isCurrent()) return;
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = item.filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+      onNotice(tr("Attachment download started.", "附件下载已开始。"));
+    } catch (error) {
+      if (!mounted.current) return;
+      onError(errorMessage(error, tr(
+        "Attachment could not be downloaded",
+        "无法下载附件",
+      )));
+    } finally {
+      if (mounted.current) setPending(false);
+    }
+  }
+
+  async function downloadCustomerAttachment(item: Attachment): Promise<void> {
+    const ticketId = customerDetail?.ticket.id;
+    if (!ticketId) return;
+    await downloadAttachment(
+      `/api/v1/tickets/${ticketId}/attachments/${item.id}`,
+      item,
+      () => customerDetailRef.current?.ticket.id === ticketId &&
+        customerDetailRef.current.attachments.some((current) => current.id === item.id),
+    );
+  }
+
   async function refreshStaffDetail(ticketId: string): Promise<void> {
     const detail = await api<StaffTicketDetail>(`/api/v1/admin/tickets/${ticketId}`);
     setStaffDetail(detail);
@@ -784,6 +849,17 @@ export function SupportOperationsPanel({
       success: tr("Attachment deleted.", "附件已删除。"),
       failure: tr("Attachment could not be deleted", "无法删除附件"),
     });
+  }
+
+  async function downloadStaffAttachment(item: Attachment): Promise<void> {
+    const ticketId = staffDetail?.ticket.id;
+    if (!ticketId) return;
+    await downloadAttachment(
+      `/api/v1/admin/tickets/${ticketId}/attachments/${item.id}`,
+      item,
+      () => staffDetailRef.current?.ticket.id === ticketId &&
+        staffDetailRef.current.attachments.some((current) => current.id === item.id),
+    );
   }
 
   function editDepartment(item: Department) {
@@ -1032,7 +1108,7 @@ export function SupportOperationsPanel({
         <h3>{customerDetail.ticket.subject}</h3><p>{customerDetail.ticket.department.name} · {customerDetail.ticket.priority}</p>
         {customerDetail.messages.map((item) => <div key={item.id}><strong>{item.authorType}</strong><p>{item.body}</p></div>)}
         <CustomerHistory detail={customerDetail} locale={locale} />
-        <AttachmentList locale={locale} attachments={customerDetail.attachments} canDelete={(item) => canWriteCustomerTickets && item.uploadedByType === "customer"} onDelete={(item) => void deleteCustomerAttachment(item)} />
+        <AttachmentList locale={locale} attachments={customerDetail.attachments} canDelete={(item) => canWriteCustomerTickets && item.uploadedByType === "customer"} onDelete={(item) => void deleteCustomerAttachment(item)} onDownload={(item) => void downloadCustomerAttachment(item)} pending={pending} />
         {canWriteCustomerTickets && customerDetail.ticket.status !== "closed" && <><textarea aria-label="Customer ticket reply" value={customerReplyText} onChange={(event) => setCustomerReplyText(event.target.value)} /><button disabled={pending || !customerReplyText.trim()} onClick={() => void customerReply()}>{tr("Send reply", "发送回复")}</button><input aria-label={tr("Customer attachment", "客户附件")} type="file" accept=".txt,.log,.csv,.pdf,.png,.jpg,.jpeg" onChange={(event) => setCustomerAttachment(event.target.files?.[0] ?? null)} /><button disabled={pending || !customerAttachment} onClick={() => void uploadCustomerAttachment()}>{tr("Upload attachment", "上传附件")}</button><button disabled={pending} onClick={() => void setCustomerStatus("closed")}>{tr("Close ticket", "关闭工单")}</button></>}
         {canWriteCustomerTickets && customerDetail.ticket.status === "closed" && <button disabled={pending} onClick={() => void setCustomerStatus("awaiting_staff")}>{tr("Reopen ticket", "重新开启工单")}</button>}
       </article>}</div>
@@ -1076,7 +1152,7 @@ export function SupportOperationsPanel({
         <button disabled={pending || !staffTicketReplyText.trim() || staffDetail.ticket.status === "closed"} onClick={() => void sendStaffMessage("public_reply")}>{tr("Send public reply", "发送公开回复")}</button>
         <button disabled={pending || !staffTicketReplyText.trim() || staffDetail.ticket.status === "closed"} onClick={() => void sendStaffMessage("internal_note")}>{tr("Save internal note", "保存内部备注")}</button>
         <StaffHistory detail={staffDetail} locale={locale} />
-        <AttachmentList locale={locale} attachments={staffDetail.attachments} canDelete={() => true} onDelete={(item) => void deleteStaffAttachment(item)} />
+        <AttachmentList locale={locale} attachments={staffDetail.attachments} canDelete={() => true} onDelete={(item) => void deleteStaffAttachment(item)} onDownload={(item) => void downloadStaffAttachment(item)} pending={pending} />
         {staffDetail.ticket.status !== "closed" && <><input aria-label={tr("Staff attachment", "客服附件")} type="file" accept=".txt,.log,.csv,.pdf,.png,.jpg,.jpeg" onChange={(event) => setStaffAttachment(event.target.files?.[0] ?? null)} /><button disabled={pending || !staffAttachment} onClick={() => void uploadStaffAttachment()}>{tr("Upload attachment", "上传附件")}</button></>}
       </article>}
     </div>

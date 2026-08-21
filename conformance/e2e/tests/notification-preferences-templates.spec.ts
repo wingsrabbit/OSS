@@ -539,7 +539,7 @@ test("an older draft cannot be offered after a newer locale revision is publishe
   await expect(panel.getByRole("button", { name: "Publish revision" })).toHaveCount(0);
 });
 
-test("Staff with all four template permissions creates, publishes, and retires a revision", async ({ page }) => {
+test("Staff template writes accept MFA once and reuse the current grant for later facts", async ({ page }) => {
   let stage: "initial" | "draft" | "published" | "retired" = "initial";
   const mutationBodies: Array<{ path: string; body: unknown }> = [];
   let reauthCount = 0;
@@ -551,7 +551,10 @@ test("Staff with all four template permissions creates, publishes, and retires a
     }
     if (request.method() === "POST" && path === "/api/v1/auth/reauth") {
       reauthCount += 1;
-      expect(request.postDataJSON()).toEqual({ password: "Synthetic-Template-Password!" });
+      expect(request.postDataJSON()).toEqual({
+        password: "Synthetic-Template-Password!",
+        factorCode: "654321",
+      });
       return fulfill(route, { expiresAt: "2026-08-20T09:15:00.000Z" });
     }
     if (request.method() === "POST") {
@@ -570,6 +573,7 @@ test("Staff with all four template permissions creates, publishes, and retires a
   const panel = page.getByTestId("notification-template-registry");
   await expect(panel).toBeVisible();
   await panel.getByLabel("Current password confirmation").fill("Synthetic-Template-Password!");
+  await panel.getByLabel("Template TOTP or recovery code").fill("654321");
   const create = panel.getByTestId("notification-template-create");
   await create.getByLabel("Template locale").selectOption("zh-CN");
   await create.getByLabel("Subject template").fill("发票 {{invoiceNumber}} 已就绪");
@@ -579,19 +583,25 @@ test("Staff with all four template permissions creates, publishes, and retires a
   await create.getByLabel("Creation reason").fill("Create reviewed Chinese revision");
   await create.getByRole("button", { name: "Create immutable draft" }).click();
   await expect(panel.getByText("invoice-issued-v2")).toBeVisible();
+  await expect(panel.getByLabel("Current password confirmation")).toHaveValue("");
+  await expect(panel.getByLabel("Template TOTP or recovery code")).toHaveValue("");
 
-  await panel.getByLabel("Current password confirmation").fill("Synthetic-Template-Password!");
   await panel.getByLabel("Publication or retirement reason").fill("Publish reviewed Chinese revision");
-  await panel.getByRole("button", { name: "Publish revision" }).click();
+  const publish = panel.getByRole("button", { name: "Publish revision" });
+  await panel.getByLabel("Template TOTP or recovery code").fill("recovery-code-without-password");
+  await expect(panel.getByTestId("notification-template-factor-requires-password")).toBeVisible();
+  await expect(publish).toBeDisabled();
+  expect(mutationBodies).toHaveLength(1);
+  await panel.getByLabel("Template TOTP or recovery code").fill("");
+  await publish.click();
   await expect(panel.getByTestId("notification-template-locale-zh-CN")).toContainText("invoice-issued-v2");
 
-  await panel.getByLabel("Current password confirmation").fill("Synthetic-Template-Password!");
   await panel.getByLabel("Publication or retirement reason").fill("Retire current Chinese revision");
   await panel.getByRole("button", { name: "Retire current revision" }).click();
   await expect(panel.getByTestId("notification-template-locale-zh-CN")).toContainText("invoice-issued-en-v1");
   await expect(panel.getByTestId("notification-template-locale-zh-CN")).toContainText("fallback");
 
-  expect(reauthCount).toBe(3);
+  expect(reauthCount).toBe(1);
   expect(mutationBodies).toEqual([
     {
       path: `/api/v1/admin/notification-templates/${eventType}/revisions`,
@@ -617,6 +627,46 @@ test("Staff with all four template permissions creates, publishes, and retires a
       },
     },
   ]);
+});
+
+test("failed template reauthentication retains password and factor without posting a fact", async ({ page }) => {
+  let factPosts = 0;
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "GET" && path === "/api/v1/admin/notification-templates") {
+      return fulfill(route, registry("draft"));
+    }
+    if (request.method() === "POST" && path === "/api/v1/auth/reauth") {
+      expect(request.postDataJSON()).toEqual({
+        password: "Synthetic-Template-Password!",
+        factorCode: "recovery-template-1",
+      });
+      return fulfill(route, { error: "Synthetic template reauthentication failed" }, false, 401);
+    }
+    if (request.method() === "POST") factPosts += 1;
+    return route.fulfill({ status: 404, json: { error: `Unmocked ${request.method()} ${path}` } });
+  });
+
+  await page.goto(
+    "/notification-preferences-templates-harness.html?mode=admin&read=1&publish=1",
+  );
+  const panel = page.getByTestId("notification-template-registry");
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Template-Password!");
+  await panel.getByLabel("Template TOTP or recovery code").fill("recovery-template-1");
+  await panel.getByLabel("Publication or retirement reason").fill("Publish reviewed revision");
+  await panel.getByRole("button", { name: "Publish revision" }).click();
+
+  await expect(page.getByLabel("Notification error")).toContainText(
+    "Synthetic template reauthentication failed",
+  );
+  await expect(panel.getByLabel("Current password confirmation")).toHaveValue(
+    "Synthetic-Template-Password!",
+  );
+  await expect(panel.getByLabel("Template TOTP or recovery code")).toHaveValue(
+    "recovery-template-1",
+  );
+  expect(factPosts).toBe(0);
 });
 
 test("without read permission the Admin panel stays unmounted and sends no registry request", async ({ page }) => {

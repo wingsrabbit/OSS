@@ -537,7 +537,7 @@ test("content.read mounts immutable history without any manage control or write 
   expect(requested).toEqual(["GET /api/v1/admin/content"]);
 });
 
-test("content.manage reauthenticates then publishes an immutable draft and refreshes history", async ({ page }) => {
+test("content.manage accepts MFA once and reuses the current grant for the next fact", async ({ page }) => {
   const mutations: string[] = [];
   let published = false;
   await routeCommon(page, {
@@ -552,7 +552,10 @@ test("content.manage reauthenticates then publishes an immutable draft and refre
       }
       if (path === "/api/v1/auth/reauth") {
         mutations.push(`${route.request().method()} ${path}`);
-        expect(route.request().postDataJSON()).toEqual({ password: "Synthetic-Browser-Reauth!" });
+        expect(route.request().postDataJSON()).toEqual({
+          password: "Synthetic-Browser-Reauth!",
+          factorCode: "content-recovery-1",
+        });
         await route.fulfill({
           headers: establishedSessionHeaders,
           json: { expiresAt: "2026-08-13T12:15:00.000Z", fixedWindowMinutes: 15 },
@@ -569,18 +572,41 @@ test("content.manage reauthenticates then publishes an immutable draft and refre
         });
         return true;
       }
+      if (path === `/api/v1/admin/content/revisions/${contentRevisionId}/retirement`) {
+        mutations.push(`${route.request().method()} ${path}`);
+        await route.fulfill({
+          status: 201,
+          headers: establishedSessionHeaders,
+          json: { entryId: contentEntryId, locale: "en", replayed: false },
+        });
+        return true;
+      }
       return false;
     },
   });
   await page.goto("/admin");
   await expect(page.getByRole("heading", { name: "Create Content entry" })).toBeVisible();
   await page.getByLabel("Current password confirmation").fill("Synthetic-Browser-Reauth!");
+  await page.getByLabel("Content TOTP or recovery code").fill("content-recovery-1");
   await page.getByRole("button", { name: "Publish", exact: true }).click();
   await expect(page.getByText("Content fact committed.")).toBeVisible();
   await expect(page.getByText("published", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Current password confirmation")).toHaveValue("");
+  await expect(page.getByLabel("Content TOTP or recovery code")).toHaveValue("");
+
+  const retire = page.getByTestId(`content-revision-context-${contentRevisionId}`)
+    .locator("xpath=ancestor::article")
+    .getByRole("button", { name: "Retire", exact: true });
+  await page.getByLabel("Content TOTP or recovery code").fill("factor-without-password");
+  await expect(page.getByTestId("content-factor-requires-password")).toBeVisible();
+  await expect(retire).toBeDisabled();
+  await page.getByLabel("Content TOTP or recovery code").fill("");
+  await retire.click();
+  await expect.poll(() => mutations.length).toBe(3);
   expect(mutations).toEqual([
     "POST /api/v1/auth/reauth",
     `POST /api/v1/admin/content/revisions/${contentRevisionId}/publication`,
+    `POST /api/v1/admin/content/revisions/${contentRevisionId}/retirement`,
   ]);
 });
 
@@ -737,6 +763,107 @@ test("a committed immutable draft resets once even when the history refresh fail
     "Content fact committed, but history refresh failed: Synthetic history refresh unavailable",
   );
   expect(createCalls).toBe(1);
+});
+
+test("failed Content MFA retains both credentials and sends no protected write", async ({ page }) => {
+  let writePosts = 0;
+  await routeCommon(page, {
+    permissions: ["content.read", "content.manage"],
+    admin: async (route, path) => {
+      if (path === "/api/v1/admin/content") {
+        await route.fulfill({ headers: establishedSessionHeaders, json: adminSnapshot(false) });
+        return true;
+      }
+      if (path === "/api/v1/auth/reauth") {
+        expect(route.request().postDataJSON()).toEqual({
+          password: "Synthetic-Browser-Reauth!",
+          factorCode: "content-recovery-failed",
+        });
+        await route.fulfill({
+          status: 401,
+          headers: establishedSessionHeaders,
+          json: { error: "Synthetic Content reauthentication failed" },
+        });
+        return true;
+      }
+      if (route.request().method() === "POST" && path.startsWith("/api/v1/admin/content/")) {
+        writePosts += 1;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("content-operations");
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Browser-Reauth!");
+  await panel.getByLabel("Content TOTP or recovery code").fill("content-recovery-failed");
+  await panel.getByRole("button", { name: "Publish", exact: true }).click();
+
+  await expect(page.locator(".notice.error")).toContainText(
+    "Synthetic Content reauthentication failed",
+  );
+  await expect(panel.getByLabel("Current password confirmation")).toHaveValue(
+    "Synthetic-Browser-Reauth!",
+  );
+  await expect(panel.getByLabel("Content TOTP or recovery code")).toHaveValue(
+    "content-recovery-failed",
+  );
+  expect(writePosts).toBe(0);
+});
+
+test("leaving Content Operations during reauthentication prevents the protected write and refresh", async ({ page }) => {
+  let markReauthStarted!: () => void;
+  let releaseReauth!: () => void;
+  let markReauthCompleted!: () => void;
+  const reauthStarted = new Promise<void>((resolve) => { markReauthStarted = resolve; });
+  const reauthGate = new Promise<void>((resolve) => { releaseReauth = resolve; });
+  const reauthCompleted = new Promise<void>((resolve) => { markReauthCompleted = resolve; });
+  let contentGets = 0;
+  let writePosts = 0;
+  await routeCommon(page, {
+    permissions: ["content.read", "content.manage"],
+    admin: async (route, path) => {
+      if (route.request().method() === "GET" && path === "/api/v1/admin/content") {
+        contentGets += 1;
+        await route.fulfill({ headers: establishedSessionHeaders, json: adminSnapshot(false) });
+        return true;
+      }
+      if (route.request().method() === "POST" && path === "/api/v1/auth/reauth") {
+        markReauthStarted();
+        await reauthGate;
+        await route.fulfill({
+          headers: establishedSessionHeaders,
+          json: { expiresAt: "2026-08-13T12:15:00.000Z", fixedWindowMinutes: 15 },
+        });
+        markReauthCompleted();
+        return true;
+      }
+      if (route.request().method() === "POST" && path.startsWith("/api/v1/admin/content/")) {
+        writePosts += 1;
+        await route.fulfill({ status: 201, headers: establishedSessionHeaders, json: { committed: true } });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("content-operations");
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Browser-Reauth!");
+  await panel.getByLabel("Content TOTP or recovery code").fill("654321");
+  await panel.getByRole("button", { name: "Publish", exact: true }).click();
+  await reauthStarted;
+  const getsBeforeLeaving = contentGets;
+
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/u);
+  releaseReauth();
+  await reauthCompleted;
+  await page.waitForTimeout(100);
+
+  expect(writePosts).toBe(0);
+  expect(contentGets).toBe(getsBeforeLeaving);
+  await expect(page.getByText(/Content fact committed|Content mutation failed/)).toHaveCount(0);
 });
 
 test("the zh-CN Staff Content workspace translates controls, states, and actions", async ({ page }) => {

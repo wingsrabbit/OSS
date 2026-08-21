@@ -61,6 +61,7 @@ type ParsedResponseContext =
   | Readonly<{ kind: "missing" | "invalid" }>;
 type ResponseContextRequirement = "none" | "session" | "account";
 type ErrorBody = Readonly<{ error?: string; code?: string }>;
+type ResponseDecoder<T> = (response: Response) => Promise<T>;
 
 let accountContext: AccountContextSnapshot = {
   clientAccountId: null,
@@ -454,6 +455,7 @@ async function request<T>(
   path: string,
   init: RequestInit | undefined,
   allowAuthoritativeRecovery: boolean,
+  decodeResponse: ResponseDecoder<T>,
   inheritedInvalidation = false,
 ): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
@@ -587,7 +589,7 @@ async function request<T>(
             );
             invalidationPublished = true;
           }
-          return request<T>(path, init, false, invalidationPublished);
+          return request<T>(path, init, false, decodeResponse, invalidationPublished);
         }
         if (!establishingLogin) {
           throw publishProtocolFailure(
@@ -650,14 +652,18 @@ async function request<T>(
       throw new ApiError("Sign-in response did not establish a session context", 502, "SESSION_CONTEXT_MISSING");
     }
     if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
+    return decodeResponse(response);
   } finally {
     if (transitionId) endSessionEpochTransition(transitionId);
     if (transition) authTransition = null;
   }
 }
 
-export function api<T>(path: string, init?: RequestInit): Promise<T> {
+function sessionRequest<T>(
+  path: string,
+  init: RequestInit | undefined,
+  decodeResponse: ResponseDecoder<T>,
+): Promise<T> {
   const pathname = new URL(path, window.location.origin).pathname;
   const isAuthTransition = pathname === "/api/v1/auth/login" ||
     pathname === "/api/v1/auth/login-challenges/complete" ||
@@ -667,7 +673,7 @@ export function api<T>(path: string, init?: RequestInit): Promise<T> {
     const execute = async () => {
       if (locks) settlePendingTransitionsAfterLockBarrier();
       else await waitForSessionTransitionsWithoutWebLocks();
-      return request<T>(path, init, true);
+      return request<T>(path, init, true, decodeResponse);
     };
     // The lock covers the context snapshot, mutation header, fetch and response
     // capture. Login/logout therefore cannot rotate the cookie mid-request.
@@ -683,7 +689,7 @@ export function api<T>(path: string, init?: RequestInit): Promise<T> {
   authRequestReserved = true;
   const execute = () => {
     if (locks) settlePendingTransitionsAfterLockBarrier();
-    return request<T>(path, init, true);
+    return request<T>(path, init, true, decodeResponse);
   };
   const pending = locks
     ? locks.request(SESSION_LOCK_NAME, { mode: "exclusive" }, execute)
@@ -691,4 +697,16 @@ export function api<T>(path: string, init?: RequestInit): Promise<T> {
   return pending.finally(() => {
     authRequestReserved = false;
   });
+}
+
+export function api<T>(path: string, init?: RequestInit): Promise<T> {
+  return sessionRequest(
+    path,
+    init,
+    async (response) => (await response.json()) as T,
+  );
+}
+
+export function apiDownload(path: string): Promise<Blob> {
+  return sessionRequest(path, { method: "GET" }, (response) => response.blob());
 }

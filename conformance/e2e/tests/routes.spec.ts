@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 import {
   fulfillNotificationInterfaceRequest,
   notificationPreferencesMockState,
@@ -859,6 +860,93 @@ test("limited ticket Staff mounts only its permitted panel and fetch", async ({ 
     "/api/v1/admin/support/departments",
     "/api/v1/admin/presales/inquiries",
   ]);
+});
+
+test("real App customer downloads the exact authorized Support attachment bytes", async ({ page }) => {
+  const ticketId = "00000000-0000-4000-8000-000000000801";
+  const messageId = "00000000-0000-4000-8000-000000000802";
+  const attachmentId = "00000000-0000-4000-8000-000000000803";
+  const createdAt = "2026-08-21T05:00:00.000Z";
+  const bytes = Buffer.from("real App Support attachment\n", "utf8");
+  const ticket = {
+    id: ticketId,
+    subject: "Real App attachment download",
+    status: "awaiting_staff",
+    service: null,
+    orderId: null,
+    authorizationPurpose: null,
+    department: { code: "general-support", name: "General Support" },
+    priority: "normal",
+    publicMessageCount: 1,
+    createdAt,
+    updatedAt: createdAt,
+  };
+  const requests = await installMockApi(
+    page,
+    mockViewer({ email: "attachment-download@example.invalid" }),
+    {
+      intercept: async (path, route) => {
+        if (route.request().method() !== "GET") return false;
+        if (path === "/api/v1/tickets") {
+          await route.fulfill({ json: { items: [ticket] } });
+          return true;
+        }
+        if (path === `/api/v1/tickets/${ticketId}`) {
+          await route.fulfill({
+            json: {
+              ticket,
+              messages: [{
+                id: messageId,
+                authorType: "customer",
+                body: "Please return the ordinary attached file.",
+                createdAt,
+              }],
+              attachments: [{
+                id: attachmentId,
+                messageId,
+                filename: "real-app.txt",
+                contentType: "text/plain",
+                sizeBytes: bytes.length,
+                uploadedByType: "customer",
+                scanStatus: "clean",
+                createdAt,
+              }],
+              statusHistory: [{
+                previousStatus: null,
+                status: "awaiting_staff",
+                summary: "Ticket created",
+                occurredAt: createdAt,
+              }],
+              routingHistory: [{
+                department: { code: "general-support", name: "General Support", revision: 1 },
+                priority: "normal",
+                summary: "Initial Support routing",
+                occurredAt: createdAt,
+              }],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/tickets/${ticketId}/attachments/${attachmentId}`) {
+          await route.fulfill({ status: 200, contentType: "text/plain", body: bytes });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  const panel = page.locator('section[aria-label="Customer support tickets"]');
+  await panel.getByRole("button", { name: /Real App attachment download/ }).click();
+  const downloadPromise = page.waitForEvent("download");
+  await panel.getByRole("button", { name: "Download real-app.txt" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("real-app.txt");
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  expect(await readFile(downloadPath!)).toEqual(bytes);
+  expect(requests).toContain(`/api/v1/tickets/${ticketId}/attachments/${attachmentId}`);
 });
 
 test("Staff without support.tickets.manage mounts no Support panel and sends zero Support GET", async ({ page }) => {

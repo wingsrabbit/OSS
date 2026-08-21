@@ -185,6 +185,13 @@ test("Staff sees the failed queue, immutable template/attempt history, and commi
   let retryPosts = 0;
   await routeApplication(page, {
     permissions: ["notifications.read", "notifications.retry"],
+    onReauthRequest: async (route) => {
+      expect(route.request().postDataJSON()).toEqual({
+        password: "Synthetic-Staff-Password!",
+        factorCode: "notification-recovery-1",
+      });
+      await route.fulfill({ headers, json: { expiresAt: "2026-08-20T08:15:00.000Z" } });
+    },
     onNotificationRequest: async (route) => {
       const path = new URL(route.request().url()).pathname;
       if (route.request().method() === "GET") {
@@ -224,6 +231,7 @@ test("Staff sees the failed queue, immutable template/attempt history, and commi
     "email-verification-v1",
   );
   await panel.getByLabel("Current password confirmation").fill("Synthetic-Staff-Password!");
+  await panel.getByLabel("Notification TOTP or recovery code").fill("notification-recovery-1");
   await panel.getByLabel("Retry reason").fill("Recipient facts reviewed for one normal retry");
   await panel.getByRole("button", { name: "Controlled single retry" }).click();
 
@@ -236,6 +244,95 @@ test("Staff sees the failed queue, immutable template/attempt history, and commi
   await expect(panel.getByTestId("notification-retry-audit")).toContainText(
     "Recipient facts reviewed for one normal retry",
   );
+});
+
+test("a current grant permits retry without another password while factor-only input is blocked", async ({ page }) => {
+  let retried = false;
+  let reauthPosts = 0;
+  let retryPosts = 0;
+  await routeApplication(page, {
+    permissions: ["notifications.read", "notifications.retry"],
+    onReauthRequest: async (route) => {
+      reauthPosts += 1;
+      await route.fulfill({ headers, json: { expiresAt: "2026-08-20T08:15:00.000Z" } });
+    },
+    onNotificationRequest: async (route) => {
+      if (route.request().method() === "GET") {
+        await route.fulfill({ headers, json: snapshot(retried) });
+        return;
+      }
+      retryPosts += 1;
+      retried = true;
+      await route.fulfill({
+        status: 201,
+        headers,
+        json: {
+          outboxId,
+          failedAttemptNumber: 1,
+          jobStatus: "pending",
+          jobUpdatedAt: "2026-08-20T08:01:00.000001Z",
+        },
+      });
+    },
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("notification-operations");
+  await expect(panel).toBeVisible();
+  await panel.getByLabel("Retry reason").fill("Use the current normal Staff grant");
+  const retry = panel.getByRole("button", { name: "Controlled single retry" });
+  await panel.getByLabel("Notification TOTP or recovery code").fill("factor-without-password");
+  await expect(panel.getByTestId("notification-factor-requires-password")).toBeVisible();
+  await expect(retry).toBeDisabled();
+  expect(retryPosts).toBe(0);
+
+  await panel.getByLabel("Notification TOTP or recovery code").fill("");
+  await retry.click();
+  await expect(panel.getByTestId("notification-summary")).toContainText("Retryable: 0");
+  expect(reauthPosts).toBe(0);
+  expect(retryPosts).toBe(1);
+});
+
+test("failed notification MFA retains credentials and does not post a retry", async ({ page }) => {
+  let retryPosts = 0;
+  await routeApplication(page, {
+    permissions: ["notifications.read", "notifications.retry"],
+    onReauthRequest: async (route) => {
+      expect(route.request().postDataJSON()).toEqual({
+        password: "Synthetic-Staff-Password!",
+        factorCode: "notification-recovery-failed",
+      });
+      await route.fulfill({
+        status: 401,
+        headers,
+        json: { error: "Synthetic notification reauthentication failed" },
+      });
+    },
+    onNotificationRequest: async (route) => {
+      if (route.request().method() === "POST") retryPosts += 1;
+      await route.fulfill({ headers, json: snapshot(false) });
+    },
+  });
+
+  await page.goto("/admin");
+  const panel = page.getByTestId("notification-operations");
+  await panel.getByLabel("Current password confirmation").fill("Synthetic-Staff-Password!");
+  await panel.getByLabel("Notification TOTP or recovery code").fill(
+    "notification-recovery-failed",
+  );
+  await panel.getByLabel("Retry reason").fill("Retain credentials after normal rejection");
+  await panel.getByRole("button", { name: "Controlled single retry" }).click();
+
+  await expect(page.locator(".notice.error")).toContainText(
+    "Synthetic notification reauthentication failed",
+  );
+  await expect(panel.getByLabel("Current password confirmation")).toHaveValue(
+    "Synthetic-Staff-Password!",
+  );
+  await expect(panel.getByLabel("Notification TOTP or recovery code")).toHaveValue(
+    "notification-recovery-failed",
+  );
+  expect(retryPosts).toBe(0);
 });
 
 test("a committed retry is acknowledged immediately while its current-scope refresh is slow", async ({ page }) => {

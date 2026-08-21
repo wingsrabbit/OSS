@@ -113,6 +113,7 @@ export function NotificationOperationsPanel({
 }>) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [password, setPassword] = useState("");
+  const [factorCode, setFactorCode] = useState("");
   const [reason, setReason] = useState("");
   const [pendingOutboxId, setPendingOutboxId] = useState<string | null>(null);
 
@@ -149,6 +150,7 @@ export function NotificationOperationsPanel({
     accessScope.current.mounted = true;
     setSnapshot(emptySnapshot);
     setPassword("");
+    setFactorCode("");
     setReason("");
     setPendingOutboxId(null);
     return () => {
@@ -207,22 +209,38 @@ export function NotificationOperationsPanel({
       !canRetry ||
       !delivery.retryable ||
       !delivery.jobUpdatedAt ||
-      password.length === 0 ||
       reason.trim().length < 3 ||
       pendingOutboxId
     ) return;
     const submittedPassword = password;
+    const submittedFactorCode = factorCode.trim();
     const submittedReason = reason.trim();
+    if (submittedPassword.length === 0 && submittedFactorCode.length > 0) {
+      onError(
+        locale === "zh-CN"
+          ? "TOTP 或恢复码必须与当前密码一起提交。"
+          : "A TOTP or recovery code must be submitted with the current password.",
+      );
+      return;
+    }
     setPendingOutboxId(delivery.outboxId);
     try {
-      try {
-        await api("/api/v1/auth/reauth", {
-          method: "POST",
-          body: JSON.stringify({ password: submittedPassword }),
-        });
-      } catch (caught) {
+      if (submittedPassword.length > 0) {
+        try {
+          await api("/api/v1/auth/reauth", {
+            method: "POST",
+            body: JSON.stringify({
+              password: submittedPassword,
+              ...(submittedFactorCode ? { factorCode: submittedFactorCode } : {}),
+            }),
+          });
+        } catch (caught) {
+          if (!scopeIsCurrent(scope)) return;
+          throw caught;
+        }
         if (!scopeIsCurrent(scope)) return;
-        throw caught;
+        setPassword("");
+        setFactorCode("");
       }
       if (!scopeIsCurrent(scope)) return;
       try {
@@ -238,7 +256,6 @@ export function NotificationOperationsPanel({
         throw caught;
       }
       if (!scopeIsCurrent(scope)) return;
-      setPassword("");
       setReason("");
       setPendingOutboxId(null);
       onNotice(
@@ -269,6 +286,7 @@ export function NotificationOperationsPanel({
 
   if (!active || !canRead) return null;
   const zh = locale === "zh-CN";
+  const factorRequiresPassword = password.length === 0 && factorCode.trim().length > 0;
   return (
     <section
       className="order-panel notification-operations"
@@ -308,7 +326,13 @@ export function NotificationOperationsPanel({
       </div>
 
       {canRetry && (
-        <div className="inline-form" data-testid="notification-retry-controls">
+        <fieldset className="inline-form" data-testid="notification-retry-controls">
+          <legend>{zh ? "Staff 重新认证" : "Staff reauthentication"}</legend>
+          <p className="muted">
+            {zh
+              ? "已有有效的 15 分钟授权时可留空；否则输入当前密码，并在已启用时输入 TOTP 或一次性恢复码。"
+              : "Leave both fields blank to reuse a current 15-minute grant. Otherwise enter the current password and, when enabled, a TOTP or one-time recovery code."}
+          </p>
           <label>
             {zh ? "当前密码确认" : "Current password confirmation"}
             <input
@@ -316,6 +340,17 @@ export function NotificationOperationsPanel({
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               autoComplete="current-password"
+              disabled={pendingOutboxId !== null}
+            />
+          </label>
+          <label>
+            {zh ? "通知操作 TOTP 或恢复码" : "Notification TOTP or recovery code"}
+            <input
+              value={factorCode}
+              onChange={(event) => setFactorCode(event.target.value)}
+              autoComplete="one-time-code"
+              aria-invalid={factorRequiresPassword}
+              disabled={pendingOutboxId !== null}
             />
           </label>
           <label>
@@ -324,9 +359,17 @@ export function NotificationOperationsPanel({
               value={reason}
               onChange={(event) => setReason(event.target.value)}
               maxLength={1_000}
+              disabled={pendingOutboxId !== null}
             />
           </label>
-        </div>
+          {factorRequiresPassword && (
+            <p className="notice error" data-testid="notification-factor-requires-password">
+              {zh
+                ? "请输入当前密码，或清空 TOTP / 恢复码以复用现有授权。"
+                : "Enter the current password, or clear the TOTP / recovery code to reuse the current grant."}
+            </p>
+          )}
+        </fieldset>
       )}
 
       <div data-testid="notification-attention-queue">
@@ -356,7 +399,7 @@ export function NotificationOperationsPanel({
                 <button
                   type="button"
                   disabled={
-                    pendingOutboxId !== null || password.length === 0 || reason.trim().length < 3
+                    pendingOutboxId !== null || factorRequiresPassword || reason.trim().length < 3
                   }
                   onClick={() => void retry(delivery)}
                 >
