@@ -413,8 +413,9 @@ function adminCancellationFixture() {
     serviceVersion: 7,
     lastError: null,
     providerOperation: null,
-    job: { status: "manual", lastError: null },
+    job: { type: "service.cancellation.due", status: "manual", lastError: null },
     interventionRequired: true,
+    completionAllowed: true,
   };
 }
 
@@ -676,7 +677,7 @@ function expectedPostBody(path: string, body: Record<string, unknown>): boolean 
     ]);
   }
   if (/\/admin\/tickets\/[^/]+\/messages$/.test(path)) {
-    return bodyHasExactly(body, ["kind", "message"]);
+    return bodyHasExactly(body, ["kind", "message", "idempotencyKey"]);
   }
   return false;
 }
@@ -1853,6 +1854,7 @@ for (const accessChange of ["principal", "revocation"] as const) {
           return true;
         }
         if (await account360Interceptor("ticket", path, route)) return true;
+        if (await operationInterceptor("ticket", false)(path, route)) return true;
         if (path === `/api/v1/admin/tickets/${ticket.ticket.id}`) {
           await route.fulfill({ json: ticket });
           return true;
@@ -1901,7 +1903,8 @@ for (const accessChange of ["principal", "revocation"] as const) {
     await expect(page.getByTestId("staff-ticket-thread")).toHaveCount(0);
     const scopedReadsBeforeRelease = requests.filter((request) =>
       request.method === "GET" &&
-      request.path === `/api/v1/admin/client-accounts/${accountA}/tickets`
+      request.path === "/api/v1/admin/tickets" &&
+      request.query === `?clientAccountId=${accountA}`
     ).length;
     const replyResponse = page.waitForResponse((response) =>
       new URL(response.url()).pathname === messagePath,
@@ -1911,7 +1914,8 @@ for (const accessChange of ["principal", "revocation"] as const) {
 
     expect(requests.filter((request) =>
       request.method === "GET" &&
-      request.path === `/api/v1/admin/client-accounts/${accountA}/tickets`
+      request.path === "/api/v1/admin/tickets" &&
+      request.query === `?clientAccountId=${accountA}`
     )).toHaveLength(scopedReadsBeforeRelease);
     await expect(page.getByText("Public reply sent.", { exact: true })).toHaveCount(0);
     await expect(page.locator(".notice.error")).toHaveCount(0);

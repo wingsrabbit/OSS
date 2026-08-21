@@ -450,18 +450,39 @@ async function createService(
   const orderItemId = randomUUID();
   const serviceId = randomUUID();
   const externalResourceId = `mock-service-operations-${label}-${serviceId}`;
+  const priceSnapshot = {
+    productId,
+    productName: "Synthetic daily operations",
+    currency: "USD",
+    billingCycle: "monthly",
+    fulfillmentMode: "automatic",
+    components: [
+      {
+        code: "base",
+        label: "Synthetic daily operations",
+        quantity: 1,
+        oneTimeMinor: "0",
+        recurringMinor: "100",
+      },
+    ],
+    oneTimeSubtotalMinor: "0",
+    setupMinor: "0",
+    recurringSubtotalMinor: "100",
+    invoiceTotalMinor: "100",
+  };
   await tx(core, async (client) => {
     await client.query(
       `INSERT INTO orders(
          id, client_account_id, submitted_by_user_id, status, currency,
          price_snapshot, one_time_minor, setup_minor, recurring_minor,
          total_minor, idempotency_key, request_fingerprint
-       ) VALUES ($1, $2, $3, 'completed', 'USD', '{}'::jsonb,
-                 0, 0, 100, 100, $4, $5)`,
+       ) VALUES ($1, $2, $3, 'completed', 'USD', $4,
+                 0, 0, 100, 100, $5, $6)`,
       [
         orderId,
         account.accountId,
         account.userId,
+        priceSnapshot,
         `service-operations-order-${orderId}`,
         createHash("sha256").update(orderId).digest("hex"),
       ],
@@ -472,8 +493,8 @@ async function createService(
          billing_cycle, configuration, price_snapshot, client_account_id
        ) VALUES ($1, $2, $4,
                  'Synthetic daily operations', 'automatic', 'monthly',
-                 '{}'::jsonb, '{}'::jsonb, $3)`,
-      [orderItemId, orderId, account.accountId, productId],
+                 '{}'::jsonb, $5, $3)`,
+      [orderItemId, orderId, account.accountId, productId, priceSnapshot],
     );
     await client.query(
       `INSERT INTO services(

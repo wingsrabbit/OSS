@@ -59,7 +59,7 @@ test("customer and staff complete a public ticket conversation while internal no
 
   const staffPanel = page.locator('section[aria-label="Staff support tickets"]');
   await expect(staffPanel.getByRole("heading", { name: "Ticket queue" })).toBeVisible();
-  await staffPanel.getByRole("button", { name: "Refresh ticket queue" }).click();
+  await staffPanel.getByRole("button", { name: "Apply filters" }).click();
   await staffPanel.getByTestId("staff-ticket-list").getByRole("button", { name: new RegExp(subject) }).click();
   const staffThread = staffPanel.getByTestId("staff-ticket-thread");
   await expect(staffThread).toContainText(subject);
