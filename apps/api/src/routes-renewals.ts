@@ -3,13 +3,19 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertFinancialReadEligible, requireUser, type AuthenticatedUser } from "./auth.js";
+import {
+  assertFinancialReadEligible,
+  requireSessionIdentity,
+  requireUser,
+  type SessionIdentity,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertProviderSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
+import { projectRenewalReminderStatus } from "./renewal-reminder-status.js";
 import {
   requireRecentReauth,
   requireStaffActionLocked,
@@ -29,9 +35,9 @@ const suspensionManualActionSchema = z
 
 async function requireRenewalAdminReadPermission(
   pool: DatabasePool,
-  user: AuthenticatedUser,
+  user: SessionIdentity,
 ): Promise<void> {
-  if (user.userRestrictedAt || user.clientAccountRestrictedAt || !user.emailVerifiedAt) {
+  if (user.userRestrictedAt || !user.emailVerifiedAt) {
     throw Object.assign(new Error("Staff account is not eligible"), { statusCode: 403 });
   }
   const result = await pool.query<{ permissions: unknown }>(
@@ -43,6 +49,12 @@ async function requireRenewalAdminReadPermission(
   const permissions = result.rows[0]?.permissions;
   if (
     !Array.isArray(permissions) ||
+    !permissions.every(
+      (permission) =>
+        typeof permission === "string" &&
+        permission.length > 0 &&
+        permission.trim() === permission,
+    ) ||
     !permissions.some((permission) =>
       ["*", "billing.automation_manage", "services.suspension_manage"].includes(permission),
     )
@@ -79,6 +91,11 @@ type RenewalListRow = {
   reminder_created_at: Date | null;
   reminder_delivery_status: "delivered" | "bounced" | "failed" | null;
   reminder_provider_occurred_at: Date | null;
+  reminder_generic_operation_status: string | null;
+  reminder_generic_attempt_number: number | null;
+  reminder_generic_fact_status: "delivered" | "bounced" | "failed" | "skipped" | null;
+  reminder_generic_recorded_at: Date | null;
+  reminder_generic_updated_at: Date | null;
   reminder_suppressed_at: Date | null;
   reminder_job_status: string | null;
   reminder_job_attempts: number | null;
@@ -141,6 +158,11 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
        reminder.created_at AS reminder_created_at,
        delivery.status AS reminder_delivery_status,
        delivery.provider_occurred_at AS reminder_provider_occurred_at,
+       generic_delivery.operation_status AS reminder_generic_operation_status,
+       generic_delivery.attempt_number AS reminder_generic_attempt_number,
+       generic_delivery.fact_status AS reminder_generic_fact_status,
+       generic_delivery.recorded_at AS reminder_generic_recorded_at,
+       generic_delivery.updated_at AS reminder_generic_updated_at,
        suppression.created_at AS reminder_suppressed_at,
        job.status AS reminder_job_status,
        job.attempts AS reminder_job_attempts,
@@ -210,7 +232,30 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
      JOIN invoice_allocation_totals allocation ON allocation.invoice_id = invoice.id
      LEFT JOIN renewal_reminder_intents reminder ON reminder.invoice_id = invoice.id
      LEFT JOIN outbox ON outbox.id = reminder.outbox_id
-     LEFT JOIN renewal_reminder_delivery_facts delivery ON delivery.intent_id = reminder.id
+     LEFT JOIN LATERAL (
+       SELECT fact.status, fact.provider_occurred_at
+       FROM renewal_reminder_delivery_facts fact
+       WHERE fact.intent_id = reminder.id
+       ORDER BY fact.attempt_number DESC
+       LIMIT 1
+     ) delivery ON true
+     LEFT JOIN LATERAL (
+       SELECT operation.status AS operation_status,
+              operation.attempt_number,
+              fact.status AS fact_status,
+              fact.recorded_at,
+              operation.updated_at
+       FROM notification_delivery_operations operation
+       LEFT JOIN notification_delivery_facts fact
+         ON fact.outbox_id = operation.outbox_id
+        AND fact.attempt_number = operation.attempt_number
+        AND fact.provider_operation_id = operation.provider_operation_id
+       WHERE operation.outbox_id = reminder.outbox_id
+         AND operation.recipient_kind = 'account_user'
+         AND operation.category = 'billing'
+       ORDER BY operation.attempt_number DESC
+       LIMIT 1
+     ) generic_delivery ON true
      LEFT JOIN renewal_reminder_suppressions suppression ON suppression.intent_id = reminder.id
      LEFT JOIN durable_jobs job
        ON job.job_type = 'notification.send'
@@ -267,6 +312,7 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
           | "delivered"
           | "bounced"
           | "failed"
+          | "skipped"
           | "suppressed"
           | "retrying"
           | "manual";
@@ -521,28 +567,28 @@ async function listRenewals(pool: DatabasePool, clientAccountId?: string) {
       items.set(row.renewal_id, item);
     }
     if (row.reminder_kind && row.reminder_created_at) {
+      const reminderProjection = projectRenewalReminderStatus({
+        deliveryStatus: row.reminder_delivery_status,
+        providerOccurredAt: row.reminder_provider_occurred_at,
+        genericOperationStatus: row.reminder_generic_operation_status,
+        genericAttemptNumber: row.reminder_generic_attempt_number,
+        genericFactStatus: row.reminder_generic_fact_status,
+        genericRecordedAt: row.reminder_generic_recorded_at,
+        genericUpdatedAt: row.reminder_generic_updated_at,
+        suppressedAt: row.reminder_suppressed_at,
+        jobStatus: row.reminder_job_status,
+        jobAttempts: row.reminder_job_attempts,
+      });
       item.reminders.push({
         kind: row.reminder_kind,
         offsetDays: row.reminder_offset_days ?? 0,
-        status: row.reminder_suppressed_at
-          ? "suppressed"
-          : row.reminder_delivery_status
-            ? row.reminder_delivery_status
-          : row.reminder_job_status === "manual"
-            ? "manual"
-            : (row.reminder_job_status === "pending" || row.reminder_job_status === "running") &&
-                (row.reminder_job_attempts ?? 0) > 0
-              ? "retrying"
-              : "queued",
+        status: reminderProjection.status,
         createdAt: row.reminder_created_at.toISOString(),
         deliveredAt:
           row.reminder_delivery_status === "delivered"
             ? row.reminder_provider_occurred_at?.toISOString() ?? null
             : null,
-        outcomeAt:
-          row.reminder_suppressed_at?.toISOString() ??
-          row.reminder_provider_occurred_at?.toISOString() ??
-          null,
+        outcomeAt: reminderProjection.outcomeAt?.toISOString() ?? null,
       });
     }
   }
@@ -565,7 +611,7 @@ export async function registerRenewalRoutes(
   });
 
   app.get("/api/v1/admin/billing/renewals", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireRenewalAdminReadPermission(pool, user);
     return { warning: LAB_WARNING, items: await listRenewals(pool) };
   });
@@ -592,7 +638,7 @@ export async function registerRenewalRoutes(
   });
 
   app.post("/api/v1/admin/billing/automation/run", async (request, reply) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "billing.automation_manage");
     await requireRecentReauth(pool, user);
     const body = z
@@ -629,7 +675,7 @@ export async function registerRenewalRoutes(
   app.post(
     "/api/v1/admin/billing/delinquency-cases/:caseId/manual-actions",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "services.suspension_manage");
       await requireRecentReauth(pool, user);
       const params = z.object({ caseId: z.uuid() }).strict().parse(request.params);
@@ -648,6 +694,7 @@ export async function registerRenewalRoutes(
           order_item_id: string;
           order_id: string;
           client_account_id: string;
+          submitted_by_user_id: string;
           renewal_invoice_ids: string[];
         }>(
           `SELECT suspension_case.service_id,
@@ -656,6 +703,7 @@ export async function registerRenewalRoutes(
                   service.order_item_id,
                   item.order_id,
                   service.client_account_id,
+                  original_order.submitted_by_user_id,
                   ARRAY(
                     SELECT renewal_invoice.id
                     FROM service_renewals service_renewal
@@ -667,6 +715,7 @@ export async function registerRenewalRoutes(
            FROM service_suspension_cases suspension_case
            JOIN services service ON service.id = suspension_case.service_id
            JOIN order_items item ON item.id = service.order_item_id
+           JOIN orders original_order ON original_order.id = item.order_id
            WHERE suspension_case.id = $1`,
           [params.caseId],
         );
@@ -676,7 +725,12 @@ export async function registerRenewalRoutes(
             statusCode: 404,
           });
         }
-        await requireStaffActionLocked(client, user, "services.suspension_manage");
+        await requireStaffActionLocked(
+          client,
+          user,
+          "services.suspension_manage",
+          [pointer.submitted_by_user_id],
+        );
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `service-suspension-manual-action:${user.userId}:${body.idempotencyKey}`,
         ]);
@@ -736,6 +790,17 @@ export async function registerRenewalRoutes(
           );
         }
 
+        await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+          pointer.client_account_id,
+        ]);
+        await client.query(
+          `SELECT user_id
+           FROM client_memberships
+           WHERE client_account_id = $1 AND user_id = $2
+           FOR UPDATE`,
+          [pointer.client_account_id, pointer.submitted_by_user_id],
+        );
+
         // Invoice is the common financial root used by payment settlement. Lock
         // every renewal invoice for this service before the service/case rows so
         // restoration cannot race another allocation or a new billing period.
@@ -753,9 +818,6 @@ export async function registerRenewalRoutes(
         ]);
         await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
           pointer.service_id,
-        ]);
-        await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-          pointer.client_account_id,
         ]);
         await client.query(
           `SELECT id
@@ -1158,7 +1220,7 @@ export async function registerRenewalRoutes(
   app.post(
     "/api/v1/admin/billing/renewals/:renewalId/resolve-hold",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "billing.automation_manage");
       await requireRecentReauth(pool, user);
       const params = z.object({ renewalId: z.uuid() }).parse(request.params);
@@ -1177,7 +1239,39 @@ export async function registerRenewalRoutes(
         expectedVersion: body.expectedVersion,
       });
       const outcome = await transaction(pool, async (client) => {
-        await requireStaffActionLocked(client, user, "billing.automation_manage");
+        const settlementIdentity = (
+          await client.query<{
+            target_user_id: string;
+            client_account_id: string;
+          }>(
+            `SELECT original_order.submitted_by_user_id AS target_user_id,
+                    service.client_account_id
+             FROM service_renewals renewal
+             JOIN services service ON service.id = renewal.service_id
+             JOIN order_items item ON item.id = service.order_item_id
+             JOIN orders original_order ON original_order.id = item.order_id
+             WHERE renewal.id = $1`,
+            [params.renewalId],
+          )
+        ).rows[0];
+        await requireStaffActionLocked(
+          client,
+          user,
+          "billing.automation_manage",
+          settlementIdentity ? [settlementIdentity.target_user_id] : [],
+        );
+        if (settlementIdentity) {
+          await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+            settlementIdentity.client_account_id,
+          ]);
+          await client.query(
+            `SELECT user_id
+             FROM client_memberships
+             WHERE client_account_id = $1 AND user_id = $2
+             FOR UPDATE`,
+            [settlementIdentity.client_account_id, settlementIdentity.target_user_id],
+          );
+        }
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `renewal-hold:${user.userId}:${body.idempotencyKey}`,
         ]);

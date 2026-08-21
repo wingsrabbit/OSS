@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import { canTransitionPayment, type PaymentStatus } from "@opensales/core";
+import {
+  canTransitionPayment,
+  hasCustomerMembershipCapability,
+  type CustomerMembershipRole,
+  type PaymentStatus,
+} from "@opensales/core";
 import { providerOperationCapabilityMatches } from "@opensales/core/provider-capability";
 import type { Config } from "./config.js";
 import type { DatabaseClient } from "./database.js";
@@ -65,24 +70,49 @@ export async function handleAddFundsPaymentEvent(
   config: Config,
   body: AddFundsPaymentEvent,
 ): Promise<Record<string, unknown>> {
-  // Worker preflight and Chargeback callbacks use this same operation-scoped
-  // lock before taking Add Funds rows. Keeping payment settlement in that
-  // order prevents an operation/attempt lock inversion during callback races.
-  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-    `provider-operation:${body.providerOperationId}`,
-  ]);
   const lockPointer = await client.query<{
     submitted_by_user_id: string;
     client_account_id: string;
   }>(
     `SELECT submitted_by_user_id, client_account_id
      FROM add_funds_attempts
-     WHERE id = $1 AND provider_installation_id = $2
-     FOR UPDATE`,
+     WHERE id = $1 AND provider_installation_id = $2`,
     [body.paymentAttemptId, PROVIDER_INSTALLATION_ID],
   );
   const pointer = lockPointer.rows[0];
   if (pointer) {
+    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+      pointer.submitted_by_user_id,
+    ]);
+    await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+      pointer.client_account_id,
+    ]);
+  }
+  const lockedMembership = pointer
+    ? await client.query<{
+        role: CustomerMembershipRole;
+        permissions: unknown;
+        restricted_at: Date | null;
+        removed_at: Date | null;
+      }>(
+        `SELECT role, permissions, restricted_at, removed_at
+         FROM client_memberships
+         WHERE user_id = $1 AND client_account_id = $2
+         FOR UPDATE`,
+        [pointer.submitted_by_user_id, pointer.client_account_id],
+      )
+    : null;
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    `provider-operation:${body.providerOperationId}`,
+  ]);
+  if (pointer) {
+    await client.query(
+      `SELECT id
+       FROM add_funds_attempts
+       WHERE id = $1 AND provider_installation_id = $2
+       FOR UPDATE`,
+      [body.paymentAttemptId, PROVIDER_INSTALLATION_ID],
+    );
     await client.query(
       `SELECT id
        FROM add_funds_commands
@@ -101,27 +131,7 @@ export async function handleAddFundsPaymentEvent(
        FOR UPDATE`,
       [body.providerOperationId, body.paymentAttemptId, PROVIDER_INSTALLATION_ID],
     );
-    // Match invoice payment settlement: shared identity is always locked in
-    // User -> Client Account -> Membership order before receipt FK writes.
-    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-      pointer.submitted_by_user_id,
-    ]);
-    await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-      pointer.client_account_id,
-    ]);
   }
-  const lockedMembership = pointer
-    ? await client.query<{
-        role: string;
-        removed_at: Date | null;
-      }>(
-        `SELECT role, removed_at
-         FROM client_memberships
-         WHERE user_id = $1 AND client_account_id = $2
-         FOR UPDATE`,
-        [pointer.submitted_by_user_id, pointer.client_account_id],
-      )
-    : null;
   const attemptResult = await client.query<{
     id: string;
     operation_id: string;
@@ -142,6 +152,8 @@ export async function handleAddFundsPaymentEvent(
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
     membership_role: string | null;
+    membership_permissions: unknown;
+    membership_restricted_at: Date | null;
     removed_at: Date | null;
     balance_cap_minor: string;
     policy_enabled: boolean;
@@ -156,7 +168,10 @@ export async function handleAddFundsPaymentEvent(
        afa.external_payment_id, afa.provider_occurred_at, afa.expires_at,
        u.email_verified_at, u.restricted_at AS user_restricted_at,
        ca.restricted_at AS account_restricted_at,
-       cm.role AS membership_role, cm.removed_at,
+       cm.role AS membership_role,
+       cm.permissions AS membership_permissions,
+       cm.restricted_at AS membership_restricted_at,
+       cm.removed_at,
        afp.balance_cap_minor::text, afp.enabled AS policy_enabled,
        EXISTS (
          SELECT 1
@@ -224,6 +239,14 @@ export async function handleAddFundsPaymentEvent(
     return { rejected: true, reason: "provider_operation_not_started" };
   }
   const membership = lockedMembership?.rows[0];
+  const membershipPermissions =
+    membership &&
+    Array.isArray(membership.permissions) &&
+    membership.permissions.every(
+      (permission): permission is string => typeof permission === "string",
+    )
+      ? membership.permissions
+      : [];
 
   const storedPayload = { ...body, callbackCapability: "[REDACTED]" };
   const inbox = await client.query(
@@ -404,8 +427,13 @@ export async function handleAddFundsPaymentEvent(
     Boolean(attempt.email_verified_at) &&
     !attempt.user_restricted_at &&
     !attempt.account_restricted_at &&
+    !membership?.restricted_at &&
     membership?.removed_at === null &&
-    (membership?.role === "owner" || membership?.role === "billing");
+    Boolean(membership?.role) &&
+    hasCustomerMembershipCapability(
+      { role: membership!.role, permissions: membershipPermissions },
+      "billing.write",
+    );
 
   await client.query(
     `INSERT INTO credit_accounts(client_account_id, currency)

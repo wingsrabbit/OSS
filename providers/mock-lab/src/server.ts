@@ -4,6 +4,10 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import Fastify from "fastify";
 import pg from "pg";
 import { z } from "zod";
+import {
+  createProviderRequestFingerprintKeyring,
+  registerProviderPlatformRoutes,
+} from "./provider-platform.js";
 
 const config = z
   .object({
@@ -11,6 +15,11 @@ const config = z
     MOCK_PAYMENT_PROVIDER_TOKEN: z.string().min(32).optional(),
     MOCK_PROVISIONING_PROVIDER_TOKEN: z.string().min(32).optional(),
     MOCK_MAIL_PROVIDER_TOKEN: z.string().min(32).optional(),
+    MOCK_PROVIDER_PLATFORM_TOKEN: z.string().min(32).optional(),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: z.string().regex(/^[A-Za-z0-9_-]{43}$/u).optional(),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: z.coerce.number().int().positive().default(1),
+    MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: z.string().default(""),
+    MOCK_PROVIDER_PUBLIC_BASE_URL: z.url().optional(),
     LAB_MAILBOX_TOKEN: z.string().min(32).optional(),
     MOCK_PAYMENT_WEBHOOK_SECRET: z.string().min(32).optional(),
     MOCK_PROVISIONING_WEBHOOK_SECRET: z.string().min(32).optional(),
@@ -113,10 +122,18 @@ const mailCreateSchema = z.object({
   subject: z.string().min(1).max(240),
   body: z.string().min(1).max(20_000),
   sensitive: z.boolean().default(false),
+  scenario: z.enum(["delivered", "bounced", "failed"]).optional(),
 });
+
+const mailOperationParamsSchema = z.object({
+  operationId: z.uuid(),
+});
+
+const mailDeliveryStatusSchema = z.enum(["delivered", "bounced", "failed"]);
 
 const mailboxQuerySchema = z.object({
   recipient: z.email(),
+  operationId: z.uuid().optional(),
 });
 
 function requestFingerprint(scope: string, body: unknown): string {
@@ -133,6 +150,68 @@ const pool = new pg.Pool({
   statement_timeout: 15_000,
   application_name: "opensales-mock-lab",
 });
+
+const inFlightMailWrites = new Map<string, Promise<void>>();
+const incomingMailRequests = new Map<string, Promise<void>>();
+const incomingMailRequestReleases = new WeakMap<object, () => void>();
+
+function registerIncomingMailRequest(operationId: string): () => void {
+  const predecessor = incomingMailRequests.get(operationId) ?? Promise.resolve();
+  let resolveCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    resolveCurrent = resolve;
+  });
+  const tail = predecessor.then(() => current);
+  incomingMailRequests.set(operationId, tail);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    resolveCurrent();
+    void tail.finally(() => {
+      if (incomingMailRequests.get(operationId) === tail) {
+        incomingMailRequests.delete(operationId);
+      }
+    });
+  };
+}
+
+async function waitForIncomingMailRequest(operationId: string): Promise<void> {
+  while (true) {
+    const pending = incomingMailRequests.get(operationId);
+    if (!pending) return;
+    await pending;
+    if (incomingMailRequests.get(operationId) === pending) return;
+  }
+}
+
+async function serializeMailWrite<T>(operationId: string, work: () => Promise<T>): Promise<T> {
+  const predecessor = inFlightMailWrites.get(operationId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.then(() => current);
+  inFlightMailWrites.set(operationId, tail);
+  await predecessor;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (inFlightMailWrites.get(operationId) === tail) {
+      inFlightMailWrites.delete(operationId);
+    }
+  }
+}
+
+async function waitForInFlightMailWrite(operationId: string): Promise<void> {
+  while (true) {
+    const pending = inFlightMailWrites.get(operationId);
+    if (!pending) return;
+    await pending;
+    if (inFlightMailWrites.get(operationId) === pending) return;
+  }
+}
 
 await pool.query(`
   CREATE EXTENSION IF NOT EXISTS citext;
@@ -255,6 +334,11 @@ await pool.query(`
     delivery_calls integer NOT NULL DEFAULT 1,
     request_fingerprint text NOT NULL
   );
+  ALTER TABLE mock_mail_messages
+    DROP CONSTRAINT IF EXISTS mock_mail_messages_status_check;
+  ALTER TABLE mock_mail_messages
+    ADD CONSTRAINT mock_mail_messages_status_check
+    CHECK (status IN ('delivered', 'bounced', 'failed'));
   ALTER TABLE mock_payment_operations
     ADD COLUMN IF NOT EXISTS request_fingerprint text;
   ALTER TABLE mock_payment_operations
@@ -281,10 +365,35 @@ await pool.query(`
   ALTER TABLE mock_resource_operations
     ADD COLUMN IF NOT EXISTS resource_state text NOT NULL DEFAULT 'active';
   ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS power_state text NOT NULL DEFAULT 'running';
+  ALTER TABLE mock_resource_operations
+    ADD COLUMN IF NOT EXISTS desired_power_state text NOT NULL DEFAULT 'running';
+  ALTER TABLE mock_resource_operations
     DROP CONSTRAINT IF EXISTS mock_resource_operations_resource_state_check;
   ALTER TABLE mock_resource_operations
     ADD CONSTRAINT mock_resource_operations_resource_state_check
     CHECK (resource_state IN ('active', 'suspended', 'terminated'));
+  ALTER TABLE mock_resource_operations
+    DROP CONSTRAINT IF EXISTS mock_resource_operations_power_state_check;
+  ALTER TABLE mock_resource_operations
+    ADD CONSTRAINT mock_resource_operations_power_state_check
+    CHECK (power_state IN ('running', 'stopped', 'terminated'));
+  ALTER TABLE mock_resource_operations
+    DROP CONSTRAINT IF EXISTS mock_resource_operations_desired_power_state_check;
+  ALTER TABLE mock_resource_operations
+    ADD CONSTRAINT mock_resource_operations_desired_power_state_check
+    CHECK (desired_power_state IN ('running', 'stopped', 'terminated'));
+  UPDATE mock_resource_operations
+  SET power_state = CASE resource_state
+    WHEN 'suspended' THEN 'stopped'
+    WHEN 'terminated' THEN 'terminated'
+    ELSE power_state
+  END;
+  UPDATE mock_resource_operations
+  SET desired_power_state = CASE resource_state
+    WHEN 'terminated' THEN 'terminated'
+    ELSE desired_power_state
+  END;
   UPDATE mock_resource_operations
   SET callback_capability = repeat('A', 43)
   WHERE callback_capability IS NULL;
@@ -391,6 +500,35 @@ await pool.query(`
   CREATE TRIGGER mock_resource_action_operations_append_only
   BEFORE UPDATE OR DELETE ON mock_resource_action_operations
   FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_resource_action_mutation();
+  CREATE OR REPLACE FUNCTION opensales_guard_mock_mail_message_mutation()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    IF TG_OP = 'DELETE'
+       OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+       -- citext equality intentionally ignores case, but the stored recipient
+       -- spelling is part of the immutable Provider request fingerprint.
+       OR NEW.recipient::text IS DISTINCT FROM OLD.recipient::text
+       OR NEW.template IS DISTINCT FROM OLD.template
+       OR NEW.locale IS DISTINCT FROM OLD.locale
+       OR NEW.subject IS DISTINCT FROM OLD.subject
+       OR NEW.body IS DISTINCT FROM OLD.body
+       OR NEW.sensitive IS DISTINCT FROM OLD.sensitive
+       OR NEW.status IS DISTINCT FROM OLD.status
+       OR NEW.delivered_at IS DISTINCT FROM OLD.delivered_at
+       OR NEW.request_fingerprint IS DISTINCT FROM OLD.request_fingerprint
+       OR NEW.delivery_calls <> OLD.delivery_calls + 1 THEN
+      RAISE EXCEPTION
+        'Mock mail messages are append-only except for idempotent delivery call counting';
+    END IF;
+    RETURN NEW;
+  END;
+  $$;
+  DROP TRIGGER IF EXISTS mock_mail_messages_append_only ON mock_mail_messages;
+  CREATE TRIGGER mock_mail_messages_append_only
+  BEFORE UPDATE OR DELETE ON mock_mail_messages
+  FOR EACH ROW EXECUTE FUNCTION opensales_guard_mock_mail_message_mutation();
 `);
 
 const app = Fastify({
@@ -402,6 +540,7 @@ const app = Fastify({
         "req.headers.x-oss-signature",
         "req.body.providerPaymentMethodToken",
         "req.body.savedPaymentMethod.providerToken",
+        "req.body.input.configuration.password",
       ],
       censor: "[REDACTED]",
     },
@@ -410,16 +549,20 @@ const app = Fastify({
 });
 
 app.addHook("onRequest", async (request, reply) => {
-  if (!request.url.startsWith("/v1/")) return;
+  const requestPath = new URL(request.url, "http://127.0.0.1").pathname;
+  if (requestPath === "/v1/manifest") return;
+  if (!requestPath.startsWith("/v1/") && !requestPath.startsWith("/v1alpha1/")) return;
   const expectedToken =
-    request.url.startsWith("/v1/payments") || request.url.startsWith("/v1/refunds")
+    requestPath.startsWith("/v1alpha1/") || requestPath === "/v1/events"
+      ? config.MOCK_PROVIDER_PLATFORM_TOKEN
+      : requestPath.startsWith("/v1/payments") || requestPath.startsWith("/v1/refunds")
       ? config.MOCK_PAYMENT_PROVIDER_TOKEN
-      : request.url.startsWith("/v1/resources") ||
-          request.url.startsWith("/v1/resource-actions")
+      : requestPath.startsWith("/v1/resources") ||
+          requestPath.startsWith("/v1/resource-actions")
         ? config.MOCK_PROVISIONING_PROVIDER_TOKEN
-        : request.url.startsWith("/v1/mailbox")
+        : requestPath.startsWith("/v1/mailbox")
           ? config.LAB_MAILBOX_TOKEN
-          : request.url === "/v1/mail"
+          : requestPath === "/v1/mail" || requestPath.startsWith("/v1/mail/")
             ? config.MOCK_MAIL_PROVIDER_TOKEN
             : undefined;
   if (!expectedToken) return reply.code(404).send({ error: "capability is not enabled" });
@@ -429,12 +572,62 @@ app.addHook("onRequest", async (request, reply) => {
   if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
     return reply.code(401).send({ error: "invalid provider credential" });
   }
+  if (request.method === "POST" && requestPath === "/v1/mail") {
+    const idempotencyKey = request.headers["idempotency-key"];
+    const parsedOperationId = z.uuid().safeParse(
+      Array.isArray(idempotencyKey) ? idempotencyKey[0] : idempotencyKey,
+    );
+    if (parsedOperationId.success) {
+      incomingMailRequestReleases.set(
+        request,
+        registerIncomingMailRequest(parsedOperationId.data),
+      );
+    }
+  }
+});
+
+if (config.MOCK_PROVIDER_PLATFORM_TOKEN) {
+  if (!config.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY) {
+    throw new Error(
+      "MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY is required when the Provider Platform is enabled",
+    );
+  }
+  await registerProviderPlatformRoutes(app, pool, {
+    publicBaseUrl:
+      config.MOCK_PROVIDER_PUBLIC_BASE_URL ??
+      `http://127.0.0.1:${config.PROVIDER_PORT}`,
+    authoritativeProvisioningResources: Boolean(config.MOCK_PROVISIONING_PROVIDER_TOKEN),
+    requestFingerprintKeyring: createProviderRequestFingerprintKeyring(
+      config.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION,
+      config.MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY,
+      config.MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS,
+    ),
+  });
+}
+
+function releaseIncomingMailRequest(request: object): void {
+  const release = incomingMailRequestReleases.get(request);
+  if (!release) return;
+  incomingMailRequestReleases.delete(request);
+  release();
+}
+
+app.addHook("onError", async (request) => {
+  releaseIncomingMailRequest(request);
+});
+
+app.addHook("onRequestAbort", async (request) => {
+  releaseIncomingMailRequest(request);
 });
 
 app.addHook("onSend", async (_request, reply) => {
   reply.header("X-Robots-Tag", "noindex, nofollow, noarchive");
   reply.header("Cache-Control", "no-store");
   reply.header("X-Content-Type-Options", "nosniff");
+});
+
+app.addHook("onResponse", async (request) => {
+  releaseIncomingMailRequest(request);
 });
 
 function signature(timestamp: string, body: unknown, secret: string): string {
@@ -1370,7 +1563,16 @@ app.post("/v1/resource-actions", async (request, reply) => {
       if (status === "succeeded") {
         await client.query(
           `UPDATE mock_resource_operations
-           SET resource_state = $3
+           SET resource_state = $3,
+               power_state = CASE $3
+                 WHEN 'suspended' THEN 'stopped'
+                 WHEN 'active' THEN desired_power_state
+                 ELSE 'terminated'
+               END,
+               desired_power_state = CASE
+                 WHEN $3 = 'terminated' THEN 'terminated'
+                 ELSE desired_power_state
+               END
            WHERE service_id = $1 AND external_resource_id = $2`,
           [
             body.serviceId,
@@ -1464,39 +1666,110 @@ app.get("/v1/resource-actions/:operationId", async (request, reply) => {
 });
 
 app.post("/v1/mail", async (request, reply) => {
-  const body = mailCreateSchema.parse(request.body);
-  if (request.headers["idempotency-key"] !== body.operationId) {
-    return reply.code(400).send({ error: "stable idempotency key is required" });
+  try {
+    const body = mailCreateSchema.parse(request.body);
+    if (request.headers["idempotency-key"] !== body.operationId) {
+      return reply.code(400).send({ error: "stable idempotency key is required" });
+    }
+    const normalizedBody = { ...body, scenario: body.scenario ?? "delivered" } as const;
+    const fingerprint = requestFingerprint("mail.send:v1", normalizedBody);
+    const result = await serializeMailWrite(normalizedBody.operationId, async () => {
+      const client = await pool.connect();
+      let transactionResult: pg.QueryResult<{
+        status: "delivered" | "bounced" | "failed";
+        delivered_at: Date;
+      }>;
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [`mock-mail-operation:${normalizedBody.operationId}`],
+        );
+        transactionResult = await client.query(
+          `INSERT INTO mock_mail_messages(
+             operation_id, recipient, template, locale, subject, body, sensitive,
+             status, request_fingerprint
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (operation_id) DO UPDATE
+             SET delivery_calls = mock_mail_messages.delivery_calls + 1
+             WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
+           RETURNING status, delivered_at`,
+          [
+            normalizedBody.operationId,
+            normalizedBody.recipient,
+            normalizedBody.template,
+            normalizedBody.locale,
+            normalizedBody.subject,
+            normalizedBody.body,
+            normalizedBody.sensitive,
+            normalizedBody.scenario,
+            fingerprint,
+          ],
+        );
+        await client.query("COMMIT");
+        return transactionResult;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+    if (!result.rows[0]) {
+      return reply.code(409).send({ error: "idempotency key was reused with a different message" });
+    }
+    return reply.code(202).send({
+      operationId: normalizedBody.operationId,
+      status: result.rows[0]?.status ?? "delivered",
+      deliveredAt: result.rows[0]?.delivered_at.toISOString(),
+    });
+  } finally {
+    // Fastify does not run onRequestAbort/onError/onResponse when a client
+    // disconnects after the complete body reached this handler. The Provider
+    // must still commit or roll back before reconciliation GET can observe 404.
+    releaseIncomingMailRequest(request);
   }
-  const fingerprint = requestFingerprint("mail.send:v1", body);
-  const result = await pool.query<{ status: string; delivered_at: Date }>(
-    `INSERT INTO mock_mail_messages(
-       operation_id, recipient, template, locale, subject, body, sensitive
-       , request_fingerprint
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (operation_id) DO UPDATE
-       SET delivery_calls = mock_mail_messages.delivery_calls + 1
-       WHERE mock_mail_messages.request_fingerprint = EXCLUDED.request_fingerprint
-     RETURNING status, delivered_at`,
-    [
-      body.operationId,
-      body.recipient,
-      body.template,
-      body.locale,
-      body.subject,
-      body.body,
-      body.sensitive,
-      fingerprint,
-    ],
-  );
-  if (!result.rows[0]) {
-    return reply.code(409).send({ error: "idempotency key was reused with a different message" });
+});
+
+app.get("/v1/mail/:operationId", async (request, reply) => {
+  const params = mailOperationParamsSchema.safeParse(request.params);
+  if (!params.success) {
+    return reply.code(400).send({ error: "operationId must be a UUID" });
   }
-  return reply.code(202).send({
-    operationId: body.operationId,
-    status: result.rows[0]?.status ?? "delivered",
-    deliveredAt: result.rows[0]?.delivered_at.toISOString(),
-  });
+  await waitForIncomingMailRequest(params.data.operationId);
+  await waitForInFlightMailWrite(params.data.operationId);
+  const client = await pool.connect();
+  let result: pg.QueryResult<{
+    operation_id: string;
+    status: "delivered" | "bounced" | "failed";
+    delivered_at: Date;
+  }>;
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`mock-mail-operation:${params.data.operationId}`],
+    );
+    result = await client.query(
+      `SELECT operation_id, status, delivered_at
+       FROM mock_mail_messages
+       WHERE operation_id = $1`,
+      [params.data.operationId],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+  const row = result.rows[0];
+  if (!row) return reply.code(404).send({ error: "operation not found" });
+  return {
+    operationId: row.operation_id,
+    status: mailDeliveryStatusSchema.parse(row.status),
+    deliveredAt: row.delivered_at.toISOString(),
+  };
 });
 
 app.post("/v1/mailbox/query", async (request) => {
@@ -1513,9 +1786,10 @@ app.post("/v1/mailbox/query", async (request) => {
     `SELECT operation_id, template, locale, subject, body, status, delivered_at
      FROM mock_mail_messages
      WHERE recipient = $1
+       AND ($2::uuid IS NULL OR operation_id = $2)
      ORDER BY delivered_at DESC
      LIMIT 20`,
-    [query.recipient],
+    [query.recipient, query.operationId ?? null],
   );
   return result.rows.map((message) => ({
     id: message.operation_id,

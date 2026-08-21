@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+{
+	auto_https off
+	admin off
+}
+
+:8443 {
+	tls /run/secrets/provider_tls_cert /run/secrets/provider_tls_key
+	encode zstd gzip
+
+	@payment_health path /health/payment
+	handle @payment_health {
+		rewrite * /health/ready
+		reverse_proxy provider-payment:4000
+	}
+
+	@provisioning_health path /health/provisioning
+	handle @provisioning_health {
+		rewrite * /health/ready
+		reverse_proxy provider-provisioning:4000
+	}
+
+	@mail_health path /health/mail
+	handle @mail_health {
+		rewrite * /health/ready
+		reverse_proxy provider-mail:4000
+	}
+
+	@mailbox_health path /health/mailbox
+	handle @mailbox_health {
+		rewrite * /health/ready
+		reverse_proxy provider-mailbox:4000
+	}
+
+	@platform_health path /health/platform
+	handle @platform_health {
+		rewrite * /health/ready
+		reverse_proxy provider-platform:4000
+	}
+
+	@payment path /v1/payments /v1/payments/* /v1/refunds /v1/refunds/*
+	handle @payment {
+		reverse_proxy provider-payment:4000
+	}
+
+	@provisioning path /v1/resources /v1/resources/* /v1/resource-actions /v1/resource-actions/*
+	handle @provisioning {
+		reverse_proxy provider-provisioning:4000
+	}
+
+	@mailbox path /v1/mailbox/query
+	handle @mailbox {
+		reverse_proxy provider-mailbox:4000
+	}
+
+	@mail path /v1/mail /v1/mail/*
+	handle @mail {
+		reverse_proxy provider-mail:4000
+	}
+
+	@platform path /v1/manifest /v1/events /v1alpha1/*
+	handle @platform {
+		reverse_proxy provider-platform:4000
+	}
+
+	handle {
+		respond 404
+	}
+}

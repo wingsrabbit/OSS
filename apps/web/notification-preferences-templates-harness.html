@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Notification preferences and templates component harness</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <main id="notification-preferences-templates-root"></main>
+    <output id="notification-notice" aria-label="Notification notice"></output>
+    <output id="notification-error" aria-label="Notification error"></output>
+    <script type="module">
+      import React from "react";
+      import { createRoot } from "react-dom/client";
+      import { NotificationPreferencesPanel } from "./src/NotificationPreferencesPanel.tsx";
+      import { NotificationTemplateRegistryPanel } from "./src/NotificationTemplateRegistryPanel.tsx";
+
+      const query = new URLSearchParams(window.location.search);
+      const state = {
+        mode: query.get("mode") ?? "customer",
+        active: query.get("active") !== "0",
+        locale: query.get("locale") === "zh-CN" ? "zh-CN" : "en",
+        accessFingerprint: query.get("fingerprint") ?? "subject-a",
+        canRead: query.get("read") !== "0",
+        canWrite: query.get("write") !== "0",
+        canCreate: query.get("create") === "1",
+        canPublish: query.get("publish") === "1",
+        canRetire: query.get("retire") === "1",
+      };
+      const root = createRoot(document.querySelector("#notification-preferences-templates-root"));
+      const notice = document.querySelector("#notification-notice");
+      const error = document.querySelector("#notification-error");
+
+      function render() {
+        const common = {
+          active: state.active,
+          locale: state.locale,
+          accessFingerprint: state.accessFingerprint,
+          onNotice: (message) => {
+            notice.textContent = message;
+          },
+          onError: (message) => {
+            error.textContent = message;
+          },
+        };
+        root.render(
+          state.mode === "admin"
+            ? React.createElement(NotificationTemplateRegistryPanel, {
+                ...common,
+                canRead: state.canRead,
+                canCreate: state.canCreate,
+                canPublish: state.canPublish,
+                canRetire: state.canRetire,
+              })
+            : React.createElement(NotificationPreferencesPanel, {
+                ...common,
+                canRead: state.canRead,
+                canWrite: state.canWrite,
+              }),
+        );
+      }
+
+      globalThis.notificationPreferencesTemplatesHarness = {
+        update(next) {
+          Object.assign(state, next);
+          notice.textContent = "";
+          error.textContent = "";
+          render();
+        },
+      };
+      render();
+    </script>
+  </body>
+</html>

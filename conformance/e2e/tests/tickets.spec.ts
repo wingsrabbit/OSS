@@ -59,11 +59,12 @@ test("customer and staff complete a public ticket conversation while internal no
 
   const staffPanel = page.locator('section[aria-label="Staff support tickets"]');
   await expect(staffPanel.getByRole("heading", { name: "Ticket queue" })).toBeVisible();
-  await staffPanel.getByRole("button", { name: "Refresh ticket queue" }).click();
+  await staffPanel.getByRole("button", { name: "Apply filters" }).click();
   await staffPanel.getByTestId("staff-ticket-list").getByRole("button", { name: new RegExp(subject) }).click();
   const staffThread = staffPanel.getByTestId("staff-ticket-thread");
   await expect(staffThread).toContainText(subject);
 
+  await staffPanel.getByLabel("Support password confirmation").fill(staffPassword);
   await staffThread.getByLabel("Staff ticket message").fill(internalNote);
   await staffThread.getByRole("button", { name: "Save internal note" }).click();
   await expect(staffThread.locator('[data-visibility="internal"]')).toContainText(internalNote);
@@ -91,5 +92,7 @@ test("customer and staff complete a public ticket conversation while internal no
   await customerThread.getByLabel("Customer ticket reply").fill(customerReply);
   await customerThread.getByRole("button", { name: "Send reply" }).click();
   await expect(customerThread).toContainText(customerReply);
-  await expect(customerThread).toContainText("awaiting staff");
+  await expect(customerThread.getByTestId("support-ticket-history")).toContainText(
+    "awaiting_customer → awaiting_staff",
+  );
 });

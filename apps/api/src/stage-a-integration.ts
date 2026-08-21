@@ -7,7 +7,12 @@ import { request as httpRequest } from "node:http";
 import { fileURLToPath } from "node:url";
 import { providerOperationCapability } from "@opensales/core/provider-capability";
 import pg from "pg";
-import { assertSchemaCompatible, runMigrations } from "./database.js";
+import {
+  assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
+  runMigrations,
+} from "./database.js";
+import { digestToken } from "./auth.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { providerSignature } from "./provider-signature.js";
 import { runRenewalAutomation } from "./renewal-lifecycle.js";
@@ -160,10 +165,7 @@ async function verifyPublished007Upgrade(): Promise<void> {
          ) AS payment_attempt_decision_generation
        FROM schema_migrations`,
     );
-    assert.equal(
-      upgraded.rows[0]?.version,
-      "018_stage_c_support_tickets",
-    );
+    assert.equal(upgraded.rows[0]?.version, REQUIRED_SCHEMA_VERSION);
     assert.equal(upgraded.rows[0]?.manual_actions, "refund_manual_actions");
     assert.equal(upgraded.rows[0]?.corrections, "refund_adjudication_corrections");
     assert.equal(
@@ -235,6 +237,36 @@ const deadlockBaseline = await corePool.query<{ deadlocks: string }>(
 );
 const initialDeadlocks = deadlockBaseline.rows[0]?.deadlocks ?? "0";
 let cookie = "";
+const configuredSessionCookieName = process.env.SESSION_COOKIE_NAME ?? "oss_session";
+const accountContextVersionByCookie = new Map<string, string>();
+
+function sessionContextHeaders(): Record<string, string> {
+  const accountContextVersion = cookie
+    ? accountContextVersionByCookie.get(cookie)
+    : undefined;
+  return {
+    ...(cookie ? { Cookie: cookie } : {}),
+    ...(accountContextVersion
+      ? { "X-OSS-Account-Context-Version": accountContextVersion }
+      : {}),
+  };
+}
+
+function rememberSessionContext(response: Response): void {
+  const setCookie = response.headers
+    .getSetCookie()
+    .find((candidate) => candidate.startsWith(`${configuredSessionCookieName}=`));
+  if (setCookie) {
+    const pair = setCookie.split(";", 1)[0] ?? "";
+    cookie = pair === `${configuredSessionCookieName}=` ? "" : pair;
+  }
+  const accountContextVersion = response.headers.get(
+    "x-oss-account-context-version",
+  );
+  if (cookie && accountContextVersion) {
+    accountContextVersionByCookie.set(cookie, accountContextVersion);
+  }
+}
 
 type Catalog = {
   products: Array<{
@@ -277,13 +309,26 @@ type OrderDetail = {
       effectiveAt: string;
       result: Record<string, unknown>;
       lastError: string | null;
-      providerOperation: { status: string; attempts: number } | null;
+      providerOperation: {
+        status: string;
+        attempts: number;
+        attemptId: string | null;
+        dispatchedAt: string | null;
+        reconcileQueries: number;
+        unresolvedReconcileQueries: number;
+        latestResult: {
+          outcome: "succeeded" | "failed";
+          source: "callback" | "reconciliation";
+          occurredAt: string | null;
+        } | null;
+      } | null;
     } | null;
   };
 };
 type ManualItem = {
   serviceId: string;
   orderId: string;
+  clientAccountId: string;
   productName: string;
 };
 type PaymentCommand = {
@@ -452,11 +497,12 @@ async function request<T>(
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...(cookie ? { Cookie: cookie } : {}),
+      ...sessionContextHeaders(),
       ...init.headers,
     },
     redirect: "error",
   });
+  rememberSessionContext(response);
   if (response.status !== expectedStatus) {
     const responseBody = await response.text();
     assert.equal(
@@ -465,8 +511,6 @@ async function request<T>(
       `${init.method ?? "GET"} ${path} expected ${expectedStatus}, received ${response.status}: ${responseBody}`,
     );
   }
-  const setCookie = response.headers.get("set-cookie");
-  if (setCookie) cookie = setCookie.split(";", 1)[0] ?? "";
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
@@ -479,15 +523,39 @@ async function rawCoreRequest(
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...(cookie ? { Cookie: cookie } : {}),
+      ...sessionContextHeaders(),
       ...init.headers,
     },
     redirect: "error",
   });
+  rememberSessionContext(response);
   return {
     status: response.status,
     body: (await response.json()) as Record<string, unknown>,
   };
+}
+
+async function refreshAccountContext(
+  expectedClientAccountId: string,
+  expectedEligible = true,
+): Promise<void> {
+  const current = await request<{
+    eligible: boolean;
+    clientAccountId: string | null;
+  }>("/api/v1/auth/me");
+  if (current.clientAccountId === expectedClientAccountId) {
+    assert.equal(current.eligible, expectedEligible);
+    return;
+  }
+  assert.equal(current.clientAccountId, null);
+  const selected = await request<{ context: { clientAccountId: string } }>(
+    "/api/v1/auth/account-context",
+    {
+      method: "PUT",
+      body: JSON.stringify({ clientAccountId: expectedClientAccountId }),
+    },
+  );
+  assert.equal(selected.context.clientAccountId, expectedClientAccountId);
 }
 
 async function submitPaymentFact(
@@ -1104,12 +1172,14 @@ const automaticPrice = catalog.products
 const manualPrice = catalog.products
   .find((product) => product.id === "hk-r640-hkbgp")
   ?.prices.find((price) => price.billingCycle === "monthly");
+const remoteHands = catalog.products.find((product) => product.id === "remote-hands");
 assert.ok(automaticPrice, "automatic laboratory product is missing");
 assert.ok(manualPrice, "manual laboratory product is missing");
-assert.equal(
-  catalog.products.some((product) => product.id === "remote-hands"),
-  false,
-  "Remote Hands must remain hidden until Colocation and authenticated ticket prerequisites exist",
+assert.ok(remoteHands, "Remote Hands must be visible in the current laboratory catalog");
+assert.equal(remoteHands.fulfillmentMode, "manual");
+assert.ok(
+  remoteHands.prices.some((price) => price.billingCycle === "one_time"),
+  "Remote Hands must retain its one-time manual fulfillment price",
 );
 
 const email = "stage-a-browser-admin@example.invalid";
@@ -1779,19 +1849,31 @@ try {
     occurredAt: forgedProvisionPaymentRecord.provider_occurred_at.toISOString(),
   });
   await waitFor(
-    "manual provision reconcile and duplicate payment callback to share Invoice root",
+    "manual provision reconcile and duplicate payment callback to follow the canonical identity-to-Invoice order",
     async () => {
-      const result = await corePool.query<{ waiting: string }>(
-        `SELECT count(*)::text AS waiting
+      const result = await corePool.query<{
+        worker_waiting: string;
+        callback_waiting: string;
+      }>(
+        `SELECT
+           count(*) FILTER (
+             WHERE application_name = 'opensales-worker'
+               AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'
+           )::text AS worker_waiting,
+           count(*) FILTER (
+             WHERE application_name = 'opensales-api'
+               AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'
+           )::text AS callback_waiting
          FROM pg_stat_activity
-         WHERE application_name IN ('opensales-api', 'opensales-worker')
-           AND state = 'active'
-           AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+         WHERE state = 'active' AND wait_event_type = 'Lock'`,
       );
-      return result.rows[0]?.waiting ?? "0";
+      return {
+        workerWaiting: result.rows[0]?.worker_waiting ?? "0",
+        callbackWaiting: result.rows[0]?.callback_waiting ?? "0",
+      };
     },
-    (waiting) => BigInt(waiting) >= 2n,
+    (waiting) =>
+      BigInt(waiting.workerWaiting) >= 1n && BigInt(waiting.callbackWaiting) >= 1n,
   );
   await forgedProvisionInvoiceGate.query("COMMIT");
   forgedProvisionInvoiceGateOpen = false;
@@ -1887,16 +1969,35 @@ await corePool.query(
 );
 const heldForRestriction = await waitFor(
   "restriction before provisioning to prevent the provider create",
-  () => request<OrderDetail>(`/api/v1/orders/${paidBeforeRestriction.order.id}`),
-  (value) => value.order.status === "on_hold",
+  async () => {
+    const state = await corePool.query<{
+      order_status: string;
+      service_status: string;
+    }>(
+      `SELECT customer_order.status AS order_status,
+              service.status AS service_status
+       FROM orders customer_order
+       JOIN services service ON service.id = $2
+       WHERE customer_order.id = $1`,
+      [paidBeforeRestriction.order.id, paidBeforeRestriction.service.id],
+    );
+    return state.rows[0] ?? null;
+  },
+  (value) => value?.order_status === "on_hold",
 );
-assert.equal(heldForRestriction.service.status, "pending");
+assert.equal(heldForRestriction?.service_status, "pending");
 const restrictedCreateCount = await providerPool.query<{ count: string }>(
   "SELECT count(*)::text AS count FROM mock_resource_operations WHERE operation_id = $1",
   [heldProvisionOperation.rows[0].id],
 );
 assert.equal(restrictedCreateCount.rows[0]?.count, "0");
 await corePool.query("UPDATE users SET restricted_at = NULL WHERE email = $1", [email]);
+const restoredAfterProvisionRestriction = await request<{
+  eligible: boolean;
+  clientAccountId: string | null;
+}>("/api/v1/auth/me");
+assert.equal(restoredAfterProvisionRestriction.eligible, true);
+assert.ok(restoredAfterProvisionRestriction.clientAccountId);
 
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_payment_start()
@@ -2147,7 +2248,13 @@ await request(
   200,
 );
 const queue = await request<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
-assert.ok(queue.items.some((item) => item.serviceId === paidManual.service.id));
+const queuedManualItem = queue.items.find((item) => item.serviceId === paidManual.service.id);
+assert.ok(queuedManualItem);
+const queuedManualOrder = await corePool.query<{ client_account_id: string }>(
+  "SELECT client_account_id FROM orders WHERE id = $1",
+  [paidManual.order.id],
+);
+assert.equal(queuedManualItem.clientAccountId, queuedManualOrder.rows[0]?.client_account_id);
 const manualPaymentRecords = await corePool.query<{
   payment_attempt_id: string;
   operation_id: string;
@@ -2234,19 +2341,31 @@ try {
     occurredAt: manualPaymentRecord.provider_occurred_at.toISOString(),
   });
   await waitFor(
-    "manual fulfillment and duplicate payment callback to share the Invoice root lock",
+    "manual fulfillment and duplicate payment callback to follow the canonical identity-to-Invoice order",
     async () => {
-      const result = await corePool.query<{ waiting: string }>(
-        `SELECT count(*)::text AS waiting
+      const result = await corePool.query<{
+        manual_waiting: string;
+        callback_waiting: string;
+      }>(
+        `SELECT
+           count(*) FILTER (
+             WHERE query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'
+           )::text AS manual_waiting,
+           count(*) FILTER (
+             WHERE query ILIKE '%SELECT id FROM users%FOR UPDATE%'
+           )::text AS callback_waiting
          FROM pg_stat_activity
          WHERE application_name = 'opensales-api'
            AND state = 'active'
-           AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+           AND wait_event_type = 'Lock'`,
       );
-      return result.rows[0]?.waiting ?? "0";
+      return {
+        manualWaiting: result.rows[0]?.manual_waiting ?? "0",
+        callbackWaiting: result.rows[0]?.callback_waiting ?? "0",
+      };
     },
-    (waiting) => BigInt(waiting) >= 2n,
+    (waiting) =>
+      BigInt(waiting.manualWaiting) >= 1n && BigInt(waiting.callbackWaiting) >= 1n,
   );
   await manualInvoiceGate.query("COMMIT");
   manualInvoiceGateOpen = false;
@@ -2267,6 +2386,26 @@ assert.equal(activeManual.service.status, "active");
 assert.equal(activeManual.service.activatedAt, activeManual.service.termStart);
 
 const staffMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
+async function setStaffPermissions(permissions: readonly string[]): Promise<void> {
+  const client = await corePool.connect();
+  let transactionOpen = false;
+  try {
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [staffMe.id]);
+    await client.query(
+      `UPDATE staff_members
+       SET permissions = $2::jsonb, updated_at = now()
+       WHERE user_id = $1`,
+      [staffMe.id, JSON.stringify(permissions)],
+    );
+    await client.query("COMMIT");
+    transactionOpen = false;
+  } finally {
+    if (transactionOpen) await client.query("ROLLBACK");
+    client.release();
+  }
+}
 const creditAdjustmentKey = randomUUID();
 const creditAdjustmentBody = {
   direction: "increase",
@@ -3748,7 +3887,7 @@ try {
            WHERE application_name = 'opensales-api'
              AND state = 'active'
              AND wait_event_type = 'Lock'
-             AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+             AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
         );
         return result.rows[0]?.waiting ?? "0";
       },
@@ -3757,11 +3896,11 @@ try {
 
     await releasePaymentStart(sharedWorkerCommand.paymentAttemptId);
     await waitFor(
-      "three callback types to wait at User while the Worker waits at the account payment-settings fence",
+      "three callback types and the Worker to wait at the shared User row",
       async () => {
         const result = await corePool.query<{
           callbacks_waiting: string;
-          worker_fence_waiting: string;
+          worker_user_waiting: string;
         }>(
           `SELECT
              (SELECT count(*)::text
@@ -3769,21 +3908,21 @@ try {
                WHERE application_name = 'opensales-api'
                  AND state = 'active'
                  AND wait_event_type = 'Lock'
-                 AND query ILIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%')
+                 AND query ILIKE '%SELECT id FROM users%FOR UPDATE%')
                AS callbacks_waiting,
              (SELECT count(*)::text
                 FROM pg_stat_activity
                WHERE application_name = 'opensales-worker'
                  AND state = 'active'
                  AND wait_event_type = 'Lock'
-                 AND query ILIKE '%SELECT pg_advisory_xact_lock(hashtextextended($1, 0))%')
-               AS worker_fence_waiting`,
+                 AND query ILIKE '%SELECT id FROM users%FOR UPDATE%')
+               AS worker_user_waiting`,
         );
         return result.rows[0];
       },
       (waiting) =>
         BigInt(waiting?.callbacks_waiting ?? "0") >= 3n &&
-        BigInt(waiting?.worker_fence_waiting ?? "0") >= 1n,
+        BigInt(waiting?.worker_user_waiting ?? "0") >= 1n,
     );
 
     const accountProbe = await corePool.connect();
@@ -4062,6 +4201,22 @@ const restorableCredit = await corePool.query<{ balance_minor: string }>(
 const restorableCreditMinor = restorableCredit.rows[0]?.balance_minor;
 assert.ok(restorableCreditMinor && BigInt(restorableCreditMinor) > 0n);
 
+const eligibilityAnchorOwnerUserId = randomUUID();
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [eligibilityAnchorOwnerUserId, `eligibility-owner-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+   VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+  [staffMe.clientAccountId, eligibilityAnchorOwnerUserId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [staffMe.clientAccountId, eligibilityAnchorOwnerUserId],
+);
+
 const eligibilityRevocations: Array<{
   label: string;
   revoke: () => Promise<unknown>;
@@ -4096,6 +4251,23 @@ const eligibilityRevocations: Array<{
       corePool.query(
         `UPDATE client_memberships
          SET removed_at = NULL
+         WHERE client_account_id = $1 AND user_id = $2`,
+        [staffMe.clientAccountId, staffMe.id],
+      ),
+  },
+  {
+    label: "membership restriction",
+    revoke: () =>
+      corePool.query(
+        `UPDATE client_memberships
+         SET restricted_at = now()
+         WHERE client_account_id = $1 AND user_id = $2`,
+        [staffMe.clientAccountId, staffMe.id],
+      ),
+    restore: () =>
+      corePool.query(
+        `UPDATE client_memberships
+         SET restricted_at = NULL
          WHERE client_account_id = $1 AND user_id = $2`,
         [staffMe.clientAccountId, staffMe.id],
       ),
@@ -4179,6 +4351,7 @@ for (const revocation of eligibilityRevocations) {
   }
 
   await revocation.restore();
+  await refreshAccountContext(staffMe.clientAccountId);
   const retryQuote = await createPaymentQuote(order.invoice.id, "card", false);
   const retry = await request<PaymentCommand>(
     `/api/v1/invoices/${order.invoice.id}/payments`,
@@ -4200,6 +4373,132 @@ for (const revocation of eligibilityRevocations) {
     (value) => value.service.status === "active",
   );
   assert.equal(retriedOrder.invoice.status, "paid");
+}
+
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [staffMe.clientAccountId, staffMe.id],
+);
+await corePool.query(
+  `UPDATE client_memberships
+   SET role = 'viewer', permissions = '[]'::jsonb
+   WHERE client_account_id = $1 AND user_id = $2`,
+  [staffMe.clientAccountId, eligibilityAnchorOwnerUserId],
+);
+
+const capabilityOwnerCookie = cookie;
+const explicitCapabilityUserId = randomUUID();
+const explicitCapabilitySessionId = randomUUID();
+const explicitCapabilitySessionToken = randomBytes(32).toString("base64url");
+const sessionCookieName = capabilityOwnerCookie.split("=", 1)[0];
+assert.ok(sessionCookieName, "integration requires a named Session cookie");
+const explicitCapabilityCookie = `${sessionCookieName}=${explicitCapabilitySessionToken}`;
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [explicitCapabilityUserId, `explicit-payment-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(
+     client_account_id, user_id, role, permissions
+   ) VALUES ($1, $2, 'viewer', '["orders.create","billing.write"]'::jsonb)`,
+  [staffMe.clientAccountId, explicitCapabilityUserId],
+);
+await corePool.query(
+  `INSERT INTO sessions(
+     id, user_id, token_digest, expires_at,
+     active_client_account_id, account_context_version
+   ) VALUES ($1, $2, $3, now() + interval '1 hour', $4, 1)`,
+  [
+    explicitCapabilitySessionId,
+    explicitCapabilityUserId,
+    digestToken(explicitCapabilitySessionToken),
+    staffMe.clientAccountId,
+  ],
+);
+cookie = explicitCapabilityCookie;
+accountContextVersionByCookie.set(cookie, "1");
+try {
+  const explicitOrder = await createOrder(automaticPrice.id, legal);
+  const explicitQuote = await createPaymentQuote(explicitOrder.invoice.id, "card", false);
+  const explicitCommand = await request<PaymentCommand>(
+    `/api/v1/invoices/${explicitOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: explicitQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(explicitCommand.paymentAttemptId);
+  await corePool.query(
+    `UPDATE client_memberships
+     SET permissions = '["orders.create"]'::jsonb
+     WHERE client_account_id = $1 AND user_id = $2`,
+    [staffMe.clientAccountId, explicitCapabilityUserId],
+  );
+  await releasePaymentStart(explicitCommand.paymentAttemptId);
+  const explicitRevoked = await waitFor(
+    "known-unsent payment to close after explicit billing.write revocation",
+    () => readPaymentRecords(explicitCommand.commandId),
+    (records) =>
+      records.command_status === "failed" &&
+      records.attempt_status === "cancelled" &&
+      records.operation_status === "failed" &&
+      records.job_status === "completed",
+    8_000,
+  );
+  const explicitRevokedProviderCalls = await providerPool.query<{ count: string }>(
+    "SELECT count(*)::text AS count FROM mock_payment_operations WHERE operation_id = $1",
+    [explicitRevoked.operation_id],
+  );
+  assert.equal(explicitRevokedProviderCalls.rows[0]?.count, "0");
+
+  await corePool.query(
+    `UPDATE client_memberships
+     SET permissions = '["orders.create","billing.write"]'::jsonb
+     WHERE client_account_id = $1 AND user_id = $2`,
+    [staffMe.clientAccountId, explicitCapabilityUserId],
+  );
+  const explicitContext = await corePool.query<{ account_context_version: string }>(
+    `SELECT account_context_version::text
+     FROM sessions WHERE id = $1`,
+    [explicitCapabilitySessionId],
+  );
+  accountContextVersionByCookie.set(
+    cookie,
+    explicitContext.rows[0]?.account_context_version ?? "3",
+  );
+  const explicitRetryQuote = await createPaymentQuote(
+    explicitOrder.invoice.id,
+    "card",
+    false,
+  );
+  const explicitRetry = await request<PaymentCommand>(
+    `/api/v1/invoices/${explicitOrder.invoice.id}/payments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        quoteId: explicitRetryQuote.quoteId,
+        scenario: "success",
+        idempotencyKey: randomUUID(),
+      }),
+    },
+    202,
+  );
+  assert.ok(explicitRetry.paymentAttemptId);
+  await releasePaymentStart(explicitRetry.paymentAttemptId);
+  const explicitRetriedOrder = await waitFor(
+    "payment retry after restoring explicit billing.write",
+    () => request<OrderDetail>(`/api/v1/orders/${explicitOrder.order.id}`),
+    (value) => value.service.status === "active",
+  );
+  assert.equal(explicitRetriedOrder.invoice.status, "paid");
+} finally {
+  cookie = capabilityOwnerCookie;
 }
 
 const definitiveOrder = await createOrder(automaticPrice.id, legal);
@@ -4505,6 +4804,7 @@ const invalidatedGrant = await corePool.query<{ count: string }>(
 );
 assert.equal(invalidatedGrant.rows[0]?.count, "0");
 await corePool.query("UPDATE users SET restricted_at = NULL WHERE email = $1", [email]);
+await refreshAccountContext(staffMe.clientAccountId);
 
 const staffCookie = cookie;
 const recoveryEmail = `expired-${randomUUID()}@example.invalid`;
@@ -4567,6 +4867,9 @@ await request(
   "/api/v1/auth/verify-email",
   { method: "POST", body: JSON.stringify({ token: replacementToken }) },
   200,
+);
+const recoveryMe = await request<{ id: string; clientAccountId: string }>(
+  "/api/v1/auth/me",
 );
 
 for (const invalidPrincipal of ["4999", "500001"]) {
@@ -4895,7 +5198,6 @@ assert.match(
   /does not match the Add Funds snapshot/,
 );
 
-const recoveryMe = await request<{ id: string; clientAccountId: string }>("/api/v1/auth/me");
 await corePool.query(`
   CREATE OR REPLACE FUNCTION integration_delay_add_funds_security()
   RETURNS trigger
@@ -4957,6 +5259,22 @@ await corePool.query(
   [disabledPolicy.command.addFundsAttemptId],
 );
 
+const revokedMembershipAnchorUserId = randomUUID();
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [revokedMembershipAnchorUserId, `add-funds-owner-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+   VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+  [recoveryMe.clientAccountId, revokedMembershipAnchorUserId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [recoveryMe.clientAccountId, revokedMembershipAnchorUserId],
+);
+
 const revokedMembershipQuote = await createAddFundsQuote("5000", "card");
 const revokedMembership = await startAddFunds(revokedMembershipQuote.quoteId, "success");
 const revokedMembershipOperation = await corePool.query<{ id: string }>(
@@ -4976,6 +5294,20 @@ const revocationClient = await corePool.connect();
 try {
   await revocationClient.query("BEGIN");
   await revocationClient.query(
+    `SELECT id
+     FROM users
+     WHERE id = $1
+     FOR UPDATE`,
+    [recoveryMe.id],
+  );
+  await revocationClient.query(
+    `SELECT id
+     FROM client_accounts
+     WHERE id = $1
+     FOR UPDATE`,
+    [recoveryMe.clientAccountId],
+  );
+  await revocationClient.query(
     `SELECT role
      FROM client_memberships
      WHERE user_id = $1 AND client_account_id = $2
@@ -4993,15 +5325,15 @@ try {
     occurredAt: new Date().toISOString(),
   });
   await waitFor(
-    "Add Funds callback to wait on the Membership authorization lock",
+    "Add Funds callback to wait on the User authorization lock",
     async () => {
       const blocked = await corePool.query<{ count: string }>(
         `SELECT count(*)::text AS count
          FROM pg_stat_activity
-         WHERE datname = current_database()
-           AND pid <> pg_backend_pid()
+         WHERE application_name = 'opensales-api'
+           AND state = 'active'
            AND wait_event_type = 'Lock'
-           AND query LIKE '%FROM client_memberships%'`,
+           AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
       );
       return Number(blocked.rows[0]?.count ?? "0");
     },
@@ -5029,6 +5361,17 @@ await corePool.query(
    WHERE user_id = $1 AND client_account_id = $2`,
   [recoveryMe.id, recoveryMe.clientAccountId],
 );
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [recoveryMe.clientAccountId, recoveryMe.id],
+);
+await corePool.query(
+  `UPDATE client_memberships
+   SET role = 'viewer', permissions = '[]'::jsonb
+   WHERE client_account_id = $1 AND user_id = $2`,
+  [recoveryMe.clientAccountId, revokedMembershipAnchorUserId],
+);
+await refreshAccountContext(recoveryMe.clientAccountId);
 const revokedMembershipManual = await waitForAddFunds(
   revokedMembership.command.commandId,
   "manual",
@@ -5568,15 +5911,16 @@ try {
     },
   );
   await waitFor(
-    "staff allocation to wait for the Provider-held invoice before locking the receipt",
+    "staff allocation to wait for the Provider-held User before locking the receipt",
     async () => {
       const result = await corePool.query<{ waiting: string }>(
         `SELECT count(*)::text AS waiting
          FROM pg_stat_activity
-         WHERE state = 'active'
+         WHERE datname = current_database()
+           AND application_name = 'opensales-api'
+           AND state = 'active'
            AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id, client_account_id, currency, total_minor::text%'
-           AND query ILIKE '%FROM invoices%'
+           AND query ILIKE '%FROM users%'
            AND query ILIKE '%FOR UPDATE%'`,
       );
       return result.rows[0]?.waiting ?? "0";
@@ -5750,15 +6094,16 @@ try {
       },
     );
     await waitFor(
-      "staff allocation to wait for the Provider-held invoice before locking the account",
+      "staff allocation to wait for the Provider-held User before locking the account",
       async () => {
         const result = await corePool.query<{ waiting: string }>(
           `SELECT count(*)::text AS waiting
            FROM pg_stat_activity
-           WHERE state = 'active'
+           WHERE datname = current_database()
+             AND application_name = 'opensales-api'
+             AND state = 'active'
              AND wait_event_type = 'Lock'
-             AND query ILIKE '%SELECT id, client_account_id, currency, total_minor::text%'
-             AND query ILIKE '%FROM invoices%'
+             AND query ILIKE '%FROM users%'
              AND query ILIKE '%FOR UPDATE%'`,
         );
         return result.rows[0]?.waiting ?? "0";
@@ -5768,7 +6113,7 @@ try {
     // The Provider callback now deliberately owns User and Client Account
     // before inserting its receipt (foreign keys would otherwise acquire the
     // Account row first implicitly). The staff allocation is observed waiting
-    // on Invoice above, so it cannot have reached its later Account lock.
+    // on User above, so it cannot have reached its later Account or Invoice locks.
 
     await accountGateClient.query("COMMIT");
     accountGateOpen = false;
@@ -8833,12 +9178,7 @@ const refundsBeforePermissionProbes = await corePool.query<{ count: string }>(
      AND source_fund_receipt_id = $1`,
   [primaryUnclaimed.receiptId],
 );
-await corePool.query(
-  `UPDATE staff_members
-   SET permissions = $2::jsonb, updated_at = now()
-   WHERE user_id = $1`,
-  [staffMe.id, JSON.stringify(["billing.unclaimed_manage"])],
-);
+await setStaffPermissions(["billing.unclaimed_manage"]);
 await request(
   "/api/v1/auth/reauth",
   { method: "POST", body: JSON.stringify({ password }) },
@@ -8852,12 +9192,7 @@ const missingRefundManage = await rawCoreRequest(
   },
 );
 assert.equal(missingRefundManage.status, 403);
-await corePool.query(
-  `UPDATE staff_members
-   SET permissions = $2::jsonb, updated_at = now()
-   WHERE user_id = $1`,
-  [staffMe.id, JSON.stringify(["billing.refund_manage"])],
-);
+await setStaffPermissions(["billing.refund_manage"]);
 await request(
   "/api/v1/auth/reauth",
   { method: "POST", body: JSON.stringify({ password }) },
@@ -8882,12 +9217,7 @@ assert.equal(
   refundsAfterPermissionProbes.rows[0]?.count,
   refundsBeforePermissionProbes.rows[0]?.count,
 );
-await corePool.query(
-  `UPDATE staff_members
-   SET permissions = '["*"]'::jsonb, updated_at = now()
-   WHERE user_id = $1`,
-  [staffMe.id],
-);
+await setStaffPermissions(["*"]);
 await request(
   "/api/v1/auth/reauth",
   { method: "POST", body: JSON.stringify({ password }) },
@@ -8943,12 +9273,7 @@ try {
     attempt_count: 0,
     job_status: "pending",
   });
-  await corePool.query(
-    `UPDATE staff_members
-     SET permissions = $2::jsonb, updated_at = now()
-     WHERE user_id = $1`,
-    [staffMe.id, JSON.stringify(["billing.refund_manage"])],
-  );
+  await setStaffPermissions(["billing.refund_manage"]);
   await request(
     "/api/v1/auth/reauth",
     { method: "POST", body: JSON.stringify({ password }) },
@@ -9011,12 +9336,7 @@ try {
   );
   assert.equal(revokedProviderCreates.rows[0]?.count, "0");
 } finally {
-  await corePool.query(
-    `UPDATE staff_members
-     SET permissions = '["*"]'::jsonb, updated_at = now()
-     WHERE user_id = $1`,
-    [staffMe.id],
-  );
+  await setStaffPermissions(["*"]);
   await dropRefundStartDelay();
 }
 await request(
@@ -10476,10 +10796,27 @@ await request(
 const activeReauthBeforeChargeback = await corePool.query<{ count: string }>(
   `SELECT count(*)::text AS count
    FROM reauth_grants
-   WHERE user_id = $1 AND invalidated_at IS NULL AND expires_at > now()`,
+   WHERE user_id = $1 AND invalidated_at IS NULL
+     AND expires_at > pg_catalog.clock_timestamp()`,
   [chargebackMe.id],
 );
 assert.equal(activeReauthBeforeChargeback.rows[0]?.count, "1");
+
+const chargebackAnchorOwnerUserId = randomUUID();
+await corePool.query(
+  `INSERT INTO users(id, email, password_hash, locale, email_verified_at)
+   VALUES ($1, $2, 'synthetic-not-a-password', 'en', now())`,
+  [chargebackAnchorOwnerUserId, `chargeback-owner-${randomUUID()}@example.invalid`],
+);
+await corePool.query(
+  `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+   VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+  [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
+);
+await corePool.query(
+  `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+  [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
+);
 
 const chargebackQuote = await createAddFundsQuote("5000", "card");
 const chargebackAddFunds = await startAddFunds(chargebackQuote.quoteId, "success");
@@ -10532,12 +10869,37 @@ const paidBeforeChargeback = await request<OrderDetail>(
 );
 assert.equal(paidBeforeChargeback.invoice.status, "paid");
 assert.equal(paidBeforeChargeback.invoice.creditAppliedMinor, "500");
-await corePool.query(
-  `UPDATE client_memberships
-   SET removed_at = now()
-   WHERE user_id = $1 AND client_account_id = $2`,
-  [chargebackMe.id, chargebackMe.clientAccountId],
-);
+const chargebackRemovalClient = await corePool.connect();
+try {
+  await chargebackRemovalClient.query("BEGIN");
+  await chargebackRemovalClient.query(
+    `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+    [chargebackMe.id],
+  );
+  await chargebackRemovalClient.query(
+    `SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE`,
+    [chargebackMe.clientAccountId],
+  );
+  await chargebackRemovalClient.query(
+    `SELECT user_id
+     FROM client_memberships
+     WHERE user_id = $1 AND client_account_id = $2
+     FOR UPDATE`,
+    [chargebackMe.id, chargebackMe.clientAccountId],
+  );
+  await chargebackRemovalClient.query(
+    `UPDATE client_memberships
+     SET removed_at = now()
+     WHERE user_id = $1 AND client_account_id = $2`,
+    [chargebackMe.id, chargebackMe.clientAccountId],
+  );
+  await chargebackRemovalClient.query("COMMIT");
+} catch (error) {
+  await chargebackRemovalClient.query("ROLLBACK").catch(() => undefined);
+  throw error;
+} finally {
+  chargebackRemovalClient.release();
+}
 
 const mockChargebackRequestId = randomUUID();
 const mockChargebackResponse = await fetch(
@@ -10601,12 +10963,54 @@ await waitFor(
   (result) => result.rows[0]?.count === "1",
   30_000,
 );
-await corePool.query(
-  `UPDATE client_memberships
-   SET removed_at = NULL
-   WHERE user_id = $1 AND client_account_id = $2`,
-  [chargebackMe.id, chargebackMe.clientAccountId],
-);
+const chargebackRestorationClient = await corePool.connect();
+try {
+  await chargebackRestorationClient.query("BEGIN");
+  await chargebackRestorationClient.query(
+    `SELECT id
+     FROM users
+     WHERE id = ANY($1::uuid[])
+     ORDER BY id
+     FOR UPDATE`,
+    [[chargebackMe.id, chargebackAnchorOwnerUserId]],
+  );
+  await chargebackRestorationClient.query(
+    `SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE`,
+    [chargebackMe.clientAccountId],
+  );
+  await chargebackRestorationClient.query(
+    `SELECT user_id
+     FROM client_memberships
+     WHERE client_account_id = $1
+       AND user_id = ANY($2::uuid[])
+     ORDER BY user_id
+     FOR UPDATE`,
+    [chargebackMe.clientAccountId, [chargebackMe.id, chargebackAnchorOwnerUserId]],
+  );
+  await chargebackRestorationClient.query(
+    `UPDATE client_memberships
+     SET removed_at = NULL
+     WHERE user_id = $1 AND client_account_id = $2`,
+    [chargebackMe.id, chargebackMe.clientAccountId],
+  );
+  await chargebackRestorationClient.query(
+    `UPDATE client_accounts SET owner_user_id = $2 WHERE id = $1`,
+    [chargebackMe.clientAccountId, chargebackMe.id],
+  );
+  await chargebackRestorationClient.query(
+    `UPDATE client_memberships
+     SET role = 'viewer', permissions = '[]'::jsonb
+     WHERE client_account_id = $1 AND user_id = $2`,
+    [chargebackMe.clientAccountId, chargebackAnchorOwnerUserId],
+  );
+  await chargebackRestorationClient.query("COMMIT");
+} catch (error) {
+  await chargebackRestorationClient.query("ROLLBACK").catch(() => undefined);
+  throw error;
+} finally {
+  chargebackRestorationClient.release();
+}
+await refreshAccountContext(chargebackMe.clientAccountId, false);
 const customerChargebackStatus = await waitFor(
   "settled Add Funds Chargeback customer status",
   () => request<ChargebackStatus>("/api/v1/billing/chargeback-status"),
@@ -10632,8 +11036,11 @@ assert.deepEqual(
 );
 await new Promise((resolve) => setTimeout(resolve, 200));
 const restrictedBilling = await rawCoreRequest("/api/v1/billing/summary", { method: "GET" });
-assert.equal(restrictedBilling.status, 403);
-assert.equal(restrictedBilling.body.code, "ACCOUNT_RESTRICTED");
+assert.equal(restrictedBilling.status, 200);
+assert.equal(
+  (restrictedBilling.body.addFunds as { allowed?: unknown } | undefined)?.allowed,
+  false,
+);
 
 const chargebackEffects = await corePool.query<{
   effects: string;
@@ -10678,7 +11085,8 @@ const chargebackEffects = await corePool.query<{
          AND source_id IN (SELECT id FROM add_funds_chargeback_effects
            WHERE add_funds_settlement_id = $1)) AS journals,
      (SELECT count(*)::text FROM reauth_grants
-       WHERE user_id = $3 AND invalidated_at IS NULL AND expires_at > now()) AS active_reauth,
+       WHERE user_id = $3 AND invalidated_at IS NULL
+         AND expires_at > pg_catalog.clock_timestamp()) AS active_reauth,
      (SELECT CASE
         WHEN allocation.allocated_minor = 0 THEN 'open'
         WHEN allocation.allocated_minor < invoice.total_minor THEN 'partially_paid'
@@ -11826,6 +12234,7 @@ await corePool.query(
   "UPDATE users SET email_verified_at = now() WHERE id = $1",
   [terminatedCreditIdentityRow.user_id],
 );
+await refreshAccountContext(terminatedCreditIdentityRow.client_account_id);
 const terminatedCreditOrder = await createOrder(automaticPrice.id, legal);
 await pay(terminatedCreditOrder, "success");
 const terminatedCreditActive = await waitFor(
@@ -12008,6 +12417,7 @@ assert.ok(cancellationIdentityRow);
 await corePool.query("UPDATE users SET email_verified_at = now() WHERE id = $1", [
   cancellationIdentityRow.user_id,
 ]);
+await refreshAccountContext(cancellationIdentityRow.client_account_id);
 const cancellationOrder = await createOrder(automaticPrice.id, legal);
 await pay(cancellationOrder, "success");
 const cancellationInitiallyActive = await waitFor(
@@ -12079,7 +12489,15 @@ assert.deepEqual(scheduledService.service.cancellation, {
   effectiveAt: cancellationActive.service.termEnd,
   result: { status: "scheduled" },
   lastError: null,
-  providerOperation: { status: "queued", attempts: 0 },
+  providerOperation: {
+    status: "queued",
+    attempts: 0,
+    attemptId: null,
+    dispatchedAt: null,
+    reconcileQueries: 0,
+    unresolvedReconcileQueries: 0,
+    latestResult: null,
+  },
 });
 
 cookie = terminatedCreditCookie;
@@ -13122,8 +13540,8 @@ await assert.rejects(
      WHERE id = $1`,
     [dueCancellationActive.service.id],
   ),
-  /confirmed Provider success/i,
-  "automatic cancellation cannot mark a service terminated before Provider success",
+  /without exact completion evidence/i,
+  "automatic cancellation cannot mark a service terminated without exact completion evidence",
 );
 await corePool.query(
   `UPDATE durable_jobs

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { api } from "./api.js";
 
 export type ManualReceiptOutflowReport = {
@@ -51,9 +51,11 @@ type Props = {
     originalSourceOutflow: ManualReceiptOriginalSourceOutflow;
   };
   password: string;
+  scopeToken: string;
   disabled?: boolean;
-  onPasswordConsumed: () => void;
-  onRefresh: () => Promise<void>;
+  isScopeCurrent: (scopeToken: string) => boolean;
+  onPasswordConsumed: (scopeToken: string) => void;
+  onRefresh: (scopeToken: string) => Promise<boolean>;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
 };
@@ -107,7 +109,9 @@ export function ManualReceiptOutflowPanel({
   clientAccountId,
   receipt,
   password,
+  scopeToken,
   disabled = false,
+  isScopeCurrent,
   onPasswordConsumed,
   onRefresh,
   onNotice,
@@ -118,6 +122,11 @@ export function ManualReceiptOutflowPanel({
     useState<ReconciliationDraft | null>(null);
   const [pending, setPending] = useState(false);
   const intentKeys = useRef(new Map<string, string>());
+  useLayoutEffect(() => {
+    setReportDraft(null);
+    setReconciliationDraft(null);
+    setPending(false);
+  }, [scopeToken]);
   const source = receipt.originalSourceOutflow;
   const reportReady =
     reportDraft !== null &&
@@ -138,7 +147,14 @@ export function ManualReceiptOutflowPanel({
     password.length > 0;
 
   async function submitReport(): Promise<void> {
-    if (!reportDraft || !reportReady || pending || disabled) return;
+    const operationScopeToken = scopeToken;
+    if (
+      !reportDraft ||
+      !reportReady ||
+      pending ||
+      disabled ||
+      !isScopeCurrent(operationScopeToken)
+    ) return;
     const payload = {
       expectedAvailableMinor: source.availableMinor,
       amountMinor: reportDraft.amountMinor,
@@ -158,11 +174,14 @@ export function ManualReceiptOutflowPanel({
     setPending(true);
     onError("");
     try {
+      if (!isScopeCurrent(operationScopeToken)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password }),
       });
-      onPasswordConsumed();
+      if (!isScopeCurrent(operationScopeToken)) return;
+      onPasswordConsumed(operationScopeToken);
+      if (!isScopeCurrent(operationScopeToken)) return;
       const outcome = await api<Outcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/outflow-reports`,
         {
@@ -171,22 +190,33 @@ export function ManualReceiptOutflowPanel({
         },
       );
       intentKeys.current.delete(identity);
+      if (!isScopeCurrent(operationScopeToken)) return;
       setReportDraft(null);
-      await onRefresh();
+      if (!await onRefresh(operationScopeToken)) return;
+      if (!isScopeCurrent(operationScopeToken)) return;
       onNotice(
         outcome.status === "unknown"
           ? `${outcome.replayed ? "Replayed" : "Recorded"} unknown original-source outflow. Capacity is frozen until staff reconciles it; no outflow ledger was posted.`
           : `${outcome.replayed ? "Replayed" : "Recorded"} confirmed original-source outflow with one immutable balanced journal. No Provider was called.`,
       );
     } catch (error) {
-      onError(error instanceof Error ? error.message : "Outflow report could not be recorded");
+      if (isScopeCurrent(operationScopeToken)) {
+        onError(error instanceof Error ? error.message : "Outflow report could not be recorded");
+      }
     } finally {
-      setPending(false);
+      if (isScopeCurrent(operationScopeToken)) setPending(false);
     }
   }
 
   async function submitReconciliation(): Promise<void> {
-    if (!reconciliationDraft || !reconciliationReady || pending || disabled) return;
+    const operationScopeToken = scopeToken;
+    if (
+      !reconciliationDraft ||
+      !reconciliationReady ||
+      pending ||
+      disabled ||
+      !isScopeCurrent(operationScopeToken)
+    ) return;
     const payload = {
       outcome: reconciliationDraft.outcome,
       occurredAt:
@@ -206,11 +236,14 @@ export function ManualReceiptOutflowPanel({
     setPending(true);
     onError("");
     try {
+      if (!isScopeCurrent(operationScopeToken)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password }),
       });
-      onPasswordConsumed();
+      if (!isScopeCurrent(operationScopeToken)) return;
+      onPasswordConsumed(operationScopeToken);
+      if (!isScopeCurrent(operationScopeToken)) return;
       const outcome = await api<Outcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/outflow-reports/${reconciliationDraft.reportId}/reconciliation`,
         {
@@ -219,17 +252,25 @@ export function ManualReceiptOutflowPanel({
         },
       );
       intentKeys.current.delete(identity);
+      if (!isScopeCurrent(operationScopeToken)) return;
       setReconciliationDraft(null);
-      await onRefresh();
+      if (!await onRefresh(operationScopeToken)) return;
+      if (!isScopeCurrent(operationScopeToken)) return;
       onNotice(
         outcome.status === "no_outflow"
           ? `${outcome.replayed ? "Replayed" : "Recorded"} no-outflow reconciliation. The frozen original-source capacity is available again.`
           : `${outcome.replayed ? "Replayed" : "Recorded"} confirmed outflow reconciliation with one immutable balanced journal. No Provider was called.`,
       );
     } catch (error) {
-      onError(error instanceof Error ? error.message : "Outflow reconciliation could not be recorded");
+      if (isScopeCurrent(operationScopeToken)) {
+        onError(
+          error instanceof Error
+            ? error.message
+            : "Outflow reconciliation could not be recorded",
+        );
+      }
     } finally {
-      setPending(false);
+      if (isScopeCurrent(operationScopeToken)) setPending(false);
     }
   }
 

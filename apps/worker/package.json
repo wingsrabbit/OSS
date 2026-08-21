@@ -10,10 +10,13 @@
     "start": "node dist/worker.js",
     "test": "node --test dist/**/*.test.js",
     "test:integration:job-claim": "node dist/job-claim.integration.js",
+    "test:integration:notification-delivery": "node dist/notification-orchestration.integration.js",
+    "test:integration:identity-notification": "node dist/identity-notification-orchestration.integration.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@opensales/core": "workspace:*",
+    "@opensales/provider-contracts": "workspace:*",
     "pg": "8.22.0",
     "zod": "4.4.3"
   },

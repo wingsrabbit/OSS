@@ -3,10 +3,23 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertBillingWriteEligible, requireUser } from "./auth.js";
+import {
+  assertCustomerCapability,
+  assertEligible,
+  expectedAccountContextVersion,
+  lockMembershipAccountForMutation,
+  lockSessionContextForMutation,
+  requireSessionIdentity,
+  requireUser,
+  type LockedAccountContext,
+} from "./auth.js";
 import type { Config } from "./config.js";
-import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
+import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import {
+  enqueueNotification,
+  enqueueSubscribedContactNotifications,
+} from "./notification-outbox.js";
 import {
   requireRecentReauth,
   requireStaffActionLocked,
@@ -55,63 +68,10 @@ function requestError(message: string, statusCode: number, code: string): Error 
   return Object.assign(new Error(message), { statusCode, code });
 }
 
-async function assertCancellationActorLocked(
-  client: DatabaseClient,
-  input: {
-    userId: string;
-    sessionId: string;
-    clientAccountId: string;
-  },
-): Promise<void> {
-  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [input.userId]);
-  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-    input.clientAccountId,
-  ]);
-  await client.query(
-    `SELECT client_account_id
-     FROM client_memberships
-     WHERE user_id = $1 AND client_account_id = $2
-     FOR UPDATE`,
-    [input.userId, input.clientAccountId],
-  );
-  const eligibility = await client.query<{
-    email_verified_at: Date | null;
-    user_restricted_at: Date | null;
-    account_restricted_at: Date | null;
-    removed_at: Date | null;
-    role: "owner" | "billing" | "technical" | "viewer" | null;
-    session_revoked_at: Date | null;
-    session_expires_at: Date | null;
-  }>(
-    `SELECT user_account.email_verified_at,
-            user_account.restricted_at AS user_restricted_at,
-            client_account.restricted_at AS account_restricted_at,
-            membership.removed_at,
-            membership.role,
-            session.revoked_at AS session_revoked_at,
-            session.expires_at AS session_expires_at
-     FROM users user_account
-     JOIN client_accounts client_account ON client_account.id = $2
-     LEFT JOIN client_memberships membership
-       ON membership.user_id = user_account.id
-      AND membership.client_account_id = client_account.id
-     LEFT JOIN sessions session
-       ON session.id = $3
-      AND session.user_id = user_account.id
-     WHERE user_account.id = $1`,
-    [input.userId, input.clientAccountId, input.sessionId],
-  );
-  const state = eligibility.rows[0];
-  if (
-    !state?.email_verified_at ||
-    state.user_restricted_at ||
-    state.account_restricted_at ||
-    state.removed_at ||
-    (state.role !== "owner" && state.role !== "billing") ||
-    state.session_revoked_at ||
-    !state.session_expires_at ||
-    state.session_expires_at.getTime() <= Date.now()
-  ) {
+function assertCancellationContextLocked(context: LockedAccountContext): void {
+  try {
+    assertCustomerCapability(context, "services.manage");
+  } catch {
     throw requestError("Account is not eligible to schedule cancellation", 403, "ACCOUNT_NOT_ELIGIBLE");
   }
 }
@@ -123,7 +83,9 @@ export async function registerServiceRoutes(
 ): Promise<void> {
   app.post("/api/v1/services/:serviceId/cancellation", async (request, reply) => {
     const user = await requireUser(request, pool, config);
-    assertBillingWriteEligible(user);
+    const expectedContextVersion = expectedAccountContextVersion(request);
+    assertEligible(user);
+    assertCustomerCapability(user, "services.manage");
     const params = z.object({ serviceId: z.uuid() }).parse(request.params);
     const body = scheduleCancellationSchema.parse(request.body);
     const fingerprint = requestFingerprint("services.schedule-cancellation:v1", {
@@ -136,6 +98,11 @@ export async function registerServiceRoutes(
     for (let transactionAttempt = 0; transactionAttempt < 3; transactionAttempt += 1) {
       try {
         outcome = await transaction(pool, async (client) => {
+      const sessionContext = await lockSessionContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `service-cancellation:${user.userId}:${body.idempotencyKey}`,
       ]);
@@ -161,11 +128,12 @@ export async function registerServiceRoutes(
             "IDEMPOTENCY_CONFLICT",
           );
         }
-        await assertCancellationActorLocked(client, {
-          userId: user.userId,
-          sessionId: user.sessionId,
-          clientAccountId: user.clientAccountId,
-        });
+        const accountContext = await lockMembershipAccountForMutation(
+          client,
+          user,
+          sessionContext,
+        );
+        assertCancellationContextLocked(accountContext);
         return { ...previous.result, replayed: true };
       }
 
@@ -278,11 +246,12 @@ export async function registerServiceRoutes(
       if (!service) {
         throw requestError("Service not found", 404, "SERVICE_NOT_FOUND");
       }
-      await assertCancellationActorLocked(client, {
-        userId: user.userId,
-        sessionId: user.sessionId,
-        clientAccountId: user.clientAccountId,
-      });
+      const accountContext = await lockMembershipAccountForMutation(
+        client,
+        user,
+        sessionContext,
+      );
+      assertCancellationContextLocked(accountContext);
       if (service.version !== body.expectedVersion) {
         throw requestError(
           "Service changed; refresh the page and confirm cancellation again",
@@ -652,7 +621,17 @@ export async function registerServiceRoutes(
              AND NOT EXISTS (
                SELECT 1 FROM renewal_reminder_delivery_facts delivery
                WHERE delivery.intent_id = reminder.id
+                 AND delivery.status IN ('delivered', 'bounced')
              )
+           ON CONFLICT (intent_id) DO NOTHING`,
+          [pristineRenewal.invoiceId],
+        );
+        await client.query(
+          `INSERT INTO renewal_notification_dispatch_suppressions(intent_id, reason)
+           SELECT reminder.id,
+                  'renewal invoice was withdrawn for cycle-end cancellation'
+           FROM renewal_reminder_intents reminder
+           WHERE reminder.invoice_id = $1
            ON CONFLICT (intent_id) DO NOTHING`,
           [pristineRenewal.invoiceId],
         );
@@ -733,30 +712,34 @@ export async function registerServiceRoutes(
           },
         ],
       );
-      const notification = await client.query<{ id: string }>(
-        `INSERT INTO outbox(event_type, unique_key, payload)
-         VALUES ('notification.service_cancellation_scheduled', $1, $2)
-         RETURNING id`,
-        [
-          `service-cancellation:${requestId}`,
-          {
-            email: user.email,
-            locale: user.locale,
-            cancellationRequestId: requestId,
-            serviceId: service.id,
-            productName: service.product_name,
-            effectiveAt: service.term_end.toISOString(),
-            executionMode,
-          },
-        ],
-      );
-      const outboxId = notification.rows[0]?.id;
-      if (!outboxId) throw new Error("Unable to queue cancellation confirmation");
-      await client.query(
-        `INSERT INTO durable_jobs(job_type, unique_key, payload)
-         VALUES ('notification.send', $1, $2)`,
-        [`outbox:${outboxId}`, { outboxId }],
-      );
+      const notificationPayload = {
+        cancellationRequestId: requestId,
+        serviceId: service.id,
+        productName: service.product_name,
+        effectiveAt: service.term_end.toISOString(),
+        executionMode,
+      } as const;
+      await enqueueNotification(client, {
+        eventType: "notification.service_cancellation_scheduled",
+        uniqueKey: `service-cancellation:${requestId}`,
+        payload: notificationPayload,
+        recipient: {
+          kind: "account_user",
+          category: "service",
+          userId: user.userId,
+          clientAccountId: user.clientAccountId,
+          email: user.email,
+          locale: user.locale === "zh-CN" ? "zh-CN" : "en",
+        },
+      });
+      await enqueueSubscribedContactNotifications(client, {
+        eventType: "notification.service_cancellation_scheduled",
+        uniqueKeyPrefix: `service-cancellation:${requestId}`,
+        payload: notificationPayload,
+        clientAccountId: user.clientAccountId,
+        category: "service",
+        excludeEmails: [user.email],
+      });
       return { ...result, replayed: false };
         });
         break;
@@ -797,7 +780,7 @@ export async function registerServiceRoutes(
   });
 
   app.get("/api/v1/admin/services/cancellations", async (request) => {
-    const user = await requireUser(request, pool, config);
+    const user = await requireSessionIdentity(request, pool, config);
     await requireStaffPermission(pool, user, "services.manual_fulfillment");
     const result = await pool.query<{
       request_id: string;
@@ -815,6 +798,16 @@ export async function registerServiceRoutes(
       last_error: string | null;
       provider_operation_status: string | null;
       provider_attempt_count: number | null;
+      provider_attempt_id: string | null;
+      provider_dispatched_at: Date | null;
+      reconciliation_query_count: number;
+      unresolved_reconciliation_count: number;
+      latest_provider_outcome: "succeeded" | "failed" | null;
+      latest_provider_observation_source: "callback" | "reconciliation" | null;
+      latest_provider_occurred_at: Date | null;
+      has_failed_provider_result: boolean;
+      has_succeeded_provider_result: boolean;
+      job_type: "service.cancellation.due" | "service.cancellation.reconcile";
       job_status: string;
       job_last_error: string | null;
     }>(
@@ -833,6 +826,28 @@ export async function registerServiceRoutes(
               execution.last_error,
               operation.status AS provider_operation_status,
               operation.attempt_count AS provider_attempt_count,
+              provider_attempt.id AS provider_attempt_id,
+              provider_attempt.dispatched_at AS provider_dispatched_at,
+              execution.reconciliation_query_count,
+              (
+                SELECT count(*)::integer
+                FROM service_cancellation_reconciliation_observations observation
+                WHERE observation.execution_id = execution.id
+              ) AS unresolved_reconciliation_count,
+              latest_result.outcome AS latest_provider_outcome,
+              latest_result.observation_source AS latest_provider_observation_source,
+              latest_result.provider_occurred_at AS latest_provider_occurred_at,
+              EXISTS (
+                SELECT 1 FROM service_cancellation_provider_results result
+                WHERE result.provider_operation_id = operation.id
+                  AND result.outcome = 'failed'
+              ) AS has_failed_provider_result,
+              EXISTS (
+                SELECT 1 FROM service_cancellation_provider_results result
+                WHERE result.provider_operation_id = operation.id
+                  AND result.outcome = 'succeeded'
+              ) AS has_succeeded_provider_result,
+              job.job_type,
               job.status AS job_status,
               job.last_error AS job_last_error
        FROM service_cancellation_requests cancellation_request
@@ -841,13 +856,31 @@ export async function registerServiceRoutes(
        JOIN services service ON service.id = cancellation_request.service_id
        JOIN client_accounts account ON account.id = service.client_account_id
        JOIN order_items item ON item.id = service.order_item_id
-       JOIN durable_jobs job
-         ON job.job_type = 'service.cancellation.due'
-        AND job.unique_key = 'service-cancellation:' || cancellation_request.id::text || ':terminate'
+       JOIN LATERAL (
+         SELECT candidate.job_type, candidate.status, candidate.last_error
+         FROM durable_jobs candidate
+         WHERE candidate.job_type IN (
+           'service.cancellation.due', 'service.cancellation.reconcile'
+         )
+           AND candidate.unique_key =
+             'service-cancellation:' || cancellation_request.id::text || ':terminate'
+         ORDER BY (candidate.job_type = 'service.cancellation.reconcile') DESC
+         LIMIT 1
+       ) job ON true
        LEFT JOIN provider_operations operation
          ON operation.subject_type = 'service_cancellation_execution'
         AND operation.subject_id = execution.id
         AND operation.kind = 'resource_terminate'
+       LEFT JOIN service_cancellation_provider_attempts provider_attempt
+         ON provider_attempt.provider_operation_id = operation.id
+        AND provider_attempt.execution_id = execution.id
+       LEFT JOIN LATERAL (
+         SELECT result.outcome, result.observation_source, result.provider_occurred_at
+         FROM service_cancellation_provider_results result
+         WHERE result.provider_operation_id = operation.id
+         ORDER BY result.provider_occurred_at DESC, result.created_at DESC, result.id DESC
+         LIMIT 1
+       ) latest_result ON true
        ORDER BY cancellation_request.effective_at, cancellation_request.created_at`,
     );
     return {
@@ -870,10 +903,40 @@ export async function registerServiceRoutes(
           ? {
               status: row.provider_operation_status,
               attempts: row.provider_attempt_count ?? 0,
+              attemptId: row.provider_attempt_id,
+              dispatchedAt: row.provider_dispatched_at?.toISOString() ?? null,
+              reconcileQueries: row.reconciliation_query_count,
+              unresolvedReconcileQueries: row.unresolved_reconciliation_count,
+              latestResult: row.latest_provider_outcome
+                ? {
+                    outcome: row.latest_provider_outcome,
+                    source: row.latest_provider_observation_source,
+                    occurredAt: row.latest_provider_occurred_at?.toISOString() ?? null,
+                  }
+                : null,
             }
           : null,
-        job: { status: row.job_status, lastError: row.job_last_error },
-        interventionRequired: row.execution_status === "manual",
+        job: {
+          type: row.job_type,
+          status: row.job_status,
+          lastError: row.job_last_error,
+        },
+        interventionRequired: row.execution_status === "manual" || row.job_status === "manual",
+        completionAllowed:
+          row.execution_status === "manual" &&
+          (row.execution_mode === "manual"
+            ? row.provider_operation_status === null &&
+              row.provider_attempt_id === null &&
+              row.execution_result.providerCalled === false &&
+              row.execution_result.preflightFailure === true &&
+              row.execution_result.preflightReason === "provider_automation_unavailable"
+            : Boolean(row.provider_attempt_id) &&
+              !row.has_succeeded_provider_result &&
+              ((row.provider_operation_status === "unknown" &&
+                row.reconciliation_query_count === 3 &&
+                row.unresolved_reconciliation_count === 3) ||
+                (row.provider_operation_status === "failed" &&
+                  row.has_failed_provider_result))),
       })),
     };
   });
@@ -881,7 +944,7 @@ export async function registerServiceRoutes(
   app.post(
     "/api/v1/admin/services/cancellations/:executionId/complete-manual",
     async (request, reply) => {
-      const user = await requireUser(request, pool, config);
+      const user = await requireSessionIdentity(request, pool, config);
       await requireStaffPermission(pool, user, "services.manual_fulfillment");
       await requireRecentReauth(pool, user);
       const params = z.object({ executionId: z.uuid() }).parse(request.params);
@@ -894,6 +957,7 @@ export async function registerServiceRoutes(
       });
 
       const outcome = await transaction(pool, async (client) => {
+        await requireStaffActionLocked(client, user, "services.manual_fulfillment");
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
           `service-cancellation-manual:${user.userId}:${body.idempotencyKey}`,
         ]);
@@ -923,12 +987,14 @@ export async function registerServiceRoutes(
           execution_id: string;
           request_id: string;
           service_id: string;
+          client_account_id: string;
           order_item_id: string;
           provider_operation_id: string | null;
         }>(
           `SELECT execution.id AS execution_id,
                   request.id AS request_id,
                   service.id AS service_id,
+                  service.client_account_id,
                   service.order_item_id,
                   operation.id AS provider_operation_id
            FROM service_cancellation_executions execution
@@ -945,6 +1011,16 @@ export async function registerServiceRoutes(
         const pointer = pointerResult.rows[0];
         if (!pointer) {
           throw requestError("Cancellation execution not found", 404, "CANCELLATION_NOT_FOUND");
+        }
+        // Match every customer mutation's Account -> business-object lock
+        // order.  Platform Staff does not need a target Membership, but it
+        // must not hold the Service while waiting for its target Account.
+        const targetAccount = await client.query(
+          "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+          [pointer.client_account_id],
+        );
+        if (targetAccount.rowCount !== 1) {
+          throw requestError("Client account not found", 404, "CLIENT_ACCOUNT_NOT_FOUND");
         }
         await client.query("SELECT id FROM order_items WHERE id = $1 FOR UPDATE", [
           pointer.order_item_id,
@@ -976,6 +1052,12 @@ export async function registerServiceRoutes(
           service_version: number;
           provider_operation_status: string | null;
           provider_attempt_count: number | null;
+          provider_attempt_id: string | null;
+          reconciliation_query_count: number;
+          unresolved_reconciliation_count: number;
+          execution_result: Record<string, unknown>;
+          has_failed_provider_result: boolean;
+          has_succeeded_provider_result: boolean;
         }>(
           `SELECT execution.execution_mode,
                   execution.status AS execution_status,
@@ -984,7 +1066,25 @@ export async function registerServiceRoutes(
                   service.status AS service_status,
                   service.version AS service_version,
                   operation.status AS provider_operation_status,
-                  operation.attempt_count AS provider_attempt_count
+                  operation.attempt_count AS provider_attempt_count,
+                  provider_attempt.id AS provider_attempt_id,
+                  execution.reconciliation_query_count,
+                  (
+                    SELECT count(*)::integer
+                    FROM service_cancellation_reconciliation_observations observation
+                    WHERE observation.execution_id = execution.id
+                  ) AS unresolved_reconciliation_count,
+                  execution.result AS execution_result,
+                  EXISTS (
+                    SELECT 1 FROM service_cancellation_provider_results result
+                    WHERE result.provider_operation_id = operation.id
+                      AND result.outcome = 'failed'
+                  ) AS has_failed_provider_result,
+                  EXISTS (
+                    SELECT 1 FROM service_cancellation_provider_results result
+                    WHERE result.provider_operation_id = operation.id
+                      AND result.outcome = 'succeeded'
+                  ) AS has_succeeded_provider_result
            FROM service_cancellation_executions execution
            JOIN service_cancellation_requests request
              ON request.id = execution.cancellation_request_id
@@ -993,6 +1093,9 @@ export async function registerServiceRoutes(
              ON operation.subject_type = 'service_cancellation_execution'
             AND operation.subject_id = execution.id
             AND operation.kind = 'resource_terminate'
+           LEFT JOIN service_cancellation_provider_attempts provider_attempt
+             ON provider_attempt.provider_operation_id = operation.id
+            AND provider_attempt.execution_id = execution.id
            WHERE execution.id = $1`,
           [params.executionId],
         );
@@ -1023,14 +1126,31 @@ export async function registerServiceRoutes(
           state.execution_mode === "manual"
             ? "manual_delivery"
             : "provider_reconciliation_takeover";
-        if (
+        const manualDeliveryReady =
+          state.execution_mode === "manual" &&
+          state.provider_operation_status === null &&
+          state.provider_attempt_id === null &&
+          state.execution_result.providerCalled === false &&
+          state.execution_result.preflightFailure === true &&
+          state.execution_result.preflightReason === "provider_automation_unavailable";
+        const automaticUnknownReady =
           state.execution_mode === "automatic" &&
-          (!state.provider_operation_status ||
-            !["unknown", "failed", "succeeded"].includes(state.provider_operation_status) ||
-            (state.provider_attempt_count ?? 0) < 1)
-        ) {
+          state.provider_operation_status === "unknown" &&
+          state.provider_attempt_count === 1 &&
+          Boolean(state.provider_attempt_id) &&
+          state.reconciliation_query_count === 3 &&
+          state.unresolved_reconciliation_count === 3 &&
+          !state.has_succeeded_provider_result;
+        const automaticFailedReady =
+          state.execution_mode === "automatic" &&
+          state.provider_operation_status === "failed" &&
+          state.provider_attempt_count === 1 &&
+          Boolean(state.provider_attempt_id) &&
+          state.has_failed_provider_result &&
+          !state.has_succeeded_provider_result;
+        if (!manualDeliveryReady && !automaticUnknownReady && !automaticFailedReady) {
           throw requestError(
-            "Automatic termination has no Provider evidence safe for manual takeover",
+            "Cancellation has no exact manual-delivery or Provider reconciliation evidence safe for Staff completion",
             409,
             "PROVIDER_RECONCILIATION_REQUIRED",
           );
@@ -1046,6 +1166,14 @@ export async function registerServiceRoutes(
           serviceStatus: "terminated",
           takeoverKind,
           providerCalled: false,
+          providerOutcome:
+            state.execution_mode === "automatic" ? state.provider_operation_status : null,
+          providerAttemptId: state.provider_attempt_id,
+          reconcileQueries: state.reconciliation_query_count,
+          unresolvedReconcileQueries: state.unresolved_reconciliation_count,
+          expectedExecutionVersion: body.expectedExecutionVersion,
+          expectedServiceVersion: body.expectedServiceVersion,
+          targetClientAccountId: pointer.client_account_id,
           completedAt: completedAt.toISOString(),
         };
         await client.query(
@@ -1053,9 +1181,9 @@ export async function registerServiceRoutes(
              id, execution_id, service_id, staff_user_id, staff_session_id,
              staff_client_account_id, takeover_kind, expected_execution_version,
              expected_service_version, reason, idempotency_key,
-             request_fingerprint, result, created_at
+             request_fingerprint, result, completed_at, created_at
            ) VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14
            )`,
           [
             actionId,
@@ -1063,7 +1191,7 @@ export async function registerServiceRoutes(
             pointer.service_id,
             user.userId,
             user.sessionId,
-            user.clientAccountId,
+            pointer.client_account_id,
             takeoverKind,
             body.expectedExecutionVersion,
             body.expectedServiceVersion,
@@ -1117,6 +1245,25 @@ export async function registerServiceRoutes(
           ],
         );
         return { ...result, replayed: false };
+      }).catch((error: unknown) => {
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "P0001" &&
+          "message" in error &&
+          typeof error.message === "string" &&
+          error.message.includes(
+            "manual cancellation completion lacks current authority or eligible state",
+          )
+        ) {
+          throw requestError(
+            "Manual cancellation authority or target account state changed; refresh and retry",
+            409,
+            "MANUAL_COMPLETION_AUTHORITY_CHANGED",
+          );
+        }
+        throw error;
       });
       return reply.code(outcome.replayed ? 200 : 201).send(outcome);
     },

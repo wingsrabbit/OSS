@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+{
+	auto_https off
+	admin off
+}
+
+:8443 {
+	tls /run/secrets/core_tls_cert /run/secrets/core_tls_key
+	encode zstd gzip
+
+	@provider_callback path /api/v1/provider-events/payment /api/v1/provider-events/refund /api/v1/provider-events/add-funds-chargeback /api/v1/provider-events/provisioning /api/v1/provider-events/resource-action /api/v1/provider-events/resource-termination
+	handle @provider_callback {
+		reverse_proxy callback-gateway:8081
+	}
+
+	handle {
+		reverse_proxy web:8080
+	}
+}

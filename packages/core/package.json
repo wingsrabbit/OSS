@@ -17,6 +17,10 @@
       "types": "./dist/provider-token-vault.d.ts",
       "default": "./dist/provider-token-vault.js"
     },
+    "./commerce": {
+      "types": "./dist/commerce.d.ts",
+      "default": "./dist/commerce.js"
+    },
     "./schema-rollback-compatibility": {
       "types": "./dist/schema-rollback-compatibility.d.ts",
       "default": "./dist/schema-rollback-compatibility.js"
@@ -32,6 +36,54 @@
     "./schema-017-018-native-compatibility": {
       "types": "./dist/schema-017-018-native-compatibility.d.ts",
       "default": "./dist/schema-017-018-native-compatibility.js"
+    },
+    "./schema-018-019-native-compatibility": {
+      "types": "./dist/schema-018-019-native-compatibility.d.ts",
+      "default": "./dist/schema-018-019-native-compatibility.js"
+    },
+    "./schema-019-020-native-compatibility": {
+      "types": "./dist/schema-019-020-native-compatibility.d.ts",
+      "default": "./dist/schema-019-020-native-compatibility.js"
+    },
+    "./schema-020-021-native-compatibility": {
+      "types": "./dist/schema-020-021-native-compatibility.d.ts",
+      "default": "./dist/schema-020-021-native-compatibility.js"
+    },
+    "./schema-021-022-native-compatibility": {
+      "types": "./dist/schema-021-022-native-compatibility.d.ts",
+      "default": "./dist/schema-021-022-native-compatibility.js"
+    },
+    "./schema-022-023-native-compatibility": {
+      "types": "./dist/schema-022-023-native-compatibility.d.ts",
+      "default": "./dist/schema-022-023-native-compatibility.js"
+    },
+    "./schema-023-024-native-compatibility": {
+      "types": "./dist/schema-023-024-native-compatibility.d.ts",
+      "default": "./dist/schema-023-024-native-compatibility.js"
+    },
+    "./schema-024-025-native-compatibility": {
+      "types": "./dist/schema-024-025-native-compatibility.d.ts",
+      "default": "./dist/schema-024-025-native-compatibility.js"
+    },
+    "./schema-025-026-native-compatibility": {
+      "types": "./dist/schema-025-026-native-compatibility.d.ts",
+      "default": "./dist/schema-025-026-native-compatibility.js"
+    },
+    "./schema-026-027-native-compatibility": {
+      "types": "./dist/schema-026-027-native-compatibility.d.ts",
+      "default": "./dist/schema-026-027-native-compatibility.js"
+    },
+    "./schema-027-028-native-compatibility": {
+      "types": "./dist/schema-027-028-native-compatibility.d.ts",
+      "default": "./dist/schema-027-028-native-compatibility.js"
+    },
+    "./schema-028-029-native-compatibility": {
+      "types": "./dist/schema-028-029-native-compatibility.d.ts",
+      "default": "./dist/schema-028-029-native-compatibility.js"
+    },
+    "./identity-security": {
+      "types": "./dist/identity-security.d.ts",
+      "default": "./dist/identity-security.js"
     }
   },
   "scripts": {

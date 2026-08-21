@@ -22,6 +22,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Verify patched dependencies are available to container installs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dockerfile in Dockerfile apps/web/Dockerfile; do
+            awk '
+              /COPY patches patches/ { patch_copy = NR }
+              /RUN pnpm install --frozen-lockfile/ { install = NR }
+              END { exit !(patch_copy > 0 && install > patch_copy) }
+            ' "${dockerfile}"
+          done
+
       - name: Set up pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -39,8 +51,21 @@ jobs:
           test "$(pnpm --version)" = '11.14.0'
           pnpm install --frozen-lockfile
 
+      - name: Verify two-host Mock-only deployment contracts
+        run: node --test tools/two-host-deployment.test.mjs
+
+      - name: Laboratory RC backup and restore-plan regressions
+        run: node --test tools/lab-backup.test.mjs
+
       - name: Build shared Core declarations
         run: pnpm --filter @opensales/core build
+
+      - name: Build public Provider package declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @opensales/provider-contracts build
+          pnpm --filter @opensales/provider-sdk-typescript build
 
       - name: Strict TypeScript
         run: pnpm -r --if-present typecheck
@@ -50,6 +75,9 @@ jobs:
 
       - name: Domain tests
         run: pnpm -r --if-present test
+
+      - name: Verify generated public Provider artifacts
+        run: pnpm --filter @opensales/provider-contracts docs:check
 
   product-integration:
     name: product-integration
@@ -76,11 +104,13 @@ jobs:
       DATABASE_API_ROLE_PASSWORD: ci-only-api-database-password-000000000000
       DATABASE_WORKER_ROLE_PASSWORD: ci-only-worker-database-password-000000000
       PROVIDER_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/provider
+      PROVIDER_CONFORMANCE_DATABASE_NAME: provider
       OSS_ENV: test
       OSS_PUBLIC_URL: http://127.0.0.1:5173
       WEB_ORIGIN: http://127.0.0.1:5173
       MOCK_PAYMENT_PROVIDER_URL: http://127.0.0.1:4000
       MOCK_PROVISIONING_PROVIDER_URL: http://127.0.0.1:4000
+      MOCK_PROVIDER_PLATFORM_URL: http://127.0.0.1:4000
       MOCK_MAIL_PROVIDER_URL: http://127.0.0.1:4000
       MOCK_MAILBOX_URL: http://127.0.0.1:4000
       CORE_INTERNAL_URL: http://127.0.0.1:3000
@@ -88,15 +118,21 @@ jobs:
       MOCK_PAYMENT_PROVIDER_TOKEN: ci-only-payment-token-00000000000000000
       MOCK_PROVISIONING_PROVIDER_TOKEN: ci-only-provision-token-000000000000000
       MOCK_MAIL_PROVIDER_TOKEN: ci-only-mail-token-00000000000000000000
+      MOCK_PROVIDER_PLATFORM_TOKEN: ci-only-provider-platform-token-00000000
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: "1"
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: ""
       LAB_MAILBOX_TOKEN: ci-only-mailbox-token-000000000000000000
       PROVIDER_OPERATION_CAPABILITY_SECRET: ci-only-operation-capability-secret-000000
       PAYMENT_METHOD_TOKEN_KEY: FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU
       PAYMENT_METHOD_TOKEN_LOOKUP_KEY: FhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhY
+      IDENTITY_SECRET_KEY: GhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGho
       MOCK_PAYMENT_WEBHOOK_SECRET: ci-only-payment-webhook-secret-0000000000
       MOCK_PROVISIONING_WEBHOOK_SECRET: ci-only-provision-webhook-secret-0000000
       MOCK_PROVISION_SCENARIO: timeout_existing
       JOB_LOCK_TIMEOUT_SECONDS: "2"
       GLOBAL_RATE_LIMIT_MAX: "1000"
+      NOTIFICATION_MAX_ATTEMPTS: "3"
       LAB_MAILBOX_ENABLED: "true"
     steps:
       - name: Check out source
@@ -122,6 +158,29 @@ jobs:
       - name: Build applications and conformance code
         run: pnpm -r --if-present build
 
+      - name: Run Identity Security PostgreSQL 18 and API journey
+        run: pnpm --filter @opensales/api test:integration:identity-security
+
+      - name: Run Identity notification PostgreSQL 18 and Mock Mail journey
+        run: pnpm --filter @opensales/worker test:integration:identity-notification
+
+      - name: Run Notification Operations PostgreSQL 18 journey
+        run: pnpm --filter @opensales/api test:integration:notification-operations
+
+      - name: Run Mock Mail result reconciliation integration
+        run: pnpm --filter @opensales/mock-lab test:integration:mail
+
+      - name: Install invoice PDF inspection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes poppler-utils
+          command -v pdfinfo
+          command -v pdffonts
+          command -v pdftotext
+          command -v pdftoppm
+
       - name: Create isolated Provider database
         shell: bash
         run: >-
@@ -131,6 +190,12 @@ jobs:
           await client.connect();
           await client.query('CREATE DATABASE provider');
           await client.end();"
+
+      - name: Run public Provider examples through HTTP-only conformance
+        run: pnpm --filter @opensales/provider-conformance test:examples
+
+      - name: Run six-capability Mock Provider reliability and restart conformance
+        run: pnpm --filter @opensales/provider-conformance test:mock-lab
 
       - name: Create isolated renewal lifecycle database
         shell: bash
@@ -151,8 +216,8 @@ jobs:
           await client.connect();
           await client.query('CREATE DATABASE payment_token_rotation');
           await client.query('CREATE DATABASE manual_receipts');
-          await client.query('CREATE DATABASE support_tickets');
           await client.query('CREATE DATABASE worker_job_claim');
+          await client.query('CREATE DATABASE notification_delivery');
           await client.query('CREATE DATABASE schema_rollback');
           await client.query('CREATE DATABASE schema_015_016_rollback');
           await client.query('CREATE DATABASE schema_016_017_rollback');
@@ -173,10 +238,85 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/manual_receipts
         run: pnpm --filter @opensales/api test:integration:manual-receipts
 
-      - name: Run support ticket PostgreSQL and API journey
+      - name: Run normal Support operations PostgreSQL 18, Mock Mail, and public API journey
+        run: pnpm --filter @opensales/api test:integration:support-operations-normal-ci
+
+      - name: Run Catalog Commerce PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:catalog-commerce
+
+      - name: Run Catalog fulfillment binding snapshot PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:catalog-fulfillment
+
+      - name: Run Catalog Provider automation policy PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:catalog-automation-policy
+
+      - name: Verify Schema 019 native catalog freeze through the latest schema
+        run: pnpm --filter @opensales/api test:integration:schema-019-native
+
+      - name: Verify Schema 025 native history, foundation, and catalog freeze
+        run: pnpm --filter @opensales/api test:integration:schema-025-native
+
+      - name: Verify Schema 026 native history, authority bindings, and application gate
+        run: pnpm --filter @opensales/api test:integration:schema-026-native
+
+      - name: Verify Schema 027 native history, bilingual registry, and application gate
+        run: pnpm --filter @opensales/api test:integration:schema-027-native
+
+      - name: Verify Schema 028 native Provider evidence history, catalog, and application gate
+        run: pnpm --filter @opensales/api test:integration:schema-028-native
+
+      - name: Run Schema 029 Service password change PostgreSQL, Worker, and Mock Provider journey
+        run: pnpm --filter @opensales/api test:integration:service-password-changes
+
+      - name: Run notification preferences and versioned templates PostgreSQL 18 journey
+        run: pnpm --filter @opensales/api test:integration:notification-preferences-templates
+
+      - name: Run normal Service cancellation Provider evidence PostgreSQL 18 journey
+        run: pnpm --filter @opensales/api test:integration:cancellation-provider-evidence-normal
+
+      - name: Run Content Operations PostgreSQL and API journey
+        run: pnpm --filter @opensales/api test:integration:content-operations
+
+      - name: Run account history PostgreSQL and API journey
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/support_tickets
-        run: pnpm --filter @opensales/api test:integration:tickets
+          ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
+        run: pnpm --filter @opensales/api test:integration:account-history
+
+      - name: Run account context normal-only PostgreSQL and public API journey
+        run: pnpm --filter @opensales/api test:integration:account-context-normal
+
+      - name: Mechanically inspect Unicode multi-page invoice PDF
+        shell: bash
+        env:
+          ACCOUNT_HISTORY_PDF_OUTPUT: ${{ runner.temp }}/account-history-invoice.pdf
+          PDF_QA_DIRECTORY: ${{ runner.temp }}/account-history-pdf-qa
+        run: |
+          set -euo pipefail
+          test -s "${ACCOUNT_HISTORY_PDF_OUTPUT}"
+          test "$(sha256sum apps/api/assets/fonts/NotoSansSC-VF.ttf | cut -d ' ' -f 1)" = \
+            'd68bafcb48a2707749396aa12bbbd833cb70401f3a9a689fd2902c7e0d295964'
+          mkdir -p "${PDF_QA_DIRECTORY}/rendered"
+          pdfinfo "${ACCOUNT_HISTORY_PDF_OUTPUT}" > "${PDF_QA_DIRECTORY}/pdfinfo.txt"
+          pdffonts "${ACCOUNT_HISTORY_PDF_OUTPUT}" > "${PDF_QA_DIRECTORY}/pdffonts.txt"
+          pdftotext -layout "${ACCOUNT_HISTORY_PDF_OUTPUT}" \
+            "${PDF_QA_DIRECTORY}/invoice.txt"
+          tr -d '[:space:]' < "${PDF_QA_DIRECTORY}/invoice.txt" \
+            > "${PDF_QA_DIRECTORY}/invoice-compact.txt"
+          pdftoppm -png -r 120 "${ACCOUNT_HISTORY_PDF_OUTPUT}" \
+            "${PDF_QA_DIRECTORY}/rendered/page"
+          pages="$(awk '/^Pages:/ { print $2 }' "${PDF_QA_DIRECTORY}/pdfinfo.txt")"
+          test "${pages}" -gt 3
+          test "$(wc -c < "${ACCOUNT_HISTORY_PDF_OUTPUT}" | tr -d ' ')" -lt 250000
+          grep -E '^OSSINV[+]NotoSansSC-Regular[[:space:]]+CID TrueType[[:space:]]+Identity-H[[:space:]]+yes[[:space:]]+yes[[:space:]]+yes' \
+            "${PDF_QA_DIRECTORY}/pdffonts.txt"
+          grep -F '简体中文账单明细 - 云服务月费' "${PDF_QA_DIRECTORY}/invoice.txt"
+          grep -F '香港节点带宽续费与技术支持' "${PDF_QA_DIRECTORY}/invoice.txt"
+          grep -F 'OSS-LONG-DESCRIPTION-BEGIN' "${PDF_QA_DIRECTORY}/invoice-compact.txt"
+          grep -F 'OSS-LONG-DESCRIPTION-END' "${PDF_QA_DIRECTORY}/invoice-compact.txt"
+          test "$(find "${PDF_QA_DIRECTORY}/rendered" -name 'page-*.png' -size +0c | wc -l | tr -d ' ')" \
+            -eq "${pages}"
+          # These checks are deterministic and mechanical; release acceptance still
+          # requires a human to inspect every rendered page for visual completeness.
 
       - name: Prepare and run schema 016 Worker job boundary PostgreSQL journey
         shell: bash
@@ -213,45 +353,27 @@ jobs:
         run: |
           pnpm --filter @opensales/worker test:integration:job-claim
 
-      - name: Prepare schema 014 rollback database
+      - name: Prepare schema 019 notification delivery PostgreSQL journey
         shell: bash
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/notification_delivery
         run: >-
           pnpm --filter @opensales/api exec node --input-type=module -e
-          "import { readdir, readFile } from 'node:fs/promises';
-          import { join } from 'node:path';
-          import pg from 'pg';
-          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
-          await client.connect();
-          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
-          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
-          const migrations = (await readdir(directory))
-            .filter((file) => /^(00[1-9]|01[0-4])_[a-z0-9_]+[.]sql$/.test(file))
-            .sort();
-          for (const file of migrations) {
-            await client.query('BEGIN');
-            try {
-              await client.query(await readFile(join(directory, file), 'utf8'));
-              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
-              await client.query('COMMIT');
-            } catch (error) {
-              await client.query('ROLLBACK');
-              throw error;
-            }
-          }
-          await client.end();"
+          "import pg from 'pg';
+          import { runMigrations } from './dist/database.js';
+          const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+          await runMigrations(pool);
+          await pool.end();"
 
-      - name: Run schema rollback PostgreSQL journey
+      - name: Run schema 019 notification delivery PostgreSQL journey
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
-          OSS_SCHEMA_ROLLBACK_BRIDGE: "014-to-015"
-        run: pnpm --filter @opensales/api test:integration:schema-rollback-preflight
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/notification_delivery
+        run: pnpm --filter @opensales/worker test:integration:notification-delivery
 
-      - name: Prepare schema 015 rollback bridge database
+      - name: Prepare schema 015 for the normal 014 rollback bridge journey
         shell: bash
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
         run: >-
           pnpm --filter @opensales/api exec node --input-type=module -e
           "import { readdir, readFile } from 'node:fs/promises';
@@ -277,15 +399,16 @@ jobs:
           }
           await client.end();"
 
-      - name: Run schema 015 to 016 rollback bridge PostgreSQL journey
+      - name: Run normal schema 014 to 015 rollback bridge PostgreSQL journey
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
-        run: pnpm --filter @opensales/api test:integration:schema-015-016-rollback-preflight
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_rollback
+          OSS_NORMAL_ROLLBACK_BRIDGE: "014-to-015"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-normal
 
-      - name: Prepare schema 016 rollback bridge database
+      - name: Prepare schema 016 for the normal 015 rollback bridge journey
         shell: bash
         env:
-          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
         run: >-
           pnpm --filter @opensales/api exec node --input-type=module -e
           "import { readdir, readFile } from 'node:fs/promises';
@@ -311,10 +434,46 @@ jobs:
           }
           await client.end();"
 
-      - name: Run schema 016 to 017 rollback bridge PostgreSQL journey
+      - name: Run normal schema 015 to 016 rollback bridge PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_015_016_rollback
+          OSS_NORMAL_ROLLBACK_BRIDGE: "015-to-016"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-normal
+
+      - name: Prepare schema 017 for the normal 016 rollback bridge journey
+        shell: bash
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
-        run: pnpm --filter @opensales/api test:integration:schema-016-017-rollback-preflight
+        run: >-
+          pnpm --filter @opensales/api exec node --input-type=module -e
+          "import { readdir, readFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          import pg from 'pg';
+          const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+          await client.connect();
+          await client.query('CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+          const directory = join(process.env.GITHUB_WORKSPACE, 'apps/api/migrations');
+          const migrations = (await readdir(directory))
+            .filter((file) => /^(00[1-9]|01[0-7])_[a-z0-9_]+[.]sql$/.test(file))
+            .sort();
+          for (const file of migrations) {
+            await client.query('BEGIN');
+            try {
+              await client.query(await readFile(join(directory, file), 'utf8'));
+              await client.query('INSERT INTO schema_migrations(version) VALUES (\$1)', [file.replace(/[.]sql$/, '')]);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK');
+              throw error;
+            }
+          }
+          await client.end();"
+
+      - name: Run normal schema 016 to 017 rollback bridge PostgreSQL journey
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/schema_016_017_rollback
+          OSS_NORMAL_ROLLBACK_BRIDGE: "016-to-017"
+        run: pnpm --filter @opensales/api test:integration:schema-rollback-normal
 
       - name: Apply forward migrations and synthetic configuration
         shell: bash
@@ -340,8 +499,10 @@ jobs:
             node apps/worker/dist/worker.js > worker.log 2>&1 &
           echo "$!" > worker.pid
           for attempt in $(seq 1 60); do
+            read -r worker_pid < worker.pid
             if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null &&
-               curl --fail --silent http://127.0.0.1:4000/health/ready >/dev/null; then
+               curl --fail --silent http://127.0.0.1:4000/health/ready >/dev/null &&
+               kill -0 "${worker_pid}" 2>/dev/null; then
               exit 0
             fi
             sleep 1
@@ -354,18 +515,62 @@ jobs:
           EXPECT_RESOURCE_ACTION_SCENARIO: timeout_success
         run: pnpm --filter @opensales/api test:integration:stage-a
 
+      - name: Stop Worker for deterministic Service operation fault phases
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r worker_pid < worker.pid
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            kill "${worker_pid}"
+            for attempt in $(seq 1 30); do
+              if ! kill -0 "${worker_pid}" 2>/dev/null; then
+                break
+              fi
+              sleep 0.2
+            done
+          fi
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            echo "Worker process did not stop cleanly"
+            exit 1
+          fi
+
+      - name: Run Schema 023 and full Service operations PostgreSQL journey
+        shell: bash
+        env:
+          SERVICE_OPERATION_STATE_FILE: ${{ runner.temp }}/service-operation-revoked.json
+          SERVICE_OPERATION_WORKER_DATABASE_URL: postgresql://oss_worker:${{ env.DATABASE_WORKER_ROLE_PASSWORD }}@127.0.0.1:5432/oss
+        run: |
+          set -euo pipefail
+          for phase in schema normal timeout failure cancellation; do
+            SERVICE_OPERATION_INTEGRATION_PHASE="${phase}" \
+              pnpm --filter @opensales/api test:integration:service-operations
+          done
+          SERVICE_OPERATION_INTEGRATION_PHASE=prepare-revoked \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_INTEGRATION_PHASE=verify-revoked \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_INTEGRATION_PHASE=mismatch \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_INTEGRATION_PHASE=reconcile-budget \
+            pnpm --filter @opensales/api test:integration:service-operations
+          SERVICE_OPERATION_STATE_FILE="${RUNNER_TEMP}/service-operation-browser.json" \
+            SERVICE_OPERATION_INTEGRATION_PHASE=prepare-browser \
+            pnpm --filter @opensales/api test:integration:service-operations
+
       - name: Restart Worker for isolated browser journey
         shell: bash
         run: |
           set -euo pipefail
           read -r worker_pid < worker.pid
-          kill "${worker_pid}"
-          for attempt in $(seq 1 30); do
-            if ! kill -0 "${worker_pid}" 2>/dev/null; then
-              break
-            fi
-            sleep 0.2
-          done
+          if kill -0 "${worker_pid}" 2>/dev/null; then
+            kill "${worker_pid}"
+            for attempt in $(seq 1 30); do
+              if ! kill -0 "${worker_pid}" 2>/dev/null; then
+                break
+              fi
+              sleep 0.2
+            done
+          fi
           if kill -0 "${worker_pid}" 2>/dev/null; then
             echo "Worker process did not stop cleanly"
             exit 1
@@ -374,6 +579,12 @@ jobs:
             DATABASE_RUNTIME_ROLE=oss_worker node apps/worker/dist/worker.js \
             > worker-browser.log 2>&1 &
           echo "$!" > worker.pid
+          sleep 2
+          read -r worker_pid < worker.pid
+          if ! kill -0 "${worker_pid}" 2>/dev/null; then
+            tail -n 100 worker-browser.log
+            exit 1
+          fi
 
       - name: Install pinned Chromium runtime
         run: pnpm --filter @opensales/e2e exec playwright install --with-deps chromium
@@ -425,6 +636,10 @@ jobs:
 
       - name: Run browser Stage A journey
         shell: bash
+        env:
+          OSS_E2E_SERVICE_OPERATION_STATE_FILE: ${{ runner.temp }}/service-operation-browser.json
+          OSS_E2E_SELF_PUMP_SERVICE_OPERATIONS: "1"
+          SERVICE_OPERATION_WORKER_DATABASE_URL: postgresql://oss_worker:${{ env.DATABASE_WORKER_ROLE_PASSWORD }}@127.0.0.1:5432/oss
         run: |
           set +e
           pnpm --filter @opensales/e2e test:e2e

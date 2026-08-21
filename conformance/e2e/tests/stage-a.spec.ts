@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Route } from "@playwright/test";
+import { completeCatalogCheckout } from "./helpers/catalog-checkout.js";
 
 test("unverified customer verifies, pays, reaches Ready for Service, and sees Add Funds Chargeback debt", async ({
   page,
@@ -51,7 +52,7 @@ test("unverified customer verifies, pays, reaches Ready for Service, and sees Ad
   await product.getByRole("button", { name: /monthly/i }).click();
   const checkoutDialog = page.getByRole("dialog");
   await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
-  await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(checkoutDialog);
 
   const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await expect(journey.getByText("waiting payment", { exact: true })).toBeVisible();
@@ -101,7 +102,7 @@ test("unverified customer verifies, pays, reaches Ready for Service, and sees Ad
 
   await product.getByRole("button", { name: /monthly/i }).click();
   await expect(checkoutDialog.getByRole("heading", { name: "HKBGP VPS" })).toBeVisible();
-  await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(checkoutDialog);
   await expect(journey.getByText("Credit this payment: $5.00", { exact: true })).toBeVisible();
   await expect(journey.getByText("External amount due: $0.00", { exact: true })).toBeVisible();
   await journey.getByRole("button", { name: "Start mock payment" }).click();

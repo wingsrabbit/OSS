@@ -18,6 +18,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   acquireAdvisoryFileLock,
+  apiEnvironment,
   classifyLifecycleLockOwner,
   cleanupExactPendingProcess,
   evaluatePendingProcessRecovery,
@@ -29,10 +30,14 @@ import {
   releaseAdvisoryFileLock,
   releaseLifecycleLockOwner,
   repositoryRevision,
+  upgradeExistingDemoConfig,
   verifyStoredProcessIdentity,
+  workerEnvironment,
 } from "./demo-local.mjs";
 import {
   assertSeparatedDemoRoles,
+  DemoSession,
+  runServiceOperationsSmoke,
   runSupportTicketSmoke,
 } from "./demo-smoke.mjs";
 
@@ -106,6 +111,71 @@ async function stopTestPid(pid) {
   }
   assert.equal(pidExists(pid), false, `test PID ${pid} did not stop`);
 }
+
+test("legacy Demo config gains independent identity and Provider platform secrets exactly once", () => {
+  const config = { secrets: {} };
+  const generated = [];
+  const tokenFactory = (bytes) => {
+    generated.push(bytes ?? null);
+    if (bytes !== 32) return "synthetic-platform-token";
+    return generated.length === 2
+      ? Buffer.alloc(32, 7).toString("base64url")
+      : Buffer.alloc(32, 8).toString("base64url");
+  };
+  assert.equal(upgradeExistingDemoConfig(config, tokenFactory), true);
+  assert.deepEqual(generated, [null, 32, 32]);
+  assert.equal(config.secrets.providerPlatformToken, "synthetic-platform-token");
+  assert.equal(
+    config.secrets.providerRequestFingerprintKey,
+    Buffer.alloc(32, 7).toString("base64url"),
+  );
+  assert.equal(config.secrets.identitySecretKey, Buffer.alloc(32, 8).toString("base64url"));
+  assert.equal(upgradeExistingDemoConfig(config, tokenFactory), false);
+  assert.deepEqual(generated, [null, 32, 32], "an upgraded config must not rotate any secret");
+});
+
+test("Demo API and Worker share the notification budget and Worker receives identity settings", () => {
+  const config = {
+    ports: {
+      api: 30_001,
+      web: 51_731,
+      payment: 40_001,
+      provisioning: 40_002,
+      mail: 40_003,
+    },
+    secrets: {
+      workerDatabasePassword: "synthetic-worker-db-password",
+      paymentProviderToken: "synthetic-payment-provider-token",
+      provisioningProviderToken: "synthetic-provisioning-provider-token",
+      providerPlatformToken: "synthetic-provider-platform-token",
+      mailProviderToken: "synthetic-mail-provider-token",
+      identitySecretKey: "synthetic-identity-secret-key",
+      providerOperationCapabilitySecret: "synthetic-operation-capability-secret",
+      paymentMethodTokenKey: "synthetic-payment-method-key",
+      paymentWebhookSecret: "synthetic-payment-webhook-secret",
+      provisioningWebhookSecret: "synthetic-provisioning-webhook-secret",
+    },
+  };
+  const environment = workerEnvironment(config);
+  const api = apiEnvironment({
+    ...config,
+    secrets: {
+      ...config.secrets,
+      apiDatabasePassword: "synthetic-api-db-password",
+      mailboxToken: "synthetic-mailbox-token",
+      paymentMethodTokenLookupKey: "synthetic-payment-method-lookup-key",
+    },
+  });
+  assert.equal(environment.OSS_PUBLIC_URL, "http://127.0.0.1:51731");
+  assert.equal(environment.IDENTITY_SECRET_KEY, "synthetic-identity-secret-key");
+  assert.equal(environment.IDENTITY_SECRET_KEY_VERSION, "1");
+  assert.equal(environment.NOTIFICATION_MAX_ATTEMPTS, "3");
+  assert.equal(api.NOTIFICATION_MAX_ATTEMPTS, environment.NOTIFICATION_MAX_ATTEMPTS);
+  assert.equal(
+    environment.MOCK_PROVIDER_PLATFORM_TOKEN,
+    "synthetic-provider-platform-token",
+  );
+});
 
 test("advisory lock keeps one stable semaphore inode across success and failure", () => {
   const directory = mkdtempSync(join(tmpdir(), "oss-demo-lock-inode-"));
@@ -715,6 +785,228 @@ test("administrator credentials recover from both current and legacy smoke state
   );
 });
 
+test("Demo session carries the exact account-context version across customer mutations", async () => {
+  const requests = [];
+  const responses = [
+    new Response(JSON.stringify({ id: "customer-user" }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Set-Cookie": "oss_session=session-id; Path=/; HttpOnly",
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response(JSON.stringify({ created: true }), {
+      status: 201,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Account-Context-Version": "18",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response(JSON.stringify({ created: true }), {
+      status: 201,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Account-Context-Version": "18",
+      },
+    }),
+  ];
+  const session = new DemoSession("http://127.0.0.1:3000", async (url, init) => {
+    requests.push({ url: String(url), init });
+    return responses.shift();
+  });
+
+  await session.request("/api/v1/auth/me");
+  await session.request(
+    "/api/v1/orders",
+    { method: "POST", body: JSON.stringify({ synthetic: true }) },
+    201,
+  );
+  await session.request(
+    "/api/v1/tickets",
+    {
+      method: "POST",
+      headers: { "X-OSS-Account-Context-Version": "99" },
+      body: JSON.stringify({ synthetic: true }),
+    },
+    201,
+  );
+
+  assert.equal(requests[0].init.headers.get("X-OSS-Account-Context-Version"), null);
+  assert.equal(requests[1].init.headers.get("X-OSS-Account-Context-Version"), "17");
+  assert.equal(requests[1].init.headers.get("Cookie"), "oss_session=session-id");
+  assert.equal(
+    requests[2].init.headers.get("X-OSS-Account-Context-Version"),
+    "99",
+    "An explicit test version must not be overwritten",
+  );
+  assert.equal(session.accountContextVersion, "18");
+  assert.equal(
+    session.clientAccountId,
+    null,
+    "An authenticated response without an active-account header must clear the cached account ID",
+  );
+});
+
+test("Demo session records a newer context version before reporting an API error", async () => {
+  const session = new DemoSession("http://127.0.0.1:3000", async () =>
+    new Response(JSON.stringify({ code: "ACCOUNT_CONTEXT_STALE" }), {
+      status: 409,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OSS-Account-Context-Version": "23",
+      },
+    }),
+  );
+
+  await assert.rejects(
+    session.request("/api/v1/orders", { method: "POST", body: "{}" }, 201),
+    /ACCOUNT_CONTEXT_STALE/,
+  );
+  assert.equal(session.accountContextVersion, "23");
+});
+
+test("Demo session ignores an older context response that arrives after a newer response", async () => {
+  let releaseOlder;
+  let releaseNewer;
+  const olderResponse = new Promise((resolve) => {
+    releaseOlder = resolve;
+  });
+  const newerResponse = new Promise((resolve) => {
+    releaseNewer = resolve;
+  });
+  const session = new DemoSession("http://127.0.0.1:3000", async (url) => {
+    if (url.pathname === "/api/v1/auth/me") {
+      return new Response("{}", {
+        headers: {
+          "Set-Cookie": "oss_session=session-id; Path=/; HttpOnly",
+          "X-OSS-Account-Context-Version": "16",
+          "X-OSS-Client-Account-Id": "account-a",
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/older") return olderResponse;
+    if (url.pathname === "/api/v1/newer") return newerResponse;
+    throw new Error(`Unexpected Demo request ${url.pathname}`);
+  });
+
+  await session.request("/api/v1/auth/me");
+  const older = session.request("/api/v1/older");
+  const newer = session.request("/api/v1/newer");
+  releaseNewer(
+    new Response("{}", {
+      headers: {
+        "X-OSS-Account-Context-Version": "18",
+        "X-OSS-Client-Account-Id": "account-b",
+      },
+    }),
+  );
+  await newer;
+  releaseOlder(
+    new Response("{}", {
+      headers: {
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+  );
+  await older;
+
+  assert.equal(session.accountContextVersion, "18");
+  assert.equal(session.clientAccountId, "account-b");
+});
+
+test("Demo session preserves context on public responses and rejects old-session responses", async () => {
+  let releaseOldSessionResponse;
+  const oldSessionResponse = new Promise((resolve) => {
+    releaseOldSessionResponse = resolve;
+  });
+  const session = new DemoSession("http://127.0.0.1:3000", async (url) => {
+    if (url.pathname === "/api/v1/auth/me") {
+      return new Response("{}", {
+        headers: {
+          "Set-Cookie": "oss_session=old-session; Path=/; HttpOnly",
+          "X-OSS-Account-Context-Version": "17",
+          "X-OSS-Client-Account-Id": "account-a",
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/catalog") return new Response("{}");
+    if (url.pathname === "/api/v1/old-session") return oldSessionResponse;
+    if (url.pathname === "/api/v1/auth/login") {
+      return new Response("{}", {
+        headers: {
+          "Set-Cookie": "oss_session=new-session; Path=/; HttpOnly",
+          "X-OSS-Account-Context-Version": "0",
+        },
+      });
+    }
+    throw new Error(`Unexpected Demo request ${url.pathname}`);
+  });
+
+  await session.request("/api/v1/auth/me");
+  await session.request("/api/v1/catalog");
+  assert.equal(session.accountContextVersion, "17");
+  assert.equal(session.clientAccountId, "account-a");
+
+  const oldRequest = session.request("/api/v1/old-session");
+  await session.request("/api/v1/auth/login", { method: "POST", body: "{}" });
+  releaseOldSessionResponse(
+    new Response("{}", {
+      headers: {
+        "X-OSS-Account-Context-Version": "18",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+  );
+  await oldRequest;
+
+  assert.equal(session.cookie, "oss_session=new-session");
+  assert.equal(session.accountContextVersion, "0");
+  assert.equal(session.clientAccountId, null);
+});
+
+test("Demo session treats a logout clear-cookie as terminal and ignores stale context headers", async () => {
+  const requests = [];
+  const responses = [
+    new Response("{}", {
+      headers: {
+        "Set-Cookie": "oss_session=session-id; Path=/; HttpOnly",
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response(null, {
+      status: 204,
+      headers: {
+        "Set-Cookie": "oss_session=; Path=/; HttpOnly; Max-Age=0",
+        "X-OSS-Account-Context-Version": "17",
+        "X-OSS-Client-Account-Id": "account-a",
+      },
+    }),
+    new Response("{}"),
+  ];
+  const session = new DemoSession("http://127.0.0.1:3000", async (url, init) => {
+    requests.push({ url: String(url), init });
+    return responses.shift();
+  });
+
+  await session.request("/api/v1/auth/me");
+  const epochBeforeLogout = session.sessionEpoch;
+  await session.request("/api/v1/auth/logout", { method: "POST", body: "{}" }, 204);
+
+  assert.equal(session.cookie, "");
+  assert.equal(session.sessionEpoch, epochBeforeLogout + 1);
+  assert.equal(session.accountContextVersion, null);
+  assert.equal(session.clientAccountId, null);
+
+  await session.request("/api/v1/catalog");
+  assert.equal(requests[2].init.headers.get("Cookie"), null);
+  assert.equal(requests[2].init.headers.get("X-OSS-Account-Context-Version"), null);
+});
+
 function ticketSessions({ leakInternalNote = false } = {}) {
   const clientAccountId = "customer-account";
   const serviceId = "active-service";
@@ -838,4 +1130,78 @@ test("ticket smoke fails if the customer response exposes the internal note", as
     }),
     /internal note leaked into the customer ticket view/,
   );
+});
+
+test("service operation smoke records Stop, Start, and Reboot terminal facts", async () => {
+  const serviceId = "10000000-0000-4000-8000-000000000001";
+  const requestIds = [
+    "20000000-0000-4000-8000-000000000001",
+    "20000000-0000-4000-8000-000000000002",
+    "20000000-0000-4000-8000-000000000003",
+  ];
+  const facts = [];
+  let resourceState = "running";
+  let resourceRevision = 1;
+  const requestedActions = [];
+  const customerSession = {
+    async request(path, init, expectedStatus) {
+      assert.equal(path, `/api/v1/services/${serviceId}/operations`);
+      if (init?.method === "POST") {
+        assert.equal(expectedStatus, 201);
+        const body = JSON.parse(init.body);
+        const expectedAction = ["stop", "start", "reboot"][requestedActions.length];
+        assert.equal(body.action, expectedAction);
+        assert.equal(body.expectedServiceVersion, 1);
+        assert.equal(body.expectedResourceRevision, resourceRevision);
+        requestedActions.push(body.action);
+        resourceState = body.action === "stop" ? "stopped" : "running";
+        resourceRevision += 1;
+        const requestId = requestIds[facts.length];
+        facts.unshift({
+          requestId,
+          action: body.action,
+          executionMode: "automatic",
+          status: "succeeded",
+          resultingResourceState: resourceState,
+          revision: 2,
+        });
+        return {
+          requestId,
+          serviceId,
+          action: body.action,
+          executionMode: "automatic",
+          status: "queued",
+          replayed: false,
+        };
+      }
+      return {
+        warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+        service: {
+          id: serviceId,
+          status: "active",
+          version: 1,
+          resourceState,
+          resourceRevision,
+          availableActions: resourceState === "stopped" ? ["start"] : ["stop", "reboot"],
+        },
+        items: facts,
+      };
+    },
+  };
+
+  const result = await runServiceOperationsSmoke({
+    customerSession,
+    serviceId,
+    timeoutMs: 1_000,
+  });
+  assert.deepEqual(requestedActions, ["stop", "start", "reboot"]);
+  assert.deepEqual(result.requests.map((request) => request.requestId), requestIds);
+  assert.deepEqual(result.requests.map((request) => request.status), [
+    "succeeded",
+    "succeeded",
+    "succeeded",
+  ]);
+  assert.equal(result.finalServiceStatus, "active");
+  assert.equal(result.finalResourceState, "running");
+  assert.equal(result.finalResourceRevision, 4);
 });

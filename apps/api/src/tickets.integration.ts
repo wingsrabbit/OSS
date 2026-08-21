@@ -7,13 +7,19 @@ import {
   assertSchema018NativeSafe,
   schema018CatalogDigest,
   schema018CatalogFingerprintInput,
+  SCHEMA_018,
   SCHEMA_018_CATALOG_DIGEST,
 } from "@opensales/core/schema-017-018-native-compatibility";
 import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
 import type { Config } from "./config.js";
-import { assertSchemaCompatible, runMigrations } from "./database.js";
+import {
+  assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
+  runMigrations,
+  transaction,
+} from "./database.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required for ticket integration");
@@ -45,9 +51,11 @@ const config: Config = {
     "synthetic-ticket-capability-secret-0000000000",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 61).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 62).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 63).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-ticket-payment-hook-000000000",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-ticket-provision-hook-0000000",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 
@@ -87,26 +95,30 @@ async function createFixture(label: string): Promise<Fixture> {
   const accountId = randomUUID();
   const sessionId = randomUUID();
   const sessionToken = randomBytes(32).toString("base64url");
-  await pool.query(
-    `INSERT INTO users(id, email, password_hash, email_verified_at)
-     VALUES ($1, $2, 'synthetic-not-a-password', now())`,
-    [userId, `ticket-${label}-${namespace}@example.invalid`],
-  );
-  await pool.query(
-    `INSERT INTO client_accounts(id, name, owner_user_id)
-     VALUES ($1, $2, $3)`,
-    [accountId, `Synthetic Ticket ${label}`, userId],
-  );
-  await pool.query(
-    `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
-     VALUES ($1, $2, 'owner', '["*"]'::jsonb)`,
-    [accountId, userId],
-  );
-  await pool.query(
-    `INSERT INTO sessions(id, user_id, token_digest, expires_at)
-     VALUES ($1, $2, $3, now() + interval '1 hour')`,
-    [sessionId, userId, digestToken(sessionToken)],
-  );
+  await transaction(pool, async (client) => {
+    await client.query(
+      `INSERT INTO users(id, email, password_hash, email_verified_at)
+       VALUES ($1, $2, 'synthetic-not-a-password', now())`,
+      [userId, `ticket-${label}-${namespace}@example.invalid`],
+    );
+    await client.query(
+      `INSERT INTO client_accounts(id, name, owner_user_id)
+       VALUES ($1, $2, $3)`,
+      [accountId, `Synthetic Ticket ${label}`, userId],
+    );
+    await client.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES ($1, $2, 'owner', '["*"]'::jsonb)`,
+      [accountId, userId],
+    );
+    await client.query(
+      `INSERT INTO sessions(
+         id, user_id, token_digest, expires_at,
+         active_client_account_id, account_context_version
+       ) VALUES ($1, $2, $3, now() + interval '1 hour', $4, 1)`,
+      [sessionId, userId, digestToken(sessionToken), accountId],
+    );
+  });
   return { userId, accountId, sessionId, sessionToken };
 }
 
@@ -184,7 +196,7 @@ try {
     END
     $$;
   `);
-  await runMigrations(pool);
+  await runMigrations(pool, { throughVersion: SCHEMA_018 });
   const repairedFunctions = await pool.query<{ definition: string }>(
     `SELECT pg_catalog.pg_get_functiondef(procedure.oid) AS definition
      FROM pg_catalog.pg_proc procedure
@@ -217,9 +229,10 @@ try {
     SCHEMA_018_CATALOG_DIGEST,
     "commit the digest emitted by the actual PostgreSQL 18 ticket catalog",
   );
-  const preflight = await assertSchemaCompatible(pool);
-  assert.equal(preflight.installedSchemaVersion, "018_stage_c_support_tickets");
-  assert.equal(preflight.mode, "native");
+  const schema018Preflight = await assertSchema018NativeSafe({
+    query: async (text: string, values?: unknown[]) => pool.query(text, values),
+  });
+  assert.equal(schema018Preflight.installedSchemaVersion, SCHEMA_018);
   await assertNative018RejectsCatalogDrift(
     "DROP TRIGGER z_schema_017_manual_outflow_provider_rejection ON public.provider_operations",
     /Schema 017 is incomplete or counterfeit/,
@@ -232,6 +245,11 @@ try {
     "ALTER TABLE public.support_tickets DROP CONSTRAINT support_tickets_status_check",
     /Schema 018 is incomplete or counterfeit/,
   );
+
+  await runMigrations(pool);
+  const preflight = await assertSchemaCompatible(pool);
+  assert.equal(preflight.installedSchemaVersion, REQUIRED_SCHEMA_VERSION);
+  assert.equal(preflight.mode, "native");
 
   const customerA = await createFixture("customer-a");
   const customerB = await createFixture("customer-b");
@@ -249,11 +267,19 @@ try {
   const cookieA = `oss_ticket_session=${customerA.sessionToken}`;
   const cookieB = `oss_ticket_session=${customerB.sessionToken}`;
   const staffCookie = `oss_ticket_session=${staff.sessionToken}`;
+  const customerAHeaders = {
+    cookie: cookieA,
+    "x-oss-account-context-version": "1",
+  };
+  const customerBHeaders = {
+    cookie: cookieB,
+    "x-oss-account-context-version": "1",
+  };
 
   const created = await app.inject({
     method: "POST",
     url: "/api/v1/tickets",
-    headers: { cookie: cookieA },
+    headers: customerAHeaders,
     payload: {
       subject: "Synthetic routing question",
       message: "Please confirm the Mock-only service handoff.",
@@ -276,20 +302,20 @@ try {
   const otherAccountRead = await app.inject({
     method: "GET",
     url: `/api/v1/tickets/${ticketId}`,
-    headers: { cookie: cookieB },
+    headers: customerBHeaders,
   });
   assert.equal(otherAccountRead.statusCode, 404);
   const otherAccountReply = await app.inject({
     method: "POST",
     url: `/api/v1/tickets/${ticketId}/replies`,
-    headers: { cookie: cookieB },
+    headers: customerBHeaders,
     payload: { message: "This must not be accepted across accounts." },
   });
   assert.equal(otherAccountReply.statusCode, 404);
   const otherAccountService = await app.inject({
     method: "POST",
     url: "/api/v1/tickets",
-    headers: { cookie: cookieB },
+    headers: customerBHeaders,
     payload: {
       subject: "Wrong service association",
       message: "This account does not own the selected service.",
@@ -362,7 +388,7 @@ try {
   const customerDetail = await app.inject({
     method: "GET",
     url: `/api/v1/tickets/${ticketId}`,
-    headers: { cookie: cookieA },
+    headers: customerAHeaders,
   });
   assert.equal(customerDetail.statusCode, 200, customerDetail.body);
   const customerMessages = responseJson<{
@@ -378,7 +404,7 @@ try {
   const customerReply = await app.inject({
     method: "POST",
     url: `/api/v1/tickets/${ticketId}/replies`,
-    headers: { cookie: cookieA },
+    headers: customerAHeaders,
     payload: { message: "Customer reply: thank you, the Mock-only handoff is clear." },
   });
   assert.equal(customerReply.statusCode, 201, customerReply.body);
@@ -400,7 +426,7 @@ try {
   );
   assert.deepEqual(counts.rows[0], { public_count: "3", internal_count: "1" });
   process.stdout.write(
-    "ticketIntegration=passed native018=passed schema017ForwardRepair=passed inherited017Catalog=passed ticketCatalogDrift=passed ticketConstraintDrift=passed accountIsolation=passed internalVisibility=passed\n",
+    "ticketIntegration=passed native018=passed native019=passed schema017ForwardRepair=passed inherited017Catalog=passed ticketCatalogDrift=passed ticketConstraintDrift=passed accountIsolation=passed internalVisibility=passed\n",
   );
 } finally {
   if (app) await app.close().catch(() => undefined);

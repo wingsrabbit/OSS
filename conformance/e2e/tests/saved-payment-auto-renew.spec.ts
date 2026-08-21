@@ -2,6 +2,7 @@
 
 import { createHmac } from "node:crypto";
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { completeCatalogCheckout } from "./helpers/catalog-checkout.js";
 
 // This story creates settled financial and service facts. Retrying in the same
 // database would create another customer after the once-per-business-day run
@@ -171,7 +172,7 @@ test("saved Provider token and service authorization drive bounded automatic ren
 
   const product = page.locator("article").filter({ hasText: "HKBGP VPS" }).first();
   await product.getByRole("button", { name: /monthly/i }).click();
-  await page.getByRole("dialog").getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(page.getByRole("dialog"));
   const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await journey.getByTestId("save-payment-method-consent").check();
   await expect(journey.getByTestId("enable-auto-renew-consent")).not.toBeChecked();

@@ -3,6 +3,82 @@
 export const LAB_BANNER = "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY" as const;
 
 export {
+  NOTIFICATION_PREFERENCE_CATEGORIES,
+  renderNotificationTemplate,
+  type NotificationPreferenceCategory,
+  type NotificationTemplateLocale,
+  type NotificationTemplateRevision,
+  type NotificationTemplateValue,
+} from "./notification-templates.js";
+
+export {
+  CONTENT_KINDS,
+  CONTENT_LOCALES,
+  CONTENT_STATUS_LEVELS,
+  contentLocale,
+  resolveLocalizedCurrent,
+  type ContentKind,
+  type ContentLocale,
+  type ContentStatusLevel,
+  type LocalizedCurrentRevision,
+} from "./content-operations.js";
+
+export const CUSTOMER_CAPABILITIES = [
+  "account.contacts.manage",
+  "account.contacts.read",
+  "account.history.read",
+  "account.members.manage",
+  "account.members.read",
+  "billing.read",
+  "billing.write",
+  "orders.create",
+  "services.manage",
+  "support.tickets.write",
+] as const;
+
+export type CustomerCapability = (typeof CUSTOMER_CAPABILITIES)[number];
+export type CustomerMembershipRole = "owner" | "billing" | "technical" | "viewer";
+
+const customerCapabilitySet = new Set<string>(CUSTOMER_CAPABILITIES);
+
+export function customerMembershipCapabilities(input: Readonly<{
+  role: CustomerMembershipRole;
+  permissions: readonly string[];
+}>): readonly CustomerCapability[] {
+  if (input.role === "owner" || input.permissions.includes("*")) {
+    return [...CUSTOMER_CAPABILITIES];
+  }
+  const capabilities = new Set<CustomerCapability>([
+    "account.history.read",
+    "billing.read",
+  ]);
+  if (input.role === "billing") {
+    capabilities.add("orders.create");
+    capabilities.add("billing.write");
+    capabilities.add("support.tickets.write");
+  } else if (input.role === "technical") {
+    capabilities.add("services.manage");
+    capabilities.add("support.tickets.write");
+  }
+  for (const permission of input.permissions) {
+    if (customerCapabilitySet.has(permission)) {
+      capabilities.add(permission as CustomerCapability);
+    }
+  }
+  return [...capabilities].sort();
+}
+
+export function hasCustomerMembershipCapability(
+  input: Readonly<{
+    role: CustomerMembershipRole;
+    permissions: readonly string[];
+  }>,
+  capability: CustomerCapability,
+): boolean {
+  return customerMembershipCapabilities(input).includes(capability);
+}
+
+export {
   assertMigrationDatabaseRoleSafe,
   assertRuntimeDatabaseRoleSafe,
   type DatabaseRoleBoundaryQueryable,
@@ -10,6 +86,72 @@ export {
 
 export type BillingCycle = "monthly" | "quarterly" | "semiannual" | "annual" | "one_time";
 export type FulfillmentMode = "automatic" | "review" | "manual" | "quote";
+export type StaffFulfillmentAction =
+  | "approve_provider_provisioning"
+  | "confirm_manual_ready";
+
+export function paidOrderRequiresStaffFulfillmentReview(
+  fulfillmentMode: FulfillmentMode,
+  invoiceTotalMinor: bigint,
+): boolean {
+  if (invoiceTotalMinor < 0n) {
+    throw new Error("Invoice total cannot be negative");
+  }
+  return invoiceTotalMinor === 0n || fulfillmentMode !== "automatic";
+}
+
+export function staffFulfillmentAction(
+  fulfillmentMode: FulfillmentMode,
+  invoiceTotalMinor: bigint,
+): StaffFulfillmentAction | null {
+  if (invoiceTotalMinor < 0n) {
+    throw new Error("Invoice total cannot be negative");
+  }
+  if (fulfillmentMode === "manual" || fulfillmentMode === "quote") {
+    return "confirm_manual_ready";
+  }
+  if (fulfillmentMode === "review" || invoiceTotalMinor === 0n) {
+    return "approve_provider_provisioning";
+  }
+  return null;
+}
+
+export function staffFulfillmentActionForBinding(input: Readonly<{
+  fulfillmentMode: FulfillmentMode;
+  invoiceTotalMinor: bigint;
+  bindingConfigured: boolean;
+  providerInstallationId: string | null;
+}>): StaffFulfillmentAction | null {
+  if (
+    input.bindingConfigured &&
+    input.providerInstallationId === null &&
+    (input.fulfillmentMode === "automatic" || input.fulfillmentMode === "review")
+  ) {
+    if (input.invoiceTotalMinor < 0n) {
+      throw new Error("Invoice total cannot be negative");
+    }
+    return "confirm_manual_ready";
+  }
+  return staffFulfillmentAction(input.fulfillmentMode, input.invoiceTotalMinor);
+}
+
+export function providerProvisioningCanStart(input: Readonly<{
+  fulfillmentMode: FulfillmentMode;
+  invoiceTotalMinor: bigint;
+  explicitStaffApprovalRecorded: boolean;
+}>): boolean {
+  if (input.invoiceTotalMinor < 0n) {
+    throw new Error("Invoice total cannot be negative");
+  }
+  if (input.fulfillmentMode === "review") {
+    return input.explicitStaffApprovalRecorded;
+  }
+  if (input.fulfillmentMode !== "automatic") {
+    return false;
+  }
+  return input.invoiceTotalMinor > 0n || input.explicitStaffApprovalRecorded;
+}
+
 export type OrderStatus =
   | "waiting_payment"
   | "on_hold"

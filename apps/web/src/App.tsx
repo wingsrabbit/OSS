@@ -6,6 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -14,15 +15,54 @@ import {
   ManualReceiptOutflowPanel,
   type ManualReceiptOriginalSourceOutflow,
 } from "./ManualReceiptOutflows.js";
-import { ApiError, api, hardResetSession } from "./api.js";
-import { TicketsPanel } from "./TicketsPanel.js";
+import {
+  AdminAccount360,
+  type AdminAccountAction,
+} from "./AdminAccount360.js";
+import { AccountAccessPanel } from "./AccountAccessPanel.js";
+import { AdminCommercePanel } from "./AdminCommercePanel.js";
+import { AdminServiceOperationsQueue } from "./AdminServiceOperationsQueue.js";
+import { AccountContextSwitcher, type MembershipRole } from "./AccountContextSwitcher.js";
+import {
+  CatalogCheckoutPanel,
+  type CatalogCheckoutOrderPayload,
+  type CatalogPrice as Price,
+  type CatalogProduct as Product,
+} from "./CatalogCheckoutPanel.js";
+import {
+  ApiError,
+  ObsoleteSessionResponseError,
+  api,
+  getAccountContextSnapshot,
+  hardResetSession,
+  subscribeAccountContextInvalidation,
+} from "./api.js";
+import { CustomerBusinessHistory } from "./CustomerBusinessHistory.js";
+import {
+  CustomerQuotePanel,
+  MarketingConsentPanel,
+} from "./CustomerQuotePanel.js";
+import { ContentHub } from "./ContentHub.js";
+import { ContentOperationsPanel } from "./ContentOperationsPanel.js";
+import { LegalHub } from "./LegalHub.js";
+import { NotificationDeliveryHistory } from "./NotificationDeliveryHistory.js";
+import { NotificationOperationsPanel } from "./NotificationOperationsPanel.js";
+import { NotificationPreferencesPanel } from "./NotificationPreferencesPanel.js";
+import { NotificationTemplateRegistryPanel } from "./NotificationTemplateRegistryPanel.js";
+import { EmailChangePage, PasswordRecoveryPage, SecurityPanel } from "./SecurityPanel.js";
+import { SupportOperationsPanel } from "./SupportOperationsPanel.js";
 
 type Locale = "en" | "zh-CN";
-type AppRoute = "/" | "/customer" | "/admin";
+type AppRoute = "/" | "/customer" | "/admin" | "/security" | "/password-recovery" | "/email-change";
 
 function routeFromPath(pathname: string): AppRoute {
   const normalized = pathname.replace(/\/+$/, "") || "/";
-  if (normalized === "/customer" || normalized === "/admin") return normalized;
+  if (
+    normalized === "/customer" || normalized === "/admin" ||
+    normalized === "/security" || normalized === "/password-recovery" ||
+    normalized === "/email-change"
+  ) return normalized;
+  if (normalized === "/membership-invitations/accept") return "/customer";
   return "/";
 }
 
@@ -44,9 +84,19 @@ type Me = {
   id: string;
   email: string;
   locale: Locale;
-  clientAccountId: string;
-  membershipRole: string;
+  clientAccountId: string | null;
+  membershipRole: MembershipRole | null;
+  accountContextVersion: string;
+  context: {
+    clientAccountId: string;
+    name: string;
+    role: MembershipRole;
+    permissions: string[];
+    capabilities: string[];
+    version: string;
+  } | null;
   verification: { email: "pending" | "passed" };
+  restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
@@ -65,27 +115,49 @@ function parseStaffPermissions(value: unknown): ReadonlySet<string> {
   }
   return new Set(value);
 }
-type Price = {
-  id: string;
-  currency: string;
-  billingCycle: string;
-  oneTimeMinor: string;
-  setupMinor: string;
-  recurringMinor: string;
-};
-type Product = {
-  id: string;
-  groupId: string;
-  groupName: string;
-  name: string;
-  description: string;
-  fulfillmentMode: "automatic" | "review" | "manual" | "quote";
-  optionSchema: Array<Record<string, unknown>>;
-  prices: Price[];
-  purchasable: boolean;
-};
+
+const ADMIN_ENTRY_PERMISSIONS = [
+  "accounts.view",
+  "billing.manual_receipt_manage",
+  "billing.refund_manage",
+  "catalog.manage",
+  "catalog.pricing.manage",
+  "catalog.promotions.manage",
+  "catalog.promotions.read",
+  "catalog.read",
+  "catalog.supply.manage",
+  "content.read",
+  "notifications.read",
+  "notifications.templates.read",
+  "quotes.manage",
+  "quotes.read",
+  "services.manual_fulfillment",
+  "services.operations_manage",
+  "support.tickets.manage",
+] as const;
+
+function viewerCanOpenAdminWorkspace(viewer: Me | null): boolean {
+  if (
+    viewer?.verification.email !== "passed" ||
+    viewer.restrictions.user ||
+    !viewer.staff
+  ) return false;
+  const permissions = parseStaffPermissions(viewer.staff.permissions);
+  return permissions.has("*") || ADMIN_ENTRY_PERMISSIONS.some((permission) => permissions.has(permission));
+}
+
 type Legal = {
-  documents: Record<"terms" | "aup" | "privacy", { version: string; title: string; body: string }>;
+  requestedLocale: Locale;
+  documents: Record<"terms" | "aup" | "privacy", {
+    id: string;
+    documentId: string;
+    locale: Locale;
+    fallback: boolean;
+    revision: string;
+    version: string;
+    title: string;
+    body: string;
+  }>;
 };
 type OrderDetail = {
   order: { id: string; status: string; price: { productName: string; billingCycle: string } };
@@ -117,7 +189,19 @@ type OrderDetail = {
       effectiveAt: string;
       result: Record<string, unknown>;
       lastError: string | null;
-      providerOperation: { status: string; attempts: number } | null;
+      providerOperation: {
+        status: string;
+        attempts: number;
+        attemptId: string | null;
+        dispatchedAt: string | null;
+        reconcileQueries: number;
+        unresolvedReconcileQueries: number;
+        latestResult: {
+          outcome: "succeeded" | "failed";
+          source: "callback" | "reconciliation" | null;
+          occurredAt: string | null;
+        } | null;
+      } | null;
     } | null;
   };
 };
@@ -139,12 +223,27 @@ type LabMessage = {
 type ManualItem = {
   serviceId: string;
   orderId: string;
+  clientAccountId: string;
   productName: string;
   billingCycle: string;
   clientAccountName: string;
   paidMinor: string;
   totalMinor: string;
   submittedAt: string;
+  action?: "approve_provider_provisioning" | "confirm_manual_ready" | null;
+  fulfillmentExecutionMode?: "manual" | "provider" | "unconfigured";
+  providerInstallationId?: string | null;
+  bindingPolicyVersion?: number | null;
+};
+type AdminOperationContext = {
+  action: AdminAccountAction;
+  account: { id: string; name: string };
+};
+type AdminOperationScope = {
+  operationGeneration: number;
+  accessGeneration: number;
+  accountId: string | null;
+  accessFingerprint: string;
 };
 type AdminCancellationItem = {
   requestId: string;
@@ -159,9 +258,26 @@ type AdminCancellationItem = {
   executionVersion: number;
   serviceVersion: number;
   lastError: string | null;
-  providerOperation: { status: string; attempts: number } | null;
-  job: { status: string; lastError: string | null };
+  providerOperation: {
+    status: string;
+    attempts: number;
+    attemptId: string | null;
+    dispatchedAt: string | null;
+    reconcileQueries: number;
+    unresolvedReconcileQueries: number;
+    latestResult: {
+      outcome: "succeeded" | "failed";
+      source: "callback" | "reconciliation" | null;
+      occurredAt: string | null;
+    } | null;
+  } | null;
+  job: {
+    type: "service.cancellation.due" | "service.cancellation.reconcile";
+    status: string;
+    lastError: string | null;
+  };
   interventionRequired: boolean;
+  completionAllowed: boolean;
 };
 
 function cancellationStatusLabel(
@@ -280,6 +396,7 @@ type RefundCandidate = {
 type RefundRecord = {
   refundId: string;
   invoiceId: string | null;
+  clientAccountId: string;
   sourceContext: "allocated_invoice" | "unclaimed_funds";
   receiptId: string;
   destination: "original_payment" | "credit" | "none";
@@ -481,6 +598,7 @@ type RenewalReminder = {
     | "delivered"
     | "bounced"
     | "failed"
+    | "skipped"
     | "suppressed"
     | "retrying"
     | "manual";
@@ -759,7 +877,26 @@ export function App() {
   const [products, setProducts] = useState<Product[]>([]);
   const [legal, setLegal] = useState<Legal | null>(null);
   const [me, setMe] = useState<Me | null>(null);
+  const meRef = useRef<Me | null>(null);
+  meRef.current = me;
+  const meRequestGeneration = useRef(0);
   const [sessionResolved, setSessionResolved] = useState(false);
+  const [loginChallenge, setLoginChallenge] = useState<{
+    id: string;
+    token: string;
+    methods: string[];
+  } | null>(null);
+  const [membershipInvitationToken, setMembershipInvitationToken] = useState<string | null>(() => {
+    const path = window.location.pathname.replace(/\/+$/, "") || "/";
+    if (path !== "/membership-invitations/accept") return null;
+    return new URLSearchParams(window.location.search).get("token");
+  });
+  const invitationAcceptGeneration = useRef(0);
+  const invitationAccepting = useRef(false);
+  const [invitationAcceptPending, setInvitationAcceptPending] = useState(false);
+  const [invitationAcceptError, setInvitationAcceptError] = useState("");
+  const [invitationRetryNonce, setInvitationRetryNonce] = useState(0);
+  const [acceptedInvitationAccountId, setAcceptedInvitationAccountId] = useState<string | null>(null);
   const [selected, setSelected] = useState<{ product: Product; price: Price } | null>(null);
   const [order, setOrder] = useState<OrderDetail | null>(null);
   const [notice, setNoticeRaw] = useState<string>("");
@@ -806,9 +943,14 @@ export function App() {
   const [adminChargebackHolds, setAdminChargebackHolds] = useState<
     AddFundsChargebackHold[]
   >([]);
-  const [quantity, setQuantity] = useState(1);
   const [mail, setMail] = useState<LabMessage[]>([]);
   const [manualItems, setManualItems] = useState<ManualItem[]>([]);
+  const [adminOperationContext, setAdminOperationContext] =
+    useState<AdminOperationContext | null>(null);
+  const adminOperationContextRef = useRef<AdminOperationContext | null>(null);
+  const adminOperationGeneration = useRef(0);
+  const adminAccessGeneration = useRef(0);
+  const manualReceiptRequestGeneration = useRef(0);
   const [adminCancellations, setAdminCancellations] = useState<AdminCancellationItem[]>([]);
   const [cancellationCompletionReason, setCancellationCompletionReason] = useState("");
   const [cancellationCompletionPendingId, setCancellationCompletionPendingId] = useState<
@@ -816,6 +958,8 @@ export function App() {
   >(null);
   const cancellationCompletionIntentKeys = useRef(new Map<string, string>());
   const [manualReceiptClientAccountId, setManualReceiptClientAccountId] = useState("");
+  const manualReceiptClientAccountIdRef = useRef("");
+  manualReceiptClientAccountIdRef.current = manualReceiptClientAccountId;
   const [manualReceiptReference, setManualReceiptReference] = useState("");
   const [manualReceiptReceivedAt, setManualReceiptReceivedAt] = useState(
     defaultManualReceiptTime,
@@ -842,7 +986,6 @@ export function App() {
   const [manualReceiptReversalOutcome, setManualReceiptReversalOutcome] =
     useState<ManualReceiptReversalOutcome | null>(null);
   const manualReceiptReversalIntentKeys = useRef(new Map<string, string>());
-  const manualReceiptDefaultedForUser = useRef<string | null>(null);
   const [unclaimedFunds, setUnclaimedFunds] = useState<UnclaimedFundItem[]>([]);
   const [refundCandidates, setRefundCandidates] = useState<RefundCandidate[]>([]);
   const [refundRecords, setRefundRecords] = useState<Record<string, RefundRecord>>({});
@@ -865,6 +1008,8 @@ export function App() {
   const refundManualActionInFlight = useRef(new Set<string>());
   const refundCorrectionInFlight = useRef(new Set<string>());
   const refundCapacityAcknowledgementInFlight = useRef(new Set<string>());
+  const refundPollInFlight = useRef(new Map<string, number>());
+  const refundPollRequestSequence = useRef(0);
   const [refundAdjudicationPendingIds, setRefundAdjudicationPendingIds] = useState<
     ReadonlySet<string>
   >(new Set());
@@ -918,17 +1063,155 @@ export function App() {
     () => parseStaffPermissions(me?.staff?.permissions),
     [me?.staff?.permissions],
   );
-  const eligibleStaff = me?.eligible === true && me.staff !== null;
+  const staffPermissionFingerprint = [...staffPermissions].sort().join("\u0000");
+  const staffMembershipActive = me?.staff !== null && me?.staff !== undefined;
+  const staffIdentityEligible =
+    me?.verification.email === "passed" && me.restrictions.user === false;
+  const staffPrincipalFingerprint = [
+    me?.id ?? "",
+    staffIdentityEligible ? "eligible" : "ineligible",
+    staffMembershipActive ? "active" : "inactive",
+  ].join("\u0001");
+  const staffAccessFingerprint = [
+    staffPrincipalFingerprint,
+    staffPermissionFingerprint,
+  ].join("\u0002");
+  const staffAccessFingerprintRef = useRef(staffAccessFingerprint);
+  staffAccessFingerprintRef.current = staffAccessFingerprint;
+  const previousStaffAccessFingerprint = useRef(staffAccessFingerprint);
+  const previousStaffPrincipalFingerprint = useRef(staffPrincipalFingerprint);
+  const canReadCustomerAccount =
+    me?.verification.email === "passed" &&
+    me.restrictions.user === false &&
+    me.clientAccountId !== null &&
+    me.clientAccountId !== undefined;
+  // A Client Account restriction blocks commerce and money mutations, but it
+  // must never cut off the verified User's support lifeline.
+  const accountCapabilities = new Set(me?.context?.capabilities ?? []);
+  const accountPermissionGranted = (permission: string) => accountCapabilities.has(permission);
+  const canReadCustomerHistory = canReadCustomerAccount;
+  const canReadCustomerNotificationHistory =
+    canReadCustomerAccount && accountPermissionGranted("account.history.read");
+  const canReadNotificationPreferences =
+    me?.verification.email === "passed" && me.restrictions.user === false;
+  const canWriteNotificationPreferences = canReadNotificationPreferences;
+  const notificationPreferenceAccessFingerprint = [
+    me?.id ?? "",
+    canReadNotificationPreferences ? "read" : "no-read",
+    canWriteNotificationPreferences ? "write" : "no-write",
+  ].join("\u0001");
+  const canUseCustomerSupport = canReadCustomerAccount;
+  const canWriteCustomerSupport =
+    canUseCustomerSupport && accountPermissionGranted("support.tickets.write");
+  const canCreateOrders =
+    me?.eligible === true && accountPermissionGranted("orders.create");
+  const canReadCustomerQuotes =
+    canReadCustomerAccount && accountPermissionGranted("account.history.read");
+  const canReadMarketingConsent = canReadCustomerQuotes;
+  const canWithdrawMarketingConsent =
+    me?.eligible === true && accountPermissionGranted("account.history.read");
+  const customerCommerceAccessFingerprint = [
+    me?.id ?? "",
+    me?.clientAccountId ?? "",
+    me?.accountContextVersion ?? "",
+    me?.context?.version ?? "",
+    [...accountCapabilities].sort().join("\u0000"),
+  ].join("\u0001");
+  const canWriteBilling =
+    me?.eligible === true && accountPermissionGranted("billing.write");
+  const canManageServices =
+    me?.eligible === true && accountPermissionGranted("services.manage");
+  const eligibleStaff = staffIdentityEligible && staffMembershipActive;
+  const staffPermissionGranted = (permission: string) =>
+    eligibleStaff && (staffPermissions.has("*") || staffPermissions.has(permission));
+  const canReadCatalog = staffPermissionGranted("catalog.read");
+  const canManageCatalog = staffPermissionGranted("catalog.manage");
+  const canManageCatalogPricing = staffPermissionGranted("catalog.pricing.manage");
+  const canManageCatalogSupply = staffPermissionGranted("catalog.supply.manage");
+  const canReadPromotions = staffPermissionGranted("catalog.promotions.read");
+  const canManagePromotions = staffPermissionGranted("catalog.promotions.manage");
+  const canReadQuotes = staffPermissionGranted("quotes.read");
+  const canManageQuotes = staffPermissionGranted("quotes.manage");
+  const canReadNotificationOperations = staffPermissionGranted("notifications.read");
+  const canRetryNotificationOperations = staffPermissionGranted("notifications.retry");
   const canManageStaffTickets =
     eligibleStaff &&
     (staffPermissions.has("*") || staffPermissions.has("support.tickets.manage"));
+  const canManageManualReceipts =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("billing.manual_receipt_manage"));
+  const canManageUnclaimedFunds =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("billing.unclaimed_manage"));
+  const canManageRefunds =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("billing.refund_manage"));
+  const canManageManualFulfillment =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("services.manual_fulfillment"));
+  const canReadContent =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("content.read"));
+  const canManageContent =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("content.manage"));
+  const canReadNotificationTemplates = staffPermissionGranted("notifications.templates.read");
+  const canCreateNotificationTemplates = staffPermissionGranted("notifications.templates.create");
+  const canPublishNotificationTemplates = staffPermissionGranted("notifications.templates.publish");
+  const canRetireNotificationTemplates = staffPermissionGranted("notifications.templates.retire");
   const canUseFullAdminWorkspace = eligibleStaff && staffPermissions.has("*");
-  const canOpenAdminWorkspace = canManageStaffTickets || canUseFullAdminWorkspace;
+  const canViewAccount360 =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("accounts.view"));
+  const canManageServiceOperations =
+    eligibleStaff &&
+    (staffPermissions.has("*") || staffPermissions.has("services.operations_manage"));
+  const canOpenAdminWorkspace = viewerCanOpenAdminWorkspace(me);
   const canUseFullAdminRoute = route === "/admin" && canUseFullAdminWorkspace;
+  const canManageManualReceiptsRoute = route === "/admin" && canManageManualReceipts;
+  const canManageRefundsRoute = route === "/admin" && canManageRefunds;
+  const canManageManualFulfillmentRoute = route === "/admin" && canManageManualFulfillment;
+  const canMountAdminOperationWorkspace =
+    canUseFullAdminWorkspace ||
+    canManageManualReceipts ||
+    canManageRefunds ||
+    canManageManualFulfillment;
+  const account360Actions = useMemo<ReadonlySet<AdminAccountAction>>(() => {
+    const actions = new Set<AdminAccountAction>();
+    if (canManageManualReceipts) actions.add("manual_receipt");
+    if (canManageRefunds) actions.add("refund");
+    if (canManageManualFulfillment) actions.add("manual_fulfillment");
+    if (canManageStaffTickets) actions.add("ticket");
+    return actions;
+  }, [
+    canManageManualFulfillment,
+    canManageManualReceipts,
+    canManageRefunds,
+    canManageStaffTickets,
+  ]);
+  const manualReceiptContextFingerprint = [
+    route,
+    staffAccessFingerprint,
+    canManageManualReceipts ? "manual-receipt" : "no-manual-receipt",
+    canManageUnclaimedFunds ? "reversal" : "no-reversal",
+    adminOperationContext?.action ?? "unscoped",
+    adminOperationContext?.account.id ?? "unscoped",
+  ].join("\u0003");
+  const previousManualReceiptContextFingerprint = useRef(
+    manualReceiptContextFingerprint,
+  );
 
   const clearWorkspaceTransientState = useCallback(() => {
+    const location = new URL(window.location.href);
+    const hadCustomerDetail = location.searchParams.has("invoice") || location.searchParams.has("service");
+    location.searchParams.delete("invoice");
+    location.searchParams.delete("service");
+    if (hadCustomerDetail) {
+      window.history.replaceState({}, "", `${location.pathname}${location.search}${location.hash}`);
+    }
     setNoticeRaw("");
     setErrorRaw("");
+    setLoginChallenge(null);
     setSelected(null);
     setOrder(null);
     setBilling(null);
@@ -957,12 +1240,16 @@ export function App() {
     setAdminChargebacks([]);
     setAdminUnclaimedChargebacks([]);
     setAdminChargebackHolds([]);
-    setQuantity(1);
     setMail([]);
     setManualItems([]);
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
     setAdminCancellations([]);
     setCancellationCompletionReason("");
     setCancellationCompletionPendingId(null);
+    manualReceiptClientAccountIdRef.current = "";
     setManualReceiptClientAccountId("");
     setManualReceiptReference("");
     setManualReceiptReceivedAt(defaultManualReceiptTime());
@@ -977,7 +1264,6 @@ export function App() {
     setManualReceiptReversalReason("");
     setManualReceiptReversalPendingId(null);
     setManualReceiptReversalOutcome(null);
-    manualReceiptDefaultedForUser.current = null;
     setUnclaimedFunds([]);
     setRefundCandidates([]);
     setRefundRecords({});
@@ -1012,6 +1298,13 @@ export function App() {
     manualReceiptIntentKeys.current.clear();
     manualReceiptReversalIntentKeys.current.clear();
     refundIntentKeys.current.clear();
+    refundInFlight.current.clear();
+    refundAdjudicationInFlight.current.clear();
+    refundManualActionInFlight.current.clear();
+    refundCorrectionInFlight.current.clear();
+    refundCapacityAcknowledgementInFlight.current.clear();
+    fundResolutionInFlight.current.clear();
+    refundPollInFlight.current.clear();
   }, []);
 
   const openRoute = useCallback((target: AppRoute, replace = false) => {
@@ -1052,6 +1345,18 @@ export function App() {
     setNotice("");
     setError(message);
   }, [setError, setNotice]);
+  const contentNotice = useRef(showTicketNotice);
+  const contentError = useRef(showTicketError);
+  contentNotice.current = showTicketNotice;
+  contentError.current = showTicketError;
+  const showContentNotice = useCallback(
+    (message: string) => contentNotice.current(message),
+    [],
+  );
+  const showContentError = useCallback(
+    (message: string) => contentError.current(message),
+    [],
+  );
   const text = words[locale];
   const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const manualReceiptAmountsValid =
@@ -1075,6 +1380,90 @@ export function App() {
     paymentSettingsReauthExpiresAt !== null && paymentSettingsReauthExpiresAt > Date.now();
   const paymentSettingsReauthReady =
     paymentSettingsReauthActive || paymentSettingsPassword.length > 0;
+  const operationAccount = adminOperationContext?.account ?? null;
+  const showUnscopedAdminOperations =
+    operationAccount === null && (canUseFullAdminWorkspace || !canViewAccount360);
+  const visibleManualItems = operationAccount
+    ? manualItems.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? manualItems
+      : [];
+  const visibleRefundCandidates = operationAccount
+    ? refundCandidates.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? refundCandidates
+      : [];
+  const visibleRefundSecurityHolds = operationAccount
+    ? refundSecurityHolds.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? refundSecurityHolds
+      : [];
+  const visibleRefundDismissalCorrections = operationAccount
+    ? refundDismissalCorrections.filter((item) => item.clientAccountId === operationAccount.id)
+    : showUnscopedAdminOperations
+      ? refundDismissalCorrections
+      : [];
+  const visibleRefundReceiptCapacityIncidents = operationAccount
+    ? refundReceiptCapacityIncidents.filter(
+        (item) => item.clientAccountId === operationAccount.id,
+      )
+    : showUnscopedAdminOperations
+      ? refundReceiptCapacityIncidents
+      : [];
+  const visibleRefundRecords = Object.values(refundRecords).filter(
+    (refund) =>
+      showUnscopedAdminOperations ||
+      (operationAccount !== null &&
+        refund.clientAccountId === operationAccount.id),
+  );
+  const captureAdminOperationScope = useCallback((): AdminOperationScope => ({
+    operationGeneration: adminOperationGeneration.current,
+    accessGeneration: adminAccessGeneration.current,
+    accountId: adminOperationContextRef.current?.account.id ?? null,
+    accessFingerprint: staffAccessFingerprintRef.current,
+  }), []);
+  const adminOperationRequestIsCurrent = useCallback(
+    (scope: AdminOperationScope, clientAccountId?: string) => {
+      if (
+        scope.operationGeneration !== adminOperationGeneration.current ||
+        scope.accessGeneration !== adminAccessGeneration.current ||
+        scope.accessFingerprint !== staffAccessFingerprintRef.current ||
+        activeRouteRef.current !== "/admin" ||
+        (adminOperationContextRef.current?.account.id ?? null) !== scope.accountId
+      ) {
+        return false;
+      }
+      return clientAccountId === undefined ||
+        scope.accountId === null ||
+        scope.accountId === clientAccountId;
+    },
+    [],
+  );
+  const currentManualReceiptScopeToken = useCallback((clientAccountId: string) => {
+    const context = adminOperationContextRef.current;
+    return [
+      activeRouteRef.current,
+      routeGenerationRef.current.toString(),
+      staffAccessFingerprintRef.current,
+      adminOperationGeneration.current.toString(),
+      context?.action ?? "unscoped",
+      context?.account.id ?? "unscoped",
+      manualReceiptRequestGeneration.current.toString(),
+      clientAccountId,
+    ].join("\u0004");
+  }, []);
+  const manualReceiptScopeIsCurrent = useCallback(
+    (scopeToken: string, clientAccountId: string) => {
+      if (
+        activeRouteRef.current !== "/admin" ||
+        manualReceiptClientAccountIdRef.current.trim().toLowerCase() !== clientAccountId
+      ) return false;
+      const context = adminOperationContextRef.current;
+      if (context && context.account.id !== clientAccountId) return false;
+      return scopeToken === currentManualReceiptScopeToken(clientAccountId);
+    },
+    [currentManualReceiptScopeToken],
+  );
 
   useEffect(() => {
     const onPopState = () => {
@@ -1092,12 +1481,25 @@ export function App() {
   }, [clearWorkspaceTransientState]);
 
   const refreshMe = useCallback(async (): Promise<Me | null> => {
+    const generation = ++meRequestGeneration.current;
     try {
       const viewer = await api<Me>("/api/v1/auth/me");
+      const capturedContext = getAccountContextSnapshot();
+      if (
+        generation !== meRequestGeneration.current ||
+        (capturedContext.version !== null &&
+          (viewer.accountContextVersion !== capturedContext.version ||
+            viewer.clientAccountId !== capturedContext.clientAccountId))
+      ) {
+        return meRef.current;
+      }
       setMe(viewer);
+      setLocale(viewer.locale);
       setSessionResolved(true);
       return viewer;
-    } catch {
+    } catch (caught) {
+      if (generation !== meRequestGeneration.current) return meRef.current;
+      if (caught instanceof ObsoleteSessionResponseError) return meRef.current;
       setMe(null);
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
@@ -1106,8 +1508,67 @@ export function App() {
     }
   }, []);
 
+  const toggleLocale = useCallback(async (): Promise<void> => {
+    const previous = locale;
+    const next: Locale = previous === "en" ? "zh-CN" : "en";
+    setLocale(next);
+    if (meRef.current === null) return;
+    try {
+      const persisted = await api<{ locale: Locale }>("/api/v1/auth/locale", {
+        method: "PUT",
+        body: JSON.stringify({ locale: next }),
+      });
+      setLocale(persisted.locale);
+      setMe((viewer) => viewer ? { ...viewer, locale: persisted.locale } : viewer);
+    } catch (caught) {
+      setLocale(previous);
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : previous === "zh-CN"
+            ? "无法保存语言偏好"
+            : "Unable to save the language preference",
+      );
+    }
+  }, [locale, setError]);
+
+  useEffect(() => subscribeAccountContextInvalidation(() => {
+    meRequestGeneration.current += 1;
+    invitationAcceptGeneration.current += 1;
+    invitationAccepting.current = false;
+    setInvitationAcceptPending(false);
+    routeGenerationRef.current += 1;
+    clearWorkspaceTransientState();
+    setMe(null);
+    // Public Home is deliberately session-neutral. It must discard stale
+    // workspace state, but a background identity read there is redundant.
+    if (activeRouteRef.current === "/") {
+      setSessionResolved(true);
+    } else {
+      setSessionResolved(false);
+      void refreshMe();
+    }
+  }), [clearWorkspaceTransientState, refreshMe]);
+
+  const accountContextSwitched = useCallback(async () => {
+    meRequestGeneration.current += 1;
+    invitationAcceptGeneration.current += 1;
+    routeGenerationRef.current += 1;
+    clearWorkspaceTransientState();
+    setMe(null);
+    setSessionResolved(false);
+    const viewer = await refreshMe();
+    if (viewer) {
+      setNoticeRaw(
+        locale === "zh-CN"
+          ? `当前客户账户：${viewer.context?.name ?? "未选择"}。`
+          : `Active Client Account: ${viewer.context?.name ?? "not selected"}.`,
+      );
+    }
+  }, [clearWorkspaceTransientState, locale, refreshMe]);
+
   const refreshLatestOrder = useCallback(async () => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setOrder(null);
       return;
     }
@@ -1118,21 +1579,21 @@ export function App() {
       return;
     }
     setOrder(await api<OrderDetail>(`/api/v1/orders/${latest.orderId}`));
-  }, [me?.clientAccountId, me?.eligible, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshBilling = useCallback(async () => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setBilling(null);
       return;
     }
     setBilling(await api<BillingSummary>("/api/v1/billing/summary"));
-  }, [me, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshPaymentSettings = useCallback(async () => {
     if (
       route !== "/customer" ||
       activeRouteRef.current !== "/customer" ||
-      me?.verification.email !== "passed"
+      !canReadCustomerHistory
     ) {
       setPaymentSettings(null);
       return;
@@ -1140,53 +1601,76 @@ export function App() {
     setPaymentSettings(
       await api<PaymentSettings>("/api/v1/billing/payment-settings"),
     );
-  }, [me?.clientAccountId, me?.verification.email, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   const refreshRenewals = useCallback(async (): Promise<RenewalItem[]> => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me?.eligible) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setRenewals([]);
       return [];
     }
     const result = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
     setRenewals(result.items);
     return result.items;
-  }, [me?.eligible, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
-  const refreshAdminRenewals = useCallback(async (): Promise<AdminRenewalItem[]> => {
+  const refreshAdminRenewals = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ): Promise<AdminRenewalItem[]> => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setAdminRenewals([]);
+      if (adminOperationRequestIsCurrent(scope)) setAdminRenewals([]);
       return [];
     }
+    if (!adminOperationRequestIsCurrent(scope)) return [];
     const result = await api<{ items: AdminRenewalItem[] }>(
       "/api/v1/admin/billing/renewals",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return [];
     setAdminRenewals(result.items);
     return result.items;
-  }, [canUseFullAdminWorkspace, route]);
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
   const refreshChargebackStatus = useCallback(async () => {
-    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !me) {
+    if (route !== "/customer" || activeRouteRef.current !== "/customer" || !canReadCustomerHistory) {
       setChargebackStatus(null);
       return;
     }
     setChargebackStatus(
       await api<ChargebackStatus>("/api/v1/billing/chargeback-status"),
     );
-  }, [me, route]);
+  }, [canReadCustomerHistory, me?.clientAccountId, route]);
 
   useEffect(() => {
-    void Promise.all([
-      api<{ products: Product[] }>(`/api/v1/catalog?locale=${locale}`).then((data) =>
-        setProducts(data.products),
-      ),
-      api<Legal>(`/api/v1/legal/current?locale=${locale}`).then(setLegal),
-    ]).catch((caught: unknown) =>
-      setError(caught instanceof Error ? caught.message : "Unable to load the laboratory"),
-    );
+    let current = true;
+    setProducts([]);
+    setLegal(null);
+    void api<{ products: Product[] }>(`/api/v1/catalog?locale=${locale}`).then((catalog) => {
+      if (!current) return;
+      setProducts(catalog.products);
+    }).catch((caught: unknown) => {
+      if (!current) return;
+      setError(caught instanceof Error ? caught.message : "Unable to load the laboratory");
+    });
+    void api<Legal>(`/api/v1/legal/current?locale=${locale}`).then((legal) => {
+      if (!current) return;
+      setLegal(legal);
+    }).catch((caught: unknown) => {
+      if (!current) return;
+      setError(caught instanceof Error ? caught.message : "Unable to load the laboratory");
+    });
+    return () => {
+      current = false;
+    };
   }, [locale, setError]);
 
   useEffect(() => {
@@ -1195,33 +1679,204 @@ export function App() {
     void refreshMe();
   }, [refreshMe, route]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (
-      route !== "/admin" ||
-      activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
-    ) {
-      manualReceiptDefaultedForUser.current = null;
-      setManualReceiptClientAccountId("");
-      setManualReceiptHistory([]);
-      setManualReceiptTarget(null);
-      setManualReceiptOutcome(null);
-      setManualReceiptReversalTargetId(null);
-      setManualReceiptReversalReason("");
-      setManualReceiptReversalOutcome(null);
-      return;
-    }
-    if (manualReceiptDefaultedForUser.current === me.id) return;
-    manualReceiptDefaultedForUser.current = me.id;
-    setManualReceiptClientAccountId("");
+      previousManualReceiptContextFingerprint.current ===
+      manualReceiptContextFingerprint
+    ) return;
+    previousManualReceiptContextFingerprint.current = manualReceiptContextFingerprint;
+    manualReceiptRequestGeneration.current += 1;
+    const context = adminOperationContextRef.current;
+    const scopedAccountId =
+      route === "/admin" &&
+      canManageManualReceipts &&
+      context?.action === "manual_receipt"
+        ? context.account.id
+        : "";
+    manualReceiptClientAccountIdRef.current = scopedAccountId;
+    setManualReceiptClientAccountId(scopedAccountId);
+    setManualReceiptReference("");
     setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
     setManualReceiptHistory([]);
     setManualReceiptTarget(null);
     setManualReceiptOutcome(null);
     setManualReceiptReversalTargetId(null);
     setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
     setManualReceiptReversalOutcome(null);
-  }, [canUseFullAdminWorkspace, me, route]);
+    setAdminPassword("");
+  }, [manualReceiptContextFingerprint]);
+
+  useLayoutEffect(() => {
+    adminAccessGeneration.current += 1;
+    const previousPrincipal = previousStaffPrincipalFingerprint.current;
+    const hadResolvedPrincipal = previousPrincipal.split("\u0001", 1)[0] !== "";
+    const accessChanged =
+      previousStaffAccessFingerprint.current !== staffAccessFingerprint;
+    const principalChanged =
+      previousStaffPrincipalFingerprint.current !== staffPrincipalFingerprint;
+    previousStaffAccessFingerprint.current = staffAccessFingerprint;
+    previousStaffPrincipalFingerprint.current = staffPrincipalFingerprint;
+    if (!accessChanged && !principalChanged) return;
+
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    if (hadResolvedPrincipal) {
+      setNoticeRaw("");
+      setErrorRaw("");
+    }
+    setManualItems([]);
+    setAdminRenewals([]);
+    setAdminCancellations([]);
+    setAdminChargebacks([]);
+    setAdminUnclaimedChargebacks([]);
+    setAdminChargebackHolds([]);
+    setUnclaimedFunds([]);
+    setRefundCandidates([]);
+    setRefundRecords({});
+    setRefundSecurityHolds([]);
+    setRefundDismissalCorrections([]);
+    setRefundReceiptCapacityIncidents([]);
+    setRenewalHoldPendingId(null);
+    setManualSuspensionPendingId(null);
+    setCancellationCompletionPendingId(null);
+    setAdminPassword("");
+    setManualReason("");
+    setAutomationEffectiveAt("");
+    setAutomationReason("");
+    setRenewalHoldReason("");
+    setManualSuspensionReason("");
+    setCancellationCompletionReason("");
+    setCreditAdjustmentMinor("5000");
+    setCreditAdjustmentReason("");
+    manualReceiptClientAccountIdRef.current = "";
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundScenario("success");
+    setRefundPendingReceiptIds(new Set());
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+    setFundResolutionMinor("");
+    setFundResolutionInvoiceId("");
+    setFundResolutionReason("");
+    setFundReturnAmountMode("full");
+    setFundReturnAmountMinor("");
+    setFundReturnReason("");
+    setFundReturnScenario("success");
+    setFundResolutionPendingReceiptIds(new Set());
+    refundInFlight.current.clear();
+    refundAdjudicationInFlight.current.clear();
+    refundManualActionInFlight.current.clear();
+    refundCorrectionInFlight.current.clear();
+    refundCapacityAcknowledgementInFlight.current.clear();
+    fundResolutionInFlight.current.clear();
+    refundPollInFlight.current.clear();
+  }, [route, staffAccessFingerprint, staffPrincipalFingerprint]);
+
+  useLayoutEffect(() => {
+    const context = adminOperationContext;
+    if (!context) return;
+    const stillAuthorized =
+      route === "/admin" &&
+      activeRouteRef.current === "/admin" &&
+      ((context.action === "manual_receipt" && canManageManualReceipts) ||
+        (context.action === "refund" && canManageRefunds) ||
+        (context.action === "ticket" && canManageStaffTickets) ||
+        (context.action === "manual_fulfillment" && canManageManualFulfillment));
+    if (stillAuthorized) return;
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    setAdminPassword("");
+    setManualReason("");
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundPendingReceiptIds(new Set());
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+  }, [
+    adminOperationContext,
+    canManageManualFulfillment,
+    canManageManualReceipts,
+    canManageRefunds,
+    canManageStaffTickets,
+    route,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!canManageManualReceipts) {
+      manualReceiptRequestGeneration.current += 1;
+      setManualReceiptClientAccountId("");
+      setManualReceiptReference("");
+      setManualReceiptReason("");
+      setManualReceiptPending(false);
+      setManualReceiptHistory([]);
+      setManualReceiptTarget(null);
+      setManualReceiptOutcome(null);
+      setManualReceiptReversalTargetId(null);
+      setManualReceiptReversalReason("");
+      setManualReceiptReversalPendingId(null);
+      setManualReceiptReversalOutcome(null);
+    }
+    if (!canManageRefunds) {
+      setRefundAmountMode("full");
+      setRefundAmountMinor("");
+      setRefundReason("");
+      setRefundPendingReceiptIds(new Set());
+      setRefundAdjudicationPendingIds(new Set());
+      setRefundManualActionPendingIds(new Set());
+      setRefundCorrectionPendingIds(new Set());
+      setRefundCapacityAcknowledgementPendingIds(new Set());
+    }
+    if (!canManageManualFulfillment) setManualReason("");
+    if (!canMountAdminOperationWorkspace) setAdminPassword("");
+  }, [
+    canManageManualFulfillment,
+    canManageManualReceipts,
+    canManageRefunds,
+    canMountAdminOperationWorkspace,
+  ]);
 
   useEffect(() => {
     void refreshLatestOrder().catch(() => undefined);
@@ -1273,7 +1928,7 @@ export function App() {
   useEffect(() => {
     if (
       route !== "/customer" ||
-      !me?.eligible ||
+      !canWriteBilling ||
       !billing?.addFunds.enabled ||
       !billing.addFunds.allowed ||
       !/^[1-9]\d*$/.test(addFundsPrincipalMinor)
@@ -1312,7 +1967,7 @@ export function App() {
     billing?.addFunds.maximumMinor,
     billing?.addFunds.minimumMinor,
     billing?.creditBalanceMinor,
-    me?.eligible,
+    canWriteBilling,
     route,
   ]);
 
@@ -1346,7 +2001,7 @@ export function App() {
   }, [addFundsCommand, refreshBilling, route]);
 
   useEffect(() => {
-    if (route !== "/customer" || !order || order.invoice.status === "paid" || !me?.eligible) {
+    if (route !== "/customer" || !order || order.invoice.status === "paid" || !canWriteBilling) {
       setPaymentQuote(null);
       return;
     }
@@ -1359,9 +2014,11 @@ export function App() {
         setPaymentQuote(null);
         setError(caught instanceof Error ? caught.message : "Payment quote is unavailable");
       });
-  }, [applyCredit, billing?.creditBalanceMinor, me?.eligible, order?.invoice.id, order?.invoice.status, paymentMethod, route]);
+  }, [applyCredit, billing?.creditBalanceMinor, canWriteBilling, order?.invoice.id, order?.invoice.status, paymentMethod, route]);
 
   useEffect(() => {
+    const path = window.location.pathname.replace(/\/+$/, "") || "/";
+    if (path !== "/verify") return;
     const token = new URLSearchParams(window.location.search).get("token");
     if (!token) return;
     void api<{ status: string }>("/api/v1/auth/verify-email", {
@@ -1378,6 +2035,83 @@ export function App() {
         setError(caught instanceof Error ? caught.message : "Verification failed"),
       );
   }, [openRoute, refreshMe, setError]);
+
+  useEffect(() => {
+    if (
+      !membershipInvitationToken ||
+      !sessionResolved ||
+      !me ||
+      me.verification.email !== "passed" ||
+      me.restrictions.user ||
+      invitationAccepting.current ||
+      (window.location.pathname.replace(/\/+$/, "") || "/") !==
+        "/membership-invitations/accept"
+    ) return;
+    const token = membershipInvitationToken;
+    const generation = ++invitationAcceptGeneration.current;
+    invitationAccepting.current = true;
+    setInvitationAcceptPending(true);
+    setInvitationAcceptError("");
+    const acceptOrResume = acceptedInvitationAccountId === null
+      ? api<{ membership: { clientAccountId: string } }>(
+          "/api/v1/membership-invitations/accept",
+          { method: "POST", body: JSON.stringify({ token }) },
+        ).then((result) => {
+          if (generation !== invitationAcceptGeneration.current) return null;
+          setAcceptedInvitationAccountId(result.membership.clientAccountId);
+          return result.membership.clientAccountId;
+        })
+      : Promise.resolve(acceptedInvitationAccountId);
+    void acceptOrResume
+      .then(async (clientAccountId) => {
+        if (!clientAccountId || generation !== invitationAcceptGeneration.current) return;
+        await api("/api/v1/auth/account-context", {
+          method: "PUT",
+          body: JSON.stringify({ clientAccountId }),
+        });
+        if (generation !== invitationAcceptGeneration.current) return;
+        setMembershipInvitationToken(null);
+        setAcceptedInvitationAccountId(null);
+        setInvitationAcceptPending(false);
+        setInvitationAcceptError("");
+        window.history.replaceState({}, "", "/customer");
+        activeRouteRef.current = "/customer";
+        routeGenerationRef.current += 1;
+        meRequestGeneration.current += 1;
+        clearWorkspaceTransientState();
+        setMe(null);
+        setSessionResolved(false);
+        await refreshMe();
+        if (generation !== invitationAcceptGeneration.current) return;
+        setNoticeRaw(
+          locale === "zh-CN"
+            ? "成员邀请已接受，并已切换到受邀客户账户。"
+            : "Membership invitation accepted and the invited Client Account is now active.",
+        );
+      })
+      .catch((caught: unknown) => {
+        if (generation !== invitationAcceptGeneration.current) return;
+        setInvitationAcceptPending(false);
+        setInvitationAcceptError(
+          caught instanceof Error ? caught.message : "Membership invitation could not be accepted",
+        );
+      })
+      .finally(() => {
+        if (generation === invitationAcceptGeneration.current) {
+          invitationAccepting.current = false;
+          setInvitationAcceptPending(false);
+        }
+      });
+  }, [
+    clearWorkspaceTransientState,
+    acceptedInvitationAccountId,
+    me,
+    membershipInvitationToken,
+    refreshMe,
+    invitationRetryNonce,
+    locale,
+    sessionResolved,
+  ]);
 
   useEffect(() => {
     if (
@@ -1404,140 +2138,244 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [order, refreshBilling, refreshPaymentSettings, route]);
 
-  const refreshManualItems = useCallback(async () => {
+  const refreshManualItems = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageManualFulfillment
     ) {
-      setManualItems([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setManualItems([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: ManualItem[] }>("/api/v1/admin/manual-fulfillment");
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setManualItems(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageManualFulfillment,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshAdminCancellations = useCallback(async () => {
+  const refreshAdminCancellations = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setAdminCancellations([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setAdminCancellations([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: AdminCancellationItem[] }>(
       "/api/v1/admin/services/cancellations",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setAdminCancellations(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshUnclaimedFunds = useCallback(async () => {
+  const refreshUnclaimedFunds = useCallback(async (
+    expectedScope?: AdminOperationScope,
+    additionalIsCurrent?: () => boolean,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
+    const requestIsCurrent = () =>
+      adminOperationRequestIsCurrent(scope) &&
+      (additionalIsCurrent?.() ?? true);
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setUnclaimedFunds([]);
-      return;
+      if (requestIsCurrent()) setUnclaimedFunds([]);
+      return false;
     }
+    if (!requestIsCurrent()) return false;
     const result = await api<{ items: UnclaimedFundItem[] }>("/api/v1/admin/funds/unclaimed");
+    if (!requestIsCurrent()) return false;
     setUnclaimedFunds(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundCandidates = useCallback(async () => {
+  const refreshRefundCandidates = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
-      setRefundCandidates([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundCandidates([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundCandidate[] }>("/api/v1/admin/refund-candidates");
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundCandidates(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundRecords = useCallback(async () => {
+  const refreshRefundRecords = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
-      setRefundRecords({});
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundRecords({});
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundRecord[] }>("/api/v1/admin/refunds");
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundRecords(
       Object.fromEntries(result.items.map((refund) => [refund.refundId, refund])),
     );
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundSecurityHolds = useCallback(async () => {
+  const refreshRefundSecurityHolds = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
-      setRefundSecurityHolds([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundSecurityHolds([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundSecurityHold[] }>(
       "/api/v1/admin/refund-security-holds",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundSecurityHolds(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundDismissalCorrections = useCallback(async () => {
+  const refreshRefundDismissalCorrections = useCallback(async (expectedScope?: AdminOperationScope) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
-      setRefundDismissalCorrections([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundDismissalCorrections([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundDismissalCorrection[] }>(
       "/api/v1/admin/refund-dismissal-corrections",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundDismissalCorrections(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshRefundReceiptCapacityIncidents = useCallback(async () => {
+  const refreshRefundReceiptCapacityIncidents = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) {
-      setRefundReceiptCapacityIncidents([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) setRefundReceiptCapacityIncidents([]);
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{ items: RefundReceiptCapacityIncident[] }>(
       "/api/v1/admin/refund-receipt-capacity-incidents",
     );
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setRefundReceiptCapacityIncidents(result.items);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
-  const refreshAdminChargebacks = useCallback(async () => {
+  const refreshAdminChargebacks = useCallback(async (
+    expectedScope?: AdminOperationScope,
+  ) => {
+    const scope = expectedScope ?? captureAdminOperationScope();
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
       !canUseFullAdminWorkspace
     ) {
-      setAdminChargebacks([]);
-      setAdminUnclaimedChargebacks([]);
-      setAdminChargebackHolds([]);
-      return;
+      if (adminOperationRequestIsCurrent(scope)) {
+        setAdminChargebacks([]);
+        setAdminUnclaimedChargebacks([]);
+        setAdminChargebackHolds([]);
+      }
+      return false;
     }
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     const result = await api<{
       items: AddFundsChargeback[];
       unclaimedChargebacks: AddFundsUnclaimedChargeback[];
       manualHolds: AddFundsChargebackHold[];
     }>("/api/v1/admin/add-funds-chargebacks");
+    if (!adminOperationRequestIsCurrent(scope)) return false;
     setAdminChargebacks(result.items);
     setAdminUnclaimedChargebacks(result.unclaimedChargebacks);
     setAdminChargebackHolds(result.manualHolds);
-  }, [canUseFullAdminWorkspace, route]);
+    return true;
+  }, [
+    adminOperationRequestIsCurrent,
+    canUseFullAdminWorkspace,
+    captureAdminOperationScope,
+    route,
+    staffAccessFingerprint,
+  ]);
 
   useEffect(() => {
     void Promise.all([
@@ -1567,37 +2405,70 @@ export function App() {
     if (
       route !== "/admin" ||
       activeRouteRef.current !== "/admin" ||
-      !canUseFullAdminWorkspace
+      !canManageRefunds
     ) return;
-    const active = Object.values(refundRecords).filter((refund) =>
-      ["queued", "processing", "unknown"].includes(refund.status),
+    const active = Object.values(refundRecords).filter(
+      (refund) =>
+        (showUnscopedAdminOperations ||
+          (operationAccount !== null && refund.clientAccountId === operationAccount.id)) &&
+        ["queued", "processing", "unknown"].includes(refund.status),
     );
     if (active.length === 0) return;
     const timer = window.setInterval(() => {
+      const operationScope = captureAdminOperationScope();
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       void Promise.all(
-        active.map((refund) =>
-          api<RefundRecord>(`/api/v1/admin/refunds/${refund.refundId}`).then((updated) => {
-            setRefundRecords((current) => ({ ...current, [updated.refundId]: updated }));
-          }),
-        ),
+        active.map(async (refund) => {
+          if (refundPollInFlight.current.has(refund.refundId)) return false;
+          const requestSequence = ++refundPollRequestSequence.current;
+          refundPollInFlight.current.set(refund.refundId, requestSequence);
+          try {
+            const updated = await api<RefundRecord>(
+              `/api/v1/admin/refunds/${refund.refundId}`,
+            );
+            if (
+              refundPollInFlight.current.get(refund.refundId) !== requestSequence ||
+              !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId) ||
+              updated.clientAccountId !== refund.clientAccountId
+            ) return false;
+            setRefundRecords((current) => {
+              const currentRefund = current[updated.refundId];
+              if (currentRefund && currentRefund.version > updated.version) return current;
+              return { ...current, [updated.refundId]: updated };
+            });
+            return true;
+          } finally {
+            if (refundPollInFlight.current.get(refund.refundId) === requestSequence) {
+              refundPollInFlight.current.delete(refund.refundId);
+            }
+          }
+        }),
       )
-        .then(() =>
-          Promise.all([
-            refreshRefundCandidates(),
-            refreshRefundSecurityHolds(),
-            refreshUnclaimedFunds(),
-          ]),
-        )
+        .then((accepted) => {
+          if (
+            !accepted.some(Boolean) ||
+            !adminOperationRequestIsCurrent(operationScope)
+          ) return undefined;
+          return Promise.all([
+            refreshRefundCandidates(operationScope),
+            refreshRefundSecurityHolds(operationScope),
+            refreshUnclaimedFunds(operationScope),
+          ]);
+        })
         .catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(timer);
   }, [
     refundRecords,
+    captureAdminOperationScope,
     refreshRefundCandidates,
     refreshRefundSecurityHolds,
     refreshUnclaimedFunds,
-    canUseFullAdminWorkspace,
+    adminOperationRequestIsCurrent,
+    canManageRefunds,
+    operationAccount,
     route,
+    showUnscopedAdminOperations,
   ]);
 
   const groups = useMemo(() => {
@@ -1630,35 +2501,180 @@ export function App() {
     }
   }
 
+  async function registerInvitationIdentity(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!membershipInvitationToken) return;
+    setError("");
+    const data = new FormData(event.currentTarget);
+    try {
+      await api("/api/v1/auth/invitation-registrations", {
+        method: "POST",
+        body: JSON.stringify({
+          token: membershipInvitationToken,
+          email: data.get("email"),
+          password: data.get("password"),
+          locale,
+        }),
+      });
+      setNotice(
+        locale === "zh-CN"
+          ? "受邀用户身份已创建，未创建客户账户。请登录并在 Mock Provider 邮箱完成验证。"
+          : "Invited User identity created without a Client Account. Sign in and verify it in the Mock Provider mailbox.",
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : locale === "zh-CN" ? "无法创建受邀用户身份" : "Invited User registration failed");
+    }
+  }
+
+  async function verifyInvitationIdentity(
+    event: ReactMouseEvent<HTMLAnchorElement>,
+    verificationUrl: string,
+  ) {
+    if (!membershipInvitationToken) return;
+    event.preventDefault();
+    setError("");
+    let verificationToken: string | null = null;
+    try {
+      const target = new URL(verificationUrl, window.location.origin);
+      if (target.pathname.replace(/\/+$/, "") !== "/verify") {
+        throw new Error(locale === "zh-CN" ? "验证链接无效" : "The verification link is invalid");
+      }
+      verificationToken = target.searchParams.get("token");
+      if (!verificationToken) {
+        throw new Error(locale === "zh-CN" ? "验证链接缺少令牌" : "The verification link has no token");
+      }
+      const result = await api<{ status: string }>("/api/v1/auth/verify-email", {
+        method: "POST",
+        body: JSON.stringify({ token: verificationToken }),
+      });
+      await refreshMe();
+      setNoticeRaw(
+        locale === "zh-CN"
+          ? `邮箱验证：${result.status === "already_verified" ? "已验证" : result.status}。正在继续接受成员邀请…`
+          : `Email verification: ${result.status === "already_verified" ? "verified" : result.status}. Continuing the membership invitation…`,
+      );
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : locale === "zh-CN"
+            ? "邮箱验证失败"
+            : "Email verification failed",
+      );
+    } finally {
+      verificationToken = null;
+    }
+  }
+
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
     const data = new FormData(event.currentTarget);
     try {
-      await api("/api/v1/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
-      });
+      let requiresAccountContext = false;
+      try {
+        const result = await api<{
+          challenge?: { id: string; token: string; methods: string[] };
+        }>("/api/v1/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email: data.get("email"), password: data.get("password") }),
+        });
+        if (result.challenge) {
+          setLoginChallenge(result.challenge);
+          setSessionResolved(true);
+          setNoticeRaw(
+            locale === "zh-CN"
+              ? "密码已确认；请输入 TOTP 或一次性恢复码。"
+              : "Password confirmed; enter a TOTP or one-time recovery code.",
+          );
+          event.currentTarget.reset();
+          return;
+        }
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.code === "ACCOUNT_CONTEXT_REQUIRED") {
+          // Login deliberately returns 409 after setting the session cookie
+          // when zero, multiple or restricted memberships need an explicit
+          // context choice. Resolve that authenticated identity normally.
+          requiresAccountContext = true;
+        } else {
+          throw caught;
+        }
+      }
       setPaymentSettingsReauthExpiresAt(null);
       setPaymentSettingsPassword("");
       const viewer = await refreshMe();
-      const viewerPermissions = parseStaffPermissions(viewer?.staff?.permissions);
-      const viewerCanOpenAdmin =
-        viewer?.eligible === true &&
-        viewer.staff !== null &&
-        (viewerPermissions.has("*") || viewerPermissions.has("support.tickets.manage"));
-      const target = route === "/admin" ? "/admin" : viewerCanOpenAdmin ? "/admin" : "/customer";
+      const resolvedLocale = viewer?.locale ?? locale;
+      const viewerCanOpenAdmin = viewerCanOpenAdminWorkspace(viewer);
+      const target = route === "/"
+        ? viewerCanOpenAdmin ? "/admin" : "/customer"
+        : route;
+      if (membershipInvitationToken) {
+        setSessionResolved(true);
+        setNoticeRaw(resolvedLocale === "zh-CN" ? "已登录，正在检查成员邀请…" : "Signed in. Checking the membership invitation…");
+        return;
+      }
       const staysOnResolvedRoute = route === target;
       openRoute(target);
       if (staysOnResolvedRoute) setSessionResolved(true);
-      setNoticeRaw("Signed in.");
+      setNoticeRaw(
+        requiresAccountContext
+          ? resolvedLocale === "zh-CN" ? "已登录。请选择当前客户账户后继续。" : "Signed in. Select an active Client Account to continue."
+          : resolvedLocale === "zh-CN" ? "已登录。" : "Signed in.",
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Sign in failed");
     }
   }
 
+  async function completeLoginChallenge(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!loginChallenge) return;
+    const data = new FormData(event.currentTarget);
+    setError("");
+    try {
+      let requiresAccountContext = false;
+      try {
+        await api("/api/v1/auth/login-challenges/complete", {
+          method: "POST",
+          body: JSON.stringify({
+            challengeId: loginChallenge.id,
+            challengeToken: loginChallenge.token,
+            factorCode: data.get("factorCode"),
+          }),
+        });
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.code === "ACCOUNT_CONTEXT_REQUIRED") {
+          requiresAccountContext = true;
+        } else {
+          throw caught;
+        }
+      }
+      setLoginChallenge(null);
+      const viewer = await refreshMe();
+      const resolvedLocale = viewer?.locale ?? locale;
+      const target = route === "/"
+        ? viewerCanOpenAdminWorkspace(viewer)
+          ? "/admin"
+          : "/customer"
+        : route;
+      const staysOnResolvedRoute = route === target;
+      openRoute(target);
+      if (staysOnResolvedRoute) setSessionResolved(true);
+      setNoticeRaw(requiresAccountContext
+        ? resolvedLocale === "zh-CN" ? "已登录。请选择当前客户账户。" : "Signed in. Select an active Client Account."
+        : resolvedLocale === "zh-CN" ? "双因素登录成功。" : "Two-factor sign-in completed.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Login challenge failed");
+    }
+  }
+
   async function logout() {
     setError("");
+    // Invalidate every route- and account-bound continuation as soon as the
+    // exclusive session transition is requested. An in-flight shared request
+    // may finish first, but it must not resume a stale mutation while logout
+    // is waiting for the Web Lock.
+    clearWorkspaceTransientState();
     try {
       await api("/api/v1/auth/logout", { method: "POST", body: "{}" });
       hardResetSession();
@@ -1667,31 +2683,29 @@ export function App() {
     }
   }
 
-  async function createOrder() {
-    if (!selected || !legal) return;
+  async function createOrder(payload: CatalogCheckoutOrderPayload): Promise<boolean> {
+    if (!selected || !legal || !canCreateOrders) return false;
     setError("");
     try {
-      const configuration =
-        selected.product.id === "gsl-inbound" ? { bandwidth_units: quantity } : {};
       const created = await api<{ orderId: string }>("/api/v1/orders", {
         method: "POST",
         body: JSON.stringify({
-          priceId: selected.price.id,
-          configuration,
-          termsVersion: legal.documents.terms.version,
-          aupVersion: legal.documents.aup.version,
+          ...payload,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
       setOrder(await api<OrderDetail>(`/api/v1/orders/${created.orderId}`));
       setSelected(null);
+      return true;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Checkout failed");
+      const error = caught instanceof Error ? caught : new Error("Checkout failed");
+      setError(error.message);
+      throw error;
     }
   }
 
   async function startPayment() {
-    if (!order) return;
+    if (!order || !canWriteBilling) return;
     setError("");
     try {
       if (savePaymentMethod || enableAutomaticRenewal) {
@@ -1895,7 +2909,7 @@ export function App() {
   }
 
   async function scheduleServiceCancellation() {
-    if (!order || cancellationPending) return;
+    if (!order || !canManageServices || cancellationPending) return;
     const reason = cancellationReason.trim();
     const requestIdentity = JSON.stringify({
       serviceId: order.service.id,
@@ -1944,7 +2958,26 @@ export function App() {
   }
 
   async function startRenewalPayment(renewal: RenewalItem) {
-    if (renewal.status === "paid" || renewalPaymentPendingId) return;
+    if (renewal.status === "paid" || renewalPaymentPendingId || !canWriteBilling || !me) return;
+    const operationScope = {
+      routeGeneration: routeGenerationRef.current,
+      viewerId: me.id,
+      accountId: me.clientAccountId,
+      contextVersion: me.accountContextVersion,
+    };
+    const paymentRequestIsCurrent = () => {
+      const current = meRef.current;
+      return (
+        activeRouteRef.current === "/customer" &&
+        routeGenerationRef.current === operationScope.routeGeneration &&
+        current?.id === operationScope.viewerId &&
+        current.clientAccountId === operationScope.accountId &&
+        current.accountContextVersion === operationScope.contextVersion &&
+        current.eligible === true &&
+        (current.context?.capabilities ?? []).includes("billing.write")
+      );
+    };
+    if (!paymentRequestIsCurrent()) return;
     setError("");
     setRenewalPaymentPendingId(renewal.renewalId);
     let paymentStarted = false;
@@ -1956,6 +2989,7 @@ export function App() {
           body: JSON.stringify({ paymentMethod, applyCredit }),
         },
       );
+      if (!paymentRequestIsCurrent()) return;
       await api(`/api/v1/invoices/${renewal.invoiceId}/payments`, {
         method: "POST",
         body: JSON.stringify({
@@ -1964,19 +2998,26 @@ export function App() {
           idempotencyKey: newIdempotencyKey(),
         }),
       });
+      if (!paymentRequestIsCurrent()) return;
       paymentStarted = true;
       setNotice(
         "Mock renewal payment started. The service term changes only after real allocations fully settle the invoice.",
       );
       for (let poll = 0; poll < 12; poll += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 500));
-        const current = await refreshRenewals();
-        if (current.find((item) => item.renewalId === renewal.renewalId)?.status === "paid") {
+        if (!paymentRequestIsCurrent()) return;
+        const current = await api<{ items: RenewalItem[] }>("/api/v1/billing/renewals");
+        if (!paymentRequestIsCurrent()) return;
+        setRenewals(current.items);
+        if (current.items.find((item) => item.renewalId === renewal.renewalId)?.status === "paid") {
           break;
         }
       }
-      await Promise.all([refreshBilling(), refreshAdminRenewals()]);
+      const refreshedBilling = await api<BillingSummary>("/api/v1/billing/summary");
+      if (!paymentRequestIsCurrent()) return;
+      setBilling(refreshedBilling);
     } catch (caught) {
+      if (!paymentRequestIsCurrent()) return;
       setError(
         paymentStarted
           ? "The payment was accepted, but its current status could not be refreshed. Check the renewal again before retrying."
@@ -1985,19 +3026,28 @@ export function App() {
             : "Renewal payment could not start",
       );
     } finally {
-      setRenewalPaymentPendingId(null);
+      if (paymentRequestIsCurrent()) setRenewalPaymentPendingId(null);
     }
   }
 
   async function runBillingAutomation() {
     if (!canUseFullAdminRoute || automationReason.trim().length < 10) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = automationReason.trim();
+    const effectiveAt = automationEffectiveAt
+      ? new Date(automationEffectiveAt).toISOString()
+      : null;
     setError("");
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       const result = await api<{
         businessDate: string;
         invoicesCreated: number;
@@ -2007,20 +3057,22 @@ export function App() {
       }>("/api/v1/admin/billing/automation/run", {
         method: "POST",
         body: JSON.stringify({
-          reason: automationReason.trim(),
+          reason,
           idempotencyKey: newIdempotencyKey(),
-          ...(automationEffectiveAt
-            ? { effectiveAt: new Date(automationEffectiveAt).toISOString() }
-            : {}),
+          ...(effectiveAt ? { effectiveAt } : {}),
         }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAutomationReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      await refreshAdminRenewals(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(
         `${result.replayed ? "Replayed" : "Completed"} Asia/Shanghai billing day ${result.businessDate}: ${result.invoicesCreated} invoice(s), ${result.remindersCreated} reminder(s), ${result.delinquencyDeferralsCreated} payment reconciliation hold(s).`,
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Billing automation failed");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Billing automation failed");
+      }
     }
   }
 
@@ -2033,30 +3085,40 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = renewalHoldReason.trim();
     setError("");
     setRenewalHoldPendingId(renewal.renewalId);
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api(`/api/v1/admin/billing/renewals/${renewal.renewalId}/resolve-hold`, {
         method: "POST",
         body: JSON.stringify({
           action: "grant_period",
-          reason: renewalHoldReason.trim(),
+          reason,
           expectedVersion: renewal.version,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setRenewalHoldReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      await refreshAdminRenewals(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice("The funded renewal Hold was reviewed and the exact service period was granted.");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Renewal Hold could not be resolved");
+      }
     } finally {
-      setRenewalHoldPendingId(null);
+      if (adminOperationRequestIsCurrent(operationScope)) setRenewalHoldPendingId(null);
     }
   }
 
@@ -2073,11 +3135,14 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = manualSuspensionReason.trim();
     const requestIdentity = JSON.stringify({
       caseId: delinquency.caseId,
       action,
       expectedVersion: delinquency.version,
-      reason: manualSuspensionReason.trim(),
+      reason,
     });
     let idempotencyKey = manualSuspensionIntentKeys.current.get(requestIdentity);
     if (!idempotencyKey) {
@@ -2087,11 +3152,14 @@ export function App() {
     setError("");
     setManualSuspensionPendingId(delinquency.caseId);
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       const outcome = await api<{
         caseStatus: string;
         serviceStatus: string;
@@ -2103,41 +3171,48 @@ export function App() {
           method: "POST",
           body: JSON.stringify({
             action,
-            reason: manualSuspensionReason.trim(),
+            reason,
             expectedVersion: delinquency.version,
             idempotencyKey,
           }),
         },
       );
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       manualSuspensionIntentKeys.current.delete(requestIdentity);
       setManualSuspensionReason("");
-      await Promise.all([refreshRenewals(), refreshAdminRenewals()]);
+      await refreshAdminRenewals(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(
         action === "confirm_suspended"
           ? `Manual suspension recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`
           : `Manual restoration recorded: Core service ${outcome.serviceStatus}, case ${outcome.caseStatus}. No Provider request was sent.`,
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual service action failed");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Manual service action failed");
+      }
     } finally {
-      setManualSuspensionPendingId(null);
+      if (adminOperationRequestIsCurrent(operationScope)) setManualSuspensionPendingId(null);
     }
   }
 
   async function completeCycleEndCancellation(item: AdminCancellationItem) {
     if (
       !canUseFullAdminRoute ||
-      !item.interventionRequired ||
+      !item.completionAllowed ||
       cancellationCompletionReason.trim().length < 10 ||
       cancellationCompletionPendingId
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const reason = cancellationCompletionReason.trim();
     const requestIdentity = JSON.stringify({
       executionId: item.executionId,
       expectedExecutionVersion: item.executionVersion,
       expectedServiceVersion: item.serviceVersion,
-      reason: cancellationCompletionReason.trim(),
+      reason,
     });
     let idempotencyKey = cancellationCompletionIntentKeys.current.get(requestIdentity);
     if (!idempotencyKey) {
@@ -2147,11 +3222,14 @@ export function App() {
     setError("");
     setCancellationCompletionPendingId(item.executionId);
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       const outcome = await api<{
         executionStatus: "terminated";
         serviceStatus: "terminated";
@@ -2162,29 +3240,35 @@ export function App() {
         body: JSON.stringify({
           expectedExecutionVersion: item.executionVersion,
           expectedServiceVersion: item.serviceVersion,
-          reason: cancellationCompletionReason.trim(),
+          reason,
           idempotencyKey,
         }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       cancellationCompletionIntentKeys.current.delete(requestIdentity);
       setCancellationCompletionReason("");
-      await Promise.all([refreshAdminCancellations(), refreshLatestOrder()]);
+      await refreshAdminCancellations(operationScope);
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(
         `${outcome.replayed ? "Replayed" : "Recorded"} manual cycle-end termination: Core service ${outcome.serviceStatus}, execution ${outcome.executionStatus}. No Provider request was sent.`,
       );
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Manual cycle-end termination could not be recorded",
-      );
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : "Manual cycle-end termination could not be recorded",
+        );
+      }
     } finally {
-      setCancellationCompletionPendingId(null);
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setCancellationCompletionPendingId(null);
+      }
     }
   }
 
   async function startAddFunds() {
-    if (!addFundsQuote) return;
+    if (!addFundsQuote || !canWriteBilling) return;
     setError("");
     try {
       const created = await api<{
@@ -2229,51 +3313,70 @@ export function App() {
     }
   }
 
-  async function fetchManualReceiptHistory(clientAccountId: string): Promise<{
+  async function fetchManualReceiptHistory(
+    clientAccountId: string,
+    scopeToken: string,
+  ): Promise<{
     clientAccount: { id: string; name: string };
     items: ManualReceiptItem[];
-  }> {
+  } | null> {
     if (
-      !canUseFullAdminRoute ||
+      !canManageManualReceiptsRoute ||
       activeRouteRef.current !== "/admin" ||
-      routeGenerationRef.current !== renderRouteGeneration
+      routeGenerationRef.current !== renderRouteGeneration ||
+      !manualReceiptScopeIsCurrent(scopeToken, clientAccountId)
     ) {
-      throw new Error("Full administrator permission is required");
+      return null;
     }
-    return api<{
+    const result = await api<{
       clientAccount: { id: string; name: string };
       items: ManualReceiptItem[];
     }>(
       `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
     );
+    return manualReceiptScopeIsCurrent(scopeToken, clientAccountId) ? result : null;
   }
 
   async function loadManualReceiptHistory() {
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
     if (
-      !canUseFullAdminRoute || manualReceiptPending || !looksLikeUuid(clientAccountId)
+      !canManageManualReceiptsRoute ||
+      manualReceiptPending ||
+      !looksLikeUuid(clientAccountId) ||
+      (operationAccount !== null && operationAccount.id !== clientAccountId)
     ) {
       return;
     }
+    manualReceiptRequestGeneration.current += 1;
+    const scopeToken = currentManualReceiptScopeToken(clientAccountId);
     setError("");
     setManualReceiptPending(true);
     try {
-      const result = await fetchManualReceiptHistory(clientAccountId);
+      const result = await fetchManualReceiptHistory(clientAccountId, scopeToken);
+      if (!result || !manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setManualReceiptTarget(result.clientAccount);
       setManualReceiptHistory(result.items);
       setNotice(
         `Verified ${result.clientAccount.name} (${result.clientAccount.id}) and refreshed its manual receipt history.`,
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual receipt history is unavailable");
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Manual receipt history is unavailable");
+      }
     } finally {
-      setManualReceiptPending(false);
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
+        setManualReceiptPending(false);
+      }
     }
   }
 
   async function recordManualReceipt() {
-    if (!canUseFullAdminRoute || manualReceiptPending || !manualReceiptFormReady) return;
+    if (!canManageManualReceiptsRoute || manualReceiptPending || !manualReceiptFormReady) return;
     const clientAccountId = manualReceiptClientAccountId.trim().toLowerCase();
+    if (operationAccount !== null && operationAccount.id !== clientAccountId) return;
+    manualReceiptRequestGeneration.current += 1;
+    const scopeToken = currentManualReceiptScopeToken(clientAccountId);
+    const operationScope = captureAdminOperationScope();
     const payload = {
       reference: manualReceiptReference.trim(),
       receivedAt: new Date(manualReceiptReceivedAt).toISOString(),
@@ -2304,11 +3407,14 @@ export function App() {
         // The in-memory key still makes a retry in this page replay-safe.
       }
 
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setAdminPassword("");
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       const outcome = await api<ManualReceiptOutcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts`,
         {
@@ -2322,6 +3428,7 @@ export function App() {
       } catch {
         // A successful Core response is authoritative even if browser storage is unavailable.
       }
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setManualReceiptOutcome(outcome);
       setManualReceiptReference("");
       setManualReceiptGrossMinor("10000");
@@ -2329,10 +3436,14 @@ export function App() {
       setManualReceiptReason("");
       setManualReceiptReceivedAt(defaultManualReceiptTime());
       const [historyRefresh, unclaimedRefresh] = await Promise.allSettled([
-        fetchManualReceiptHistory(clientAccountId),
-        refreshUnclaimedFunds(),
+        fetchManualReceiptHistory(clientAccountId, scopeToken),
+        refreshUnclaimedFunds(
+          operationScope,
+          () => manualReceiptScopeIsCurrent(scopeToken, clientAccountId),
+        ),
       ]);
-      if (historyRefresh.status === "fulfilled") {
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
+      if (historyRefresh.status === "fulfilled" && historyRefresh.value) {
         setManualReceiptTarget(historyRefresh.value.clientAccount);
         setManualReceiptHistory(historyRefresh.value.items);
       }
@@ -2345,16 +3456,21 @@ export function App() {
         setError("The receipt was saved, but one of the administrator lists could not be refreshed.");
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Manual receipt could not be recorded");
+      }
     } finally {
-      setManualReceiptPending(false);
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
+        setManualReceiptPending(false);
+      }
     }
   }
 
   async function reverseManualReceipt(receipt: ManualReceiptItem) {
     const clientAccountId = manualReceiptTarget?.id;
     if (
-      !canUseFullAdminRoute ||
+      !canManageManualReceiptsRoute ||
+      !canManageUnclaimedFunds ||
       !clientAccountId ||
       manualReceiptReversalPendingId !== null ||
       manualReceiptReversalTargetId !== receipt.manualReceiptId ||
@@ -2365,6 +3481,10 @@ export function App() {
     ) {
       return;
     }
+    if (operationAccount !== null && operationAccount.id !== clientAccountId) return;
+    manualReceiptRequestGeneration.current += 1;
+    const scopeToken = currentManualReceiptScopeToken(clientAccountId);
+    const operationScope = captureAdminOperationScope();
     const payload = {
       expectedFundReceiptId: receipt.fundReceiptId,
       expectedGrossAmountMinor: receipt.grossAmountMinor,
@@ -2396,11 +3516,14 @@ export function App() {
         // The in-memory key still protects a retry in this page.
       }
 
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setAdminPassword("");
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       const outcome = await api<ManualReceiptReversalOutcome>(
         `/api/v1/admin/client-accounts/${clientAccountId}/manual-receipts/${receipt.manualReceiptId}/reversal`,
         {
@@ -2414,14 +3537,19 @@ export function App() {
       } catch {
         // Core's successful response is authoritative.
       }
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
       setManualReceiptReversalOutcome(outcome);
       setManualReceiptReversalTargetId(null);
       setManualReceiptReversalReason("");
       const [historyRefresh, unclaimedRefresh] = await Promise.allSettled([
-        fetchManualReceiptHistory(clientAccountId),
-        refreshUnclaimedFunds(),
+        fetchManualReceiptHistory(clientAccountId, scopeToken),
+        refreshUnclaimedFunds(
+          operationScope,
+          () => manualReceiptScopeIsCurrent(scopeToken, clientAccountId),
+        ),
       ]);
-      if (historyRefresh.status === "fulfilled") {
+      if (!manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) return;
+      if (historyRefresh.status === "fulfilled" && historyRefresh.value) {
         setManualReceiptTarget(historyRefresh.value.clientAccount);
         setManualReceiptHistory(historyRefresh.value.items);
       }
@@ -2434,58 +3562,96 @@ export function App() {
         setError("The reversal was saved, but one of the administrator lists could not be refreshed.");
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual receipt could not be reversed");
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Manual receipt could not be reversed");
+      }
     } finally {
-      setManualReceiptReversalPendingId(null);
+      if (manualReceiptScopeIsCurrent(scopeToken, clientAccountId)) {
+        setManualReceiptReversalPendingId(null);
+      }
     }
   }
 
-  async function completeManual(serviceId: string) {
-    if (!canUseFullAdminRoute) return;
+  async function completeManual(item: ManualItem) {
+    if (
+      !canManageManualFulfillmentRoute ||
+      (operationAccount !== null && item.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     setError("");
     try {
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
       setAdminPassword("");
-      await api(`/api/v1/admin/services/${serviceId}/complete-manual`, {
+      const outcome = await api<{ fulfillment?: "provider_queued" | "manual_ready" }>(
+        `/api/v1/admin/services/${item.serviceId}/complete-manual`, {
         method: "POST",
         body: JSON.stringify({ reason: manualReason }),
-      });
+        },
+      );
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
       setAdminPassword("");
       setManualReason("");
-      await refreshManualItems();
-      setNotice("Manual service marked Ready for Service with an audited activation time.");
+      await refreshManualItems(operationScope);
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
+      setNotice(
+        outcome.fulfillment === "provider_queued"
+          ? "The saved Provider binding was approved and its stable provisioning operation is queued."
+          : "Manual fulfillment was confirmed Ready for Service with an audited activation time.",
+      );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual fulfillment failed");
+      if (
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) {
+        setError(caught instanceof Error ? caught.message : "Manual fulfillment failed");
+      }
     }
   }
 
   async function adjustCredit(direction: "increase" | "decrease") {
     if (!canUseFullAdminRoute || !me) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope)) return;
+    const clientAccountId = me.clientAccountId;
+    const amountMinor = creditAdjustmentMinor;
+    const reason = creditAdjustmentReason;
     setError("");
     try {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setAdminPassword("");
-      await api(`/api/v1/admin/client-accounts/${me.clientAccountId}/credit-adjustments`, {
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
+      await api(`/api/v1/admin/client-accounts/${clientAccountId}/credit-adjustments`, {
         method: "POST",
         body: JSON.stringify({
           direction,
-          amountMinor: creditAdjustmentMinor,
+          amountMinor,
           currency: "USD",
-          reason: creditAdjustmentReason,
+          reason,
           idempotencyKey: newIdempotencyKey(),
         }),
       });
-      await refreshBilling();
+      if (!adminOperationRequestIsCurrent(operationScope)) return;
       setNotice(`Credit ${direction} recorded with a balanced journal and audit event.`);
       setCreditAdjustmentReason("");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
+      if (adminOperationRequestIsCurrent(operationScope)) {
+        setError(caught instanceof Error ? caught.message : "Credit adjustment failed");
+      }
     }
   }
 
@@ -2500,6 +3666,8 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const invoiceId =
       action === "allocate_invoice"
         ? fundResolutionInvoiceId || item.suggestedInvoiceId
@@ -2521,11 +3689,14 @@ export function App() {
     setError("");
     try {
       const idempotencyKey = await fundResolutionIdempotencyKey(requestIdentity);
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       const resolution = await api<{ replayed: boolean }>(
         `/api/v1/admin/funds/${item.receiptId}/resolutions`,
         {
@@ -2539,6 +3710,7 @@ export function App() {
           }),
         },
       );
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setNotice(
         resolution.replayed
           ? "This exact fund resolution was already recorded; no second money movement occurred."
@@ -2549,21 +3721,26 @@ export function App() {
       setFundResolutionMinor("");
       setFundResolutionReason("");
       const refreshResults = await Promise.allSettled([
-        refreshUnclaimedFunds(),
+        refreshUnclaimedFunds(operationScope),
         ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
       ]);
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       if (refreshResults.some((result) => result.status === "rejected")) {
         setError("The resolution was saved, but current balances could not be refreshed.");
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Fund resolution failed");
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Fund resolution failed");
+      }
     } finally {
       fundResolutionInFlight.current.delete(item.receiptId);
-      setFundResolutionPendingReceiptIds((current) => {
-        const next = new Set(current);
-        next.delete(item.receiptId);
-        return next;
-      });
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setFundResolutionPendingReceiptIds((current) => {
+          const next = new Set(current);
+          next.delete(item.receiptId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2575,6 +3752,8 @@ export function App() {
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const amountMinor = fundReturnAmountMode === "partial" ? fundReturnAmountMinor : null;
     const reason = fundReturnReason.trim();
     const identity = JSON.stringify({
@@ -2605,11 +3784,14 @@ export function App() {
       } catch {
         // The in-memory key still makes repeated clicks replay the same request.
       }
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       await api("/api/v1/auth/reauth", {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setAdminPassword("");
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       const refund = await api<RefundRecord>(
         `/api/v1/admin/funds/${item.receiptId}/refunds`,
         {
@@ -2630,6 +3812,7 @@ export function App() {
       } catch {
         // A retained key is safe: a later retry replays instead of returning funds twice.
       }
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
       setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
       setNotice(
         refund.replayed
@@ -2638,16 +3821,24 @@ export function App() {
       );
       setFundReturnAmountMinor("");
       setFundReturnReason("");
-      await Promise.all([refreshUnclaimedFunds(), refreshRefundRecords()]);
+      await Promise.all([
+        refreshUnclaimedFunds(operationScope),
+        refreshRefundRecords(operationScope),
+      ]);
+      if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Unclaimed-funds return failed");
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setError(caught instanceof Error ? caught.message : "Unclaimed-funds return failed");
+      }
     } finally {
       refundInFlight.current.delete(item.receiptId);
-      setRefundPendingReceiptIds((current) => {
-        const next = new Set(current);
-        next.delete(item.receiptId);
-        return next;
-      });
+      if (adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) {
+        setRefundPendingReceiptIds((current) => {
+          const next = new Set(current);
+          next.delete(item.receiptId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2655,7 +3846,13 @@ export function App() {
     item: RefundCandidate,
     destination: "original_payment" | "credit" | "none",
   ) {
-    if (!canUseFullAdminRoute || refundInFlight.current.has(item.receiptId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundInFlight.current.has(item.receiptId) ||
+      (operationAccount !== null && item.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const amountMode = destination === "none" ? "none" : refundAmountMode;
     const amountMinor =
       destination !== "none" && refundAmountMode === "partial" ? refundAmountMinor : null;
@@ -2693,6 +3890,9 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
       setAdminPassword("");
       const refund = await api<RefundRecord>(
         `/api/v1/admin/invoices/${item.invoiceId}/refunds`,
@@ -2716,6 +3916,9 @@ export function App() {
       } catch {
         // A retained key is safe: a later retry will replay instead of moving money twice.
       }
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
       setRefundRecords((current) => ({ ...current, [refund.refundId]: refund }));
       setNotice(
         refund.replayed
@@ -2729,18 +3932,29 @@ export function App() {
       setRefundReason("");
       setRefundAmountMinor("");
       await Promise.all([
-        refreshRefundCandidates(),
+        refreshRefundCandidates(operationScope),
         ...(item.clientAccountId === me.clientAccountId ? [refreshBilling()] : []),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Refund decision failed");
+      if (
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) {
+        setError(caught instanceof Error ? caught.message : "Refund decision failed");
+      }
     } finally {
       refundInFlight.current.delete(item.receiptId);
-      setRefundPendingReceiptIds((current) => {
-        const next = new Set(current);
-        next.delete(item.receiptId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) {
+        setRefundPendingReceiptIds((current) => {
+          const next = new Set(current);
+          next.delete(item.receiptId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2751,7 +3965,13 @@ export function App() {
       | "record_unexpected_outflow"
       | "dismiss_provider_claim",
   ) {
-    if (!canUseFullAdminRoute || refundAdjudicationInFlight.current.has(hold.holdId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundAdjudicationInFlight.current.has(hold.holdId) ||
+      (operationAccount !== null && hold.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({ holdId: hold.holdId, decision, reason });
     refundAdjudicationInFlight.current.add(hold.holdId);
@@ -2775,6 +3995,9 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-security-holds/${hold.holdId}/adjudications`,
@@ -2793,6 +4016,9 @@ export function App() {
       } catch {
         // A retained key can only replay the same immutable adjudication.
       }
+      if (
+        !adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
+      ) return;
       setNotice(
         result.replayed
           ? "The same hold adjudication was replayed; no second settlement or journal was created."
@@ -2804,21 +4030,32 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundSecurityHolds(),
-        refreshRefundDismissalCorrections(),
-        refreshRefundReceiptCapacityIncidents(),
-        refreshRefundCandidates(),
-        refreshRefundRecords(),
+        refreshRefundSecurityHolds(operationScope),
+        refreshRefundDismissalCorrections(operationScope),
+        refreshRefundReceiptCapacityIncidents(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundRecords(operationScope),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Refund hold adjudication failed");
+      if (
+        adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
+      ) {
+        setError(caught instanceof Error ? caught.message : "Refund hold adjudication failed");
+      }
     } finally {
       refundAdjudicationInFlight.current.delete(hold.holdId);
-      setRefundAdjudicationPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(hold.holdId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(operationScope, hold.clientAccountId)
+      ) {
+        setRefundAdjudicationPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(hold.holdId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2826,7 +4063,14 @@ export function App() {
     refund: RefundRecord,
     action: "retry_query" | "confirm_no_outflow",
   ) {
-    if (!canUseFullAdminRoute || refundManualActionInFlight.current.has(refund.refundId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundManualActionInFlight.current.has(refund.refundId) ||
+      (operationAccount !== null &&
+        refund.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       refundId: refund.refundId,
@@ -2855,6 +4099,9 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refunds/${refund.refundId}/manual-actions`,
@@ -2873,6 +4120,9 @@ export function App() {
       } catch {
         // A retained key can only replay this same manual action.
       }
+      if (
+        !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
+      ) return;
       setNotice(
         result.replayed
           ? "The same manual refund action was replayed; no duplicate query or decision occurred."
@@ -2882,24 +4132,41 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundRecords(),
-        refreshRefundCandidates(),
-        refreshRefundSecurityHolds(),
+        refreshRefundRecords(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundSecurityHolds(operationScope),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Manual refund action failed");
+      if (
+        adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
+      ) {
+        setError(caught instanceof Error ? caught.message : "Manual refund action failed");
+      }
     } finally {
       refundManualActionInFlight.current.delete(refund.refundId);
-      setRefundManualActionPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(refund.refundId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(operationScope, refund.clientAccountId)
+      ) {
+        setRefundManualActionPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(refund.refundId);
+          return next;
+        });
+      }
     }
   }
 
   async function correctDismissedRefundOutflow(item: RefundDismissalCorrection) {
-    if (!canUseFullAdminRoute || refundCorrectionInFlight.current.has(item.adjudicationId)) return;
+    if (
+      !canManageRefundsRoute ||
+      refundCorrectionInFlight.current.has(item.adjudicationId) ||
+      (operationAccount !== null && item.clientAccountId !== operationAccount.id)
+    ) return;
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, item.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       adjudicationId: item.adjudicationId,
@@ -2927,6 +4194,9 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-adjudications/${item.adjudicationId}/corrections`,
@@ -2944,6 +4214,9 @@ export function App() {
       } catch {
         // A retained key can only replay the same immutable correction.
       }
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
       setNotice(
         result.replayed
           ? "The same dismissal correction was replayed; cash and capacity were not reduced twice."
@@ -2951,21 +4224,32 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundDismissalCorrections(),
-        refreshRefundReceiptCapacityIncidents(),
-        refreshRefundSecurityHolds(),
-        refreshRefundCandidates(),
-        refreshRefundRecords(),
+        refreshRefundDismissalCorrections(operationScope),
+        refreshRefundReceiptCapacityIncidents(operationScope),
+        refreshRefundSecurityHolds(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundRecords(operationScope),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) return;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Refund dismissal correction failed");
+      if (
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) {
+        setError(caught instanceof Error ? caught.message : "Refund dismissal correction failed");
+      }
     } finally {
       refundCorrectionInFlight.current.delete(item.adjudicationId);
-      setRefundCorrectionPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(item.adjudicationId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(operationScope, item.clientAccountId)
+      ) {
+        setRefundCorrectionPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(item.adjudicationId);
+          return next;
+        });
+      }
     }
   }
 
@@ -2973,11 +4257,14 @@ export function App() {
     incident: RefundReceiptCapacityIncident,
   ) {
     if (
-      !canUseFullAdminRoute ||
-      refundCapacityAcknowledgementInFlight.current.has(incident.incidentId)
+      !canManageRefundsRoute ||
+      refundCapacityAcknowledgementInFlight.current.has(incident.incidentId) ||
+      (operationAccount !== null && incident.clientAccountId !== operationAccount.id)
     ) {
       return;
     }
+    const operationScope = captureAdminOperationScope();
+    if (!adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)) return;
     const reason = refundReason.trim();
     const identity = JSON.stringify({
       incidentId: incident.incidentId,
@@ -3008,6 +4295,9 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ password: adminPassword }),
       });
+      if (
+        !adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
+      ) return;
       setAdminPassword("");
       const result = await api<{ replayed: boolean }>(
         `/api/v1/admin/refund-receipt-capacity-incidents/${incident.incidentId}/acknowledgements`,
@@ -3026,6 +4316,9 @@ export function App() {
       } catch {
         // A retained key can only replay the same acknowledgement.
       }
+      if (
+        !adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
+      ) return;
       setNotice(
         result.replayed
           ? "The same receipt overage acknowledgement was replayed; no financial fact changed."
@@ -3033,24 +4326,118 @@ export function App() {
       );
       setRefundReason("");
       await Promise.all([
-        refreshRefundReceiptCapacityIncidents(),
-        refreshRefundCandidates(),
-        refreshRefundRecords(),
+        refreshRefundReceiptCapacityIncidents(operationScope),
+        refreshRefundCandidates(operationScope),
+        refreshRefundRecords(operationScope),
       ]);
+      if (
+        !adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
+      ) return;
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Refund receipt capacity acknowledgement failed",
-      );
+      if (
+        adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
+      ) {
+        setError(
+          caught instanceof Error
+            ? caught.message
+            : "Refund receipt capacity acknowledgement failed",
+        );
+      }
     } finally {
       refundCapacityAcknowledgementInFlight.current.delete(incident.incidentId);
-      setRefundCapacityAcknowledgementPendingIds((current) => {
-        const next = new Set(current);
-        next.delete(incident.incidentId);
-        return next;
-      });
+      if (
+        adminOperationRequestIsCurrent(operationScope, incident.clientAccountId)
+      ) {
+        setRefundCapacityAcknowledgementPendingIds((current) => {
+          const next = new Set(current);
+          next.delete(incident.incidentId);
+          return next;
+        });
+      }
     }
+  }
+
+  function clearAdminOperationSelection() {
+    adminOperationGeneration.current += 1;
+    manualReceiptRequestGeneration.current += 1;
+    adminOperationContextRef.current = null;
+    setAdminOperationContext(null);
+    setAdminPassword("");
+    setManualReason("");
+    manualReceiptClientAccountIdRef.current = "";
+    setManualReceiptClientAccountId("");
+    setManualReceiptReference("");
+    setManualReceiptReceivedAt(defaultManualReceiptTime());
+    setManualReceiptGrossMinor("10000");
+    setManualReceiptFeeMinor("0");
+    setManualReceiptReason("");
+    setManualReceiptPending(false);
+    setManualReceiptHistory([]);
+    setManualReceiptTarget(null);
+    setManualReceiptOutcome(null);
+    setManualReceiptReversalTargetId(null);
+    setManualReceiptReversalReason("");
+    setManualReceiptReversalPendingId(null);
+    setManualReceiptReversalOutcome(null);
+    setRefundAmountMode("full");
+    setRefundAmountMinor("");
+    setRefundReason("");
+    setRefundPendingReceiptIds(new Set());
+    setRefundAdjudicationPendingIds(new Set());
+    setRefundManualActionPendingIds(new Set());
+    setRefundCorrectionPendingIds(new Set());
+    setRefundCapacityAcknowledgementPendingIds(new Set());
+    setFundResolutionPendingReceiptIds(new Set());
+    refundInFlight.current.clear();
+    refundAdjudicationInFlight.current.clear();
+    refundManualActionInFlight.current.clear();
+    refundCorrectionInFlight.current.clear();
+    refundCapacityAcknowledgementInFlight.current.clear();
+    fundResolutionInFlight.current.clear();
+    refundPollInFlight.current.clear();
+  }
+
+  function selectedAdminAccountChanged(account: { id: string; name: string } | null) {
+    const context = adminOperationContextRef.current;
+    if (!context || context.account.id === account?.id) return;
+    clearAdminOperationSelection();
+    setNotice("");
+  }
+
+  function openAdminAccountAction(
+    action: AdminAccountAction,
+    account: { id: string; name: string },
+  ) {
+    if (route !== "/admin" || activeRouteRef.current !== "/admin") return;
+    const authorized =
+      (action === "manual_receipt" && canManageManualReceipts) ||
+      (action === "refund" && canManageRefunds) ||
+      (action === "ticket" && canManageStaffTickets) ||
+      (action === "manual_fulfillment" && canManageManualFulfillment);
+    if (!authorized) return;
+    clearAdminOperationSelection();
+    const context = { action, account };
+    adminOperationContextRef.current = context;
+    setAdminOperationContext(context);
+    manualReceiptClientAccountIdRef.current = account.id;
+    setManualReceiptClientAccountId(account.id);
+    let selector = "";
+    if (action === "manual_receipt") {
+      selector = '[aria-label="Record manual receipt"]';
+      setNotice(`Manual receipt target fixed to ${account.name}. Verify the account and load its history before recording money.`);
+    } else if (action === "refund") {
+      selector = '[aria-label="Manual refunds"]';
+      setNotice(`Refund operations are fixed to ${account.name}; unrelated receipts and refund facts are hidden.`);
+    } else if (action === "ticket") {
+      selector = '[aria-label="Staff support tickets"]';
+      setNotice(`Ticket operations are fixed to ${account.name}; unrelated conversations are hidden.`);
+    } else {
+      selector = '[aria-label="Manual fulfillment queue"]';
+      setNotice(`Manual fulfillment is fixed to ${account.name}; unrelated services are hidden.`);
+    }
+    requestAnimationFrame(() => {
+      document.querySelector(selector)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   }
 
   return (
@@ -3083,9 +4470,16 @@ export function App() {
           >
             Admin
           </a>
+          <a
+            aria-current={route === "/security" ? "page" : undefined}
+            href="/security"
+            onClick={(event) => followRouteLink(event, "/security")}
+          >
+            Security
+          </a>
         </nav>
         <div className="header-actions">
-          <button onClick={() => setLocale(locale === "en" ? "zh-CN" : "en")}>
+          <button onClick={() => void toggleLocale()}>
             {locale === "en" ? "简体中文" : "English"}
           </button>
           <span className={route === "/" ? "pill" : me?.eligible ? "pill good" : "pill"}>
@@ -3107,21 +4501,33 @@ export function App() {
               ? "Public · Mock-only laboratory"
               : route === "/customer"
                 ? "Customer workspace · Mock-only"
-                : "Staff workspace · Mock-only"}
+                : route === "/admin"
+                  ? "Staff workspace · Mock-only"
+                  : route === "/security"
+                    ? "Shared User Security · Mock-only"
+                    : "Identity recovery · Mock-only"}
           </p>
           <h1>
             {route === "/"
               ? "Customer, billing and service operations — without vendor lock-in."
               : route === "/customer"
                 ? "Orders, billing, services and support in one customer workspace."
-                : "Audited support, money and service operations for Staff."}
+                : route === "/admin"
+                  ? "Audited support, money and service operations for Staff."
+                  : route === "/security"
+                    ? "One identity security surface for Customer and Staff."
+                    : "Complete a one-time identity link without exposing its secret."}
           </h1>
           <p>
             {route === "/"
               ? "Explore the synthetic catalog, create an account or sign in. Customer and Staff data stay inside their dedicated workspaces."
               : route === "/customer"
                 ? "Continue the real Mock Provider journey: open tickets, manage billing and follow each order through service delivery."
-                : "Public replies, internal notes, manual receipts, refunds and operational decisions remain explicit and reviewable."}
+                : route === "/admin"
+                  ? "Public replies, internal notes, manual receipts, refunds and operational decisions remain explicit and reviewable."
+                  : route === "/security"
+                    ? "Manage password, verified email, optional TOTP, sessions and low-risk customer API keys with fresh authorization checks."
+                    : "Tokens stay in memory only and are removed from the address bar before use."}
           </p>
         </section>
 
@@ -3130,6 +4536,86 @@ export function App() {
             {error || notice}
             <button onClick={() => (error ? setError("") : setNotice(""))}>×</button>
           </div>
+        )}
+
+        {loginChallenge && (
+          <section className="route-access" aria-label="Login factor challenge" data-testid="login-factor-challenge">
+            <p className="eyebrow">{locale === "zh-CN" ? "登录第二步" : "Sign-in second step"}</p>
+            <h2>{locale === "zh-CN" ? "确认身份因子" : "Confirm an identity factor"}</h2>
+            <p>{locale === "zh-CN" ? "输入当前 TOTP，或使用一条尚未使用的一次性恢复码。" : "Enter the current TOTP, or one unused single-use recovery code."}</p>
+            <form onSubmit={completeLoginChallenge}>
+              <label>{locale === "zh-CN" ? "TOTP / 恢复码" : "TOTP / recovery code"}<input name="factorCode" autoComplete="one-time-code" required /></label>
+              <button className="primary" type="submit">{locale === "zh-CN" ? "完成登录" : "Complete sign in"}</button>
+              <button type="button" onClick={() => setLoginChallenge(null)}>{locale === "zh-CN" ? "取消" : "Cancel"}</button>
+            </form>
+          </section>
+        )}
+
+        {route === "/security" && sessionResolved && (
+          <SecurityPanel
+            active
+            authenticated={Boolean(
+              me && me.verification.email === "passed" && !me.restrictions.user,
+            )}
+            customerApiEligible={Boolean(me?.clientAccountId && me?.context)}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/password-recovery" && (
+          <PasswordRecoveryPage
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/email-change" && sessionResolved && (
+          <EmailChangePage
+            authenticated={Boolean(
+              me && me.verification.email === "passed" && !me.restrictions.user,
+            )}
+            locale={locale}
+            onLogin={login}
+            onCompleted={async () => { await refreshMe(); }}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && membershipInvitationToken && (
+          <section className="route-access" aria-label="Membership invitation acceptance" data-testid="membership-invitation-acceptance">
+            <p className="eyebrow">{locale === "zh-CN" ? "客户账户成员邀请" : "Client Account membership invitation"}</p>
+            <h2>
+              {!me
+                ? locale === "zh-CN" ? "使用受邀邮箱登录" : "Sign in with the invited email"
+                : invitationAcceptPending
+                  ? locale === "zh-CN" ? "正在接受邀请…" : "Accepting the invitation…"
+                  : invitationAcceptError
+                    ? locale === "zh-CN" ? "邀请尚未接受" : "The invitation was not accepted"
+                    : locale === "zh-CN" ? "正在检查邀请…" : "Checking this invitation…"}
+            </h2>
+            <p>
+              {!me
+                ? locale === "zh-CN"
+                  ? "邀请令牌只保留在当前页面；请在下方登录，它不会复制到本地存储或日志。"
+                  : "The invitation stays in this page only. Sign in below; it is never copied to local storage or logs."
+                : invitationAcceptError || (locale === "zh-CN"
+                  ? "未经明确选择，新成员关系不会替换当前客户账户。"
+                  : "The new membership will not replace your active Client Account without an explicit selection.")}
+            </p>
+            {me && invitationAcceptError && (
+              <button
+                className="primary"
+                disabled={invitationAcceptPending}
+                onClick={() => setInvitationRetryNonce((value) => value + 1)}
+              >
+                {locale === "zh-CN" ? "重试接受邀请" : "Retry invitation acceptance"}
+              </button>
+            )}
+          </section>
         )}
 
         {route === "/" && (
@@ -3180,6 +4666,13 @@ export function App() {
                   <button className="primary" type="submit">
                     {text.login}
                   </button>
+                  <a
+                    className="route-action"
+                    href="/password-recovery"
+                    onClick={(event) => followRouteLink(event, "/password-recovery")}
+                  >
+                    {locale === "zh-CN" ? "忘记密码？" : "Forgot password?"}
+                  </a>
                 </form>
               </div>
             </div>
@@ -3195,25 +4688,65 @@ export function App() {
             ) : me ? (
               <>
                 <h2>{me.email}</h2>
-                <p>{me.eligible ? text.ready : text.pending}</p>
+                <p>
+                  {me.eligible
+                    ? text.ready
+                    : me.verification.email !== "passed"
+                      ? text.pending
+                      : me.restrictions.user
+                        ? locale === "zh-CN"
+                          ? "当前用户已受限。"
+                          : "This user is restricted."
+                        : !me.clientAccountId
+                          ? locale === "zh-CN"
+                            ? "请选择当前客户账户后继续。"
+                            : "Select the active Client Account to continue."
+                          : locale === "zh-CN"
+                            ? "客户账户已受限；已保存的业务历史仍可读取。"
+                            : "The Client Account is restricted; saved business history remains readable."}
+                </p>
                 <div className="status-row">
                   <span>Email verification</span>
                   <strong>{me.verification.email}</strong>
                 </div>
-                {!me.eligible && (
+                {me.verification.email !== "passed" && (
                   <>
                     <button className="primary" onClick={openLabMailbox}>
                       Open my Mock Provider mailbox
                     </button>
                     {mail.map((message) => {
-                      const verificationUrl = message.body.match(/https?:\/\/\S+/)?.[0];
+                      const messageUrl = message.body.match(/https?:\/\/\S+/)?.[0];
+                      let verificationUrl: string | null = null;
+                      let isMembershipInvitation = false;
+                      if (messageUrl) {
+                        try {
+                          const parsed = new URL(messageUrl, window.location.origin);
+                          const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+                          if (pathname === "/verify") verificationUrl = messageUrl;
+                          isMembershipInvitation = pathname === "/membership-invitations/accept";
+                        } catch {
+                          // Malformed Mock Provider links remain inert message facts.
+                        }
+                      }
                       return (
                         <div className="mock-message" key={message.id}>
                           <strong>{message.subject}</strong>
                           <span>
                             {message.status} · {new Date(message.deliveredAt).toLocaleString()}
                           </span>
-                          {verificationUrl && <a href={verificationUrl}>Use one-time verification link</a>}
+                          {verificationUrl && (
+                            <a
+                              href={verificationUrl}
+                              onClick={(event) => void verifyInvitationIdentity(event, verificationUrl)}
+                            >
+                              {locale === "zh-CN" ? "使用一次性验证链接" : "Use one-time verification link"}
+                            </a>
+                          )}
+                          {isMembershipInvitation && (
+                            <span className="muted">
+                              {locale === "zh-CN" ? "当前成员邀请链接（无需重复打开）" : "Current membership invitation link (already open)"}
+                            </span>
+                          )}
                         </div>
                       );
                     })}
@@ -3222,21 +4755,48 @@ export function App() {
               </>
             ) : (
               <div className="form-columns">
-                <form onSubmit={register}>
-                  <h3>{text.register}</h3>
-                  <input name="clientName" placeholder="Client account name" required />
-                  <input name="email" type="email" placeholder="Email" required />
-                  <input
-                    name="password"
-                    type="password"
-                    minLength={12}
-                    placeholder="Password (12+ characters)"
-                    required
-                  />
-                  <button className="primary" type="submit">
-                    {text.register}
-                  </button>
-                </form>
+                {membershipInvitationToken ? (
+                  <form onSubmit={registerInvitationIdentity} data-testid="invitation-registration-form">
+                    <h3>{locale === "zh-CN" ? "创建受邀用户身份" : "Create invited User identity"}</h3>
+                    <p className="muted">
+                      {locale === "zh-CN"
+                        ? "此流程只创建用户身份，不会创建无关的客户账户。"
+                        : "This creates only your User identity and no unrelated Client Account."}
+                    </p>
+                    <input
+                      name="email"
+                      type="email"
+                      placeholder={locale === "zh-CN" ? "受邀邮箱" : "Invited email"}
+                      required
+                    />
+                    <input
+                      name="password"
+                      type="password"
+                      minLength={12}
+                      placeholder={locale === "zh-CN" ? "密码（至少12个字符）" : "Password (12+ characters)"}
+                      required
+                    />
+                    <button className="primary" type="submit">
+                      {locale === "zh-CN" ? "创建受邀用户身份" : "Create invited identity"}
+                    </button>
+                  </form>
+                ) : (
+                  <form onSubmit={register}>
+                    <h3>{text.register}</h3>
+                    <input name="clientName" placeholder="Client account name" required />
+                    <input name="email" type="email" placeholder="Email" required />
+                    <input
+                      name="password"
+                      type="password"
+                      minLength={12}
+                      placeholder="Password (12+ characters)"
+                      required
+                    />
+                    <button className="primary" type="submit">
+                      {text.register}
+                    </button>
+                  </form>
+                )}
                 <form onSubmit={login}>
                   <h3>{text.login}</h3>
                   <input name="email" type="email" placeholder="Email" required />
@@ -3244,6 +4804,13 @@ export function App() {
                   <button className="primary" type="submit">
                     {text.login}
                   </button>
+                  <a
+                    className="route-action"
+                    href="/password-recovery"
+                    onClick={(event) => followRouteLink(event, "/password-recovery")}
+                  >
+                    {locale === "zh-CN" ? "忘记密码？" : "Forgot password?"}
+                  </a>
                 </form>
               </div>
             )}
@@ -3251,14 +4818,60 @@ export function App() {
         </section>
         )}
 
+        {route === "/customer" &&
+          sessionResolved &&
+          me &&
+          me.verification.email === "passed" &&
+          !me.restrictions.user &&
+          typeof me.accountContextVersion === "string" && (
+          <AccountContextSwitcher
+            active={route === "/customer"}
+            viewerId={me.id}
+            activeClientAccountId={me.clientAccountId}
+            activeContext={me.context ? {
+              clientAccountId: me.context.clientAccountId,
+              name: me.context.name,
+              role: me.context.role,
+              permissions: me.context.permissions,
+              capabilities: me.context.capabilities ?? [],
+              restrictions: {
+                membership: false,
+                clientAccount: me.restrictions.clientAccount,
+              },
+            } : null}
+            accountContextVersion={me.accountContextVersion}
+            locale={locale}
+            onSwitched={accountContextSwitched}
+            onError={showTicketError}
+          />
+        )}
+
         {route === "/customer" && !me?.eligible && (
           <section className="route-access" aria-label="Customer access status">
             <p className="eyebrow">Customer access</p>
-            <h2>{me ? "Verify your email to continue" : "Sign in to open the customer workspace"}</h2>
+            <h2>
+              {!me
+                ? "Sign in to open the customer workspace"
+                : me.verification.email !== "passed"
+                  ? "Verify your email to continue"
+                : me.restrictions.user
+                    ? "This user is restricted"
+                    : !me.clientAccountId
+                      ? "Select an active Client Account"
+                      : locale === "zh-CN" ? "购买与账户变更不可用" : "Purchases and account changes are unavailable"}
+            </h2>
             <p>
-              {me
-                ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
-                : "Use the account forms above. Successful sign-in returns directly to this customer page."}
+              {!me
+                ? "Use the account forms above. Successful sign-in returns directly to this customer page."
+                : me.verification.email !== "passed"
+                  ? "Customer billing, orders, services and support become available after the Mock Provider verification step above."
+                  : me.restrictions.user
+                    ? "This user cannot open account history or perform customer actions while the user restriction remains active."
+                    : !me.clientAccountId
+                      ? "Choose an unrestricted membership above. No customer account data is loaded until that choice is explicit."
+                      : locale === "zh-CN"
+                        ? "客户账户限制会阻止商业、账单与账户变更；已保存历史和支持工单通道仍可继续使用。"
+                        : "The Client Account restriction prevents commerce, billing and account changes. Saved history and the support-ticket lifeline remain available below."}
             </p>
           </section>
         )}
@@ -3281,14 +4894,14 @@ export function App() {
             <h2>
               {!me
                 ? "Sign in required"
-                : !me.eligible
-                  ? "Access denied — eligible Staff account required"
+                : !staffIdentityEligible
+                  ? "Access denied — verified, unrestricted Staff User required"
                   : "Access denied — Staff permission required"}
             </h2>
             <p>
               {!me
                 ? "Sign in with an authorized Staff account. No administrative capability is shown to guests."
-                : !me.eligible
+                : !staffIdentityEligible
                   ? `${me.email} is not currently eligible. No administrative capability has been loaded on this page.`
                   : `${me.email} has no recognized Staff permission for this workspace. No administrative capability has been loaded.`}
             </p>
@@ -3303,6 +4916,13 @@ export function App() {
                   <input name="password" type="password" placeholder="Staff password" required />
                 </label>
                 <button className="primary" type="submit">Sign in to Staff workspace</button>
+                <a
+                  className="route-action"
+                  href="/password-recovery"
+                  onClick={(event) => followRouteLink(event, "/password-recovery")}
+                >
+                  Forgot password?
+                </a>
               </form>
             )}
             <a className="route-action" href="/" onClick={(event) => followRouteLink(event, "/")}>
@@ -3311,37 +4931,253 @@ export function App() {
           </section>
         )}
 
-        {route === "/customer" && (
-          <TicketsPanel
-            mode="customer"
-            me={me}
+        {route === "/customer" && sessionResolved && canReadCustomerHistory && me && (
+          <CustomerBusinessHistory
+            key={`${me.id}:${me.clientAccountId}:${me.accountContextVersion}`}
+            active={route === "/customer"}
+            canReadHistory={canReadCustomerHistory}
+            canManageServices={canManageServices}
+            accessFingerprint={customerCommerceAccessFingerprint}
+            clientAccountId={me.clientAccountId}
             locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && canReadCustomerNotificationHistory && me?.context && (
+          <NotificationDeliveryHistory
+            active={route === "/customer"}
+            endpoint="/api/v1/customer/notification-deliveries"
+            accountId={me.context.clientAccountId}
+            scopeKey={`${me.id}:${me.context.clientAccountId}:${me.context.version}`}
+            refreshKey={me.context.version}
+            locale={locale}
+            variant="customer"
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && me && !membershipInvitationToken && (
+          <NotificationPreferencesPanel
+            active={route === "/customer"}
+            locale={locale}
+            accessFingerprint={notificationPreferenceAccessFingerprint}
+            canRead={canReadNotificationPreferences}
+            canWrite={canWriteNotificationPreferences}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && canReadCustomerHistory && me?.context && (
+          <AccountAccessPanel
+            active={route === "/customer"}
+            viewerId={me.id}
+            accountId={me.context.clientAccountId}
+            accountName={me.context.name}
+            role={me.context.role}
+            capabilities={me.context.capabilities ?? []}
+            contextVersion={me.context.version}
+            writeEligible={me.eligible}
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+            onSelfMembershipChanged={accountContextSwitched}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && me?.context && (
+          <MarketingConsentPanel
+            active={route === "/customer"}
+            locale={locale}
+            viewerId={me.id}
+            clientAccountId={me.context.clientAccountId}
+            accessFingerprint={customerCommerceAccessFingerprint}
+            canRead={canReadMarketingConsent}
+            canWithdraw={canWithdrawMarketingConsent}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && me?.context && (
+          <CustomerQuotePanel
+            active={route === "/customer"}
+            locale={locale}
+            clientAccountId={me.context.clientAccountId}
+            accessFingerprint={customerCommerceAccessFingerprint}
+            canReadQuotes={canReadCustomerQuotes}
+            canAcceptQuotes={canCreateOrders}
+            legal={legal}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+            onAccepted={() => {
+              void refreshLatestOrder().catch((caught) => {
+                showTicketError(
+                  caught instanceof Error
+                    ? caught.message
+                    : "The accepted Quote Order could not be refreshed",
+                );
+              });
+              void refreshBilling().catch((caught) => {
+                showTicketError(
+                  caught instanceof Error
+                    ? caught.message
+                    : "Billing could not be refreshed after Quote acceptance",
+                );
+              });
+            }}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canViewAccount360 && me && (
+          <AdminAccount360
+            active={route === "/admin"}
+            accessFingerprint={staffAccessFingerprint}
+            permissions={staffPermissions}
+            locale={locale}
+            availableActions={account360Actions}
+            onAction={openAdminAccountAction}
+            onSelectedAccountChange={selectedAdminAccountChanged}
+            onRefreshAccess={async () => { await refreshMe(); }}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canManageServiceOperations && (
+          <AdminServiceOperationsQueue
+            active={route === "/admin"}
+            locale={locale}
+            onNotice={setNotice}
+            onError={setError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canOpenAdminWorkspace && (
+          <AdminCommercePanel
+            active={route === "/admin"}
+            locale={locale}
+            accessFingerprint={staffAccessFingerprint}
+            canCatalogRead={canReadCatalog}
+            canCatalogManage={canManageCatalog}
+            canPricingManage={canManageCatalogPricing}
+            canSupplyManage={canManageCatalogSupply}
+            canPromotionsRead={canReadPromotions}
+            canPromotionsManage={canManagePromotions}
+            canQuotesRead={canReadQuotes}
+            canQuotesManage={canManageQuotes}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/admin" && sessionResolved && canReadNotificationOperations && (
+          <NotificationOperationsPanel
+            active={route === "/admin"}
+            locale={locale}
+            canRead={canReadNotificationOperations}
+            canRetry={canRetryNotificationOperations}
+            accessFingerprint={staffAccessFingerprint}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/" && (
+          <SupportOperationsPanel
+            key={`visitor-support:${routeGenerationRef.current}`}
+            mode="visitor"
+            locale={locale}
+            onNotice={showTicketNotice}
+            onError={showTicketError}
+          />
+        )}
+
+        {route === "/customer" && sessionResolved && (
+          <SupportOperationsPanel
+            key={`customer-support:${customerCommerceAccessFingerprint}`}
+            mode="customer"
+            locale={locale}
+            canReadCustomerTickets={canUseCustomerSupport}
+            canWriteCustomerTickets={canWriteCustomerSupport}
             onNotice={showTicketNotice}
             onError={showTicketError}
           />
         )}
 
         {route === "/admin" && sessionResolved && canManageStaffTickets && (
-          <TicketsPanel
+          <SupportOperationsPanel
+            key={`staff-support:${staffAccessFingerprint}:${operationAccount?.id ?? "global"}`}
             mode="staff"
-            canManageTickets={canManageStaffTickets}
-            me={me}
+            canManageSupport={canManageStaffTickets}
+            staffAccountContext={operationAccount}
             locale={locale}
             onNotice={showTicketNotice}
             onError={showTicketError}
           />
         )}
 
-        {route === "/admin" && canManageStaffTickets && !canUseFullAdminWorkspace && (
+        {route === "/admin" && canOpenAdminWorkspace && !canUseFullAdminWorkspace && (
           <section className="route-access" data-testid="limited-admin-scope">
             <p className="eyebrow">Permission-scoped Staff workspace</p>
-            <h2>Ticket support only</h2>
+            <h2>Permission-scoped operations</h2>
             <p>
-              This Staff session can manage support tickets. Billing, refunds, money and service
-              administration remain unmounted because wildcard permission is not present.
+              This Staff session loads only its explicitly permitted Account 360, support and
+              operation panels. Other billing, money and service administration stays unmounted
+              and is not requested.
             </p>
           </section>
         )}
+
+        <ContentHub
+          active={route === "/"}
+          customer={false}
+          locale={locale}
+          onError={showContentError}
+        />
+
+        <ContentHub
+          active={
+            route === "/customer" &&
+            sessionResolved &&
+            me !== null &&
+            me.verification.email === "passed" &&
+            !me.restrictions.user
+          }
+          customer
+          locale={locale}
+          onError={showContentError}
+        />
+
+        <LegalHub
+          active={route === "/" || route === "/customer"}
+          locale={locale}
+          documents={legal?.documents ?? null}
+        />
+
+        <ContentOperationsPanel
+          active={route === "/admin" && sessionResolved && canReadContent}
+          locale={locale}
+          canRead={canReadContent}
+          canManage={canManageContent}
+          accessFingerprint={staffAccessFingerprint}
+          onNotice={showContentNotice}
+          onError={showContentError}
+        />
+
+        <NotificationTemplateRegistryPanel
+          active={route === "/admin" && sessionResolved && canReadNotificationTemplates}
+          locale={locale}
+          canRead={canReadNotificationTemplates}
+          canCreate={canCreateNotificationTemplates}
+          canPublish={canPublishNotificationTemplates}
+          canRetire={canRetireNotificationTemplates}
+          accessFingerprint={staffAccessFingerprint}
+          onNotice={showTicketNotice}
+          onError={showTicketError}
+        />
 
         {route === "/customer" &&
           me &&
@@ -3422,7 +5258,7 @@ export function App() {
             </section>
           )}
 
-        {route === "/customer" && me?.eligible && paymentSettings && (
+        {route === "/customer" && canReadCustomerHistory && paymentSettings && (
           <section className="order-panel" aria-label="Payment methods and automatic renewal">
             <div>
               <p className="eyebrow">Customer billing · payment permissions</p>
@@ -3435,7 +5271,17 @@ export function App() {
                 background attempt; customer action or failure stops background charging.
               </p>
             </div>
-            {paymentSettingsReauthActive ? (
+            {!canWriteBilling ? (
+              <p className="notice" data-testid="payment-settings-read-only">
+                {locale === "zh-CN"
+                  ? me?.restrictions.clientAccount
+                    ? "客户账户当前受限；已保存的付款方式与自动续费状态仅供查看，不能更改。"
+                    : "当前成员权限仅允许查看付款方式与自动续费状态，不能更改。"
+                  : me?.restrictions.clientAccount
+                    ? "The Client Account is restricted. Saved payment methods and automatic-renewal status are read-only."
+                    : "This membership can view payment methods and automatic-renewal status but cannot change them."}
+              </p>
+            ) : paymentSettingsReauthActive ? (
               <p className="muted" data-testid="payment-settings-reauth-active">
                 Password confirmed until {new Date(paymentSettingsReauthExpiresAt!).toLocaleTimeString()}.
                 This fixed window does not extend when you make another change.
@@ -3484,7 +5330,7 @@ export function App() {
                       <span>
                         Saved with consent {method.consentVersion} at {new Date(method.savedAt).toLocaleString()}
                       </span>
-                      <div className="fund-actions">
+                      {canWriteBilling && <div className="fund-actions">
                         {!method.default && (
                           <button
                             disabled={paymentSettingsPending || !paymentSettingsReauthReady}
@@ -3511,7 +5357,7 @@ export function App() {
                                 : "Enable automatic renewal for current service"}
                             </button>
                           )}
-                      </div>
+                      </div>}
                     </article>
                   );
                 })}
@@ -3530,12 +5376,14 @@ export function App() {
                       Withdrawing this consent does not cancel the invoice payment; it only prevents a
                       late payment result from enabling future off-session charges.
                     </span>
-                    <button
-                      disabled={paymentSettingsPending || !paymentSettingsReauthReady}
-                      onClick={() => void revokePendingAutomaticRenewal(pending)}
-                    >
-                      Withdraw pending automatic-renewal consent
-                    </button>
+                    {canWriteBilling && (
+                      <button
+                        disabled={paymentSettingsPending || !paymentSettingsReauthReady}
+                        onClick={() => void revokePendingAutomaticRenewal(pending)}
+                      >
+                        Withdraw pending automatic-renewal consent
+                      </button>
+                    )}
                   </article>
                 ))}
               </div>
@@ -3566,7 +5414,7 @@ export function App() {
                           : ""}
                       </span>
                     )}
-                    {authorization.status === "active" && (
+                    {canWriteBilling && authorization.status === "active" && (
                       <button
                         disabled={paymentSettingsPending || !paymentSettingsReauthReady}
                         onClick={() => void revokeServiceAutomaticRenewal(authorization)}
@@ -3580,7 +5428,7 @@ export function App() {
           </section>
         )}
 
-        {route === "/customer" && me?.eligible && renewals.length > 0 && (
+        {route === "/customer" && canReadCustomerHistory && renewals.length > 0 && (
           <section className="order-panel" aria-label="Service renewals">
             <div>
               <p className="eyebrow">Customer billing · renewals</p>
@@ -3672,7 +5520,7 @@ export function App() {
                             .join(", ")}
                     </span>
                   </div>
-                  {renewal.status !== "paid" && renewal.status !== "cancelled" && (
+                  {canWriteBilling && renewal.status !== "paid" && renewal.status !== "cancelled" && (
                     <div className="fund-actions">
                       <select
                         aria-label={`Renewal payment method ${renewal.invoiceId}`}
@@ -3732,7 +5580,7 @@ export function App() {
           </section>
         )}
 
-        {route === "/customer" && me?.eligible && billing?.addFunds.enabled && (
+        {route === "/customer" && canWriteBilling && billing?.addFunds.enabled && (
           <section className="order-panel" aria-label="Add Funds">
             <div>
               <p className="eyebrow">Customer billing · Mock Add Funds</p>
@@ -3848,8 +5696,44 @@ export function App() {
           </section>
         )}
 
-        {route === "/admin" && sessionResolved && canUseFullAdminWorkspace && me && (
-          <section className="admin-panel" data-testid="full-admin-workspace">
+        {route === "/admin" && sessionResolved && canMountAdminOperationWorkspace && me && (
+          <section
+            className="admin-panel"
+            data-testid={
+              canUseFullAdminWorkspace
+                ? "full-admin-workspace"
+                : "permission-admin-operations"
+            }
+          >
+            {!canUseFullAdminWorkspace && (
+              <div data-testid="permission-operation-reauth">
+                <p className="eyebrow">Permission-scoped audited operation</p>
+                <h2>Authorized account operation</h2>
+                {operationAccount ? (
+                  <p className="notice" data-testid="admin-operation-account-context">
+                    Fixed Client Account: {operationAccount.name} · {operationAccount.id}
+                  </p>
+                ) : canViewAccount360 ? (
+                  <p className="muted" data-testid="admin-operation-account-required">
+                    Select a Client Account in Account 360 and choose the required operation.
+                  </p>
+                ) : (
+                  <p className="muted">
+                    This permission can operate its complete queue. Account 360 filtering is not
+                    available without accounts.view.
+                  </p>
+                )}
+                <input
+                  aria-label="Operation password confirmation"
+                  type="password"
+                  value={adminPassword}
+                  onChange={(event) => setAdminPassword(event.target.value)}
+                  placeholder="Re-enter password (15-minute fixed window)"
+                />
+              </div>
+            )}
+            {canUseFullAdminWorkspace && (
+              <>
             <div>
               <p className="eyebrow">Administrator · audited billing and fulfillment</p>
               <h2>Credit adjustment and human Ready decisions</h2>
@@ -4156,13 +6040,30 @@ export function App() {
                           {item.serviceStatus}
                         </span>
                         <span>
-                          {locale === "zh-CN" ? "到期任务" : "Due job"} {item.job.status}
+                          {item.job.type === "service.cancellation.reconcile"
+                            ? locale === "zh-CN"
+                              ? "对账任务"
+                              : "Reconcile job"
+                            : locale === "zh-CN"
+                              ? "到期任务"
+                              : "Due job"}{" "}
+                          {item.job.status}
                           {item.providerOperation
-                            ? ` · Provider ${item.providerOperation.status}/${item.providerOperation.attempts}`
+                            ? ` · Provider ${item.providerOperation.status}/${item.providerOperation.attempts} · GET ${item.providerOperation.reconcileQueries}/3 · unresolved ${item.providerOperation.unresolvedReconcileQueries}`
                             : locale === "zh-CN"
                               ? " · 无 Provider 操作"
                               : " · no Provider operation"}
                         </span>
+                        {item.providerOperation?.attemptId && (
+                          <span data-testid="admin-cancellation-provider-evidence">
+                            {locale === "zh-CN" ? "不可变尝试" : "Immutable attempt"}: {item.providerOperation.attemptId}
+                            {item.providerOperation.latestResult
+                              ? ` · ${item.providerOperation.latestResult.source} ${item.providerOperation.latestResult.outcome}`
+                              : locale === "zh-CN"
+                                ? " · 尚无终态结果事实"
+                                : " · no terminal result fact yet"}
+                          </span>
+                        )}
                         {item.interventionRequired && (
                           <>
                             <span data-testid="admin-cancellation-manual">
@@ -4173,6 +6074,7 @@ export function App() {
                             <button
                               className="primary"
                               disabled={
+                                !item.completionAllowed ||
                                 cancellationCompletionPendingId !== null ||
                                 adminPassword.length === 0 ||
                                 cancellationCompletionReason.trim().length < 10
@@ -4184,8 +6086,12 @@ export function App() {
                                   ? "正在记录终止…"
                                   : "Recording termination…"
                                 : locale === "zh-CN"
-                                  ? "确认人工终止"
-                                  : "Confirm manual termination"}
+                                  ? item.completionAllowed
+                                    ? "确认人工终止"
+                                    : "等待精确 Provider 证据"
+                                  : item.completionAllowed
+                                    ? "Confirm manual termination"
+                                    : "Await exact Provider evidence"}
                             </button>
                           </>
                         )}
@@ -4295,10 +6201,24 @@ export function App() {
                 </div>
               )}
             </div>
-            {manualItems.length === 0 ? (
-              <p className="muted">No paid manual services are waiting.</p>
-            ) : (
-              <>
+              </>
+            )}
+            {canManageManualFulfillment && (
+            <div className="admin-subsection" aria-label="Manual fulfillment queue">
+              <h3>Staff fulfillment queue</h3>
+              {operationAccount && (
+                <p className="notice" data-testid="manual-fulfillment-account-context">
+                  Showing only {operationAccount.name} · {operationAccount.id}
+                </p>
+              )}
+              {visibleManualItems.length === 0 ? (
+                <p className="muted">
+                  {operationAccount === null && canViewAccount360 && !canUseFullAdminWorkspace
+                    ? "Select a Client Account in Account 360 to open its fulfillment queue."
+                    : "No paid services are waiting for a Staff fulfillment action."}
+                </p>
+              ) : (
+                <>
                 <div className="inline-form admin-confirm">
                   <input
                     value={manualReason}
@@ -4306,26 +6226,40 @@ export function App() {
                     placeholder="Reason and delivery evidence (10+ characters)"
                   />
                 </div>
-                {manualItems.map((item) => (
-                  <article className="manual-item" key={item.serviceId}>
+                {visibleManualItems.map((item) => (
+                  <article className="manual-item" data-testid="manual-fulfillment-item" key={item.serviceId}>
                     <div>
                       <strong>{item.productName}</strong>
                       <span>
                         {item.clientAccountName} · {item.billingCycle} ·{" "}
                         {usd(item.paidMinor)} paid
                       </span>
+                      <span>
+                        {item.action === "approve_provider_provisioning"
+                          ? `Saved Provider binding${item.providerInstallationId ? ` · ${item.providerInstallationId}` : ""}${item.bindingPolicyVersion ? ` · policy v${item.bindingPolicyVersion}` : ""}`
+                          : item.fulfillmentExecutionMode === "unconfigured"
+                            ? "Binding snapshot unavailable"
+                            : item.bindingPolicyVersion
+                              ? `Saved manual fulfillment binding · policy v${item.bindingPolicyVersion}`
+                              : "Manual fulfillment mode · no Provider operation or job"}
+                      </span>
                     </div>
                     <button
                       className="primary"
                       disabled={adminPassword.length === 0 || manualReason.trim().length < 10}
-                      onClick={() => completeManual(item.serviceId)}
+                      onClick={() => completeManual(item)}
                     >
-                      Confirm Ready for Service
+                      {item.action === "approve_provider_provisioning"
+                        ? "Approve Provider Provisioning"
+                        : "Confirm Manual Ready"}
                     </button>
                   </article>
                 ))}
-              </>
+                </>
+              )}
+            </div>
             )}
+            {canManageManualReceipts && (
             <div className="admin-subsection" aria-label="Record manual receipt">
               <div>
                 <p className="eyebrow">Audited offline or manual money fact</p>
@@ -4335,6 +6269,11 @@ export function App() {
                   immutable gross, fee, net cash, and unclaimed liability facts. It does not call a
                   Provider, pay an invoice, add Credit, or activate a service.
                 </p>
+                {operationAccount && (
+                  <p className="notice" data-testid="manual-receipt-account-context">
+                    Target fixed to {operationAccount.name} · {operationAccount.id}
+                  </p>
+                )}
               </div>
               <div className="manual-receipt-form">
                 <label>
@@ -4344,15 +6283,29 @@ export function App() {
                     disabled={
                       manualReceiptPending || manualReceiptReversalPendingId !== null
                     }
+                    readOnly={
+                      operationAccount !== null ||
+                      (!canUseFullAdminWorkspace && canViewAccount360)
+                    }
                     value={manualReceiptClientAccountId}
                     onChange={(event) => {
+                      manualReceiptRequestGeneration.current += 1;
+                      manualReceiptClientAccountIdRef.current = event.target.value;
                       setManualReceiptClientAccountId(event.target.value);
+                      setManualReceiptReference("");
+                      setManualReceiptReceivedAt(defaultManualReceiptTime());
+                      setManualReceiptGrossMinor("10000");
+                      setManualReceiptFeeMinor("0");
+                      setManualReceiptReason("");
+                      setManualReceiptPending(false);
                       setManualReceiptHistory([]);
                       setManualReceiptTarget(null);
                       setManualReceiptOutcome(null);
                       setManualReceiptReversalTargetId(null);
                       setManualReceiptReversalReason("");
+                      setManualReceiptReversalPendingId(null);
                       setManualReceiptReversalOutcome(null);
+                      setAdminPassword("");
                     }}
                     placeholder="Client Account UUID"
                   />
@@ -4545,22 +6498,87 @@ export function App() {
                             {receipt.disposition}
                           </span>
                           <span>{receipt.reason}</span>
-                          {manualReceiptTarget && (
+                          {manualReceiptTarget && canManageRefunds && (
                             <ManualReceiptOutflowPanel
                               clientAccountId={manualReceiptTarget.id}
                               receipt={receipt}
                               password={adminPassword}
+                              scopeToken={currentManualReceiptScopeToken(
+                                manualReceiptTarget.id,
+                              )}
                               disabled={
                                 manualReceiptPending ||
                                 manualReceiptReversalPendingId !== null
                               }
-                              onPasswordConsumed={() => setAdminPassword("")}
-                              onRefresh={async () => {
-                                const refreshed = await fetchManualReceiptHistory(
+                              isScopeCurrent={(scopeToken) =>
+                                manualReceiptScopeIsCurrent(
+                                  scopeToken,
                                   manualReceiptTarget.id,
-                                );
-                                setManualReceiptTarget(refreshed.clientAccount);
-                                setManualReceiptHistory(refreshed.items);
+                                )}
+                              onPasswordConsumed={(scopeToken) => {
+                                if (
+                                  manualReceiptScopeIsCurrent(
+                                    scopeToken,
+                                    manualReceiptTarget.id,
+                                  )
+                                ) setAdminPassword("");
+                              }}
+                              onRefresh={async (scopeToken) => {
+                                const clientAccountId = manualReceiptTarget.id;
+                                if (
+                                  !manualReceiptScopeIsCurrent(
+                                    scopeToken,
+                                    clientAccountId,
+                                  )
+                                ) return false;
+                                const operationScope = captureAdminOperationScope();
+                                if (
+                                  !adminOperationRequestIsCurrent(
+                                    operationScope,
+                                    clientAccountId,
+                                  )
+                                ) return false;
+                                const [historyResult, unclaimedResult] =
+                                  await Promise.allSettled([
+                                    fetchManualReceiptHistory(clientAccountId, scopeToken),
+                                    canUseFullAdminWorkspace
+                                      ? refreshUnclaimedFunds(
+                                          operationScope,
+                                          () => manualReceiptScopeIsCurrent(
+                                            scopeToken,
+                                            clientAccountId,
+                                          ),
+                                        )
+                                      : Promise.resolve(true),
+                                  ]);
+                                if (
+                                  !manualReceiptScopeIsCurrent(
+                                    scopeToken,
+                                    clientAccountId,
+                                  ) ||
+                                  !adminOperationRequestIsCurrent(
+                                    operationScope,
+                                    clientAccountId,
+                                  )
+                                ) return false;
+                                if (
+                                  historyResult.status === "fulfilled" &&
+                                  historyResult.value
+                                ) {
+                                  setManualReceiptTarget(historyResult.value.clientAccount);
+                                  setManualReceiptHistory(historyResult.value.items);
+                                }
+                                if (
+                                  historyResult.status === "rejected" ||
+                                  !historyResult.value ||
+                                  unclaimedResult.status === "rejected" ||
+                                  !unclaimedResult.value
+                                ) {
+                                  setError(
+                                    "The outflow fact was saved, but one of the administrator balances could not be refreshed.",
+                                  );
+                                }
+                                return true;
                               }}
                               onNotice={setNotice}
                               onError={setError}
@@ -4579,7 +6597,9 @@ export function App() {
                             </span>
                           )}
                         </div>
-                        {manualReceiptIsUntouched(receipt) && !reviewingReversal && (
+                        {canManageUnclaimedFunds &&
+                          manualReceiptIsUntouched(receipt) &&
+                          !reviewingReversal && (
                           <button
                             disabled={manualReceiptReversalPendingId !== null}
                             onClick={() => {
@@ -4591,7 +6611,9 @@ export function App() {
                             Review reversal
                           </button>
                         )}
-                        {manualReceiptIsUntouched(receipt) && reviewingReversal && (
+                        {canManageUnclaimedFunds &&
+                          manualReceiptIsUntouched(receipt) &&
+                          reviewingReversal && (
                           <div
                             className="manual-receipt-reversal-review"
                             aria-label="Manual receipt reversal review"
@@ -4647,6 +6669,8 @@ export function App() {
                 </div>
               )}
             </div>
+            )}
+            {canUseFullAdminWorkspace && operationAccount === null && (
             <div className="admin-subsection">
               <div>
                 <p className="eyebrow">Money received but not yet assigned</p>
@@ -4825,6 +6849,8 @@ export function App() {
                 </div>
               )}
             </div>
+            )}
+            {canManageRefunds && (
             <div className="admin-subsection" aria-label="Manual refunds">
               <div>
                 <p className="eyebrow">Independent money decision</p>
@@ -4835,6 +6861,11 @@ export function App() {
                   allocated invoice receipts; unclaimed original-payment returns are handled in
                   the funds queue above.
                 </p>
+                {operationAccount && (
+                  <p className="notice" data-testid="refund-account-context">
+                    Showing only {operationAccount.name} · {operationAccount.id}
+                  </p>
+                )}
               </div>
               <button
                 onClick={() =>
@@ -4843,6 +6874,7 @@ export function App() {
                     refreshRefundRecords(),
                     refreshRefundSecurityHolds(),
                     refreshRefundDismissalCorrections(),
+                    refreshRefundReceiptCapacityIncidents(),
                   ])
                 }
               >
@@ -4900,11 +6932,15 @@ export function App() {
                 Third-party destinations are disabled until a logged-in customer ticket and
                 two-person approval are both implemented.
               </p>
-              {refundCandidates.length === 0 ? (
-                <p className="muted">No fully allocated invoice receipt is currently refundable.</p>
+              {visibleRefundCandidates.length === 0 ? (
+                <p className="muted">
+                  {operationAccount === null && canViewAccount360 && !canUseFullAdminWorkspace
+                    ? "Select a Client Account in Account 360 to open its refund facts."
+                    : "No fully allocated invoice receipt is currently refundable."}
+                </p>
               ) : (
                 <div data-testid="refund-candidate-list">
-                  {refundCandidates.map((item) => {
+                  {visibleRefundCandidates.map((item) => {
                     const disabled =
                       refundPendingReceiptIds.has(item.receiptId) ||
                       adminPassword.length === 0 ||
@@ -4965,7 +7001,7 @@ export function App() {
                   })}
                 </div>
               )}
-              {refundReceiptCapacityIncidents.length > 0 && (
+              {visibleRefundReceiptCapacityIncidents.length > 0 && (
                 <div data-testid="refund-receipt-capacity-incident-list">
                   <h4>Receipt compensation overages requiring manual recovery</h4>
                   <p className="muted">
@@ -4973,7 +7009,7 @@ export function App() {
                     receipt, only the latest cumulative snapshot is the current recovery amount;
                     older snapshots remain visible as history and must not be added together.
                   </p>
-                  {refundReceiptCapacityIncidents.map((incident) => {
+                  {visibleRefundReceiptCapacityIncidents.map((incident) => {
                     const pending = refundCapacityAcknowledgementPendingIds.has(
                       incident.incidentId,
                     );
@@ -5036,14 +7072,14 @@ export function App() {
                   })}
                 </div>
               )}
-              {refundSecurityHolds.length > 0 && (
+              {visibleRefundSecurityHolds.length > 0 && (
                 <div data-testid="refund-security-hold-list">
                   <h4>Provider facts requiring human adjudication</h4>
                   <p className="muted">
                     Review the immutable fact and impact. Provider callbacks cannot close these
                     holds. Your password confirmation and the reason above are required.
                   </p>
-                  {refundSecurityHolds.map((hold) => {
+                  {visibleRefundSecurityHolds.map((hold) => {
                     const pending = refundAdjudicationPendingIds.has(hold.holdId);
                     const allocatedContributionMinor =
                       hold.sourceContext === "unclaimed_funds"
@@ -5147,7 +7183,7 @@ export function App() {
                   })}
                 </div>
               )}
-              {refundDismissalCorrections.length > 0 && (
+              {visibleRefundDismissalCorrections.length > 0 && (
                 <div data-testid="refund-dismissal-correction-list">
                   <h4>Dismissed Provider facts that can be corrected</h4>
                   <p className="muted">
@@ -5155,7 +7191,7 @@ export function App() {
                     outflow. The prior decision stays immutable; this adds a compensating journal
                     and reserves same-currency receipt capacity.
                   </p>
-                  {refundDismissalCorrections.map((item) => {
+                  {visibleRefundDismissalCorrections.map((item) => {
                     const pending = refundCorrectionPendingIds.has(item.adjudicationId);
                     return (
                       <article
@@ -5192,9 +7228,9 @@ export function App() {
                   })}
                 </div>
               )}
-              {Object.values(refundRecords).length > 0 && (
+              {visibleRefundRecords.length > 0 && (
                 <div data-testid="refund-status-list">
-                  {Object.values(refundRecords).map((refund) => (
+                  {visibleRefundRecords.map((refund) => (
                     <article
                       className="manual-item"
                       data-testid="refund-status"
@@ -5258,6 +7294,7 @@ export function App() {
                 </div>
               )}
             </div>
+            )}
           </section>
         )}
 
@@ -5282,7 +7319,7 @@ export function App() {
               <span>Payment fee charged {usd(order.invoice.paymentFeeMinor)}</span>
               <strong>Due {usd(order.invoice.dueMinor)}</strong>
             </div>
-            {order.invoice.status !== "paid" && (
+            {order.invoice.status !== "paid" && canWriteBilling && (
               <div className="payment-controls">
                 <select
                   aria-label="Payment method"
@@ -5368,7 +7405,7 @@ export function App() {
                 <button
                   className="primary"
                   disabled={
-                    !me?.eligible ||
+                    !canWriteBilling ||
                     !paymentQuote ||
                     ((savePaymentMethod || enableAutomaticRenewal) &&
                       !paymentSettingsReauthReady)
@@ -5439,10 +7476,18 @@ export function App() {
                     ? "不会生成下一张续费发票；此操作不会自动退款。"
                     : "No new renewal invoice will be generated. This action does not issue a refund."}
                 </span>
+                {order.service.cancellation.providerOperation?.attemptId && (
+                  <span data-testid="customer-cancellation-provider-evidence">
+                    {locale === "zh-CN" ? "不可变 Provider 尝试已记录" : "Immutable Provider attempt recorded"}
+                    {order.service.cancellation.providerOperation.latestResult
+                      ? ` · ${order.service.cancellation.providerOperation.latestResult.source} ${order.service.cancellation.providerOperation.latestResult.outcome}`
+                      : ""}
+                  </span>
+                )}
                 <span>
                   {locale === "zh-CN" ? "执行方式" : "Delivery"}: {cancellationExecutionLabel(order.service.cancellation.executionMode, locale)}
                   {order.service.cancellation.providerOperation
-                    ? ` · Provider ${order.service.cancellation.providerOperation.status}/${order.service.cancellation.providerOperation.attempts}`
+                    ? ` · Provider ${order.service.cancellation.providerOperation.status}/${order.service.cancellation.providerOperation.attempts} · GET ${order.service.cancellation.providerOperation.reconcileQueries}/3 · unresolved ${order.service.cancellation.providerOperation.unresolvedReconcileQueries}`
                     : locale === "zh-CN"
                       ? " · 不会自动调用 Provider"
                       : " · no automatic Provider mutation"}
@@ -5451,9 +7496,9 @@ export function App() {
                   <span>{order.service.cancellation.lastError}</span>
                 )}
               </div>
-            ) : order.service.termEnd &&
+            ) : canManageServices && order.service.termEnd &&
               (order.service.status === "active" || order.service.status === "suspended") &&
-              (me?.membershipRole === "owner" || me?.membershipRole === "billing") ? (
+              !order.service.cancellation ? (
               <div
                 className="payment-controls"
                 aria-label={locale === "zh-CN" ? "安排服务取消" : "Schedule service cancellation"}
@@ -5540,58 +7585,21 @@ export function App() {
       </main>
 
       {(route === "/" || route === "/customer") && selected && (
-        <div className="modal-backdrop" role="presentation" onClick={() => setSelected(null)}>
-          <section className="modal" role="dialog" onClick={(event) => event.stopPropagation()}>
-            <button className="close" onClick={() => setSelected(null)}>
-              ×
-            </button>
-            <p className="eyebrow">Checkout configuration</p>
-            <h2>{selected.product.name}</h2>
-            <p>
-              {selected.price.billingCycle} ·{" "}
-              {usd(
-                (
-                  BigInt(selected.price.oneTimeMinor) +
-                  BigInt(selected.price.setupMinor) +
-                  BigInt(selected.price.recurringMinor)
-                ).toString(),
-              )}
-            </p>
-            {selected.product.id === "gsl-inbound" && (
-              <label>
-                100 Mbps units
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={quantity}
-                  onChange={(event) => setQuantity(Number(event.target.value))}
-                />
-              </label>
-            )}
-            <div className="legal-box">
-              <strong>{legal?.documents.terms.title}</strong>
-              <p>{legal?.documents.terms.body}</p>
-              <strong>{legal?.documents.aup.title}</strong>
-              <p>{legal?.documents.aup.body}</p>
-            </div>
-            {route === "/" ? (
-              <button
-                className="primary wide"
-                onClick={() => {
-                  setSelected(null);
-                  openRoute("/customer");
-                }}
-              >
-                Continue in customer workspace
-              </button>
-            ) : (
-              <button className="primary wide" disabled={!me?.eligible} onClick={createOrder}>
-                {me?.eligible ? text.buy : text.pending}
-              </button>
-            )}
-          </section>
-        </div>
+        <CatalogCheckoutPanel
+          key={`${selected.product.id}:${selected.price.id}:${locale}:${route}`}
+          product={selected.product}
+          price={selected.price}
+          legal={legal}
+          locale={locale}
+          mode={route === "/" ? "public" : "customer"}
+          canCreateOrders={canCreateOrders}
+          onClose={() => setSelected(null)}
+          onContinueToCustomer={() => {
+            setSelected(null);
+            openRoute("/customer");
+          }}
+          onCreateOrder={createOrder}
+        />
       )}
     </>
   );

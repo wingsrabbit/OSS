@@ -8,9 +8,13 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
+    "test": "node --test dist/**/*.test.js",
+    "test:integration:mail": "node dist/mail.integration.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@opensales/provider-contracts": "workspace:*",
+    "@opensales/provider-sdk-typescript": "workspace:*",
     "fastify": "5.10.0",
     "pg": "8.22.0",
     "zod": "4.4.3"

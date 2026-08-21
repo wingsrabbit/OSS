@@ -7,6 +7,7 @@ import {
   assertSchema018NativeSafe,
   SCHEMA_018,
   SCHEMA_018_CATALOG_DIGEST,
+  schema018CatalogFingerprintInput,
 } from "./schema-017-018-native-compatibility.js";
 
 test("schema 018 catalog gate accepts only the committed PG18 digest", () => {
@@ -15,6 +16,21 @@ test("schema 018 catalog gate accepts only the committed PG18 digest", () => {
     () => assertSchema018CatalogDigest("counterfeit-schema-018-catalog"),
     /Schema 018 is incomplete or counterfeit/,
   );
+});
+
+test("schema 018 support extension projection is explicit and default-deny", async () => {
+  const parameters: unknown[] = [];
+  const database = {
+    query: async (_sql: string, params?: readonly unknown[]) => {
+      parameters.push(params?.[0]);
+      return { rows: [{ fingerprint_input: "synthetic" }] };
+    },
+  };
+  await schema018CatalogFingerprintInput(database);
+  await schema018CatalogFingerprintInput(database, {
+    allowSchema021SupportExtensions: true,
+  });
+  assert.deepEqual(parameters, [false, true]);
 });
 
 test("schema 018 native preflight retains the reviewed schema 017 catalog gate", async () => {

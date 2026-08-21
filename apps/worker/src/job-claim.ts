@@ -5,6 +5,7 @@ import type pg from "pg";
 export const SCHEMA_016_GENERIC_RECOVERY_JOB_TYPES = Object.freeze([
   "billing.automation.scheduled",
   "notification.send",
+  "identity.notification.send",
   "payment.start",
   "payment.reconcile",
   "add_funds.start",
@@ -30,11 +31,23 @@ export const SCHEMA_016_CANCELLATION_JOB_TYPES = Object.freeze([
   "service.cancellation.reconcile",
 ] as const);
 
+export const SCHEMA_023_SERVICE_OPERATION_JOB_TYPES = Object.freeze([
+  "service.operation.start",
+  "service.operation.reconcile",
+] as const);
+
+export const SCHEMA_029_SERVICE_PASSWORD_CHANGE_JOB_TYPES = Object.freeze([
+  "service.password_change.start",
+  "service.password_change.reconcile",
+] as const);
+
 export const SCHEMA_016_SUPPORTED_JOB_TYPES = Object.freeze([
   ...SCHEMA_016_GENERIC_RECOVERY_JOB_TYPES,
   ...SCHEMA_016_REFUND_JOB_TYPES,
   ...SCHEMA_016_SERVICE_ACTION_JOB_TYPES,
   ...SCHEMA_016_CANCELLATION_JOB_TYPES,
+  ...SCHEMA_023_SERVICE_OPERATION_JOB_TYPES,
+  ...SCHEMA_029_SERVICE_PASSWORD_CHANGE_JOB_TYPES,
 ] as const);
 
 export type Schema016SupportedJobType =

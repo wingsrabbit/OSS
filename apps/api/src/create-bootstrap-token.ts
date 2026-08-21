@@ -2,12 +2,9 @@
 
 import { open } from "node:fs/promises";
 import { assertRuntimeDatabaseRoleSafe } from "@opensales/core";
-import { createOpaqueToken, digestToken } from "./auth.js";
 import { loadConfig } from "./config.js";
-import {
-  createPool,
-  transaction,
-} from "./database.js";
+import { createPool } from "./database.js";
+import { issueInitialStaffBootstrapToken } from "./staff-bootstrap.js";
 
 const config = loadConfig();
 if (!config.DATABASE_RUNTIME_ROLE) {
@@ -23,25 +20,7 @@ if (!outputFile) {
   await pool.end();
   throw new Error("BOOTSTRAP_TOKEN_OUTPUT_FILE is required");
 }
-const token = createOpaqueToken();
-const expiresAt = new Date(Date.now() + 15 * 60_000);
-await transaction(pool, async (client) => {
-  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-    "opensales:staff-bootstrap",
-  ]);
-  const existingStaff = await client.query("SELECT 1 FROM staff_members LIMIT 1");
-  if (existingStaff.rowCount !== 0) {
-    throw new Error("Staff bootstrap is already complete");
-  }
-  await client.query(
-    "UPDATE staff_bootstrap_tokens SET used_at = now() WHERE used_at IS NULL",
-  );
-  await client.query(
-    `INSERT INTO staff_bootstrap_tokens(token_digest, expires_at)
-     VALUES ($1, $2)`,
-    [digestToken(token), expiresAt],
-  );
-});
+const { token, expiresAt } = await issueInitialStaffBootstrapToken(pool);
 await pool.end();
 const handle = await open(outputFile, "wx", 0o600);
 try {

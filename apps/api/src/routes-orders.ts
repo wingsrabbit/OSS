@@ -1,19 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import {
-  buildPriceSnapshot,
-  jsonMoney,
-  type BillingCycle,
-  type FulfillmentMode,
-  type PriceComponent,
-} from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertBillingWriteEligible, assertEligible, requireUser } from "./auth.js";
+import {
+  assertBillingWriteEligible,
+  assertCustomerCapability,
+  assertEligible,
+  assertFinancialReadEligible,
+  expectedAccountContextVersion,
+  lockAccountContextForMutation,
+  requireUser,
+  setAccountContextHeaders,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabaseClient, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import {
+  buildOfferSnapshot,
+  issueCommercialOrder,
+  loadLegalDocuments,
+  lockCatalogOffer,
+  lockPromotion,
+  recordMarketingConsent,
+  replayCommercialOrder,
+  supplyPreflight,
+} from "./commerce-service.js";
 import { advancePaidInvoice } from "./invoice-settlement.js";
 import { assertInvoicePaymentBusinessStateLocked } from "./invoice-payment-eligibility.js";
 import {
@@ -21,14 +33,69 @@ import {
   PAYMENT_METHOD_SAVE_CONSENT_VERSION,
 } from "./routes-payment-methods.js";
 import { requireRecentReauth, requireRecentReauthLocked } from "./routes-admin.js";
+import { MARKETING_CONSENT_POLICY_VERSION } from "./routes-commerce.js";
 
-const checkoutSchema = z.object({
-  priceId: z.uuid(),
-  configuration: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({}),
-  termsVersion: z.string().min(1).max(64),
-  aupVersion: z.string().min(1).max(64),
-  idempotencyKey: z.string().min(8).max(128),
-});
+const checkoutSchema = z
+  .object({
+    priceId: z.uuid(),
+    configuration: z
+      .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+      .default({}),
+    promotionCode: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(/^[A-Z0-9][A-Z0-9_-]{2,63}$/)
+      .nullable()
+      .default(null),
+    termsVersion: z.string().min(1).max(64),
+    aupVersion: z.string().min(1).max(64),
+    termsDocumentId: z.uuid().optional(),
+    aupDocumentId: z.uuid().optional(),
+    legalLocale: z.enum(["en", "zh-CN"]).optional(),
+    termsLocale: z.enum(["en", "zh-CN"]).optional(),
+    aupLocale: z.enum(["en", "zh-CN"]).optional(),
+    marketingConsent: z.boolean().default(false),
+    marketingConsentPolicyVersion: z.string().min(1).max(80).optional(),
+    idempotencyKey: z.string().min(8).max(128),
+  })
+  .strict()
+  .superRefine((body, context) => {
+    const exactLegalSelection = [
+      body.termsDocumentId,
+      body.aupDocumentId,
+      body.legalLocale,
+      body.termsLocale,
+      body.aupLocale,
+    ];
+    if (
+      exactLegalSelection.some((value) => value !== undefined) &&
+      exactLegalSelection.some((value) => value === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["termsDocumentId"],
+        message: "Exact legal document IDs, requested locale, and resolved locales must be supplied together",
+      });
+    }
+    if (body.marketingConsent !== (body.marketingConsentPolicyVersion !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["marketingConsentPolicyVersion"],
+        message: "Marketing Consent is optional, defaults off, and requires an explicit policy version",
+      });
+    }
+    if (
+      body.marketingConsentPolicyVersion &&
+      body.marketingConsentPolicyVersion !== MARKETING_CONSENT_POLICY_VERSION
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["marketingConsentPolicyVersion"],
+        message: "Marketing Consent policy version is not current",
+      });
+    }
+  });
 
 const paymentSchema = z
   .object({
@@ -74,122 +141,10 @@ const paymentSchema = z
     }
   });
 
-function buildOptionComponents(
-  optionSchema: unknown,
-  configuration: Record<string, string | number | boolean>,
-): PriceComponent[] {
-  if (!Array.isArray(optionSchema)) {
-    if (Object.keys(configuration).length > 0) {
-      throw Object.assign(new Error("This product does not accept configuration options"), {
-        statusCode: 400,
-        code: "INVALID_CONFIGURATION",
-      });
-    }
-    return [];
-  }
-  const components: PriceComponent[] = [];
-  const acceptedKeys = new Set<string>();
-  for (const rawOption of optionSchema) {
-    if (typeof rawOption !== "object" || rawOption === null) {
-      throw new Error("Product option schema is invalid");
-    }
-    const option = rawOption as Record<string, unknown>;
-    if (typeof option.code !== "string" || option.code.length === 0) {
-      throw new Error("Product option schema has no code");
-    }
-    if (acceptedKeys.has(option.code)) throw new Error(`Product option schema repeats ${option.code}`);
-    acceptedKeys.add(option.code);
-    const configured = Object.prototype.hasOwnProperty.call(configuration, option.code);
-    if (option.required === true && !configured) {
-      throw Object.assign(new Error(`${option.code} is required`), {
-        statusCode: 400,
-        code: "INVALID_CONFIGURATION",
-      });
-    }
-    if (!configured) continue;
-
-    if (option.type === "quantity" && typeof option.recurringUnitMinor === "number") {
-      const rawQuantity = configuration[option.code];
-      const quantity =
-        typeof rawQuantity === "number"
-          ? rawQuantity
-          : typeof rawQuantity === "string" && /^-?\d+$/.test(rawQuantity)
-            ? Number(rawQuantity)
-            : Number.NaN;
-      const minimum = typeof option.min === "number" ? option.min : 1;
-      const maximum = typeof option.max === "number" ? option.max : Number.MAX_SAFE_INTEGER;
-      const step = typeof option.step === "number" ? option.step : 1;
-      if (
-        !Number.isSafeInteger(quantity) ||
-        !Number.isSafeInteger(minimum) ||
-        !Number.isSafeInteger(maximum) ||
-        !Number.isSafeInteger(step) ||
-        step <= 0 ||
-        quantity < minimum ||
-        quantity > maximum ||
-        (quantity - minimum) % step !== 0
-      ) {
-        throw Object.assign(new Error(`${option.code} is outside its allowed quantity range`), {
-          statusCode: 400,
-          code: "INVALID_CONFIGURATION",
-        });
-      }
-      components.push({
-        code: option.code,
-        label: option.code,
-        quantity,
-        oneTimeMinor: 0n,
-        recurringMinor: BigInt(option.recurringUnitMinor),
-      });
-      continue;
-    }
-
-    if (option.type === "text" || option.type === "password" || option.type === "textarea") {
-      const value = configuration[option.code];
-      const minimum = typeof option.minLength === "number" ? option.minLength : 0;
-      const maximum = typeof option.maxLength === "number" ? option.maxLength : 4096;
-      if (typeof value !== "string" || value.length < minimum || value.length > maximum) {
-        throw Object.assign(new Error(`${option.code} is not valid text`), {
-          statusCode: 400,
-          code: "INVALID_CONFIGURATION",
-        });
-      }
-      continue;
-    }
-
-    throw new Error(`Product option type ${String(option.type)} is not supported safely`);
-  }
-  for (const key of Object.keys(configuration)) {
-    if (!acceptedKeys.has(key)) {
-      throw Object.assign(new Error(`Unknown product option ${key}`), {
-        statusCode: 400,
-        code: "INVALID_CONFIGURATION",
-      });
-    }
-  }
-  return components;
-}
-
-function jsonPriceSnapshot(snapshot: ReturnType<typeof buildPriceSnapshot>) {
-  return {
-    ...snapshot,
-    oneTimeSubtotalMinor: jsonMoney(snapshot.oneTimeSubtotalMinor),
-    setupMinor: jsonMoney(snapshot.setupMinor),
-    recurringSubtotalMinor: jsonMoney(snapshot.recurringSubtotalMinor),
-    invoiceTotalMinor: jsonMoney(snapshot.invoiceTotalMinor),
-    components: snapshot.components.map((component) => ({
-      ...component,
-      oneTimeMinor: jsonMoney(component.oneTimeMinor),
-      recurringMinor: jsonMoney(component.recurringMinor),
-    })),
-  };
-}
-
 async function assertEligibilityLocked(
   client: DatabaseClient,
   userId: string,
   clientAccountId: string,
-  requireBillingRole = false,
 ): Promise<void> {
   // Keep the shared identity lock order explicit. PostgreSQL does not promise
   // the row-lock order of a multi-relation FOR UPDATE join, and payment
@@ -210,14 +165,12 @@ async function assertEligibilityLocked(
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
     removed_at: Date | null;
-    membership_role: "owner" | "billing" | "technical" | "viewer";
   }>(
     `SELECT
        u.email_verified_at,
        u.restricted_at AS user_restricted_at,
        ca.restricted_at AS account_restricted_at,
-       cm.removed_at,
-       cm.role AS membership_role
+       cm.removed_at
      FROM users u
      JOIN client_memberships cm ON cm.user_id = u.id AND cm.client_account_id = $2
      JOIN client_accounts ca ON ca.id = cm.client_account_id
@@ -229,10 +182,7 @@ async function assertEligibilityLocked(
     !state?.email_verified_at ||
     state.user_restricted_at ||
     state.account_restricted_at ||
-    state.removed_at ||
-    (requireBillingRole &&
-      state.membership_role !== "owner" &&
-      state.membership_role !== "billing")
+    state.removed_at
   ) {
     throw Object.assign(new Error("Account is not eligible for this operation"), {
       statusCode: 403,
@@ -248,257 +198,127 @@ export async function registerOrderRoutes(
 ): Promise<void> {
   app.post("/api/v1/orders", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertEligible(user);
+    assertCustomerCapability(user, "orders.create");
     const body = checkoutSchema.parse(request.body);
-    const fingerprint = requestFingerprint("orders.create:v1", {
+    const baseFingerprintInput = {
       priceId: body.priceId,
       configuration: body.configuration,
       termsVersion: body.termsVersion,
       aupVersion: body.aupVersion,
-    });
+    };
+    const fingerprint =
+      body.termsDocumentId !== undefined && body.aupDocumentId !== undefined
+        ? requestFingerprint("orders.create:v3", {
+            ...baseFingerprintInput,
+            termsDocumentId: body.termsDocumentId,
+            aupDocumentId: body.aupDocumentId,
+            legalLocale: body.legalLocale,
+            termsLocale: body.termsLocale,
+            aupLocale: body.aupLocale,
+            promotionCode: body.promotionCode,
+            marketingConsent: body.marketingConsent,
+            marketingConsentPolicyVersion:
+              body.marketingConsentPolicyVersion ?? null,
+          })
+        : body.promotionCode === null && !body.marketingConsent
+          ? requestFingerprint("orders.create:v1", baseFingerprintInput)
+          : requestFingerprint("orders.create:v2", {
+              ...baseFingerprintInput,
+              promotionCode: body.promotionCode,
+              marketingConsent: body.marketingConsent,
+              marketingConsentPolicyVersion:
+                body.marketingConsentPolicyVersion ?? null,
+            });
 
     const created = await transaction(pool, async (client) => {
+      const context = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "orders.create");
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `order:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
-      const existing = await client.query<{
-        id: string;
-        request_fingerprint: string;
-      }>(
-        `SELECT id, request_fingerprint
-         FROM orders
-         WHERE client_account_id = $1 AND idempotency_key = $2
-         FOR UPDATE`,
-        [user.clientAccountId, body.idempotencyKey],
-      );
-      const previous = existing.rows[0];
-      if (previous) {
-        if (previous.request_fingerprint !== fingerprint) {
-          throw Object.assign(new Error("The idempotency key was used for a different order"), {
-            statusCode: 409,
-            code: "IDEMPOTENCY_CONFLICT",
-          });
-        }
-        return { orderId: previous.id, replayed: true };
-      }
+      const previous = await replayCommercialOrder(client, {
+        clientAccountId: user.clientAccountId,
+        idempotencyKey: body.idempotencyKey,
+        requestFingerprint: fingerprint,
+        sourceQuoteId: null,
+      });
+      if (previous) return previous;
 
       await assertEligibilityLocked(client, user.userId, user.clientAccountId);
-      const priceResult = await client.query<{
-        id: string;
-        product_id: string;
-        revision: number;
-        currency: string;
-        billing_cycle: BillingCycle;
-        one_time_minor: string;
-        setup_minor: string;
-        recurring_minor: string;
-        fulfillment_mode: FulfillmentMode;
-        names: Record<string, string>;
-        option_schema: unknown;
-        active: boolean;
-        hidden: boolean;
-      }>(
-        `SELECT
-           pp.id, pp.product_id, pp.revision, pp.currency, pp.billing_cycle,
-           pp.one_time_minor, pp.setup_minor, pp.recurring_minor,
-           p.fulfillment_mode, p.names, p.option_schema, p.active, p.hidden
-         FROM product_prices pp
-         JOIN products p ON p.id = pp.product_id
-         WHERE pp.id = $1
-           AND pp.active
-           AND pp.valid_from <= now()
-           AND (pp.valid_until IS NULL OR pp.valid_until > now())
-         FOR SHARE OF pp, p`,
-        [body.priceId],
-      );
-      const price = priceResult.rows[0];
-      if (!price || !price.active || price.hidden) {
-        throw Object.assign(new Error("Product is not available"), { statusCode: 409 });
-      }
-      if (price.fulfillment_mode === "quote") {
-        throw Object.assign(new Error("This product requires a confirmed quote before ordering"), {
-          statusCode: 409,
-          code: "QUOTE_REQUIRED",
-        });
-      }
-
-      const productName = price.names[user.locale] ?? price.names.en ?? price.product_id;
-      const snapshot = buildPriceSnapshot({
-        productId: price.product_id,
-        productName,
-        currency: price.currency,
-        billingCycle: price.billing_cycle,
-        fulfillmentMode: price.fulfillment_mode,
-        baseOneTimeMinor: BigInt(price.one_time_minor),
-        setupMinor: BigInt(price.setup_minor),
-        baseRecurringMinor: BigInt(price.recurring_minor),
-        optionComponents: buildOptionComponents(price.option_schema, body.configuration),
+      const offer = await lockCatalogOffer(client, {
+        priceId: body.priceId,
+        locale: body.legalLocale ?? user.locale,
+        allowQuote: false,
       });
-      const serializedSnapshot = jsonPriceSnapshot(snapshot);
-
-      const legalResult = await client.query<{ id: string; kind: "terms" | "aup" }>(
-        `SELECT id, kind
-         FROM legal_documents
-         WHERE locale = $1
-           AND ((kind = 'terms' AND version = $2) OR (kind = 'aup' AND version = $3))
-         ORDER BY kind`,
-        [user.locale, body.termsVersion, body.aupVersion],
-      );
-      if (
-        legalResult.rows.length !== 2 ||
-        !legalResult.rows.some((document) => document.kind === "terms") ||
-        !legalResult.rows.some((document) => document.kind === "aup")
-      ) {
-        throw Object.assign(new Error("The selected legal document version is not available"), {
-          statusCode: 409,
+      const promotion = await lockPromotion(client, {
+        code: body.promotionCode,
+        productId: offer.productId,
+        billingCycle: offer.billingCycle,
+        currency: offer.currency,
+        forUpdate: body.promotionCode !== null,
+      });
+      const priced = buildOfferSnapshot(offer, body.configuration, promotion);
+      const capacity = await supplyPreflight(client, {
+        productId: offer.productId,
+        units: priced.capacityUnits,
+        commit: true,
+      });
+      const legal = await loadLegalDocuments(client, {
+        locale: body.legalLocale ?? user.locale,
+        termsVersion: body.termsVersion,
+        aupVersion: body.aupVersion,
+        termsDocumentId: body.termsDocumentId,
+        aupDocumentId: body.aupDocumentId,
+        termsLocale: body.termsLocale,
+        aupLocale: body.aupLocale,
+      });
+      const issued = await issueCommercialOrder(client, {
+        clientAccountId: user.clientAccountId,
+        userId: user.userId,
+        idempotencyKey: body.idempotencyKey,
+        requestFingerprint: fingerprint,
+        sourceQuoteId: null,
+        productId: offer.productId,
+        productName: offer.productName,
+        productRevisionId: offer.productRevisionId,
+        productRevision: offer.productRevision,
+        priceId: offer.priceId,
+        priceRevision: offer.priceRevision,
+        fulfillmentMode: offer.fulfillmentMode,
+        billingCycle: offer.billingCycle,
+        configurationSnapshot: priced.configurationSnapshot,
+        snapshot: priced.snapshot,
+        capacity,
+        legal,
+        promotion,
+      });
+      if (body.marketingConsent) {
+        await recordMarketingConsent(client, {
+          clientAccountId: user.clientAccountId,
+          userId: user.userId,
+          granted: true,
+          policyVersion: MARKETING_CONSENT_POLICY_VERSION,
+          source: "checkout",
+          idempotencyKey: `checkout:${fingerprint}`,
+          requestFingerprint: fingerprint,
         });
       }
-
-      const orderResult = await client.query<{ id: string }>(
-        `INSERT INTO orders(
-           client_account_id, submitted_by_user_id, status, currency, price_snapshot,
-           one_time_minor, setup_minor, recurring_minor, total_minor, idempotency_key,
-           request_fingerprint
-         ) VALUES ($1, $2, 'waiting_payment', $3, $4, $5, $6, $7, $8, $9, $10)
-         RETURNING id`,
-        [
-          user.clientAccountId,
-          user.userId,
-          snapshot.currency,
-          serializedSnapshot,
-          snapshot.oneTimeSubtotalMinor.toString(),
-          snapshot.setupMinor.toString(),
-          snapshot.recurringSubtotalMinor.toString(),
-          snapshot.invoiceTotalMinor.toString(),
-          body.idempotencyKey,
-          fingerprint,
-        ],
-      );
-      const orderId = orderResult.rows[0]?.id;
-      if (!orderId) throw new Error("Unable to create order");
-
-      for (const legalDocument of legalResult.rows) {
-        await client.query(
-          `INSERT INTO legal_acceptances(client_account_id, user_id, document_id)
-           VALUES ($1, $2, $3)`,
-          [user.clientAccountId, user.userId, legalDocument.id],
-        );
-      }
-
-      const orderItemResult = await client.query<{ id: string }>(
-        `INSERT INTO order_items(
-           order_id, product_id, product_name, fulfillment_mode, billing_cycle,
-           configuration, price_snapshot
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id`,
-        [
-          orderId,
-          snapshot.productId,
-          snapshot.productName,
-          snapshot.fulfillmentMode,
-          snapshot.billingCycle,
-          body.configuration,
-          serializedSnapshot,
-        ],
-      );
-      const orderItemId = orderItemResult.rows[0]?.id;
-      if (!orderItemId) throw new Error("Unable to create order item");
-
-      const invoiceResult = await client.query<{ id: string }>(
-        `INSERT INTO invoices(client_account_id, order_id, currency, total_minor, due_at)
-         VALUES ($1, $2, $3, $4, now() + interval '7 days')
-         RETURNING id`,
-        [
-          user.clientAccountId,
-          orderId,
-          snapshot.currency,
-          snapshot.invoiceTotalMinor.toString(),
-        ],
-      );
-      const invoiceId = invoiceResult.rows[0]?.id;
-      if (!invoiceId) throw new Error("Unable to create invoice");
-
-      const journalResult = await client.query<{ id: string }>(
-        `INSERT INTO ledger_journals(source_type, source_id, currency, description)
-         VALUES ('invoice_issuance', $1, $2, 'Invoice issued')
-         RETURNING id`,
-        [invoiceId, snapshot.currency],
-      );
-      const invoiceJournalId = journalResult.rows[0]?.id;
-      if (!invoiceJournalId) throw new Error("Unable to create invoice journal");
-      if (snapshot.invoiceTotalMinor > 0n) {
-        await client.query(
-          `INSERT INTO ledger_lines(journal_id, account_code, debit_minor, credit_minor)
-           VALUES
-             ($1, 'accounts_receivable', $2, 0),
-             ($1, 'deferred_service_revenue', 0, $2)`,
-          [invoiceJournalId, snapshot.invoiceTotalMinor.toString()],
-        );
-      }
-
-      const invoiceLines = [
-        ["one_time", `${snapshot.productName} one-time`, snapshot.oneTimeSubtotalMinor],
-        ["setup", `${snapshot.productName} setup`, snapshot.setupMinor],
-        ["recurring", `${snapshot.productName} ${snapshot.billingCycle}`, snapshot.recurringSubtotalMinor],
-      ] as const;
-      for (const [kind, description, amount] of invoiceLines) {
-        if (amount > 0n) {
-          await client.query(
-            `INSERT INTO invoice_lines(invoice_id, kind, description, amount_minor)
-             VALUES ($1, $2, $3, $4)`,
-            [invoiceId, kind, description, amount.toString()],
-          );
-        }
-      }
-
-      const serviceResult = await client.query<{ id: string }>(
-        `INSERT INTO services(client_account_id, order_item_id, status, billing_cycle)
-         VALUES ($1, $2, 'pending', $3)
-         RETURNING id`,
-        [user.clientAccountId, orderItemId, snapshot.billingCycle],
-      );
-      const serviceId = serviceResult.rows[0]?.id;
-      if (!serviceId) throw new Error("Unable to create service");
-
-      await client.query(
-        `INSERT INTO service_provider_bindings(
-           service_id, provider_installation_id, overdue_action_snapshot,
-           capability_snapshot, product_policy_version,
-           cycle_end_cancellation_mode_snapshot,
-           cycle_end_cancellation_execution_mode_snapshot,
-           cycle_end_cancellation_min_notice_hours_snapshot,
-           cycle_end_cancellation_requirement_key_snapshot
-         )
-         SELECT
-           $1,
-           policy.provider_installation_id,
-           policy.overdue_action,
-           COALESCE(provider.capabilities, '[]'::jsonb),
-           policy.version,
-           policy.cycle_end_cancellation_mode,
-           policy.cycle_end_cancellation_execution_mode,
-           policy.cycle_end_cancellation_min_notice_hours,
-           policy.cycle_end_cancellation_requirement_key
-         FROM product_service_automation_policies policy
-         LEFT JOIN provider_installation_capabilities provider
-           ON provider.provider_installation_id = policy.provider_installation_id
-         WHERE policy.product_id = $2`,
-        [serviceId, snapshot.productId],
-      );
-
-      await client.query(
-        `INSERT INTO outbox(event_type, unique_key, payload)
-         VALUES ('order.submitted', $1, $2)`,
-        [`order:${orderId}`, { orderId, invoiceId, clientAccountId: user.clientAccountId }],
-      );
-      return { orderId, invoiceId, serviceId, replayed: false };
+      return { ...issued, replayed: false };
     });
 
+    setAccountContextHeaders(reply, user);
     return reply.code(created.replayed ? 200 : 201).send(created);
   });
 
   app.get("/api/v1/orders", async (request) => {
     const user = await requireUser(request, pool, config);
+    assertFinancialReadEligible(user);
     const result = await pool.query<{
       order_id: string;
       order_status: string;
@@ -535,6 +355,7 @@ export async function registerOrderRoutes(
 
   app.get("/api/v1/orders/:orderId", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    assertFinancialReadEligible(user);
     const params = z.object({ orderId: z.uuid() }).parse(request.params);
     const result = await pool.query<{
       order_id: string;
@@ -569,6 +390,13 @@ export async function registerOrderRoutes(
       cancellation_last_error: string | null;
       cancellation_operation_status: string | null;
       cancellation_operation_attempt_count: number | null;
+      cancellation_provider_attempt_id: string | null;
+      cancellation_provider_dispatched_at: Date | null;
+      cancellation_reconciliation_query_count: number | null;
+      cancellation_unresolved_reconciliation_count: number | null;
+      cancellation_latest_provider_outcome: "succeeded" | "failed" | null;
+      cancellation_latest_provider_source: "callback" | "reconciliation" | null;
+      cancellation_latest_provider_occurred_at: Date | null;
       payment_status: string | null;
       provider_operation_status: string | null;
     }>(
@@ -599,6 +427,19 @@ export async function registerOrderRoutes(
          cancellation_execution.last_error AS cancellation_last_error,
          cancellation_operation.status AS cancellation_operation_status,
          cancellation_operation.attempt_count AS cancellation_operation_attempt_count,
+         cancellation_provider_attempt.id AS cancellation_provider_attempt_id,
+         cancellation_provider_attempt.dispatched_at AS cancellation_provider_dispatched_at,
+         cancellation_execution.reconciliation_query_count
+           AS cancellation_reconciliation_query_count,
+         (
+           SELECT count(*)::integer
+           FROM service_cancellation_reconciliation_observations observation
+           WHERE observation.execution_id = cancellation_execution.id
+         ) AS cancellation_unresolved_reconciliation_count,
+         cancellation_latest_result.outcome AS cancellation_latest_provider_outcome,
+         cancellation_latest_result.observation_source AS cancellation_latest_provider_source,
+         cancellation_latest_result.provider_occurred_at
+           AS cancellation_latest_provider_occurred_at,
          pay.status AS payment_status,
          provision.status AS provider_operation_status
        FROM orders o
@@ -611,6 +452,16 @@ export async function registerOrderRoutes(
          ON cancellation_operation.subject_type = 'service_cancellation_execution'
         AND cancellation_operation.subject_id = cancellation_execution.id
         AND cancellation_operation.kind = 'resource_terminate'
+       LEFT JOIN service_cancellation_provider_attempts cancellation_provider_attempt
+         ON cancellation_provider_attempt.provider_operation_id = cancellation_operation.id
+        AND cancellation_provider_attempt.execution_id = cancellation_execution.id
+       LEFT JOIN LATERAL (
+         SELECT result.outcome, result.observation_source, result.provider_occurred_at
+         FROM service_cancellation_provider_results result
+         WHERE result.provider_operation_id = cancellation_operation.id
+         ORDER BY result.provider_occurred_at DESC, result.created_at DESC, result.id DESC
+         LIMIT 1
+       ) cancellation_latest_result ON true
        JOIN invoice_allocation_totals alloc ON alloc.invoice_id = i.id
        LEFT JOIN LATERAL (
          SELECT COALESCE(sum(amount_minor), 0) AS amount_minor
@@ -676,6 +527,20 @@ export async function registerOrderRoutes(
                   ? {
                       status: row.cancellation_operation_status,
                       attempts: row.cancellation_operation_attempt_count ?? 0,
+                      attemptId: row.cancellation_provider_attempt_id,
+                      dispatchedAt:
+                        row.cancellation_provider_dispatched_at?.toISOString() ?? null,
+                      reconcileQueries: row.cancellation_reconciliation_query_count ?? 0,
+                      unresolvedReconcileQueries:
+                        row.cancellation_unresolved_reconciliation_count ?? 0,
+                      latestResult: row.cancellation_latest_provider_outcome
+                        ? {
+                            outcome: row.cancellation_latest_provider_outcome,
+                            source: row.cancellation_latest_provider_source,
+                            occurredAt:
+                              row.cancellation_latest_provider_occurred_at?.toISOString() ?? null,
+                          }
+                        : null,
                     }
                   : null,
               }
@@ -686,6 +551,7 @@ export async function registerOrderRoutes(
 
   app.post("/api/v1/invoices/:invoiceId/payments", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = paymentSchema.parse(request.body);
@@ -703,6 +569,37 @@ export async function registerOrderRoutes(
     });
 
     const result = await transaction(pool, async (client) => {
+      const settlementIdentity = await client.query<{ target_user_id: string | null }>(
+        `SELECT coalesce(
+                  order_record.submitted_by_user_id,
+                  original_order.submitted_by_user_id
+                ) AS target_user_id
+         FROM invoices invoice
+         LEFT JOIN orders order_record ON order_record.id = invoice.order_id
+         LEFT JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+         LEFT JOIN services service ON service.id = renewal.service_id
+         LEFT JOIN order_items item ON item.id = service.order_item_id
+         LEFT JOIN orders original_order ON original_order.id = item.order_id
+         WHERE invoice.id = $1`,
+        [params.invoiceId],
+      );
+      const targetUserId = settlementIdentity.rows[0]?.target_user_id;
+      const accountContext = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+        targetUserId ? [targetUserId] : [],
+      );
+      assertCustomerCapability(accountContext, "billing.write");
+      if (targetUserId && targetUserId !== user.userId) {
+        await client.query(
+          `SELECT user_id
+           FROM client_memberships
+           WHERE client_account_id = $1 AND user_id = $2
+           FOR UPDATE`,
+          [user.clientAccountId, targetUserId],
+        );
+      }
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `payment:${user.clientAccountId}:${body.idempotencyKey}`,
       ]);
@@ -884,7 +781,7 @@ export async function registerOrderRoutes(
         }
         automaticRenewalServiceId = renewable.id;
       }
-      await assertEligibilityLocked(client, user.userId, user.clientAccountId, true);
+      await assertEligibilityLocked(client, user.userId, user.clientAccountId);
       if (body.savePaymentMethod || body.enableAutomaticRenewal) {
         await requireRecentReauthLocked(client, user);
       }
@@ -1135,6 +1032,7 @@ export async function registerOrderRoutes(
         replayed: false,
       };
     });
+    setAccountContextHeaders(reply, user);
     return reply
       .code(result.replayed || result.paymentAttemptId === null ? 200 : 202)
       .send(result);

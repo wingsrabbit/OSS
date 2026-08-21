@@ -13,17 +13,38 @@ Current project version: `0.1.1`.
 
 ## What a laboratory user can do now
 
-The first runnable vertical slice is implemented:
+The current work-in-progress laboratory build includes runnable, real-page
+workflows across customer, Staff, Core, Worker, and Mock Provider boundaries:
 
-- a visitor can browse the synthetic TermRat product configuration and see
-  one-time, setup, and recurring prices by billing cycle;
+- a visitor can browse the versioned synthetic TermRat catalog, configure all
+  supported option types, preview exact one-time/setup/recurring pricing, and
+  submit a Presales inquiry;
 - a customer can register, sign in while still unverified, receive a
   one-time verification link through the Mock Mail Provider, and verify the
   account;
+- a User can switch between authorized Client Accounts while stale account or
+  authorization context is rejected, manage Account access and Contacts, and
+  view immutable business, notification, and Unicode invoice history;
 - an unverified or restricted account is rejected by the server when it tries
   to order or start a payment;
-- an eligible customer can accept versioned laboratory Terms/AUP, submit a
-  price-snapshotted order, and receive a distinct invoice and pending service;
+- an eligible customer can accept versioned laboratory Terms/AUP, apply an
+  eligible Promotion, optionally grant Marketing Consent, submit a
+  price-snapshotted order or accept an immutable Quote, and receive a distinct
+  invoice and pending service;
+- independently permissioned Staff pages manage Catalog revisions, prices,
+  supply, Promotions, Quotes, Provider automation policy, Client Account 360,
+  Support/Presales, Content/Legal, Service operations, Identity recovery, and
+  notification delivery operations;
+- customers and Staff use full Support ticket fields, public replies, internal
+  notes, assignment/routing/status history, department revisions, and ordinary
+  attachment upload/list/delete plus backend-authorized ordinary download;
+  unavailable attachments have no download action, and no scanning or safety
+  conclusion is claimed;
+- published bilingual Content and Legal revisions retain immutable history,
+  deterministic zh-CN to English fallback, and a persisted User locale;
+- identity flows cover current Sessions, MFA/TOTP, API keys, recovery codes,
+  account recovery, recent reauthentication, and Mock Mail delivery without
+  exposing one-time material in Staff history;
 - the customer can run Mock payment success, failure, cancellation, timeout,
   duplicate, and out-of-order scenarios;
 - a settled payment creates one balanced journal and invoice allocation before
@@ -58,6 +79,9 @@ The first runnable vertical slice is implemented:
   snapshots stay visible as non-additive history;
 - automatic products create one stable Provider operation; a timeout becomes
   `unknown`/`confirming` and is reconciled instead of creating a second resource;
+- the public Provider surface publishes six capability contracts, generated
+  schemas/OpenAPI, a TypeScript SDK, examples, all fourteen mutation actions,
+  and a normal install/pause/resume/credential-rotation/limit/revoke lifecycle;
 - a service becomes Active only after a Ready for Service fact, and its term
   starts at that time.
 
@@ -66,10 +90,16 @@ Provider Operation, Refund, and Service as separate facts. It never presents
 payment success as service activation, or a refund as implicit cancellation.
 
 This code is protected by strict TypeScript checks, production builds, and
-PostgreSQL exact-money/state journeys. The two-VPS deployment, remaining billing
-lifecycle, customer operations, plugin developer journey, and recovery drills
-are not yet complete, so this version is not the final Laboratory Release
-Candidate.
+PostgreSQL exact-money/state journeys. Notification templates and User
+preferences are implemented, and isolated blank TestA/TestB archive restores
+have been rehearsed through Schema 028. A consistent backup and exact rollback
+of the currently running Schema 018 Demo, bulk exports, account
+deletion/anonymization, remaining Service credential and usage workflows,
+prebuilt digest-bound images, the actual two-VPS deployment and TLS evidence,
+and final release evidence are not yet complete. Ordinary Support attachment
+download is available only when the existing backend authorization contract
+permits it; this repository does not claim that an attachment was scanned or
+safe. This version is therefore not the final Laboratory Release Candidate.
 
 ## Quick start
 
@@ -84,7 +114,9 @@ Provider processes on loopback, creates distinct synthetic Staff and customer
 accounts with separate authenticated sessions, and proves the Stage A happy
 path through an Active service, a service-linked support ticket whose Staff
 internal note stays customer-hidden, plus one Provider-free manual
-receipt/original-source outflow:
+receipt/original-source outflow. The smoke journey also performs Stop, Start,
+and Reboot on its newly activated automatic Service, waits for each terminal
+Mock Provider fact, and records the final active/running state:
 
 ```bash
 node tools/demo-local.mjs up
@@ -124,6 +156,11 @@ network is separated from the Core data network.
 The repository deliberately has no default administrator password and no real
 Provider credential. Laboratory deployment secrets belong outside Git.
 
+`compose.yaml` remains the single-host local laboratory topology. It must not be
+split across Docker daemons. The digest-bound TestA/TestB deployment topology,
+gates, and Provider-first start order are documented in
+[`docs/operators/two-host-mock-rc-deployment.md`](docs/operators/two-host-mock-rc-deployment.md).
+
 ## Repository layout
 
 - `apps/api`: Fastify API, forward migration, authentication, checkout, finance,
@@ -131,8 +168,12 @@ Provider credential. Laboratory deployment secrets belong outside Git.
 - `apps/worker`: PostgreSQL durable job worker and reconciliation flow.
 - `apps/web`: React/Vite customer interface with persistent Mock-only warning.
 - `packages/core`: exact-money pricing and monotonic state rules.
-- `providers/mock-lab`: out-of-process Mock Payment, Provisioning, and Mail
-  Provider with its own database.
+- `packages/provider-contracts` and `packages/provider-sdk-typescript`: public
+  Apache-2.0 schemas, validator, generated OpenAPI, and official SDK.
+- `providers/mock-lab`: out-of-process six-capability functional Mock Provider
+  with its own database.
+- `providers/example-sdk` and `providers/example-schema-only-tax`: official SDK
+  and independent public-schema-only Provider examples.
 - `compose.yaml`: isolated local laboratory topology.
 
 TermRat names and prices live only in the deployment seed
@@ -148,6 +189,10 @@ Core, Web, Worker, and core administration tools are licensed under
 `AGPL-3.0-or-later`. Provider contracts, SDK material, conformance assets, and
 Mock Providers use `Apache-2.0` as described in
 [LICENSES/README.md](LICENSES/README.md).
+
+Provider developers can start from the generated artifacts, both examples, and
+the HTTP-only functional conformance workflow in
+[docs/provider-development.md](docs/provider-development.md).
 
 Operators handling synthetic Add Funds losses should read
 [docs/operators/add-funds-chargebacks.md](docs/operators/add-funds-chargebacks.md).

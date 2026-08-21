@@ -13,4 +13,14 @@ Providers are licensed under Apache-2.0 as described in LICENSES/README.md.
 Cloud TermRat is a deployment configuration and synthetic laboratory acceptance
 profile; it is not hard-coded product logic.
 
+Third-party font notice
+
+Invoice PDFs embed a subset of the Noto Sans SC variable TrueType font from
+Noto CJK Sans 2.004,
+copyright 2014-2021 Adobe, licensed under the SIL Open Font License 1.1.
+Upstream: https://github.com/notofonts/noto-cjk/tree/Sans2.004
+Vendored font SHA-256:
+d68bafcb48a2707749396aa12bbbd833cb70401f3a9a689fd2902c7e0d295964
+License text: LICENSES/OFL-1.1-Noto-Sans-CJK.txt
+
 NOT FOR PRODUCTION — MOCK PROVIDERS ONLY

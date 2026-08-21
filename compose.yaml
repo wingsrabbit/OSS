@@ -4,6 +4,7 @@ name: opensales-laboratory
 
 x-core-env: &core-env
   OSS_ENV: ${OSS_ENV:-development}
+  NOTIFICATION_MAX_ATTEMPTS: ${NOTIFICATION_MAX_ATTEMPTS:-3}
   OSS_PUBLIC_URL: ${OSS_PUBLIC_URL:-http://localhost:8080}
   WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
   MOCK_MAILBOX_URL: http://mailbox-gateway:8082
@@ -14,6 +15,9 @@ x-core-env: &core-env
   PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: ${PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS:-}
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: ${PAYMENT_METHOD_TOKEN_LOOKUP_KEY:?required}
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: ${PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION:-1}
+  IDENTITY_SECRET_KEY: ${IDENTITY_SECRET_KEY:?required}
+  IDENTITY_SECRET_KEY_VERSION: ${IDENTITY_SECRET_KEY_VERSION:-1}
+  IDENTITY_SECRET_PREVIOUS_KEYS: ${IDENTITY_SECRET_PREVIOUS_KEYS:-}
   PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: ${PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS:-}
   OSS_SCHEMA_ROLLBACK_BRIDGE: ${OSS_SCHEMA_ROLLBACK_BRIDGE:-disabled}
   MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
@@ -23,7 +27,7 @@ x-core-env: &core-env
 x-provider-base: &provider-base
   build:
     context: .
-    target: runtime
+    target: provider-runtime
   command: ["node", "providers/mock-lab/dist/server.js"]
   restart: unless-stopped
   read_only: true
@@ -111,10 +115,27 @@ services:
       retries: 20
     security_opt: ["no-new-privileges:true"]
 
+  provider-platform-db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: provider_platform
+      POSTGRES_USER: provider_platform
+      POSTGRES_PASSWORD: ${PROVIDER_PLATFORM_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-platform-db-data:/var/lib/postgresql
+    networks: [provider-platform-data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U provider_platform -d provider_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+
   seed:
     build:
       context: .
-      target: runtime
+      target: core-runtime
     command:
       [
         "sh",
@@ -138,7 +159,7 @@ services:
   api:
     build:
       context: .
-      target: runtime
+      target: core-runtime
     command: ["node", "apps/api/dist/server.js"]
     restart: unless-stopped
     environment:
@@ -170,7 +191,7 @@ services:
   worker:
     build:
       context: .
-      target: runtime
+      target: core-runtime
     command: ["node", "apps/worker/dist/worker.js"]
     restart: unless-stopped
     environment:
@@ -180,12 +201,15 @@ services:
       CORE_INTERNAL_URL: http://api:3000
       MOCK_PAYMENT_PROVIDER_URL: http://provider-payment:4000
       MOCK_PROVISIONING_PROVIDER_URL: http://provider-provisioning:4000
+      MOCK_PROVIDER_PLATFORM_URL: http://provider-platform:4000
       MOCK_MAIL_PROVIDER_URL: http://provider-mail:4000
       MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
       MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
       MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
       MOCK_PROVISION_SCENARIO: ${MOCK_PROVISION_SCENARIO:-success}
       MOCK_RESOURCE_ACTION_SCENARIO: ${MOCK_RESOURCE_ACTION_SCENARIO:-success}
+      MOCK_SERVICE_OPERATION_SCENARIO: ${MOCK_SERVICE_OPERATION_SCENARIO:-normal}
     depends_on:
       api:
         condition: service_healthy
@@ -195,7 +219,9 @@ services:
         condition: service_healthy
       provider-mail:
         condition: service_healthy
-    networks: [core-data, core-app, payment-app, provisioning-app, mail-app]
+      provider-platform:
+        condition: service_healthy
+    networks: [core-data, core-app, payment-app, provisioning-app, mail-app, provider-platform-app]
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -262,6 +288,13 @@ services:
 
   provider-mailbox:
     <<: *provider-base
+    command:
+      - sh
+      - -c
+      - >-
+        until node -e "fetch('http://provider-mail:4000/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))";
+        do sleep 1; done;
+        exec node providers/mock-lab/dist/server.js
     environment:
       PROVIDER_DATABASE_URL: postgresql://mail_provider:${MAIL_PROVIDER_DATABASE_PASSWORD:?required}@provider-mail-db:5432/mail_provider
       LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
@@ -269,7 +302,26 @@ services:
     depends_on:
       provider-mail-db:
         condition: service_healthy
+      provider-mail:
+        condition: service_healthy
     networks: [mail-data, mailbox-app]
+
+  provider-platform:
+    <<: *provider-base
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider_platform:${PROVIDER_PLATFORM_DATABASE_PASSWORD:?required}@provider-platform-db:5432/provider_platform
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: ${MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY:?required}
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: ${MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION:-1}
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: ${MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS:-}
+      MOCK_PROVIDER_PUBLIC_BASE_URL: http://127.0.0.1:4105
+      CORE_CALLBACK_URL: http://127.0.0.1
+    depends_on:
+      provider-platform-db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4105:4000"
+    networks: [provider-platform-data, provider-platform-app]
 
   web:
     build:
@@ -293,6 +345,7 @@ volumes:
   provider-payment-db-data:
   provider-provisioning-db-data:
   provider-mail-db-data:
+  provider-platform-db-data:
 
 networks:
   core-data:
@@ -303,6 +356,8 @@ networks:
     internal: true
   mail-data:
     internal: true
+  provider-platform-data:
+    internal: true
   core-app:
     internal: true
   payment-app:
@@ -312,6 +367,8 @@ networks:
   mail-app:
     internal: true
   mailbox-app:
+    internal: true
+  provider-platform-app:
     internal: true
   payment-callback:
     internal: true

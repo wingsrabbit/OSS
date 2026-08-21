@@ -4,7 +4,9 @@ import { randomUUID } from "node:crypto";
 import {
   addBillingCycle,
   canTransitionPayment,
+  hasCustomerMembershipCapability,
   type BillingCycle,
+  type CustomerMembershipRole,
   type PaymentStatus,
 } from "@opensales/core";
 import { providerOperationCapabilityMatches } from "@opensales/core/provider-capability";
@@ -78,6 +80,7 @@ const resourceActionEventSchema = z.object({
 
 const resourceTerminationEventSchema = z.object({
   eventId: z.string().min(1).max(160),
+  reconciliationQueryId: z.uuid().optional(),
   providerOperationId: z.uuid(),
   callbackCapability: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   serviceId: z.uuid(),
@@ -615,10 +618,109 @@ export async function registerProviderEventRoutes(
         );
         return { rejected: true, reason: "unknown_payment_attempt" };
       }
-      // Match the payment-settings API and Worker ordering before taking
-      // Invoice/Attempt/Operation locks. A callback can still settle an
-      // already-dispatched operation after consent revocation, but it cannot
-      // deadlock the revocation transaction.
+      const identityPointers = await client.query<{
+        order_id: string;
+        service_id: string;
+        lock_user_id: string;
+        submitted_user_id: string;
+        client_account_id: string;
+      }>(
+        `SELECT order_id, service_id, lock_user_id, submitted_user_id,
+                client_account_id
+         FROM (
+           SELECT
+             original_order.id AS order_id,
+             service.id AS service_id,
+             command.initiated_by_user_id AS lock_user_id,
+             original_order.submitted_by_user_id AS submitted_user_id,
+             original_order.client_account_id
+           FROM invoices invoice
+           JOIN orders original_order ON original_order.id = invoice.order_id
+           JOIN order_items item ON item.order_id = original_order.id
+           JOIN services service ON service.order_item_id = item.id
+           JOIN invoice_payment_commands command
+             ON command.invoice_id = invoice.id
+            AND command.payment_attempt_id = $2
+            AND command.initiator_type = 'user'
+           WHERE invoice.id = $1
+
+           UNION ALL
+
+           SELECT
+             original_order.id AS order_id,
+             service.id AS service_id,
+             COALESCE(command.initiated_by_user_id, renewal_authorization.granted_by_user_id)
+               AS lock_user_id,
+             original_order.submitted_by_user_id AS submitted_user_id,
+             service.client_account_id
+           FROM invoices invoice
+           JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+           JOIN services service ON service.id = renewal.service_id
+           JOIN order_items item ON item.id = service.order_item_id
+           JOIN orders original_order ON original_order.id = item.order_id
+           JOIN client_accounts account ON account.id = service.client_account_id
+           JOIN invoice_payment_commands command
+             ON command.invoice_id = invoice.id
+            AND command.payment_attempt_id = $2
+           JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
+           LEFT JOIN automatic_renewal_authorizations renewal_authorization
+             ON renewal_authorization.id = attempt.automatic_renewal_authorization_id
+           WHERE command.initiator_type IN ('user', 'system')
+             AND invoice.id = $1
+         ) identity`,
+        [invoiceId, body.paymentAttemptId],
+      );
+      const identityPointer = identityPointers.rows[0];
+      if (
+        !identityPointer ||
+        !identityPointer.lock_user_id ||
+        identityPointer.client_account_id !== paymentPointer.client_account_id
+      ) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          `provider-operation:${body.providerOperationId}`,
+        ]);
+        await auditProvider(
+          client,
+          MOCK_PAYMENT_INSTALLATION_ID,
+          "payment.event_rejected",
+          "payment",
+          body.paymentAttemptId,
+          "payment Attempt is linked to inconsistent Core ownership records",
+          { eventId: body.eventId, providerOperationId: body.providerOperationId },
+        );
+        return { rejected: true, reason: "core_ownership_mismatch" };
+      }
+
+      // Universal mutation order: User -> Account -> Membership -> business
+      // rows. Customer mutations additionally lock Session between User and
+      // Account. Keep each relation in a separate statement.
+      const identityUserIds = [
+        identityPointer.lock_user_id,
+        identityPointer.submitted_user_id,
+      ]
+        .filter((value, index, values) => values.indexOf(value) === index)
+        .sort();
+      await client.query(
+        `SELECT id FROM users
+         WHERE id = ANY($1::uuid[])
+         ORDER BY id
+         FOR UPDATE`,
+        [identityUserIds],
+      );
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        identityPointer.client_account_id,
+      ]);
+      await client.query(
+        `SELECT user_id
+         FROM client_memberships
+         WHERE client_account_id = $1 AND user_id = ANY($2::uuid[])
+         ORDER BY user_id
+         FOR UPDATE`,
+        [identityPointer.client_account_id, identityUserIds],
+      );
+      // Match the payment-settings API and Worker ordering only after the
+      // shared identity prefix. A callback can settle an already-dispatched
+      // operation after consent revocation without forming a row/advisory cycle.
       await client.query(
         "SELECT pg_advisory_xact_lock_shared(hashtextextended('opensales:payment-method-token-rewrap', 0))",
       );
@@ -761,60 +863,7 @@ export async function registerProviderEventRoutes(
         return { rejected: true, reason: "provider_operation_not_started" };
       }
 
-      // Acquire the shared business identity rows before inserting any receipt.
-      // The fund_receipts.client_account_id foreign key otherwise takes an
-      // implicit Key Share lock on Client Account before advancePaidInvoice
-      // reaches User, recreating a cross-invoice User/Account lock inversion.
-      const identityPointers = await client.query<{
-        order_id: string;
-        service_id: string;
-        lock_user_id: string;
-        client_account_id: string;
-      }>(
-        `SELECT order_id, service_id, lock_user_id, client_account_id
-         FROM (
-           SELECT
-             original_order.id AS order_id,
-             service.id AS service_id,
-             command.initiated_by_user_id AS lock_user_id,
-             original_order.client_account_id
-           FROM invoices invoice
-           JOIN orders original_order ON original_order.id = invoice.order_id
-           JOIN order_items item ON item.order_id = original_order.id
-           JOIN services service ON service.order_item_id = item.id
-           JOIN invoice_payment_commands command
-             ON command.invoice_id = invoice.id
-            AND command.payment_attempt_id = $2
-            AND command.initiator_type = 'user'
-           WHERE invoice.id = $1
-
-           UNION ALL
-
-           SELECT
-             original_order.id AS order_id,
-             service.id AS service_id,
-             COALESCE(command.initiated_by_user_id, renewal_authorization.granted_by_user_id) AS lock_user_id,
-             service.client_account_id
-           FROM invoices invoice
-           JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
-           JOIN services service ON service.id = renewal.service_id
-           JOIN order_items item ON item.id = service.order_item_id
-           JOIN orders original_order ON original_order.id = item.order_id
-           JOIN client_accounts account ON account.id = service.client_account_id
-           JOIN invoice_payment_commands command
-             ON command.invoice_id = invoice.id
-            AND command.payment_attempt_id = $2
-           JOIN payment_attempts attempt ON attempt.id = command.payment_attempt_id
-           LEFT JOIN automatic_renewal_authorizations renewal_authorization
-             ON renewal_authorization.id = attempt.automatic_renewal_authorization_id
-           WHERE command.initiator_type IN ('user', 'system')
-             AND invoice.id = $1
-         ) identity`,
-        [attempt.invoice_id, attempt.id],
-      );
-      const identityPointer = identityPointers.rows[0];
       if (
-        !identityPointer ||
         identityPointer.client_account_id !== attempt.client_account_id ||
         (attempt.automatic_renewal_requested &&
           attempt.automatic_renewal_service_id !== identityPointer.service_id)
@@ -836,27 +885,22 @@ export async function registerProviderEventRoutes(
       await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
         identityPointer.service_id,
       ]);
-      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-        identityPointer.lock_user_id,
-      ]);
-      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-        identityPointer.client_account_id,
-      ]);
-      await client.query(
-        `SELECT client_account_id
-         FROM client_memberships
-         WHERE client_account_id = $1 AND user_id = $2
-         FOR UPDATE`,
-        [identityPointer.client_account_id, identityPointer.lock_user_id],
-      );
-      const consentActor = await client.query<{ eligible: boolean }>(
-        `SELECT (
-           user_account.email_verified_at IS NOT NULL
-           AND user_account.restricted_at IS NULL
-           AND account.restricted_at IS NULL
-           AND membership.removed_at IS NULL
-           AND membership.role IN ('owner', 'billing')
-         ) AS eligible
+      const consentActor = await client.query<{
+        email_verified_at: Date | null;
+        user_restricted_at: Date | null;
+        account_restricted_at: Date | null;
+        membership_role: CustomerMembershipRole | null;
+        membership_permissions: unknown;
+        membership_restricted_at: Date | null;
+        removed_at: Date | null;
+      }>(
+        `SELECT user_account.email_verified_at,
+                user_account.restricted_at AS user_restricted_at,
+                account.restricted_at AS account_restricted_at,
+                membership.role AS membership_role,
+                membership.permissions AS membership_permissions,
+                membership.restricted_at AS membership_restricted_at,
+                membership.removed_at
          FROM users user_account
          JOIN client_accounts account ON account.id = $2
          LEFT JOIN client_memberships membership
@@ -865,8 +909,30 @@ export async function registerProviderEventRoutes(
          WHERE user_account.id = $1`,
         [identityPointer.lock_user_id, identityPointer.client_account_id],
       );
+      const consent = consentActor.rows[0];
+      const consentPermissions =
+        consent &&
+        Array.isArray(consent.membership_permissions) &&
+        consent.membership_permissions.every(
+          (permission): permission is string => typeof permission === "string",
+        )
+          ? consent.membership_permissions
+          : [];
       const canMaterializePaymentConsent =
-        attempt.initiator_type === "user" && consentActor.rows[0]?.eligible === true;
+        attempt.initiator_type === "user" &&
+        Boolean(consent?.email_verified_at) &&
+        !consent?.user_restricted_at &&
+        !consent?.account_restricted_at &&
+        !consent?.membership_restricted_at &&
+        !consent?.removed_at &&
+        Boolean(consent?.membership_role) &&
+        hasCustomerMembershipCapability(
+          {
+            role: consent!.membership_role!,
+            permissions: consentPermissions,
+          },
+          "billing.write",
+        );
       const inboxOutcome = await insertInbox(
         client,
         MOCK_PAYMENT_INSTALLATION_ID,
@@ -2433,11 +2499,13 @@ export async function registerProviderEventRoutes(
         operation_stable_key: string;
         operation_attempt_count: number;
         operation_provider_occurred_at: Date | null;
+        provider_attempt_id: string | null;
         execution_id: string;
         execution_provider_installation_id: string | null;
         execution_status: string;
         execution_version: number;
         execution_provider_occurred_at: Date | null;
+        reconciliation_query_count: number;
         request_id: string;
         effective_at: Date;
         service_id: string;
@@ -2451,11 +2519,13 @@ export async function registerProviderEventRoutes(
                 operation.stable_key AS operation_stable_key,
                 operation.attempt_count AS operation_attempt_count,
                 operation.provider_occurred_at AS operation_provider_occurred_at,
+                provider_attempt.id AS provider_attempt_id,
                 execution.id AS execution_id,
                 execution.provider_installation_id AS execution_provider_installation_id,
                 execution.status AS execution_status,
                 execution.version AS execution_version,
                 execution.provider_occurred_at AS execution_provider_occurred_at,
+                execution.reconciliation_query_count,
                 cancellation_request.id AS request_id,
                 cancellation_request.effective_at,
                 service.id AS service_id,
@@ -2468,6 +2538,9 @@ export async function registerProviderEventRoutes(
          JOIN service_cancellation_requests cancellation_request
            ON cancellation_request.id = execution.cancellation_request_id
          JOIN services service ON service.id = execution.service_id
+         LEFT JOIN service_cancellation_provider_attempts provider_attempt
+           ON provider_attempt.provider_operation_id = operation.id
+          AND provider_attempt.execution_id = execution.id
          WHERE operation.id = $1`,
         [body.providerOperationId],
       );
@@ -2508,7 +2581,7 @@ export async function registerProviderEventRoutes(
       ) {
         return { rejected: true, reason: "invalid_operation_capability" };
       }
-      if (state.operation_attempt_count === 0) {
+      if (state.operation_attempt_count !== 1 || !state.provider_attempt_id) {
         return { rejected: true, reason: "provider_operation_not_started" };
       }
 
@@ -2524,12 +2597,60 @@ export async function registerProviderEventRoutes(
         return { rejected: true, reason: "event_id_conflict" };
       }
 
+      const inboxResult = await client.query<{ id: string }>(
+        `SELECT id
+         FROM provider_inbox
+         WHERE provider_installation_id = $1 AND external_event_id = $2
+         FOR UPDATE`,
+        [MOCK_PROVISIONING_INSTALLATION_ID, body.eventId],
+      );
+      const providerInboxId = inboxResult.rows[0]?.id;
+      if (!providerInboxId) throw new Error("Cancellation Provider inbox fact disappeared");
+
       const occurredAt = new Date(body.occurredAt);
+      const observationSource = body.eventId.startsWith(
+        `reconcile:resource-termination:${state.operation_id}:`,
+      )
+        ? "reconciliation"
+        : "callback";
+      await client.query(
+        `INSERT INTO service_cancellation_provider_results(
+           id, attempt_id, execution_id, cancellation_request_id, service_id,
+           provider_operation_id, provider_inbox_id, provider_installation_id,
+           reconciliation_query_id, observation_source, outcome, external_resource_id,
+           provider_occurred_at, result_snapshot
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+         )`,
+        [
+          randomUUID(),
+          state.provider_attempt_id,
+          state.execution_id,
+          state.request_id,
+          state.service_id,
+          state.operation_id,
+          providerInboxId,
+          MOCK_PROVISIONING_INSTALLATION_ID,
+          body.reconciliationQueryId ?? null,
+          observationSource,
+          body.status,
+          body.externalResourceId,
+          occurredAt,
+          {
+            status: body.status,
+            serviceId: body.serviceId,
+            externalResourceId: body.externalResourceId,
+            occurredAt: body.occurredAt,
+            reconciliationQueryId: body.reconciliationQueryId ?? null,
+          },
+        ],
+      );
+
       const enqueueQueryOnly = async (reason: string) => {
         await client.query(
           `UPDATE provider_operations
            SET status = 'unknown', last_error = $2, updated_at = now()
-           WHERE id = $1 AND status NOT IN ('succeeded', 'failed')`,
+           WHERE id = $1 AND status <> 'succeeded'`,
           [state.operation_id, reason],
         );
         if (state.execution_status === "processing") {
@@ -2549,7 +2670,30 @@ export async function registerProviderEventRoutes(
         await client.query(
           `INSERT INTO durable_jobs(job_type, unique_key, payload)
            VALUES ('service.cancellation.reconcile', $1, $2)
-           ON CONFLICT (job_type, unique_key) DO NOTHING`,
+           ON CONFLICT (job_type, unique_key) DO UPDATE
+             SET payload = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.payload
+                   ELSE EXCLUDED.payload
+                 END,
+                 status = CASE
+                   WHEN durable_jobs.status = 'manual' THEN 'manual'
+                   WHEN durable_jobs.status = 'running' THEN 'running'
+                   ELSE 'pending'
+                 END,
+                 available_at = CASE
+                   WHEN durable_jobs.status IN ('manual', 'running')
+                     THEN durable_jobs.available_at
+                   ELSE EXCLUDED.available_at
+                 END,
+                 locked_at = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_at
+                   ELSE NULL
+                 END,
+                 locked_by = CASE
+                   WHEN durable_jobs.status = 'running' THEN durable_jobs.locked_by
+                   ELSE NULL
+                 END,
+                 updated_at = now()`,
           [
             state.operation_stable_key,
             {
@@ -2693,9 +2837,6 @@ export async function registerProviderEventRoutes(
     const body = resourceActionEventSchema.parse(request.body);
     assertProviderSignature(request, config.MOCK_PROVISIONING_WEBHOOK_SECRET, body);
     const outcome = await transaction(pool, async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-        `provider-operation:${body.providerOperationId}`,
-      ]);
       const pointerResult = await client.query<{
         case_id: string;
         service_id: string;
@@ -2703,6 +2844,8 @@ export async function registerProviderEventRoutes(
         invoice_id: string;
         order_id: string;
         order_item_id: string;
+        client_account_id: string;
+        submitted_by_user_id: string;
       }>(
         `SELECT
            suspension_case.id AS case_id,
@@ -2710,7 +2853,9 @@ export async function registerProviderEventRoutes(
            suspension_case.service_renewal_id AS renewal_id,
            suspension_case.invoice_id,
            customer_order.id AS order_id,
-           item.id AS order_item_id
+           item.id AS order_item_id,
+           service.client_account_id,
+           customer_order.submitted_by_user_id
          FROM provider_operations operation
          JOIN service_suspension_cases suspension_case
            ON operation.subject_type = 'service_suspension_case'
@@ -2723,6 +2868,22 @@ export async function registerProviderEventRoutes(
       );
       const pointer = pointerResult.rows[0];
       if (!pointer) return { rejected: true, reason: "unknown_provider_operation" };
+      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        pointer.submitted_by_user_id,
+      ]);
+      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        pointer.client_account_id,
+      ]);
+      await client.query(
+        `SELECT user_id
+         FROM client_memberships
+         WHERE client_account_id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [pointer.client_account_id, pointer.submitted_by_user_id],
+      );
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `provider-operation:${body.providerOperationId}`,
+      ]);
       await client.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
         pointer.invoice_id,
       ]);
@@ -2759,6 +2920,7 @@ export async function registerProviderEventRoutes(
         external_resource_id: string | null;
         renewal_status: string;
         account_restricted_at: Date | null;
+        client_account_id: string;
         other_unpaid_case: boolean;
       }>(
         `SELECT
@@ -2781,6 +2943,7 @@ export async function registerProviderEventRoutes(
            service.external_resource_id,
            renewal.status AS renewal_status,
            account.restricted_at AS account_restricted_at,
+           account.id AS client_account_id,
            EXISTS (
              SELECT 1
              FROM service_suspension_cases other_case
@@ -2803,7 +2966,12 @@ export async function registerProviderEventRoutes(
         [body.providerOperationId],
       );
       const state = stateResult.rows[0];
-      if (!state || state.case_id !== pointer.case_id || state.service_id !== pointer.service_id) {
+      if (
+        !state ||
+        state.case_id !== pointer.case_id ||
+        state.service_id !== pointer.service_id ||
+        state.client_account_id !== pointer.client_account_id
+      ) {
         return { rejected: true, reason: "core_ownership_mismatch" };
       }
       const expectedKind = body.action === "suspend" ? "resource_suspend" : "resource_resume";
@@ -3123,10 +3291,57 @@ export async function registerProviderEventRoutes(
     const body = provisioningEventSchema.parse(request.body);
     assertProviderSignature(request, config.MOCK_PROVISIONING_WEBHOOK_SECRET, body);
     const outcome = await transaction(pool, async (client) => {
+      const occurredAt = new Date(body.occurredAt);
+      const operationPointerResult = await client.query<{ subject_id: string }>(
+        `SELECT subject_id
+         FROM provider_operations
+         WHERE id = $1
+           AND provider_installation_id = $2
+           AND subject_type = 'service'
+           AND kind = 'resource_create'`,
+        [body.providerOperationId, MOCK_PROVISIONING_INSTALLATION_ID],
+      );
+      const operationPointer = operationPointerResult.rows[0];
+      if (!operationPointer) return { rejected: true, reason: "unknown_provider_operation" };
+      const provisionPointers = await client.query<{
+        invoice_id: string;
+        order_id: string;
+        order_item_id: string;
+        submitted_by_user_id: string;
+        client_account_id: string;
+      }>(
+        `SELECT
+           i.id AS invoice_id,
+           o.id AS order_id,
+           oi.id AS order_item_id,
+           o.submitted_by_user_id,
+           o.client_account_id
+         FROM services s
+         JOIN order_items oi ON oi.id = s.order_item_id
+         JOIN orders o ON o.id = oi.order_id
+         JOIN invoices i ON i.order_id = o.id
+         WHERE s.id = $1`,
+        [operationPointer.subject_id],
+      );
+      const provisionPointer = provisionPointers.rows[0];
+      if (provisionPointer) {
+        await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+          provisionPointer.submitted_by_user_id,
+        ]);
+        await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+          provisionPointer.client_account_id,
+        ]);
+        await client.query(
+          `SELECT client_account_id
+           FROM client_memberships
+           WHERE client_account_id = $1 AND user_id = $2
+           FOR UPDATE`,
+          [provisionPointer.client_account_id, provisionPointer.submitted_by_user_id],
+        );
+      }
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
         `provider-operation:${body.providerOperationId}`,
       ]);
-      const occurredAt = new Date(body.occurredAt);
       const operationResult = await client.query<{
         id: string;
         subject_id: string;
@@ -3145,7 +3360,9 @@ export async function registerProviderEventRoutes(
         [body.providerOperationId, MOCK_PROVISIONING_INSTALLATION_ID],
       );
       const operation = operationResult.rows[0];
-      if (!operation) return { rejected: true, reason: "unknown_provider_operation" };
+      if (!operation || operation.subject_id !== operationPointer.subject_id) {
+        return { rejected: true, reason: "unknown_provider_operation" };
+      }
       if (
         !providerOperationCapabilityMatches(
           body.callbackCapability,
@@ -3177,27 +3394,6 @@ export async function registerProviderEventRoutes(
         );
         return { rejected: true, reason: "provider_operation_not_started" };
       }
-      const provisionPointers = await client.query<{
-        invoice_id: string;
-        order_id: string;
-        order_item_id: string;
-        submitted_by_user_id: string;
-        client_account_id: string;
-      }>(
-        `SELECT
-           i.id AS invoice_id,
-           o.id AS order_id,
-           oi.id AS order_item_id,
-           o.submitted_by_user_id,
-           o.client_account_id
-         FROM services s
-         JOIN order_items oi ON oi.id = s.order_item_id
-         JOIN orders o ON o.id = oi.order_id
-         JOIN invoices i ON i.order_id = o.id
-         WHERE s.id = $1`,
-        [operation.subject_id],
-      );
-      const provisionPointer = provisionPointers.rows[0];
       if (!provisionPointer) {
         await auditProvider(
           client,
@@ -3222,19 +3418,6 @@ export async function registerProviderEventRoutes(
       await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
         operation.subject_id,
       ]);
-      await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-        provisionPointer.submitted_by_user_id,
-      ]);
-      await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-        provisionPointer.client_account_id,
-      ]);
-      await client.query(
-        `SELECT client_account_id
-         FROM client_memberships
-         WHERE client_account_id = $1 AND user_id = $2
-         FOR UPDATE`,
-        [provisionPointer.client_account_id, provisionPointer.submitted_by_user_id],
-      );
       const inboxOutcome = await insertInbox(
         client,
         MOCK_PROVISIONING_INSTALLATION_ID,

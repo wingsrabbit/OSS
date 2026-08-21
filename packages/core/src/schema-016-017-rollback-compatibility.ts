@@ -39,9 +39,15 @@ const EXPECTED_MIGRATION_HISTORY = [
   "016_stage_b_manual_receipts",
   SCHEMA_017,
 ] as const;
+const EXPECTED_SCHEMA_019_EXTENSION_HISTORY = [
+  ...EXPECTED_MIGRATION_HISTORY,
+  "018_stage_c_support_tickets",
+  "019_stage_c_account_context_memberships_contacts",
+] as const;
 
 export type Schema017CatalogShapeInput = Readonly<{
   expectedMigrationHistory?: readonly string[];
+  allowSchema019RecordedOwnerInvariant?: boolean;
 }>;
 
 export type Schema017NativePreflightReport = Readonly<{
@@ -99,6 +105,16 @@ export async function schema017CatalogFingerprintInput(
   database: RollbackPreflightQueryable,
   input: Schema017CatalogShapeInput = {},
 ): Promise<Readonly<{ historyExact: boolean; fingerprintInput: string | null }>> {
+  const expectedMigrationHistory =
+    input.expectedMigrationHistory ?? EXPECTED_MIGRATION_HISTORY;
+  const allowSchema019RecordedOwnerInvariant =
+    input.allowSchema019RecordedOwnerInvariant === true &&
+    input.expectedMigrationHistory !== undefined &&
+    input.expectedMigrationHistory.length ===
+      EXPECTED_SCHEMA_019_EXTENSION_HISTORY.length &&
+    input.expectedMigrationHistory.every(
+      (version, index) => version === EXPECTED_SCHEMA_019_EXTENSION_HISTORY[index],
+    );
   const result = await database.query(
     `WITH catalog_items(item) AS (
        SELECT pg_catalog.concat_ws('|', 'relation', namespace.nspname, relation.relname,
@@ -182,6 +198,11 @@ export async function schema017CatalogFingerprintInput(
        JOIN pg_catalog.pg_class relation ON relation.relnamespace = namespace.oid
        JOIN pg_catalog.pg_constraint actual ON actual.conrelid = relation.oid
        WHERE namespace.nspname = 'public'
+         AND NOT (
+           $2::boolean
+           AND relation.relname = 'client_accounts'
+           AND actual.conname = 'client_accounts_owner_invariant'
+         )
          AND (
            relation.relname IN (
              'client_account_debt_accounts',
@@ -222,6 +243,15 @@ export async function schema017CatalogFingerprintInput(
          ON procedure_namespace.oid = procedure.pronamespace
        WHERE namespace.nspname = 'public'
          AND NOT actual.tgisinternal
+         AND NOT (
+           $2::boolean
+           AND relation.relname = 'client_accounts'
+           AND actual.tgname IN (
+             'client_accounts_owner_invariant',
+             'client_accounts_record_owner_transfer',
+             'client_accounts_prelock_reauth'
+           )
+         )
          AND (
            relation.relname IN (
              'client_account_debt_accounts',
@@ -346,7 +376,10 @@ export async function schema017CatalogFingerprintInput(
        (SELECT pg_catalog.array_agg(version ORDER BY version COLLATE "C")
         FROM public.schema_migrations) = $1::text[] AS history_exact,
        (SELECT value FROM fingerprint) AS fingerprint_input`,
-    [[...(input.expectedMigrationHistory ?? EXPECTED_MIGRATION_HISTORY)]],
+    [
+      [...expectedMigrationHistory],
+      allowSchema019RecordedOwnerInvariant,
+    ],
   );
   const row = rowRecord(result.rows[0]);
   return {

@@ -62,9 +62,11 @@ const config: Config = {
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: newLookupKey,
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: 2,
   PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: `1:${oldLookupKey}`,
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 35).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-payment-webhook-secret-for-rotation-test",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-provision-webhook-secret-for-rotation-test",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 const {
@@ -122,6 +124,11 @@ try {
     );
     accountId = account.rows[0]?.id ?? "";
     if (!accountId) throw new Error("Unable to seed rotation integration account");
+    await seed.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES ($1, $2, 'owner', '[]'::jsonb)`,
+      [accountId, userId],
+    );
     await seed.query(
       `INSERT INTO provider_installation_capabilities(
          provider_installation_id, provider_type, enabled, capabilities

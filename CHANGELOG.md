@@ -8,6 +8,15 @@ All notable project changes will be documented here. Project release numbering a
 
 ### Added
 
+- Forward-only Schema 027 adds immutable English and Simplified Chinese
+  notification-template revisions with separate Staff read/create/publish/
+  retire permissions, deterministic English fallback, and exact revision
+  freezing on standard and identity delivery attempts. Customer Users can
+  manage optional billing, service, and support email preferences; identity,
+  transactional, and high-risk delivery remains mandatory and is labelled as
+  such in the Customer UI. API, Worker, Mock Mail, Demo, PostgreSQL 18 native
+  gates, and real Chrome acceptance share the same registry and preference
+  contracts.
 - Billing staff can record an independently confirmed USD manual or offline
   receipt for a Client Account after fixed-window password confirmation. Core
   preserves gross, fee, net, reference, received time, operator, and reason as

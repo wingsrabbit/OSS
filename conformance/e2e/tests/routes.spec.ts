@@ -1,42 +1,114 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+import {
+  fulfillNotificationInterfaceRequest,
+  notificationPreferencesMockState,
+} from "./helpers/notification-interfaces.js";
 
 type MockViewer = {
   id: string;
   email: string;
-  locale: "en";
+  locale: "en" | "zh-CN";
   clientAccountId: string;
   membershipRole: string;
-  verification: { email: "passed" };
+  accountContextVersion: string;
+  authorizationEpoch: string;
+  context: {
+    clientAccountId: string;
+    name: string;
+    role: "owner";
+    permissions: string[];
+    capabilities: string[];
+    version: string;
+  };
+  verification: { email: "passed" | "pending" };
+  restrictions: { user: boolean; clientAccount: boolean };
   eligible: boolean;
   staff: { roles: string[]; permissions: unknown } | null;
 };
+
+const ownerCapabilities = [
+  "account.contacts.manage",
+  "account.contacts.read",
+  "account.members.manage",
+  "account.members.read",
+  "billing.read",
+  "billing.write",
+  "orders.create",
+  "services.manage",
+  "support.tickets.write",
+];
 
 function mockViewer({
   email,
   eligible = true,
   permissions = null,
+  restrictions = { user: false, clientAccount: false },
 }: {
   email: string;
   eligible?: boolean;
   permissions?: unknown;
+  restrictions?: { user: boolean; clientAccount: boolean };
 }): MockViewer {
+  const clientAccountId = "00000000-0000-4000-8000-000000000002";
   return {
     id: "00000000-0000-4000-8000-000000000001",
     email,
     locale: "en",
-    clientAccountId: "00000000-0000-4000-8000-000000000002",
+    clientAccountId,
     membershipRole: "owner",
+    accountContextVersion: "1",
+    authorizationEpoch: "1",
+    context: {
+      clientAccountId,
+      name: "Synthetic route account",
+      role: "owner",
+      permissions: ["*"],
+      capabilities: ownerCapabilities,
+      version: "1",
+    },
     verification: { email: "passed" },
+    restrictions,
     eligible,
     staff: permissions === null ? null : { roles: ["support"], permissions },
   };
 }
 
+function withViewerSessionContext(route: Route, viewer: MockViewer | null): Route {
+  if (!viewer) return route;
+  return new Proxy(route, {
+    get(target, property, receiver) {
+      if (property === "fulfill") {
+        return (options: Parameters<Route["fulfill"]>[0]) => {
+          const response = options ?? {};
+          return target.fulfill({
+            ...response,
+            headers: {
+              "X-OSS-Account-Context-Version": viewer.accountContextVersion,
+              "X-OSS-Client-Account-Id": viewer.clientAccountId,
+              "X-OSS-Authorization-Epoch": viewer.authorizationEpoch,
+              ...(response.headers ?? {}),
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+type MockViewerSource = MockViewer | null | (() => MockViewer | null);
+
+function currentMockViewer(source: MockViewerSource): MockViewer | null {
+  return typeof source === "function" ? source() : source;
+}
+
 async function installMockApi(
   page: Page,
-  viewer: MockViewer | null,
+  viewerSource: MockViewerSource,
   options: {
     unauthorizedPath?: string;
     unauthorizedError?: string;
@@ -44,25 +116,78 @@ async function installMockApi(
   } = {},
 ): Promise<string[]> {
   const requests: string[] = [];
-  await page.route("**/api/v1/**", async (route) => {
+  const notificationPreferences = notificationPreferencesMockState();
+  await page.route("**/api/v1/**", async (rawRoute) => {
+    const viewer = currentMockViewer(viewerSource);
+    const route = withViewerSessionContext(rawRoute, viewer);
     const request = route.request();
     const path = new URL(request.url()).pathname;
     requests.push(path);
 
     if (options.intercept && await options.intercept(path, route)) return;
 
+    const viewerStaffPermissions = Array.isArray(viewer?.staff?.permissions)
+      ? viewer.staff.permissions.filter((permission): permission is string => typeof permission === "string")
+      : [];
+    if (await fulfillNotificationInterfaceRequest(route, {
+      customerPreferences:
+        viewer?.verification.email === "passed" && viewer.restrictions.user === false,
+      adminTemplates:
+        viewer?.verification.email === "passed" &&
+        viewer.restrictions.user === false &&
+        viewer.staff !== null &&
+        (viewerStaffPermissions.includes("*") ||
+          viewerStaffPermissions.includes("notifications.templates.read")),
+      preferenceState: notificationPreferences,
+    })) return;
+
     if (path === "/api/v1/auth/me") {
       if (viewer) {
-        await route.fulfill({ json: viewer });
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": viewer.accountContextVersion,
+            "X-OSS-Client-Account-Id": viewer.clientAccountId,
+            "X-OSS-Authorization-Epoch": viewer.authorizationEpoch,
+          },
+          json: viewer,
+        });
       } else {
         await route.fulfill({ status: 401, json: { error: "Authentication required" } });
       }
       return;
     }
+    if (path === "/api/v1/auth/account-contexts" && viewer) {
+      await route.fulfill({
+        headers: {
+          "X-OSS-Account-Context-Version": viewer.accountContextVersion,
+          "X-OSS-Client-Account-Id": viewer.clientAccountId,
+          "X-OSS-Authorization-Epoch": viewer.authorizationEpoch,
+        },
+        json: {
+          activeClientAccountId: viewer.clientAccountId,
+          accountContextVersion: viewer.accountContextVersion,
+          items: [{
+            clientAccountId: viewer.clientAccountId,
+            name: viewer.context.name,
+            role: viewer.context.role,
+            permissions: viewer.context.permissions,
+            capabilities: viewer.context.capabilities,
+            restrictions: {
+              membership: false,
+              clientAccount: viewer.restrictions.clientAccount,
+            },
+          }],
+          limit: 25,
+          hasMore: false,
+          nextCursor: null,
+        },
+      });
+      return;
+    }
     if (path === options.unauthorizedPath) {
       await route.fulfill({
         status: 401,
-        json: { error: options.unauthorizedError ?? "Session expired" },
+        json: { error: options.unauthorizedError ?? "Session is invalid or expired" },
       });
       return;
     }
@@ -110,8 +235,145 @@ async function installMockApi(
       await route.fulfill({ json: { documents: { terms: document, aup: document, privacy: document } } });
       return;
     }
+    if (path === "/api/v1/content" || path === "/api/v1/customer/content") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (path === "/api/v1/support/departments") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (request.method() === "GET" && path === "/api/v1/admin/service-operations") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          items: [],
+        },
+      });
+      return;
+    }
+    if (request.method() === "GET" && path === "/api/v1/admin/content") {
+      await route.fulfill({
+        json: {
+          entries: [],
+          revisions: [],
+          legalDocuments: [],
+        },
+      });
+      return;
+    }
+    if (request.method() === "GET" && path === "/api/v1/admin/notification-operations") {
+      await route.fulfill({
+        json: {
+          summary: {
+            attentionCount: 0,
+            failedCount: 0,
+            unknownCount: 0,
+            manualCount: 0,
+            retryableCount: 0,
+            oldestTask: null,
+          },
+          queue: [],
+          history: [],
+          retryAudit: [],
+        },
+      });
+      return;
+    }
+    if (request.method() === "GET" && path === "/api/v1/admin/catalog") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          groups: [],
+          products: [],
+          revisions: [],
+          prices: [],
+          supply: [],
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === "GET" &&
+      (path === "/api/v1/admin/promotions" || path === "/api/v1/admin/quotes")
+    ) {
+      await route.fulfill({
+        json: { warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY", items: [] },
+      });
+      return;
+    }
+    if (
+      request.method() === "GET" &&
+      (
+        /^\/api\/v1\/services\/[0-9a-f-]+\/password-changes$/u.test(path) ||
+        /^\/api\/v1\/admin\/client-accounts\/[0-9a-f-]+\/services\/[0-9a-f-]+\/password-changes$/u.test(path)
+      )
+    ) {
+      const serviceId = path.split("/").at(-2) ?? "";
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          service: {
+            id: serviceId,
+            productName: "Synthetic route service",
+            status: "active",
+            version: 1,
+            resourceRevision: 0,
+            canChangePassword: true,
+          },
+          items: [],
+        },
+      });
+      return;
+    }
+    if (
+      request.method() === "GET" &&
+      (
+        /^\/api\/v1\/services\/[0-9a-f-]+\/operations$/u.test(path) ||
+        /^\/api\/v1\/admin\/client-accounts\/[0-9a-f-]+\/services\/[0-9a-f-]+\/operations$/u.test(path)
+      )
+    ) {
+      const serviceId = path.split("/").at(-2) ?? "";
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          service: {
+            id: serviceId,
+            productName: "Synthetic route service",
+            status: "active",
+            version: 1,
+            resourceState: null,
+            resourceRevision: 0,
+            availableActions: [],
+          },
+          items: [],
+        },
+      });
+      return;
+    }
     if (path === "/api/v1/orders") {
       await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (path === "/api/v1/customer/business-history") {
+      await route.fulfill({
+        json: {
+          warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+          account: {
+            id: viewer?.clientAccountId ?? "",
+            name: "Synthetic route account",
+          },
+          orders: [],
+          invoices: [],
+          payments: [],
+          credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+          refunds: [],
+          services: [],
+          renewals: [],
+          cancellations: [],
+          tickets: [],
+        },
+      });
       return;
     }
     if (path === "/api/v1/billing/summary") {
@@ -191,6 +453,14 @@ async function installMockApi(
       return;
     }
     if (
+      path === "/api/v1/account/members" ||
+      path === "/api/v1/account/membership-invitations" ||
+      path === "/api/v1/account/contacts"
+    ) {
+      await route.fulfill({ json: { items: [], limit: 25, hasMore: false, nextCursor: null } });
+      return;
+    }
+    if (
       path.startsWith("/api/v1/billing/payment-methods/") &&
       path.endsWith("/default")
     ) {
@@ -204,6 +474,9 @@ async function installMockApi(
     if (
       [
         "/api/v1/admin/tickets",
+        "/api/v1/admin/tickets/staff-options",
+        "/api/v1/admin/support/departments",
+        "/api/v1/admin/presales/inquiries",
         "/api/v1/admin/billing/renewals",
         "/api/v1/admin/manual-fulfillment",
         "/api/v1/admin/services/cancellations",
@@ -264,6 +537,47 @@ test("public, customer, and admin routes mount only their intended workspace", a
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
 });
 
+test("real App visitor Presales entry clears its unsent draft after leaving Home", async ({ page }) => {
+  const requests = await installMockApi(page, null);
+  await page.goto("/");
+  const presales = page.locator('section[aria-label="Visitor Presales"]');
+  await expect(presales).toBeVisible();
+  await presales.getByLabel("Name").fill("Draft Visitor");
+  await presales.getByLabel("Subject").fill("Draft product question");
+  await presales.getByLabel("Message").fill("This ordinary question has not been submitted.");
+
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  await expect(presales).toHaveCount(0);
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  const returning = page.locator('section[aria-label="Visitor Presales"]');
+  await expect(returning.getByLabel("Name")).toHaveValue("");
+  await expect(returning.getByLabel("Subject")).toHaveValue("");
+  await expect(returning.getByLabel("Message")).toHaveValue("");
+  expect(requests.filter((path) => path === "/api/v1/support/departments").length).toBeGreaterThanOrEqual(2);
+});
+
+test("real App customer Support read and write stay account-scoped and clear drafts on navigation", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({ email: "customer-support-entry@example.invalid" }),
+  );
+  await page.goto("/customer");
+  const support = page.locator('section[aria-label="Customer support tickets"]');
+  await expect(support).toBeVisible();
+  await expect(support.getByRole("button", { name: "Create ticket" })).toBeVisible();
+  await support.getByLabel("Ticket subject").fill("Unsent account-scoped draft");
+  await support.getByLabel("Opening message").fill("This ordinary draft must not cross routes.");
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  const returning = page.locator('section[aria-label="Customer support tickets"]');
+  await expect(returning.getByLabel("Ticket subject")).toHaveValue("");
+  await expect(returning.getByLabel("Opening message")).toHaveValue("");
+  expect(requests).toContain("/api/v1/tickets");
+  expect(requests).toContain("/api/v1/tickets/service-options");
+  expect(requests).toContain("/api/v1/support/departments");
+  expect(requests.filter((path) => path.startsWith("/api/v1/admin/"))).toEqual([]);
+});
+
 test("customer and Staff sessions stay separated and can switch accounts through sign out", async ({
   page,
 }) => {
@@ -274,6 +588,50 @@ test("customer and Staff sessions stay separated and can switch accounts through
     process.env.OSS_E2E_STAFF_EMAIL ?? "stage-a-browser-admin@example.invalid";
   const staffPassword =
     process.env.OSS_E2E_STAFF_PASSWORD ?? "Synthetic-Stage-A-Browser-Admin-Only!";
+
+  const customer = {
+    ...mockViewer({ email: customerEmail }),
+    verification: { email: "pending" as const },
+    eligible: false,
+  };
+  const staff = mockViewer({ email: staffEmail, permissions: ["*"] });
+  let activeViewer: MockViewer | null = null;
+  await installMockApi(page, () => activeViewer, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/register") {
+        await route.fulfill({ status: 201, json: { registered: true } });
+        return true;
+      }
+      if (path === "/api/v1/auth/login") {
+        const body = route.request().postDataJSON() as { email?: unknown; password?: unknown };
+        const nextViewer = body.email === customerEmail && body.password === customerPassword
+          ? customer
+          : body.email === staffEmail && body.password === staffPassword
+            ? staff
+            : null;
+        if (!nextViewer) {
+          await route.fulfill({ status: 401, json: { error: "Invalid email or password" } });
+          return true;
+        }
+        activeViewer = nextViewer;
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": nextViewer.accountContextVersion,
+            "X-OSS-Client-Account-Id": nextViewer.clientAccountId,
+            "X-OSS-Authorization-Epoch": nextViewer.authorizationEpoch,
+          },
+          json: { requiresAccountContext: false },
+        });
+        return true;
+      }
+      if (path === "/api/v1/auth/logout") {
+        activeViewer = null;
+        await route.fulfill({ status: 204, body: "" });
+        return true;
+      }
+      return false;
+    },
+  });
 
   await page.goto("/");
   await page.getByPlaceholder("Client account name").fill(`Route Customer ${unique.slice(0, 8)}`);
@@ -292,7 +650,7 @@ test("customer and Staff sessions stay separated and can switch accounts through
 
   await page.getByRole("link", { name: "Admin", exact: true }).click();
   await expect(page.getByTestId("admin-access-restricted")).toContainText(
-    "Access denied — eligible Staff account required",
+    "Access denied — verified, unrestricted Staff User required",
   );
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
   await page.getByRole("button", { name: "Sign out" }).click();
@@ -338,13 +696,13 @@ test("public Home stays session-neutral for a signed-in wildcard Staff account",
   await expect(page.getByRole("button", { name: "Register", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
   expect(new Set(requests)).toEqual(
-    new Set(["/api/v1/catalog", "/api/v1/legal/current"]),
+    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content", "/api/v1/support/departments"]),
   );
   const requestCountBeforeLocaleChange = requests.length;
   await page.getByRole("button", { name: "简体中文" }).click();
   await expect.poll(() => requests.length).toBeGreaterThan(requestCountBeforeLocaleChange);
   expect(new Set(requests)).toEqual(
-    new Set(["/api/v1/catalog", "/api/v1/legal/current"]),
+    new Set(["/api/v1/catalog", "/api/v1/legal/current", "/api/v1/content", "/api/v1/support/departments"]),
   );
 });
 
@@ -417,6 +775,56 @@ test("catalog query 401 stays on public Home without a hard-reload loop", async 
   await expect(page).toHaveURL(/\/$/);
 });
 
+test("public Content query 401 stays on Home without a hard reload", async ({ page }) => {
+  await installMockApi(page, null, {
+    unauthorizedPath: "/api/v1/content",
+    unauthorizedError: "Synthetic Content unavailable",
+  });
+  const documents: string[] = [];
+  const contentRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.resourceType() === "document") documents.push(url.pathname);
+    if (url.pathname === "/api/v1/content") contentRequests.push(url.toString());
+  });
+
+  await page.goto("/");
+  await expect(page.locator(".notice.error")).toContainText("Synthetic Content unavailable");
+  await page.waitForTimeout(250);
+  expect(documents).toEqual(["/"]);
+  expect(contentRequests.length).toBeGreaterThan(0);
+  expect(
+    contentRequests.every((url) => new URL(url).searchParams.get("locale") === "en"),
+  ).toBe(true);
+  await expect(page).toHaveURL(/\/$/);
+});
+
+test("an expired locale mutation hard-resets the authenticated workspace", async ({ page }) => {
+  const activeViewer = mockViewer({ email: "expired-locale-session@example.invalid" });
+  await installMockApi(page, activeViewer, {
+    intercept: async (path, route) => {
+      if (path !== "/api/v1/auth/locale" || route.request().method() !== "PUT") return false;
+      await route.fulfill({
+        status: 401,
+        json: { error: "Session is invalid or expired" },
+      });
+      return true;
+    },
+  });
+
+  await page.goto("/customer");
+  await expect(page.getByRole("banner").getByText(activeViewer.email, { exact: true })).toBeVisible();
+  const rootDocument = page.waitForRequest(
+    (request) => request.resourceType() === "document" && new URL(request.url()).pathname === "/",
+  );
+  await page.getByRole("button", { name: "简体中文" }).click();
+  await rootDocument;
+
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByText(activeViewer.email)).toHaveCount(0);
+  await expect(page.getByTestId("customer-business-history")).toHaveCount(0);
+});
+
 test("restricted wildcard Staff mounts no Admin capability or Admin fetch", async ({ page }) => {
   const requests = await installMockApi(
     page,
@@ -424,12 +832,13 @@ test("restricted wildcard Staff mounts no Admin capability or Admin fetch", asyn
       email: "restricted-wildcard@example.invalid",
       eligible: false,
       permissions: ["*"],
+      restrictions: { user: true, clientAccount: false },
     }),
   );
 
   await page.goto("/admin");
   await expect(page.getByTestId("admin-access-restricted")).toContainText(
-    "Access denied — eligible Staff account required",
+    "Access denied — verified, unrestricted Staff User required",
   );
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.locator("section.admin-panel")).toHaveCount(0);
@@ -465,11 +874,1558 @@ test("limited ticket Staff mounts only its permitted panel and fetch", async ({ 
 
   await page.goto("/admin");
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toBeVisible();
-  await expect(page.getByTestId("limited-admin-scope")).toContainText("Ticket support only");
+  await expect(page.getByTestId("limited-admin-scope")).toContainText("Permission-scoped operations");
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
   await expect(page.getByTestId("admin-access-restricted")).toHaveCount(0);
   const adminPaths = [...new Set(requests.filter((path) => path.startsWith("/api/v1/admin/")))];
-  expect(adminPaths).toEqual(["/api/v1/admin/tickets"]);
+  expect(adminPaths).toEqual([
+    "/api/v1/admin/tickets",
+    "/api/v1/admin/tickets/staff-options",
+    "/api/v1/admin/support/departments",
+    "/api/v1/admin/presales/inquiries",
+  ]);
+});
+
+test("real App customer downloads the exact authorized Support attachment bytes", async ({ page }) => {
+  const ticketId = "00000000-0000-4000-8000-000000000801";
+  const messageId = "00000000-0000-4000-8000-000000000802";
+  const attachmentId = "00000000-0000-4000-8000-000000000803";
+  const createdAt = "2026-08-21T05:00:00.000Z";
+  const bytes = Buffer.from("real App Support attachment\n", "utf8");
+  const ticket = {
+    id: ticketId,
+    subject: "Real App attachment download",
+    status: "awaiting_staff",
+    service: null,
+    orderId: null,
+    authorizationPurpose: null,
+    department: { code: "general-support", name: "General Support" },
+    priority: "normal",
+    publicMessageCount: 1,
+    createdAt,
+    updatedAt: createdAt,
+  };
+  const requests = await installMockApi(
+    page,
+    mockViewer({ email: "attachment-download@example.invalid" }),
+    {
+      intercept: async (path, route) => {
+        if (route.request().method() !== "GET") return false;
+        if (path === "/api/v1/tickets") {
+          await route.fulfill({ json: { items: [ticket] } });
+          return true;
+        }
+        if (path === `/api/v1/tickets/${ticketId}`) {
+          await route.fulfill({
+            json: {
+              ticket,
+              messages: [{
+                id: messageId,
+                authorType: "customer",
+                body: "Please return the ordinary attached file.",
+                createdAt,
+              }],
+              attachments: [{
+                id: attachmentId,
+                messageId,
+                filename: "real-app.txt",
+                contentType: "text/plain",
+                sizeBytes: bytes.length,
+                uploadedByType: "customer",
+                scanStatus: "clean",
+                createdAt,
+              }],
+              statusHistory: [{
+                previousStatus: null,
+                status: "awaiting_staff",
+                summary: "Ticket created",
+                occurredAt: createdAt,
+              }],
+              routingHistory: [{
+                department: { code: "general-support", name: "General Support", revision: 1 },
+                priority: "normal",
+                summary: "Initial Support routing",
+                occurredAt: createdAt,
+              }],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/tickets/${ticketId}/attachments/${attachmentId}`) {
+          await route.fulfill({ status: 200, contentType: "text/plain", body: bytes });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  const panel = page.locator('section[aria-label="Customer support tickets"]');
+  await panel.getByRole("button", { name: /Real App attachment download/ }).click();
+  const downloadPromise = page.waitForEvent("download");
+  await panel.getByRole("button", { name: "Download real-app.txt" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("real-app.txt");
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  expect(await readFile(downloadPath!)).toEqual(bytes);
+  expect(requests).toContain(`/api/v1/tickets/${ticketId}/attachments/${attachmentId}`);
+});
+
+test("Staff without support.tickets.manage mounts no Support panel and sends zero Support GET", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "content-only-staff@example.invalid",
+      permissions: ["content.read"],
+    }),
+  );
+  await page.goto("/admin");
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
+  const supportPaths = requests.filter((path) =>
+    path === "/api/v1/admin/tickets" ||
+    path === "/api/v1/admin/tickets/staff-options" ||
+    path === "/api/v1/admin/support/departments" ||
+    path === "/api/v1/admin/presales/inquiries",
+  );
+  expect(supportPaths).toEqual([]);
+});
+
+test("Account 360 ticket action replaces the global Staff queue with an exact Client Account filter", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000711";
+  const occurredAt = "2026-08-20T00:00:00.000Z";
+  const queueUrls: URL[] = [];
+  await installMockApi(
+    page,
+    mockViewer({
+      email: "account-scoped-support@example.invalid",
+      permissions: ["accounts.view", "support.tickets.manage"],
+    }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/tickets" && route.request().method() === "GET") {
+          queueUrls.push(new URL(route.request().url()));
+          await route.fulfill({ json: { items: [] } });
+          return true;
+        }
+        if (path === "/api/v1/admin/client-accounts") {
+          await route.fulfill({ json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            items: [{
+              id: accountId,
+              name: "Scoped Support Account",
+              owner: { userId: accountId, email: "scoped@example.invalid", emailVerifiedAt: occurredAt },
+              restrictedAt: null,
+              activeMemberCount: 1,
+              createdAt: occurredAt,
+            }],
+            hasMore: false,
+            nextCursor: null,
+          } });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+          await route.fulfill({ json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Scoped Support Account", createdAt: occurredAt, restrictedAt: null },
+            owner: { userId: accountId, email: "scoped@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+            memberships: [],
+            restrictions: [],
+          } });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/tickets`) {
+          await route.fulfill({ json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Scoped Support Account" },
+            items: [],
+            limit: 25,
+            hasMore: false,
+            nextCursor: null,
+          } });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  await expect.poll(() => queueUrls.some((url) => !url.searchParams.has("clientAccountId"))).toBe(true);
+  const account360 = page.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill("Scoped Support Account");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByRole("button", { name: /Scoped Support Account/ }).click();
+  await account360.getByRole("button", { name: "Open ticket operations" }).click();
+  await expect(page.getByTestId("staff-support-account-context")).toContainText(accountId);
+  await expect.poll(() => queueUrls.some((url) => url.searchParams.get("clientAccountId") === accountId)).toBe(true);
+});
+
+test("Client Account restriction keeps verified customer history readable while writes stay unavailable", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "account-restricted-history@example.invalid",
+      eligible: false,
+      restrictions: { user: false, clientAccount: true },
+    }),
+  );
+
+  await page.goto("/customer");
+  await expect(page.getByTestId("customer-business-history")).toBeVisible();
+  await expect(page.getByTestId("history-account")).toContainText("Synthetic route account");
+  await expect(page.getByRole("heading", { name: "Purchases and account changes are unavailable" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open my Mock Provider mailbox" })).toHaveCount(0);
+  expect(requests).toContain("/api/v1/customer/business-history");
+  expect(requests).toContain("/api/v1/orders");
+});
+
+test("user restriction unmounts customer history without issuing its request", async ({ page }) => {
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "user-restricted-history@example.invalid",
+      eligible: false,
+      restrictions: { user: true, clientAccount: false },
+    }),
+  );
+
+  await page.goto("/customer");
+  await expect(page.getByRole("heading", { name: "This user is restricted" })).toBeVisible();
+  await expect(page.getByTestId("customer-business-history")).toHaveCount(0);
+  expect(requests.filter((path) => path === "/api/v1/customer/business-history")).toEqual([]);
+});
+
+test("changing Client Account clears old history before the new request and ignores the late old response", async ({ page }) => {
+  const accountAId = "00000000-0000-4000-8000-0000000000a1";
+  const accountBId = "00000000-0000-4000-8000-0000000000b2";
+  const invoiceAId = "00000000-0000-4000-8000-0000000000a3";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const invoiceA = {
+    id: invoiceAId,
+    orderId: null,
+    currency: "USD",
+    totalMinor: "500",
+    allocatedMinor: "500",
+    paymentAllocatedMinor: "500",
+    creditAppliedMinor: "0",
+    dueMinor: "0",
+    status: "paid",
+    dueAt: occurredAt,
+    createdAt: occurredAt,
+  };
+  const viewerA = {
+    ...mockViewer({ email: "account-a@example.invalid" }),
+    clientAccountId: accountAId,
+    accountContextVersion: "1",
+    context: {
+      clientAccountId: accountAId,
+      name: "Account A saved facts",
+      role: "owner" as const,
+      permissions: ["*"],
+      capabilities: ownerCapabilities,
+      version: "1",
+    },
+  };
+  const viewerB = {
+    ...mockViewer({ email: "account-b@example.invalid" }),
+    clientAccountId: accountBId,
+    accountContextVersion: "2",
+    context: {
+      clientAccountId: accountBId,
+      name: "Account B saved facts",
+      role: "owner" as const,
+      permissions: ["*"],
+      capabilities: ownerCapabilities,
+      version: "2",
+    },
+  };
+  let serveViewerB = false;
+  let delayNextAccountAHistory = false;
+  let releaseLateAccountA!: () => void;
+  let releaseAccountB!: () => void;
+  let markLateAccountAStarted!: () => void;
+  let markLateAccountAFulfilled!: () => void;
+  let markAccountBStarted!: () => void;
+  const lateAccountAGate = new Promise<void>((resolve) => { releaseLateAccountA = resolve; });
+  const accountBGate = new Promise<void>((resolve) => { releaseAccountB = resolve; });
+  const lateAccountAStarted = new Promise<void>((resolve) => { markLateAccountAStarted = resolve; });
+  const lateAccountAFulfilled = new Promise<void>((resolve) => { markLateAccountAFulfilled = resolve; });
+  const accountBStarted = new Promise<void>((resolve) => { markAccountBStarted = resolve; });
+  const historyPayload = (id: string, name: string) => ({
+    warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+    account: { id, name },
+    orders: [],
+    invoices: id === accountAId ? [invoiceA] : [],
+    payments: [],
+    credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+    refunds: [],
+    services: [],
+    renewals: [],
+    cancellations: [],
+    tickets: [],
+  });
+
+  await installMockApi(page, viewerA, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/me") {
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": serveViewerB ? "2" : "1",
+            "X-OSS-Client-Account-Id": serveViewerB ? accountBId : accountAId,
+          },
+          json: serveViewerB ? viewerB : viewerA,
+        });
+        return true;
+      }
+      if (path === "/api/v1/auth/account-contexts") {
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": serveViewerB ? "2" : "1",
+            "X-OSS-Client-Account-Id": serveViewerB ? accountBId : accountAId,
+          },
+          json: {
+            activeClientAccountId: serveViewerB ? accountBId : accountAId,
+            accountContextVersion: serveViewerB ? "2" : "1",
+            items: [
+              { clientAccountId: accountAId, name: "Account A saved facts", role: "owner", permissions: ["*"], restrictions: { membership: false, clientAccount: false } },
+              { clientAccountId: accountBId, name: "Account B saved facts", role: "owner", permissions: ["*"], restrictions: { membership: false, clientAccount: false } },
+            ],
+            limit: 25,
+            hasMore: false,
+            nextCursor: null,
+          },
+        });
+        return true;
+      }
+      if (path === "/api/v1/auth/account-context" && route.request().method() === "PUT") {
+        expect(route.request().headers()["x-oss-account-context-version"]).toBe("1");
+        serveViewerB = true;
+        // Keep the helper's default protected-response headers aligned with
+        // the same synthetic session after the explicit context switch.
+        viewerA.clientAccountId = accountBId;
+        viewerA.accountContextVersion = "2";
+        viewerA.context = viewerB.context;
+        await route.fulfill({
+          headers: {
+            "X-OSS-Account-Context-Version": "2",
+            "X-OSS-Client-Account-Id": accountBId,
+          },
+          json: { context: { ...viewerB.context, restrictions: { clientAccount: false } } },
+        });
+        return true;
+      }
+      if (path === `/api/v1/customer/invoices/${invoiceAId}`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            invoice: { ...invoiceA, lines: [] },
+            payments: [],
+            creditApplications: [],
+            refunds: [],
+            related: { orderId: null, serviceIds: [], renewalIds: [] },
+            pdfUrl: `/api/v1/customer/invoices/${invoiceAId}/pdf`,
+          },
+        });
+        return true;
+      }
+      if (path !== "/api/v1/customer/business-history") return false;
+      if (!serveViewerB && delayNextAccountAHistory) {
+        delayNextAccountAHistory = false;
+        markLateAccountAStarted();
+        await lateAccountAGate;
+        await route.fulfill({
+          headers: { "X-OSS-Account-Context-Version": "1", "X-OSS-Client-Account-Id": accountAId },
+          json: historyPayload(accountAId, "Late Account A facts"),
+        });
+        markLateAccountAFulfilled();
+        return true;
+      }
+      if (serveViewerB) {
+        markAccountBStarted();
+        await accountBGate;
+        await route.fulfill({
+          headers: { "X-OSS-Account-Context-Version": "2", "X-OSS-Client-Account-Id": accountBId },
+          json: historyPayload(accountBId, "Account B saved facts"),
+        });
+        return true;
+      }
+      await route.fulfill({
+        headers: { "X-OSS-Account-Context-Version": "1", "X-OSS-Client-Account-Id": accountAId },
+        json: historyPayload(accountAId, "Account A saved facts"),
+      });
+      return true;
+    },
+  });
+
+  await page.goto("/customer");
+  await expect(page.getByTestId("history-account")).toContainText("Account A saved facts");
+  await page.getByTestId("history-invoice").click();
+  await expect(page.getByTestId("customer-history-detail")).toContainText("Invoice detail");
+  await expect(page).toHaveURL(new RegExp(`invoice=${invoiceAId}`));
+  delayNextAccountAHistory = true;
+  await page.getByTestId("customer-business-history").getByRole("button", { name: "Refresh history" }).click();
+  await lateAccountAStarted;
+
+  const switcher = page.getByTestId("account-context-switcher");
+  await switcher.getByLabel("Active Client Account").selectOption(accountBId);
+  await switcher.getByRole("button", { name: "Switch account" }).click();
+  await accountBStarted;
+  await expect(page.getByTestId("history-account")).toHaveCount(0);
+  await expect(page.getByTestId("customer-history-detail")).toHaveCount(0);
+  await expect(page).not.toHaveURL(/invoice=|service=/);
+
+  releaseLateAccountA();
+  await lateAccountAFulfilled;
+  await page.waitForTimeout(50);
+  await expect(page.getByText("Late Account A facts")).toHaveCount(0);
+  await expect(page.getByTestId("history-account")).toHaveCount(0);
+
+  releaseAccountB();
+  await expect(page.getByTestId("history-account")).toContainText("Account B saved facts");
+  await expect(page.getByTestId("history-account")).toContainText(accountBId);
+});
+
+test("customer history restores independent facts, detail query and invoice PDF", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000101";
+  const orderId = "00000000-0000-4000-8000-000000000102";
+  const invoiceId = "00000000-0000-4000-8000-000000000103";
+  const paymentId = "00000000-0000-4000-8000-000000000104";
+  const serviceId = "00000000-0000-4000-8000-000000000105";
+  const renewalId = "00000000-0000-4000-8000-000000000106";
+  const cancellationId = "00000000-0000-4000-8000-000000000107";
+  const ticketId = "00000000-0000-4000-8000-000000000108";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const invoice = {
+    id: invoiceId,
+    orderId,
+    currency: "USD",
+    totalMinor: "500",
+    allocatedMinor: "500",
+    paymentAllocatedMinor: "400",
+    creditAppliedMinor: "100",
+    dueMinor: "0",
+    status: "paid",
+    dueAt: occurredAt,
+    createdAt: occurredAt,
+  };
+  const payment = {
+    id: paymentId,
+    invoiceId,
+    status: "succeeded",
+    amountMinor: "414",
+    principalMinor: "400",
+    feeMinor: "14",
+    currency: "USD",
+    paymentMethodCode: "card",
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+  };
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [invoiceId],
+    productName: "Synthetic history plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-10T00:00:00.000Z",
+    version: 2,
+    cancellation: { requestId: cancellationId, effectiveAt: "2026-09-10T00:00:00.000Z", status: "scheduled" },
+  };
+  const renewal = {
+    id: renewalId,
+    serviceId,
+    invoiceId,
+    status: "paid",
+    currency: "USD",
+    totalMinor: "300",
+    allocatedMinor: "300",
+    dueMinor: "0",
+    periodStart: "2026-09-10T00:00:00.000Z",
+    periodEnd: "2026-10-10T00:00:00.000Z",
+    fundedAt: occurredAt,
+    settledAt: occurredAt,
+    createdAt: occurredAt,
+  };
+  const cancellation = {
+    requestId: cancellationId,
+    serviceId,
+    effectiveAt: "2026-09-10T00:00:00.000Z",
+    reason: "Synthetic cycle-end request",
+    createdAt: occurredAt,
+    execution: { id: cancellationId, mode: "automatic", status: "scheduled", completedAt: null },
+  };
+  const ticket = {
+    id: ticketId,
+    subject: "Synthetic linked support",
+    status: "awaiting_staff",
+    serviceId,
+    productName: "Synthetic history plan",
+    publicMessageCount: 2,
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+  };
+  await installMockApi(
+    page,
+    { ...mockViewer({ email: "history@example.invalid" }), clientAccountId: accountId },
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/customer/business-history") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic history account" },
+              orders: [{
+                id: orderId,
+                status: "completed",
+                currency: "USD",
+                totalMinor: "500",
+                submittedAt: occurredAt,
+                items: [{ id: orderId, productName: "Synthetic history plan", billingCycle: "monthly" }],
+              }],
+              invoices: [invoice],
+              payments: [payment],
+              credit: {
+                currency: "USD",
+                balanceMinor: "100",
+                transactions: [{
+                  id: paymentId,
+                  kind: "adjustment",
+                  creditMinor: "100",
+                  debitMinor: "0",
+                  deltaMinor: "100",
+                  sourceType: "credit_adjustment",
+                  sourceId: paymentId,
+                  reason: "Synthetic history fixture",
+                  createdAt: occurredAt,
+                }],
+              },
+              refunds: [{
+                id: paymentId,
+                invoiceId,
+                status: "succeeded",
+                destination: "credit",
+                amountMode: "partial",
+                amountMinor: "50",
+                currency: "USD",
+                createdAt: occurredAt,
+                updatedAt: occurredAt,
+              }],
+              services: [service],
+              renewals: [renewal],
+              cancellations: [cancellation],
+              tickets: [ticket],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/customer/invoices/${invoiceId}`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              invoice: {
+                ...invoice,
+                lines: [{ id: invoiceId, kind: "recurring", description: "Synthetic monthly plan", amountMinor: "500" }],
+              },
+              payments: [payment],
+              creditApplications: [{ transactionId: paymentId, amountMinor: "100", createdAt: occurredAt }],
+              refunds: [],
+              related: { orderId, serviceIds: [serviceId], renewalIds: [renewalId] },
+              pdfUrl: `/api/v1/customer/invoices/${invoiceId}/pdf`,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/customer/invoices/${invoiceId}/pdf`) {
+          await route.fulfill({
+            body: "%PDF-1.4\nSynthetic invoice\n%%EOF",
+            contentType: "application/pdf",
+            headers: { "Content-Disposition": `attachment; filename="invoice-${invoiceId}.pdf"` },
+          });
+          return true;
+        }
+        if (path === `/api/v1/customer/services/${serviceId}`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              service: { ...service, externalResourceId: "synthetic-resource-101" },
+              order: { id: orderId, status: "completed", currency: "USD", totalMinor: "500", submittedAt: occurredAt },
+              invoices: [{ ...invoice, kind: "initial" }],
+              payments: [payment],
+              periods: [{ id: renewalId, invoiceId, kind: "initial", start: occurredAt, end: "2026-09-10T00:00:00.000Z", grantedAt: occurredAt }],
+              renewals: [renewal],
+              cancellation,
+              tickets: [ticket],
+              trace: {
+                orderId,
+                invoiceIds: [invoiceId],
+                paymentIds: [paymentId],
+                renewalIds: [renewalId],
+                cancellationRequestId: cancellationId,
+                ticketIds: [ticketId],
+              },
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  const history = page.getByTestId("customer-business-history");
+  await expect(history.getByTestId("history-account")).toContainText("Synthetic history account");
+  await expect(history.getByTestId("history-order")).toHaveCount(1);
+  await expect(history.getByTestId("history-payment")).toHaveCount(1);
+  await expect(history.getByTestId("history-credit-transaction")).toHaveCount(1);
+  await expect(history.getByTestId("history-refund")).toHaveCount(1);
+  await expect(history.getByTestId("history-renewal")).toHaveCount(1);
+  await expect(history.getByTestId("history-cancellation")).toHaveCount(1);
+  await expect(history.getByTestId("history-ticket")).toHaveCount(1);
+
+  await history.getByTestId("history-invoice").click();
+  await expect(page).toHaveURL(new RegExp(`invoice=${invoiceId}`));
+  const invoiceDetail = history.getByTestId("customer-history-detail");
+  await expect(invoiceDetail).toContainText("Synthetic monthly plan");
+  const downloadPromise = page.waitForEvent("download");
+  await invoiceDetail.getByTestId("invoice-pdf-download").click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe(`invoice-${invoiceId}.pdf`);
+
+  await page.reload();
+  await expect(page.getByTestId("customer-history-detail")).toContainText(invoiceId);
+  await page.getByTestId("history-service").click();
+  await expect(page).toHaveURL(new RegExp(`service=${serviceId}`));
+  const trace = page.getByTestId("service-trace");
+  await expect(trace).toContainText(orderId);
+  await expect(trace).toContainText(paymentId);
+  await expect(trace).toContainText(renewalId);
+  await expect(trace).toContainText(cancellationId);
+  await expect(trace).toContainText("Synthetic linked support");
+});
+
+test("customer changes a Mock service password through password and MFA reauthentication without retaining it in UI history", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000002";
+  const orderId = "00000000-0000-4000-8000-000000000901";
+  const serviceId = "00000000-0000-4000-8000-000000000902";
+  const requestId = "00000000-0000-4000-8000-000000000903";
+  const occurredAt = "2026-08-21T06:00:00.000Z";
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [],
+    productName: "Synthetic password-change plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-21T06:00:00.000Z",
+    version: 1,
+    cancellation: null,
+  };
+  const newPassword = `${"B".repeat(18)}!029`;
+  const currentPassword = `${"A".repeat(18)}!029`;
+  const sensitiveRequestOrder: string[] = [];
+  let reauthBody: Record<string, unknown> = {};
+  let postedBody: Record<string, unknown> = {};
+  let passwordChangeItems: Array<Record<string, unknown>> = [];
+  let rejectNextReauthentication = true;
+
+  await installMockApi(page, mockViewer({ email: "service-password-change@example.invalid" }), {
+    intercept: async (path, route) => {
+      const method = route.request().method();
+      if (path === "/api/v1/auth/reauth" && method === "POST") {
+        sensitiveRequestOrder.push("reauth");
+        reauthBody = route.request().postDataJSON() as Record<string, unknown>;
+        if (rejectNextReauthentication) {
+          rejectNextReauthentication = false;
+          await route.fulfill({ status: 401, json: { error: "Synthetic MFA reauthentication failed" } });
+          return true;
+        }
+        return false;
+      }
+      if (path === "/api/v1/customer/business-history") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Synthetic password-change account" },
+            orders: [],
+            invoices: [],
+            payments: [],
+            credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+            refunds: [],
+            services: [service],
+            renewals: [],
+            cancellations: [],
+            tickets: [],
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/customer/services/${serviceId}`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: { ...service, externalResourceId: `mock-resource-${serviceId}` },
+            order: {
+              id: orderId,
+              status: "completed",
+              currency: "USD",
+              totalMinor: "100",
+              submittedAt: occurredAt,
+            },
+            invoices: [],
+            payments: [],
+            periods: [],
+            renewals: [],
+            cancellation: null,
+            tickets: [],
+            trace: {
+              orderId,
+              invoiceIds: [],
+              paymentIds: [],
+              renewalIds: [],
+              cancellationRequestId: null,
+              ticketIds: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "GET") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: {
+              id: serviceId,
+              productName: service.productName,
+              status: "active",
+              version: 1,
+              resourceRevision: 0,
+              canChangePassword: passwordChangeItems.length === 0,
+            },
+            items: passwordChangeItems,
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "POST") {
+        sensitiveRequestOrder.push("password-change");
+        postedBody = route.request().postDataJSON() as Record<string, unknown>;
+        passwordChangeItems = [{
+          requestId,
+          action: "change_password",
+          status: "queued",
+          revision: 0,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        }];
+        await route.fulfill({
+          status: 201,
+          json: {
+            requestId,
+            serviceId,
+            action: "change_password",
+            status: "queued",
+            serviceVersion: 1,
+            resourceRevision: 0,
+            createdAt: occurredAt,
+            replayed: false,
+          },
+        });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Customer", exact: true }).click();
+  await page.getByTestId("history-service").click();
+  await expect(page).toHaveURL(new RegExp(`service=${serviceId}`));
+  const panel = page.getByTestId("customer-service-operations");
+  const passwordPanel = panel.getByTestId("service-password-change-panel");
+  await expect(passwordPanel.getByRole("heading", { name: "Service password" })).toBeVisible();
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("TOTP or recovery code").fill("029029");
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await expect(passwordPanel.getByTestId("service-password-factor-requires-password")).toBeVisible();
+  expect(sensitiveRequestOrder).toEqual([]);
+
+  await passwordPanel.getByLabel("Current account password").fill(currentPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await expect(page.locator("main > .notice.error")).toContainText("Synthetic MFA reauthentication failed");
+  expect(sensitiveRequestOrder).toEqual(["reauth"]);
+  await expect(passwordPanel.getByLabel("Current account password")).toHaveValue(currentPassword);
+  await expect(passwordPanel.getByLabel("TOTP or recovery code")).toHaveValue("029029");
+  await expect(passwordPanel.getByLabel("New service password", { exact: true })).toHaveValue(newPassword);
+  await expect(passwordPanel.getByLabel("Confirm new service password", { exact: true })).toHaveValue(newPassword);
+
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+
+  await expect(page.locator("main > .notice")).toContainText(
+    "The service password change was safely queued; the new password will not appear in history.",
+  );
+  expect(sensitiveRequestOrder).toEqual(["reauth", "reauth", "password-change"]);
+  expect(reauthBody).toEqual({
+    password: currentPassword,
+    factorCode: "029029",
+  });
+  expect(postedBody).toMatchObject({
+    expectedServiceVersion: 1,
+    expectedResourceRevision: 0,
+    newPassword,
+  });
+  expect(String(postedBody.idempotencyKey)).toMatch(/^change-password-/u);
+  await expect(passwordPanel.getByLabel("Current account password")).toHaveCount(0);
+  await expect(passwordPanel.getByLabel("New service password", { exact: true })).toHaveCount(0);
+  await expect(passwordPanel).toContainText(`${requestId}`);
+  await expect(passwordPanel).not.toContainText(newPassword);
+  const storedBrowserState = await page.evaluate(() => JSON.stringify({
+    localStorage: { ...window.localStorage },
+    sessionStorage: { ...window.sessionStorage },
+  }));
+  expect(storedBrowserState).not.toContain(newPassword);
+});
+
+async function openCustomerPasswordChangeSurface(
+  page: Page,
+  hooks: {
+    reauthenticate?: (route: Route) => Promise<void>;
+    changePassword?: (route: Route) => Promise<void>;
+  } = {},
+) {
+  const accountId = "00000000-0000-4000-8000-000000000912";
+  const orderId = "00000000-0000-4000-8000-000000000913";
+  const serviceId = "00000000-0000-4000-8000-000000000914";
+  const requestId = "00000000-0000-4000-8000-000000000915";
+  const occurredAt = "2026-08-21T07:00:00.000Z";
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [],
+    productName: "Synthetic password barrier plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-21T07:00:00.000Z",
+    version: 1,
+    cancellation: null,
+  };
+  const state = {
+    reauthenticationBodies: [] as Record<string, unknown>[],
+    mutationBodies: [] as Record<string, unknown>[],
+    passwordChangeGetCount: 0,
+    items: [] as Array<Record<string, unknown>>,
+  };
+
+  await installMockApi(page, mockViewer({ email: "service-password-barrier@example.invalid" }), {
+    intercept: async (path, route) => {
+      const method = route.request().method();
+      if (path === "/api/v1/auth/reauth" && method === "POST") {
+        state.reauthenticationBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+        if (hooks.reauthenticate) {
+          await hooks.reauthenticate(route);
+        } else {
+          await route.fulfill({
+            json: {
+              expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+              fixedWindowMinutes: 15,
+            },
+          });
+        }
+        return true;
+      }
+      if (path === "/api/v1/customer/business-history") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Synthetic password barrier account" },
+            orders: [],
+            invoices: [],
+            payments: [],
+            credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+            refunds: [],
+            services: [service],
+            renewals: [],
+            cancellations: [],
+            tickets: [],
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/customer/services/${serviceId}`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: { ...service, externalResourceId: `mock-resource-${serviceId}` },
+            order: {
+              id: orderId,
+              status: "completed",
+              currency: "USD",
+              totalMinor: "100",
+              submittedAt: occurredAt,
+            },
+            invoices: [],
+            payments: [],
+            periods: [],
+            renewals: [],
+            cancellation: null,
+            tickets: [],
+            trace: {
+              orderId,
+              invoiceIds: [],
+              paymentIds: [],
+              renewalIds: [],
+              cancellationRequestId: null,
+              ticketIds: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "GET") {
+        state.passwordChangeGetCount += 1;
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            service: {
+              id: serviceId,
+              productName: service.productName,
+              status: "active",
+              version: 1,
+              resourceRevision: 0,
+              canChangePassword: state.items.length === 0,
+            },
+            items: state.items,
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/services/${serviceId}/password-changes` && method === "POST") {
+        state.mutationBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+        if (hooks.changePassword) {
+          await hooks.changePassword(route);
+        } else {
+          state.items = [{
+            requestId,
+            action: "change_password",
+            status: "queued",
+            revision: 0,
+            updatedAt: occurredAt,
+          }];
+          await route.fulfill({
+            status: 201,
+            json: {
+              requestId,
+              serviceId,
+              action: "change_password",
+              status: "queued",
+              serviceVersion: 1,
+              resourceRevision: 0,
+              createdAt: occurredAt,
+              replayed: false,
+            },
+          });
+        }
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/customer");
+  await page.getByTestId("history-service").click();
+  const panel = page.getByTestId("customer-service-operations");
+  const passwordPanel = panel.getByTestId("service-password-change-panel");
+  await expect(passwordPanel.getByRole("heading", { name: "Service password" })).toBeVisible();
+  return { panel, passwordPanel, serviceId, state };
+}
+
+test("customer reuses a current fresh grant without sending a redundant reauthentication request", async ({ page }) => {
+  const { passwordPanel, state } = await openCustomerPasswordChangeSurface(page);
+  const newPassword = `${"G".repeat(18)}!029`;
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+
+  await expect(page.locator("main > .notice")).toContainText(
+    "The service password change was safely queued; the new password will not appear in history.",
+  );
+  expect(state.reauthenticationBodies).toEqual([]);
+  expect(state.mutationBodies).toHaveLength(1);
+  expect(state.mutationBodies[0]).toMatchObject({ newPassword });
+});
+
+test("leaving while service-password reauthentication is pending sends no mutation or late UI effects", async ({ page }) => {
+  let releaseReauthentication!: () => void;
+  let markReauthenticationStarted!: () => void;
+  let markReauthenticationFulfilled!: () => void;
+  const reauthenticationGate = new Promise<void>((resolve) => { releaseReauthentication = resolve; });
+  const reauthenticationStarted = new Promise<void>((resolve) => { markReauthenticationStarted = resolve; });
+  const reauthenticationFulfilled = new Promise<void>((resolve) => { markReauthenticationFulfilled = resolve; });
+  const { passwordPanel, state } = await openCustomerPasswordChangeSurface(page, {
+    reauthenticate: async (route) => {
+      markReauthenticationStarted();
+      await reauthenticationGate;
+      await route.fulfill({
+        json: {
+          expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+          fixedWindowMinutes: 15,
+        },
+      });
+      markReauthenticationFulfilled();
+    },
+  });
+  const initialRefreshCount = state.passwordChangeGetCount;
+  const newPassword = `${"Q".repeat(18)}!029`;
+  const currentPassword = `${"U".repeat(18)}!029`;
+  await passwordPanel.getByLabel("Current account password").fill(currentPassword);
+  await passwordPanel.getByLabel("TOTP or recovery code").fill("123456");
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await reauthenticationStarted;
+
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseReauthentication();
+  await reauthenticationFulfilled;
+  await page.waitForTimeout(50);
+
+  expect(state.reauthenticationBodies).toHaveLength(1);
+  expect(state.mutationBodies).toEqual([]);
+  expect(state.passwordChangeGetCount).toBe(initialRefreshCount);
+  await expect(page.locator("main > .notice")).toHaveCount(0);
+  const storedIntent = await page.evaluate(() => Object.entries(window.localStorage)
+    .filter(([key]) => key.includes("service-operation-intent") && key.includes("change-password")));
+  expect(storedIntent).toEqual([]);
+});
+
+test("leaving after a service-password POST preserves an unknown intent and suppresses late notice and refresh", async ({ page }) => {
+  let releaseMutation!: () => void;
+  let markMutationStarted!: () => void;
+  let markMutationFinished!: () => void;
+  const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve; });
+  const mutationStarted = new Promise<void>((resolve) => { markMutationStarted = resolve; });
+  const mutationFinished = new Promise<void>((resolve) => { markMutationFinished = resolve; });
+  const { passwordPanel, state } = await openCustomerPasswordChangeSurface(page, {
+    changePassword: async (route) => {
+      markMutationStarted();
+      await mutationGate;
+      await route.abort("connectionfailed");
+      markMutationFinished();
+    },
+  });
+  const initialRefreshCount = state.passwordChangeGetCount;
+  const newPassword = `${"N".repeat(18)}!029`;
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+  await mutationStarted;
+  const submittedIntent = String(state.mutationBodies[0]?.idempotencyKey ?? "");
+  expect(submittedIntent).toMatch(/^change-password-/u);
+
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseMutation();
+  await mutationFinished;
+  await page.waitForTimeout(50);
+
+  expect(state.reauthenticationBodies).toEqual([]);
+  expect(state.mutationBodies).toHaveLength(1);
+  expect(state.passwordChangeGetCount).toBe(initialRefreshCount);
+  await expect(page.locator("main > .notice")).toHaveCount(0);
+  const storedIntentValues = await page.evaluate(() => Object.entries(window.localStorage)
+    .filter(([key]) => key.includes("service-operation-intent") && key.includes("change-password"))
+    .map(([, value]) => value));
+  expect(storedIntentValues).toEqual([submittedIntent]);
+});
+
+test("Staff changes a service password through password and MFA reauthentication", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000922";
+  const orderId = "00000000-0000-4000-8000-000000000923";
+  const serviceId = "00000000-0000-4000-8000-000000000924";
+  const requestId = "00000000-0000-4000-8000-000000000925";
+  const occurredAt = "2026-08-21T08:00:00.000Z";
+  const service = {
+    id: serviceId,
+    orderId,
+    invoiceIds: [],
+    productName: "Synthetic Staff password-change plan",
+    status: "active",
+    billingCycle: "monthly",
+    activatedAt: occurredAt,
+    termStart: occurredAt,
+    termEnd: "2026-09-21T08:00:00.000Z",
+    version: 1,
+    cancellation: null,
+  };
+  const newPassword = `${"F".repeat(18)}!029`;
+  const currentPassword = `${"I".repeat(18)}!029`;
+  let reauthenticationBody: Record<string, unknown> = {};
+  let mutationBody: Record<string, unknown> = {};
+  let passwordChangeItems: Array<Record<string, unknown>> = [];
+
+  await installMockApi(
+    page,
+    mockViewer({
+      email: "service-password-staff@example.invalid",
+      permissions: ["accounts.view", "services.read", "services.operations_manage"],
+    }),
+    {
+      intercept: async (path, route) => {
+        const method = route.request().method();
+        if (path === "/api/v1/auth/reauth" && method === "POST") {
+          reauthenticationBody = route.request().postDataJSON() as Record<string, unknown>;
+          return false;
+        }
+        if (path === "/api/v1/admin/client-accounts") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              items: [{
+                id: accountId,
+                name: "Synthetic Staff password account",
+                owner: { userId: accountId, email: "staff-password-owner@example.invalid", emailVerifiedAt: occurredAt },
+                restrictedAt: null,
+                activeMemberCount: 1,
+                createdAt: occurredAt,
+              }],
+              hasMore: false,
+              nextCursor: null,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic Staff password account", createdAt: occurredAt, restrictedAt: null },
+              owner: {
+                userId: accountId,
+                email: "staff-password-owner@example.invalid",
+                emailVerifiedAt: occurredAt,
+                restrictedAt: null,
+              },
+              memberships: [],
+              restrictions: [],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/services`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic Staff password account" },
+              items: [service],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/cancellations`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic Staff password account" },
+              items: [],
+            },
+          });
+          return true;
+        }
+        const passwordChangePath = `/api/v1/admin/client-accounts/${accountId}/services/${serviceId}/password-changes`;
+        if (path === passwordChangePath && method === "GET") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              service: {
+                id: serviceId,
+                productName: service.productName,
+                status: "active",
+                version: 1,
+                resourceRevision: 0,
+                canChangePassword: passwordChangeItems.length === 0,
+              },
+              items: passwordChangeItems,
+            },
+          });
+          return true;
+        }
+        if (path === passwordChangePath && method === "POST") {
+          mutationBody = route.request().postDataJSON() as Record<string, unknown>;
+          passwordChangeItems = [{
+            requestId,
+            action: "change_password",
+            actorType: "staff",
+            status: "queued",
+            revision: 0,
+            updatedAt: occurredAt,
+          }];
+          await route.fulfill({
+            status: 201,
+            json: {
+              requestId,
+              serviceId,
+              action: "change_password",
+              status: "queued",
+              serviceVersion: 1,
+              resourceRevision: 0,
+              createdAt: occurredAt,
+              replayed: false,
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  const account360 = page.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill(accountId);
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByTestId("account360-search-results")
+    .getByRole("button", { name: /Synthetic Staff password account/ })
+    .click();
+  const serviceDetails = account360.getByTestId("account360-services")
+    .locator("details")
+    .filter({ hasText: service.productName });
+  await serviceDetails.locator("summary").click();
+  const panel = serviceDetails.getByTestId("staff-service-operations");
+  const passwordPanel = panel.getByTestId("service-password-change-panel");
+  await panel.getByLabel("Staff current password").fill(currentPassword);
+  await panel.getByLabel("Staff TOTP or recovery code").fill("654321");
+  await passwordPanel.getByLabel("New service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByLabel("Confirm new service password", { exact: true }).fill(newPassword);
+  await passwordPanel.getByRole("button", { name: "Change service password" }).click();
+
+  await expect(page.locator("main > .notice")).toContainText(
+    "The service password change was safely queued; the new password will not appear in history.",
+  );
+  expect(reauthenticationBody).toEqual({
+    password: currentPassword,
+    factorCode: "654321",
+  });
+  expect(mutationBody).toMatchObject({
+    expectedServiceVersion: 1,
+    expectedResourceRevision: 0,
+    newPassword,
+    reason: "Verified daily resource operation",
+  });
+  await expect(passwordPanel).toContainText(requestId);
+  await expect(passwordPanel).not.toContainText(newPassword);
+});
+
+test("failed customer history refresh reports only the error and never a success notice", async ({ page }) => {
+  let failRefresh = false;
+  await installMockApi(page, mockViewer({ email: "failed-history-refresh@example.invalid" }), {
+    intercept: async (path, route) => {
+      if (path !== "/api/v1/customer/business-history" || !failRefresh) return false;
+      await route.fulfill({ status: 500, json: { error: "Synthetic history refresh failed" } });
+      return true;
+    },
+  });
+
+  await page.goto("/customer");
+  const history = page.getByTestId("customer-business-history");
+  await expect(history.getByTestId("history-account")).toBeVisible();
+  failRefresh = true;
+  await history.getByRole("button", { name: "Refresh all saved facts" }).click();
+  await expect(page.locator(".notice.error")).toContainText("Synthetic history refresh failed");
+  await expect(page.getByText("Business history refreshed.", { exact: true })).toHaveCount(0);
+});
+
+test("Account 360 requests only the panels granted to Staff", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000201";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const requests = await installMockApi(
+    page,
+    mockViewer({
+      email: "billing-reader@example.invalid",
+      permissions: ["accounts.view", "billing.read"],
+    }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/client-accounts") {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              items: [{
+                id: accountId,
+                name: "Synthetic 360 account",
+                owner: { userId: accountId, email: "owner@example.invalid", emailVerifiedAt: occurredAt },
+                restrictedAt: null,
+                activeMemberCount: 1,
+                createdAt: occurredAt,
+              }],
+              hasMore: false,
+              nextCursor: null,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic 360 account", createdAt: occurredAt, restrictedAt: null },
+              owner: { userId: accountId, email: "owner@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+              memberships: [{
+                userId: accountId,
+                email: "owner@example.invalid",
+                role: "owner",
+                permissions: [],
+                emailVerifiedAt: occurredAt,
+                userRestrictedAt: null,
+                createdAt: occurredAt,
+                removedAt: null,
+              }],
+              restrictions: [],
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/billing`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic 360 account" },
+              invoices: [],
+              payments: [],
+              credit: { currency: "USD", balanceMinor: "125", transactions: [] },
+              fundReceipts: [],
+              refunds: [],
+              chargebacks: [],
+              debt: { currency: "USD", balanceMinor: "0" },
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${accountId}/renewals`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: accountId, name: "Synthetic 360 account" },
+              items: [],
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  const workspace = page.getByTestId("client-account-360");
+  const searchInput = workspace.getByLabel("Search Client Accounts");
+  await expect(searchInput).toHaveAttribute("maxlength", "200");
+  await searchInput.fill("owner@example.invalid");
+  await workspace.getByRole("button", { name: "Search accounts" }).click();
+  await workspace.getByTestId("account360-search-results").getByRole("button", { name: /Synthetic 360 account/ }).click();
+  await expect(workspace.getByRole("heading", { name: "Account identity, verification and restrictions" })).toBeVisible();
+  await expect(workspace.getByText("Founder owner@example.invalid", { exact: true })).toBeVisible();
+  await expect(workspace.locator('section[aria-label="Account Contacts"]')).toHaveCount(0);
+  await expect(workspace.getByTestId("account360-billing")).toContainText("$1.25");
+  await expect(workspace.locator('section[aria-label="Account renewals"]')).toBeVisible();
+  await expect(workspace.locator('section[aria-label="Account orders"]')).toHaveCount(0);
+  await expect(workspace.locator('section[aria-label="Account services"]')).toHaveCount(0);
+  await expect(workspace.locator('section[aria-label="Account cancellations"]')).toHaveCount(0);
+  await expect(workspace.locator('section[aria-label="Account tickets"]')).toHaveCount(0);
+
+  const accountPaths = [...new Set(requests.filter((path) => path.includes("/client-accounts")))].sort();
+  expect(accountPaths).toEqual([
+    "/api/v1/admin/client-accounts",
+    `/api/v1/admin/client-accounts/${accountId}/billing`,
+    `/api/v1/admin/client-accounts/${accountId}/renewals`,
+    `/api/v1/admin/client-accounts/${accountId}/summary`,
+  ].sort());
+});
+
+test("Account 360 pagination binds the cursor to the query, appends uniquely and clears on query change", async ({ page }) => {
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const firstId = "00000000-0000-4000-8000-000000000221";
+  const secondId = "00000000-0000-4000-8000-000000000222";
+  const thirdId = "00000000-0000-4000-8000-000000000223";
+  const searchUrls: URL[] = [];
+  const item = (id: string, name: string) => ({
+    id,
+    name,
+    owner: { userId: id, email: `${name.toLowerCase().replaceAll(" ", "-")}@example.invalid`, emailVerifiedAt: occurredAt },
+    restrictedAt: null,
+    activeMemberCount: 1,
+    createdAt: occurredAt,
+  });
+
+  await installMockApi(
+    page,
+    mockViewer({ email: "paginated-reader@example.invalid", permissions: ["accounts.view"] }),
+    {
+      intercept: async (path, route) => {
+        if (path === "/api/v1/admin/client-accounts") {
+          const url = new URL(route.request().url());
+          searchUrls.push(url);
+          const query = url.searchParams.get("query");
+          const cursor = url.searchParams.get("cursor");
+          if (query === "Founder" && cursor === null) {
+            await route.fulfill({
+              json: {
+                warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+                items: [item(firstId, "Founder Alpha"), item(secondId, "Founder Beta")],
+                hasMore: true,
+                nextCursor: "founder-page-2",
+              },
+            });
+            return true;
+          }
+          if (query === "Founder" && cursor === "founder-page-2") {
+            await route.fulfill({
+              json: {
+                warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+                items: [item(secondId, "Founder Beta updated"), item(thirdId, "Founder Gamma")],
+                hasMore: false,
+                nextCursor: null,
+              },
+            });
+            return true;
+          }
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              items: [item(thirdId, "Different Query")],
+              hasMore: false,
+              nextCursor: null,
+            },
+          });
+          return true;
+        }
+        if (path === `/api/v1/admin/client-accounts/${firstId}/summary`) {
+          await route.fulfill({
+            json: {
+              warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+              account: { id: firstId, name: "Founder Alpha", createdAt: occurredAt, restrictedAt: null },
+              owner: { userId: firstId, email: "founder-alpha@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+              memberships: [],
+              restrictions: [],
+            },
+          });
+          return true;
+        }
+        return false;
+      },
+    },
+  );
+
+  await page.goto("/admin");
+  const account360 = page.getByTestId("client-account-360");
+  const input = account360.getByLabel("Search Client Accounts");
+  await input.fill("  Founder  ");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  const results = account360.getByTestId("account360-search-results");
+  await expect(results.locator(":scope > button").filter({ has: page.locator("strong") })).toHaveCount(2);
+  await results.getByRole("button", { name: /Founder Alpha/ }).click();
+  await expect(account360.getByTestId("account360-workspace")).toBeVisible();
+
+  await results.getByRole("button", { name: "Load more accounts" }).click();
+  await expect(results.getByRole("button", { name: /Founder Gamma/ })).toBeVisible();
+  await expect(results.getByRole("button", { name: /Founder Beta updated/ })).toHaveCount(1);
+  await expect(results.getByRole("button", { name: "Load more accounts" })).toHaveCount(0);
+  expect(searchUrls[1]?.searchParams.get("query")).toBe("Founder");
+  expect(searchUrls[1]?.searchParams.get("limit")).toBe("20");
+  expect(searchUrls[1]?.searchParams.get("cursor")).toBe("founder-page-2");
+
+  await input.fill("Different");
+  await expect(account360.getByTestId("account360-search-results")).toHaveCount(0);
+  await expect(account360.getByTestId("account360-workspace")).toHaveCount(0);
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await expect(account360.getByRole("button", { name: /Different Query/ })).toBeVisible();
+  expect(searchUrls.at(-1)?.searchParams.get("query")).toBe("Different");
+  expect(searchUrls.at(-1)?.searchParams.has("cursor")).toBe(false);
+});
+
+test("refreshing Staff access immediately removes a loaded Account 360 after permission revocation", async ({ page }) => {
+  const accountId = "00000000-0000-4000-8000-000000000211";
+  const occurredAt = "2026-08-10T00:00:00.000Z";
+  const activeViewer = mockViewer({
+    email: "revoked-account-reader@example.invalid",
+    permissions: ["accounts.view"],
+  });
+  const revokedViewer = mockViewer({
+    email: "revoked-account-reader@example.invalid",
+    permissions: ["support.tickets.manage"],
+  });
+  let revoked = false;
+  const requests = await installMockApi(page, activeViewer, {
+    intercept: async (path, route) => {
+      if (path === "/api/v1/auth/me") {
+        await route.fulfill({ json: revoked ? revokedViewer : activeViewer });
+        return true;
+      }
+      if (path === "/api/v1/admin/client-accounts") {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            items: [{
+              id: accountId,
+              name: "Revocable Account 360",
+              owner: { userId: accountId, email: "founder@example.invalid", emailVerifiedAt: occurredAt },
+              restrictedAt: null,
+              activeMemberCount: 1,
+              createdAt: occurredAt,
+            }],
+            hasMore: false,
+            nextCursor: null,
+          },
+        });
+        return true;
+      }
+      if (path === `/api/v1/admin/client-accounts/${accountId}/summary`) {
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: { id: accountId, name: "Revocable Account 360", createdAt: occurredAt, restrictedAt: null },
+            owner: { userId: accountId, email: "founder@example.invalid", emailVerifiedAt: occurredAt, restrictedAt: null },
+            memberships: [{
+              userId: accountId,
+              email: "founder@example.invalid",
+              role: "owner",
+              permissions: [],
+              emailVerifiedAt: occurredAt,
+              userRestrictedAt: null,
+              createdAt: occurredAt,
+              removedAt: null,
+            }],
+            restrictions: [],
+          },
+        });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  await page.goto("/admin");
+  const account360 = page.getByTestId("client-account-360");
+  await account360.getByLabel("Search Client Accounts").fill("founder@example.invalid");
+  await account360.getByRole("button", { name: "Search accounts" }).click();
+  await account360.getByRole("button", { name: /Revocable Account 360/ }).click();
+  await expect(account360.getByTestId("account360-memberships")).toContainText("founder@example.invalid");
+  const accountRequestCount = requests.filter((path) => path.includes("/client-accounts")).length;
+
+  revoked = true;
+  await account360.getByRole("button", { name: "Refresh Staff access" }).click();
+  await expect(page.getByTestId("client-account-360")).toHaveCount(0);
+  await expect(page.getByText("Revocable Account 360")).toHaveCount(0);
+  await expect(page.locator('section[aria-label="Staff support tickets"]')).toBeVisible();
+  await expect(page.getByTestId("limited-admin-scope")).toBeVisible();
+  expect(requests.filter((path) => path.includes("/client-accounts"))).toHaveLength(accountRequestCount);
 });
 
 test("Staff visiting customer mounts customer tickets without Staff DOM or fetches", async ({ page }) => {
@@ -558,6 +2514,56 @@ test("reauth password rejection stays in the current workspace", async ({ page }
   expect(documents).toEqual(["/customer"]);
 });
 
+test("delayed business history cannot mount facts after leaving customer", async ({ page }) => {
+  let releaseResponse!: () => void;
+  let markRequestStarted!: () => void;
+  let markResponseFulfilled!: () => void;
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  const requestStarted = new Promise<void>((resolve) => { markRequestStarted = resolve; });
+  const responseFulfilled = new Promise<void>((resolve) => { markResponseFulfilled = resolve; });
+  await installMockApi(
+    page,
+    mockViewer({ email: "delayed-history@example.invalid" }),
+    {
+      intercept: async (path, route) => {
+        if (path !== "/api/v1/customer/business-history") return false;
+        markRequestStarted();
+        await responseGate;
+        await route.fulfill({
+          json: {
+            warning: "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+            account: {
+              id: "00000000-0000-4000-8000-000000000301",
+              name: "Delayed history account",
+            },
+            orders: [],
+            invoices: [],
+            payments: [],
+            credit: { currency: "USD", balanceMinor: "0", transactions: [] },
+            refunds: [],
+            services: [],
+            renewals: [],
+            cancellations: [],
+            tickets: [],
+          },
+        });
+        markResponseFulfilled();
+        return true;
+      },
+    },
+  );
+
+  await page.goto("/customer");
+  await requestStarted;
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  releaseResponse();
+  await responseFulfilled;
+  await page.waitForTimeout(50);
+  await expect(page.getByTestId("customer-business-history")).toHaveCount(0);
+  await expect(page.getByText("Delayed history account")).toHaveCount(0);
+  await expect(page.locator(".notice")).toHaveCount(0);
+});
+
 for (const sessionError of ["Session is invalid or expired", "Authentication required"]) {
   test(`reauth session error hard-navigates: ${sessionError}`, async ({ page }) => {
     await installMockApi(
@@ -631,7 +2637,7 @@ test("delayed customer completion cannot leak notice or DOM after navigating Hom
   releaseResponse();
   await responseFulfilled;
   await page.waitForTimeout(50);
-  await expect(page.locator(".notice")).toHaveCount(0);
+  await expect(page.getByText("Support ticket created.", { exact: true })).toHaveCount(0);
   await expect(page.locator('section[aria-label="Customer support tickets"]')).toHaveCount(0);
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
@@ -653,6 +2659,11 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
     subject: "Delayed Staff ticket",
     status: "awaiting_staff",
     service: null,
+    orderId: null,
+    authorizationPurpose: null,
+    department: { code: "general-support", name: "General Support" },
+    priority: "normal",
+    assignedStaffUserId: null,
     publicMessageCount: 1,
     createdAt,
     updatedAt: createdAt,
@@ -675,7 +2686,14 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
           return true;
         }
         if (path === `/api/v1/admin/tickets/${ticketId}`) {
-          await route.fulfill({ json: { ticket, messages: [] } });
+          await route.fulfill({ json: {
+            ticket,
+            messages: [],
+            attachments: [],
+            statusHistory: [],
+            assignmentHistory: [],
+            routingHistory: [],
+          } });
           return true;
         }
         if (
@@ -698,6 +2716,10 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
                   createdAt,
                 },
               ],
+              attachments: [],
+              statusHistory: [],
+              assignmentHistory: [],
+              routingHistory: [],
             },
           });
           markResponseFulfilled();
@@ -722,7 +2744,7 @@ test("delayed Staff completion cannot leak or refetch after navigating to custom
   releaseResponse();
   await responseFulfilled;
   await page.waitForTimeout(50);
-  await expect(page.locator(".notice")).toHaveCount(0);
+  await expect(page.getByText("Public reply sent.", { exact: true })).toHaveCount(0);
   await expect(page.locator('section[aria-label="Staff support tickets"]')).toHaveCount(0);
   await expect(page.getByTestId("full-admin-workspace")).toHaveCount(0);
   expect(requests.filter((path) => path === "/api/v1/admin/tickets").length).toBe(

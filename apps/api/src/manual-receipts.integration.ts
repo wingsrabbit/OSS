@@ -6,7 +6,11 @@ import pg from "pg";
 import { buildApp } from "./app.js";
 import { digestToken } from "./auth.js";
 import type { Config } from "./config.js";
-import { assertSchemaCompatible, runMigrations } from "./database.js";
+import {
+  assertSchemaCompatible,
+  REQUIRED_SCHEMA_VERSION,
+  runMigrations,
+} from "./database.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required for manual receipt integration");
@@ -42,9 +46,11 @@ const config: Config = {
     "synthetic-manual-receipt-capability-secret",
   PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 41).toString("base64url"),
   PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 42).toString("base64url"),
+  IDENTITY_SECRET_KEY: Buffer.alloc(32, 43).toString("base64url"),
   MOCK_PAYMENT_WEBHOOK_SECRET: "synthetic-manual-receipt-payment-hook",
   MOCK_PROVISIONING_WEBHOOK_SECRET:
     "synthetic-manual-receipt-provision-hook",
+  NOTIFICATION_MAX_ATTEMPTS: 3,
   LAB_MAILBOX_ENABLED: false,
 };
 
@@ -56,10 +62,7 @@ let app: Awaited<ReturnType<typeof buildApp>>["app"] | null = null;
 try {
   await runMigrations(pool);
   const schema = await assertSchemaCompatible(pool);
-  assert.equal(
-    schema.installedSchemaVersion,
-    "018_stage_c_support_tickets",
-  );
+  assert.equal(schema.installedSchemaVersion, REQUIRED_SCHEMA_VERSION);
   assert.equal(schema.mode, "native");
 
   await pool.query(
@@ -67,18 +70,30 @@ try {
      VALUES ($1, $2, 'synthetic-not-a-password', now())`,
     [userId, `manual-receipt-${namespace}@example.invalid`],
   );
-  await pool.query(
-    `INSERT INTO client_accounts(id, name, owner_user_id)
-     VALUES
-       ($1, 'Synthetic staff account', $3),
-       ($2, 'Synthetic manual receipt target', $3)`,
-    [staffAccountId, targetAccountId, userId],
-  );
-  await pool.query(
-    `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
-     VALUES ($1, $2, 'owner', '[]'::jsonb)`,
-    [staffAccountId, userId],
-  );
+  const accountSetup = await pool.connect();
+  try {
+    await accountSetup.query("BEGIN");
+    await accountSetup.query(
+      `INSERT INTO client_accounts(id, name, owner_user_id)
+       VALUES
+         ($1, 'Synthetic staff account', $3),
+         ($2, 'Synthetic manual receipt target', $3)`,
+      [staffAccountId, targetAccountId, userId],
+    );
+    await accountSetup.query(
+      `INSERT INTO client_memberships(client_account_id, user_id, role, permissions)
+       VALUES
+         ($1, $3, 'owner', '[]'::jsonb),
+         ($2, $3, 'owner', '[]'::jsonb)`,
+      [staffAccountId, targetAccountId, userId],
+    );
+    await accountSetup.query("COMMIT");
+  } catch (error) {
+    await accountSetup.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    accountSetup.release();
+  }
   await pool.query(
     `INSERT INTO sessions(id, user_id, token_digest, expires_at)
      VALUES ($1, $2, $3, now() + interval '1 hour')`,
@@ -1212,7 +1227,7 @@ try {
 
   await assert.rejects(
     runMigrations(pool),
-    /running schema-017 API or Worker/,
+    new RegExp(`running schema-${REQUIRED_SCHEMA_VERSION.slice(0, 3)} API or Worker`),
   );
   await app.close();
   app = null;
@@ -1221,7 +1236,7 @@ try {
 
   process.stdout.write(
     `${JSON.stringify({
-      schema018Native: true,
+      schema019Native: true,
       manualReceiptRecorded: true,
       mistakenManualReceiptReversed: true,
       reversalRequiresBothPermissions: true,

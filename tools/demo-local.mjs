@@ -43,6 +43,7 @@ const lifecycleSemaphoreFile = join(lifecycleLockDirectory, "lifecycle.lock");
 const lifecycleOwnerFile = join(lifecycleLockDirectory, "owner.json");
 const logsDir = join(runtimeDir, "logs");
 const ownerRole = "oss_demo_owner";
+const notificationMaxAttempts = "3";
 const processNames = Object.freeze([
   "provider-payment",
   "provider-provisioning",
@@ -103,10 +104,33 @@ function readJson(path, fallback) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+export function upgradeExistingDemoConfig(config, tokenFactory = secureToken) {
+  let changed = false;
+  config.secrets ??= {};
+  if (!config.secrets.providerPlatformToken) {
+    config.secrets.providerPlatformToken = tokenFactory();
+    changed = true;
+  }
+  if (!config.secrets.providerRequestFingerprintKey) {
+    config.secrets.providerRequestFingerprintKey = tokenFactory(32);
+    changed = true;
+  }
+  if (!config.secrets.identitySecretKey) {
+    config.secrets.identitySecretKey = tokenFactory(32);
+    changed = true;
+  }
+  return changed;
+}
+
 function createConfig() {
   ensureRuntimeDirectories();
   const existing = readJson(configFile, null);
-  if (existing) return existing;
+  if (existing) {
+    if (upgradeExistingDemoConfig(existing)) {
+      writePrivateJson(configFile, existing);
+    }
+    return existing;
+  }
   const config = {
     warning: LAB_WARNING,
     createdAt: new Date().toISOString(),
@@ -116,6 +140,8 @@ function createConfig() {
       workerDatabasePassword: secureToken(),
       paymentProviderToken: secureToken(),
       provisioningProviderToken: secureToken(),
+      providerPlatformToken: secureToken(),
+      providerRequestFingerprintKey: secureToken(32),
       mailProviderToken: secureToken(),
       mailboxToken: secureToken(),
       providerOperationCapabilitySecret: secureToken(),
@@ -123,6 +149,7 @@ function createConfig() {
       provisioningWebhookSecret: secureToken(),
       paymentMethodTokenKey: secureToken(32),
       paymentMethodTokenLookupKey: secureToken(32),
+      identitySecretKey: secureToken(32),
     },
   };
   writePrivateJson(configFile, config);
@@ -355,6 +382,7 @@ function commonCoreEnvironment(config) {
     OSS_PUBLIC_URL: `http://127.0.0.1:${config.ports.web}`,
     WEB_ORIGIN: `http://127.0.0.1:${config.ports.web}`,
     SESSION_COOKIE_NAME: "oss_demo_session",
+    NOTIFICATION_MAX_ATTEMPTS: notificationMaxAttempts,
     LAB_MAILBOX_ENABLED: "true",
     LAB_MAILBOX_TOKEN: config.secrets.mailboxToken,
     MOCK_MAILBOX_URL: `http://127.0.0.1:${config.ports.mailbox}`,
@@ -364,6 +392,8 @@ function commonCoreEnvironment(config) {
     PAYMENT_METHOD_TOKEN_PREVIOUS_KEYS: "",
     PAYMENT_METHOD_TOKEN_LOOKUP_KEY: config.secrets.paymentMethodTokenLookupKey,
     PAYMENT_METHOD_TOKEN_LOOKUP_KEY_VERSION: "1",
+    IDENTITY_SECRET_KEY: config.secrets.identitySecretKey,
+    IDENTITY_SECRET_KEY_VERSION: "1",
     PAYMENT_METHOD_TOKEN_LOOKUP_PREVIOUS_KEYS: "",
     OSS_SCHEMA_ROLLBACK_BRIDGE: "disabled",
     MOCK_PAYMENT_WEBHOOK_SECRET: config.secrets.paymentWebhookSecret,
@@ -371,7 +401,7 @@ function commonCoreEnvironment(config) {
   };
 }
 
-function apiEnvironment(config) {
+export function apiEnvironment(config) {
   return {
     ...commonCoreEnvironment(config),
     DATABASE_URL: postgresUrl(
@@ -386,7 +416,7 @@ function apiEnvironment(config) {
   };
 }
 
-function workerEnvironment(config) {
+export function workerEnvironment(config) {
   return {
     DATABASE_URL: postgresUrl(
       config,
@@ -395,12 +425,18 @@ function workerEnvironment(config) {
       config.secrets.workerDatabasePassword,
     ),
     DATABASE_RUNTIME_ROLE: "oss_worker",
+    NOTIFICATION_MAX_ATTEMPTS: notificationMaxAttempts,
     MOCK_PAYMENT_PROVIDER_URL: `http://127.0.0.1:${config.ports.payment}`,
     MOCK_PROVISIONING_PROVIDER_URL: `http://127.0.0.1:${config.ports.provisioning}`,
+    MOCK_PROVIDER_PLATFORM_URL: `http://127.0.0.1:${config.ports.provisioning}`,
     MOCK_MAIL_PROVIDER_URL: `http://127.0.0.1:${config.ports.mail}`,
     MOCK_PAYMENT_PROVIDER_TOKEN: config.secrets.paymentProviderToken,
     MOCK_PROVISIONING_PROVIDER_TOKEN: config.secrets.provisioningProviderToken,
+    MOCK_PROVIDER_PLATFORM_TOKEN: config.secrets.providerPlatformToken,
     MOCK_MAIL_PROVIDER_TOKEN: config.secrets.mailProviderToken,
+    OSS_PUBLIC_URL: `http://127.0.0.1:${config.ports.web}`,
+    IDENTITY_SECRET_KEY: config.secrets.identitySecretKey,
+    IDENTITY_SECRET_KEY_VERSION: "1",
     PROVIDER_OPERATION_CAPABILITY_SECRET: config.secrets.providerOperationCapabilitySecret,
     PAYMENT_METHOD_TOKEN_KEY: config.secrets.paymentMethodTokenKey,
     PAYMENT_METHOD_TOKEN_KEY_VERSION: "1",
@@ -411,6 +447,7 @@ function workerEnvironment(config) {
     CORE_INTERNAL_URL: `http://127.0.0.1:${config.ports.api}`,
     MOCK_PROVISION_SCENARIO: "success",
     MOCK_RESOURCE_ACTION_SCENARIO: "success",
+    MOCK_SERVICE_OPERATION_SCENARIO: "normal",
   };
 }
 
@@ -434,6 +471,11 @@ function providerEnvironment(config, kind) {
       PROVIDER_PORT: String(config.ports.provisioning),
       PROVIDER_DATABASE_URL: postgresUrl(config, "provisioning_provider"),
       MOCK_PROVISIONING_PROVIDER_TOKEN: config.secrets.provisioningProviderToken,
+      MOCK_PROVIDER_PLATFORM_TOKEN: config.secrets.providerPlatformToken,
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: config.secrets.providerRequestFingerprintKey,
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: "1",
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: "",
+      MOCK_PROVIDER_PUBLIC_BASE_URL: `http://127.0.0.1:${config.ports.provisioning}`,
       MOCK_PROVISIONING_WEBHOOK_SECRET: config.secrets.provisioningWebhookSecret,
     };
   }
@@ -456,6 +498,8 @@ function providerEnvironment(config, kind) {
 function assertDependenciesPresent() {
   const required = [
     "packages/core/node_modules/typescript/bin/tsc",
+    "packages/provider-contracts/node_modules/typescript/bin/tsc",
+    "packages/provider-sdk-typescript/node_modules/typescript/bin/tsc",
     "apps/api/node_modules/typescript/bin/tsc",
     "apps/worker/node_modules/typescript/bin/tsc",
     "providers/mock-lab/node_modules/typescript/bin/tsc",
@@ -473,12 +517,18 @@ function assertDependenciesPresent() {
 function buildWorkspace(node) {
   if (process.env.OSS_DEMO_SKIP_BUILD === "1") return;
   assertDependenciesPresent();
-  console.log("Building API, Worker, Web, Core, and Mock Provider with Node 24.18.0...");
+  console.log("Building API, Worker, Web, Core, public Provider packages, and Mock Provider with Node 24.18.0...");
   commandResult(node, [
     "packages/core/node_modules/typescript/bin/tsc",
     "-p",
     "packages/core/tsconfig.json",
   ]);
+  for (const [compiler, project] of [
+    ["packages/provider-contracts/node_modules/typescript/bin/tsc", "packages/provider-contracts/tsconfig.json"],
+    ["packages/provider-sdk-typescript/node_modules/typescript/bin/tsc", "packages/provider-sdk-typescript/tsconfig.json"],
+  ]) {
+    commandResult(node, [compiler, "-p", project]);
+  }
   for (const [compiler, project] of [
     ["apps/api/node_modules/typescript/bin/tsc", "apps/api/tsconfig.json"],
     ["apps/worker/node_modules/typescript/bin/tsc", "apps/worker/tsconfig.json"],
@@ -1444,7 +1494,7 @@ function prepareDatabases(config, pgBin, node) {
     DATABASE_API_ROLE_PASSWORD: config.secrets.apiDatabasePassword,
     DATABASE_WORKER_ROLE_PASSWORD: config.secrets.workerDatabasePassword,
   };
-  console.log("Applying the latest native schema (018) and synthetic catalog seed...");
+  console.log("Applying the latest native schema and synthetic catalog seed...");
   commandResult(node, ["apps/api/dist/migrate.js"], { env: migrationEnvironment });
   commandResult(node, ["apps/api/dist/seed-termrat.js"], { env: apiEnvironment(config) });
 }

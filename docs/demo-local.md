@@ -192,7 +192,8 @@ and database files are ignored by Git.
   a deliberately shared Mock mail database.
 - `conformance/e2e/tests/stage-a.spec.ts` remains the broad browser acceptance
   suite. `tools/demo-smoke.mjs` is intentionally shorter: it proves all three
-  SPA entry paths, the main customer journey, Staff-only ticket-note visibility,
+  SPA entry paths, the main customer journey, User notification preferences,
+  the bilingual Staff template registry, Staff-only ticket-note visibility,
   and one Provider-free manual-receipt outflow, then leaves the stack running
   for a human Demo.
 

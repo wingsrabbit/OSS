@@ -36,6 +36,7 @@ function buildIntegrationConfig(sessionCookieName = "oss_renewal_integration_ses
     API_HOST: "127.0.0.1",
     API_PORT: 3000,
     GLOBAL_RATE_LIMIT_MAX: 10_000,
+    NOTIFICATION_MAX_ATTEMPTS: 3,
     SESSION_COOKIE_NAME: sessionCookieName,
     SESSION_TTL_HOURS: 24,
     VERIFICATION_TTL_MINUTES: 30,
@@ -46,6 +47,7 @@ function buildIntegrationConfig(sessionCookieName = "oss_renewal_integration_ses
       "manual-action-capability-secret-0000000000000000",
     PAYMENT_METHOD_TOKEN_KEY: Buffer.alloc(32, 9).toString("base64url"),
     PAYMENT_METHOD_TOKEN_LOOKUP_KEY: Buffer.alloc(32, 10).toString("base64url"),
+    IDENTITY_SECRET_KEY: Buffer.alloc(32, 11).toString("base64url"),
     MOCK_PAYMENT_WEBHOOK_SECRET: "manual-action-payment-secret-000000000000000000",
     MOCK_PROVISIONING_WEBHOOK_SECRET:
       "manual-action-provisioning-secret-0000000000000000",
@@ -1873,9 +1875,65 @@ async function proveManualSuspensionApi(pool: pg.Pool): Promise<void> {
       listedManual?.delinquency?.version ?? 0,
       manualSuspendKey,
     );
-    const manualSuspended = await request(
-      `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
-      { method: "POST", body: manualSuspendBody },
+    const deadlocksBeforeManualAction = await pool.query<{ deadlocks: string }>(
+      `SELECT deadlocks::text
+       FROM pg_stat_database
+       WHERE datname = current_database()`,
+    );
+    const settlementBarrier = await pool.connect();
+    let manualSuspended!: Awaited<ReturnType<typeof request>>;
+    let manualSuspensionPromise: ReturnType<typeof request> | null = null;
+    try {
+      await settlementBarrier.query("BEGIN");
+      await settlementBarrier.query("SET LOCAL lock_timeout = '2s'");
+      await settlementBarrier.query(
+        "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+        [manualAccount.clientAccountId],
+      );
+      manualSuspensionPromise = request(
+        `/api/v1/admin/billing/delinquency-cases/${manualCaseId}/manual-actions`,
+        { method: "POST", body: manualSuspendBody },
+      );
+      let observedAccountWait = false;
+      for (let poll = 0; poll < 150 && !observedAccountWait; poll += 1) {
+        const waiting = await pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%FROM client_accounts WHERE id = $1 FOR UPDATE%'`,
+        );
+        observedAccountWait = waiting.rows[0]?.count !== "0";
+        if (!observedAccountWait) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      assert.equal(
+        observedAccountWait,
+        true,
+        "Staff manual action must wait at Account before taking the renewal Invoice lock",
+      );
+      await settlementBarrier.query(
+        "SELECT id FROM invoices WHERE id = $1 FOR UPDATE",
+        [manualRenewal.invoice_id],
+      );
+      await settlementBarrier.query("COMMIT");
+      manualSuspended = await manualSuspensionPromise;
+    } catch (error) {
+      await settlementBarrier.query("ROLLBACK").catch(() => undefined);
+      await manualSuspensionPromise?.catch(() => undefined);
+      throw error;
+    } finally {
+      settlementBarrier.release();
+    }
+    const deadlocksAfterManualAction = await pool.query<{ deadlocks: string }>(
+      `SELECT deadlocks::text
+       FROM pg_stat_database
+       WHERE datname = current_database()`,
+    );
+    assert.equal(
+      deadlocksAfterManualAction.rows[0]?.deadlocks,
+      deadlocksBeforeManualAction.rows[0]?.deadlocks,
     );
     assert.equal(manualSuspended.statusCode, 201);
     assert.equal(manualSuspended.body.serviceStatus, "suspended");
@@ -2164,19 +2222,171 @@ async function proveManualSuspensionApi(pool: pg.Pool): Promise<void> {
       occurredAt: resumeOccurredAt.toISOString(),
     };
     const resumeCallbackTimestamp = Date.now().toString();
-    const resumeCallback = await app.inject({
-      method: "POST",
-      url: "/api/v1/provider-events/resource-action",
-      headers: {
-        "x-oss-timestamp": resumeCallbackTimestamp,
-        "x-oss-signature": providerSignature(
-          config.MOCK_PROVISIONING_WEBHOOK_SECRET,
-          resumeCallbackTimestamp,
-          resumeCallbackBody,
-        ),
-      },
-      payload: resumeCallbackBody,
-    });
+    const injectResumeCallback = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/v1/provider-events/resource-action",
+        headers: {
+          "x-oss-timestamp": resumeCallbackTimestamp,
+          "x-oss-signature": providerSignature(
+            config.MOCK_PROVISIONING_WEBHOOK_SECRET,
+            resumeCallbackTimestamp,
+            resumeCallbackBody,
+          ),
+        },
+        payload: resumeCallbackBody,
+      });
+    const deadlocksBeforeCallbackBarrier = await pool.query<{ deadlocks: string }>(
+      `SELECT deadlocks::text
+       FROM pg_stat_database
+       WHERE datname = current_database()`,
+    );
+    const invoiceBarrier = await pool.connect();
+    const workerFirst = await pool.connect();
+    const workerFollower = await pool.connect();
+    let resumeCallbackPromise: ReturnType<typeof injectResumeCallback> | null = null;
+    let workerFollowerPromise: Promise<void> | null = null;
+    let resumeCallback!: Awaited<ReturnType<typeof injectResumeCallback>>;
+    try {
+      await invoiceBarrier.query("BEGIN");
+      await invoiceBarrier.query("SET LOCAL lock_timeout = '2s'");
+      await invoiceBarrier.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+        automaticRenewal.invoice_id,
+      ]);
+
+      await workerFirst.query("BEGIN");
+      await workerFirst.query("SET LOCAL lock_timeout = '2s'");
+      await workerFirst.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+        automaticAccount.userId,
+      ]);
+      await workerFirst.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+        automaticAccount.clientAccountId,
+      ]);
+      await workerFirst.query(
+        `SELECT user_id
+         FROM client_memberships
+         WHERE client_account_id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [automaticAccount.clientAccountId, automaticAccount.userId],
+      );
+
+      resumeCallbackPromise = injectResumeCallback();
+      let callbackWaitedOnIdentity = false;
+      for (let poll = 0; poll < 150 && !callbackWaitedOnIdentity; poll += 1) {
+        const waiting = await pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+        );
+        callbackWaitedOnIdentity = waiting.rows[0]?.count !== "0";
+        if (!callbackWaitedOnIdentity) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      assert.equal(
+        callbackWaitedOnIdentity,
+        true,
+        "Provider callback must wait on the submitted User before taking the Provider advisory lock",
+      );
+      await workerFirst.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`provider-operation:${automaticResumeRow.operation_id}`],
+      );
+      await workerFirst.query("COMMIT");
+
+      let callbackWaitedOnInvoice = false;
+      for (let poll = 0; poll < 150 && !callbackWaitedOnInvoice; poll += 1) {
+        const waiting = await pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%SELECT id FROM invoices WHERE id = $1 FOR UPDATE%'`,
+        );
+        callbackWaitedOnInvoice = waiting.rows[0]?.count !== "0";
+        if (!callbackWaitedOnInvoice) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      assert.equal(
+        callbackWaitedOnInvoice,
+        true,
+        "Provider callback must hold User and Account before waiting on the renewal Invoice",
+      );
+
+      workerFollowerPromise = (async () => {
+        await workerFollower.query("BEGIN");
+        await workerFollower.query("SET LOCAL lock_timeout = '2s'");
+        await workerFollower.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+          automaticAccount.userId,
+        ]);
+        await workerFollower.query(
+          "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
+          [automaticAccount.clientAccountId],
+        );
+        await workerFollower.query(
+          `SELECT user_id
+           FROM client_memberships
+           WHERE client_account_id = $1 AND user_id = $2
+           FOR UPDATE`,
+          [automaticAccount.clientAccountId, automaticAccount.userId],
+        );
+        await workerFollower.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [`provider-operation:${automaticResumeRow.operation_id}`],
+        );
+        await workerFollower.query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE", [
+          automaticRenewal.invoice_id,
+        ]);
+        await workerFollower.query("COMMIT");
+      })();
+      let workerWaitedOnIdentity = false;
+      for (let poll = 0; poll < 150 && !workerWaitedOnIdentity; poll += 1) {
+        const waiting = await pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%SELECT id FROM users WHERE id = $1 FOR UPDATE%'`,
+        );
+        workerWaitedOnIdentity = waiting.rows[0]?.count !== "0";
+        if (!workerWaitedOnIdentity) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      assert.equal(
+        workerWaitedOnIdentity,
+        true,
+        "Worker preflight must wait at User while the callback owns the canonical lock prefix",
+      );
+      await invoiceBarrier.query("COMMIT");
+      resumeCallback = await resumeCallbackPromise;
+      await workerFollowerPromise;
+    } catch (error) {
+      await Promise.all([
+        invoiceBarrier.query("ROLLBACK").catch(() => undefined),
+        workerFirst.query("ROLLBACK").catch(() => undefined),
+        workerFollower.query("ROLLBACK").catch(() => undefined),
+      ]);
+      await resumeCallbackPromise?.catch(() => undefined);
+      await workerFollowerPromise?.catch(() => undefined);
+      throw error;
+    } finally {
+      invoiceBarrier.release();
+      workerFirst.release();
+      workerFollower.release();
+    }
+    const deadlocksAfterCallbackBarrier = await pool.query<{ deadlocks: string }>(
+      `SELECT deadlocks::text
+       FROM pg_stat_database
+       WHERE datname = current_database()`,
+    );
+    assert.equal(
+      deadlocksAfterCallbackBarrier.rows[0]?.deadlocks,
+      deadlocksBeforeCallbackBarrier.rows[0]?.deadlocks,
+    );
     assert.equal(resumeCallback.statusCode, 202);
     assert.deepEqual(resumeCallback.json(), {
       accepted: true,
@@ -2371,14 +2581,20 @@ async function provePaymentSettingsDecisionConflicts(pool: pg.Pool): Promise<voi
       [owner.clientAccountId, billingUserId],
     );
     const ownerSession = await setup.query<{ id: string }>(
-      `INSERT INTO sessions(user_id, token_digest, expires_at)
-       VALUES ($1, $2, now() + interval '1 hour') RETURNING id`,
-      [owner.userId, digestToken(ownerSessionToken)],
+      `INSERT INTO sessions(
+         user_id, token_digest, expires_at,
+         active_client_account_id, account_context_version
+       ) VALUES ($1, $2, now() + interval '1 hour', $3, 1)
+       RETURNING id`,
+      [owner.userId, digestToken(ownerSessionToken), owner.clientAccountId],
     );
     const billingSession = await setup.query<{ id: string }>(
-      `INSERT INTO sessions(user_id, token_digest, expires_at)
-       VALUES ($1, $2, now() + interval '1 hour') RETURNING id`,
-      [billingUserId, digestToken(billingSessionToken)],
+      `INSERT INTO sessions(
+         user_id, token_digest, expires_at,
+         active_client_account_id, account_context_version
+       ) VALUES ($1, $2, now() + interval '1 hour', $3, 1)
+       RETURNING id`,
+      [billingUserId, digestToken(billingSessionToken), owner.clientAccountId],
     );
     await setup.query(
       `INSERT INTO reauth_grants(user_id, session_id, expires_at)
@@ -2580,7 +2796,10 @@ async function provePaymentSettingsDecisionConflicts(pool: pg.Pool): Promise<voi
     const response = await app.inject({
       method: input.method ?? "GET",
       url: path,
-      headers: { cookie: `${config.SESSION_COOKIE_NAME}=${sessionToken}` },
+      headers: {
+        cookie: `${config.SESSION_COOKIE_NAME}=${sessionToken}`,
+        "x-oss-account-context-version": "1",
+      },
       ...(input.body ? { payload: input.body } : {}),
     });
     return {
@@ -3213,10 +3432,6 @@ async function provePaymentSettingsDecisionConflicts(pool: pg.Pool): Promise<voi
         true,
         "real HTTP replacement must be observed waiting on the held Service row",
       );
-      await serviceGate.query(
-        "SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE",
-        [owner.clientAccountId],
-      );
       await serviceGate.query("COMMIT");
       replaced = await replacementPromise;
     } catch (error) {
@@ -3282,7 +3497,9 @@ async function proveConcurrentBillingDay(pool: pg.Pool): Promise<{ runId: string
   const productId = `renewal-concurrency-product-${namespace}`;
   const effectiveAt = new Date("2002-01-18T01:00:00.000Z");
   let account: FixtureAccount;
+  let eligibleAccount: FixtureAccount;
   let service: FixtureService;
+  let eligibleService: FixtureService;
   try {
     await setup.query("BEGIN");
     await setup.query(
@@ -3309,6 +3526,29 @@ async function proveConcurrentBillingDay(pool: pg.Pool): Promise<{ runId: string
       termStart: new Date("2002-01-01T15:00:00.000Z"),
       termEnd: new Date("2002-02-01T15:00:00.000Z"),
     });
+    eligibleAccount = await createFixtureAccount(setup, "concurrent-eligible");
+    eligibleService = await createFixtureService(setup, eligibleAccount, {
+      label: "Concurrent Eligible Renewal Service",
+      productId,
+      recurringMinor: 888n,
+      termStart: new Date("2002-01-01T15:00:00.000Z"),
+      termEnd: new Date("2002-02-01T15:00:00.000Z"),
+    });
+    await setup.query(
+      `INSERT INTO client_contacts(
+         client_account_id, display_name, email, locale,
+         notification_subscriptions
+       )
+       SELECT $1, 'Same-email billing Contact', email, locale,
+              '["billing"]'::jsonb
+       FROM users
+       WHERE id = $2`,
+      [account.clientAccountId, account.userId],
+    );
+    await setup.query(
+      `UPDATE users SET restricted_at = pg_catalog.now() WHERE id = $1`,
+      [account.userId],
+    );
     await setup.query("COMMIT");
   } catch (error) {
     await setup.query("ROLLBACK").catch(() => undefined);
@@ -3338,34 +3578,93 @@ async function proveConcurrentBillingDay(pool: pg.Pool): Promise<{ runId: string
   assert.equal(outcomes.filter((outcome) => outcome.replayed).length, 1);
   assert.equal(outcomes.filter((outcome) => !outcome.replayed).length, 1);
   assert.equal(outcomes[0]?.runId, outcomes[1]?.runId);
-  assert.ok(outcomes.every((outcome) => outcome.invoicesCreated === 1));
+  assert.ok(outcomes.every((outcome) => outcome.invoicesCreated === 2));
 
   const proof = await pool.query<{
     runs: string;
     renewals: string;
     invoice_journals: string;
     reminders: string;
+    notification_operations: string;
+    restricted_owner_skipped_operations: string;
+    restricted_owner_skipped_facts: string;
+    restricted_owner_terminal_projection: string;
+    same_email_contact_queued_operations: string;
+    eligible_owner_queued_operations: string;
   }>(
     `SELECT
        (SELECT count(*)::text FROM billing_automation_runs
         WHERE policy_id = 'default' AND business_date = '2002-01-18') AS runs,
        (SELECT count(*)::text FROM service_renewals renewal
-        WHERE renewal.service_id = $1) AS renewals,
+        WHERE renewal.service_id = ANY($1::uuid[])) AS renewals,
        (SELECT count(*)::text
         FROM service_renewals renewal
         JOIN ledger_journals journal
           ON journal.source_type = 'invoice_issuance'
          AND journal.source_id = renewal.invoice_id
-        WHERE renewal.service_id = $1) AS invoice_journals,
+        WHERE renewal.service_id = ANY($1::uuid[])) AS invoice_journals,
        (SELECT count(*)::text FROM renewal_reminder_intents reminder
-        WHERE reminder.service_id = $1 AND reminder.kind = 'renewal_created') AS reminders`,
-    [service.serviceId],
+        WHERE reminder.service_id = ANY($1::uuid[])
+          AND reminder.kind = 'renewal_created') AS reminders,
+       (SELECT count(*)::text
+        FROM renewal_reminder_intents reminder
+        JOIN notification_delivery_operations operation
+          ON operation.outbox_id = reminder.outbox_id
+         AND operation.attempt_number = 1
+         AND operation.recipient_kind = 'account_user'
+        WHERE reminder.service_id = ANY($1::uuid[])
+          AND reminder.kind = 'renewal_created') AS notification_operations,
+       (SELECT count(*)::text
+        FROM notification_delivery_operations operation
+        WHERE operation.payload_snapshot ->> 'serviceId' = $2
+          AND operation.recipient_kind = 'account_user'
+          AND operation.status = 'skipped') AS restricted_owner_skipped_operations,
+       (SELECT count(*)::text
+        FROM notification_delivery_facts fact
+        JOIN notification_delivery_operations operation
+          ON operation.outbox_id = fact.outbox_id
+         AND operation.attempt_number = fact.attempt_number
+        WHERE operation.payload_snapshot ->> 'serviceId' = $2
+          AND operation.recipient_kind = 'account_user'
+          AND fact.status = 'skipped') AS restricted_owner_skipped_facts,
+       (SELECT count(*)::text
+        FROM notification_delivery_operations operation
+        JOIN outbox event ON event.id = operation.outbox_id
+        JOIN durable_jobs job
+          ON job.job_type = 'notification.send'
+         AND job.unique_key = 'outbox:' || event.id::text
+        WHERE operation.payload_snapshot ->> 'serviceId' = $2
+          AND operation.recipient_kind = 'account_user'
+          AND operation.status = 'skipped'
+          AND operation.last_error = 'ACCOUNT_USER_RECIPIENT_INELIGIBLE'
+          AND event.published_at IS NOT NULL
+          AND job.status = 'completed'
+          AND job.attempts = 0
+          AND job.last_error = operation.last_error)
+         AS restricted_owner_terminal_projection,
+       (SELECT count(*)::text
+        FROM notification_delivery_operations operation
+        WHERE operation.payload_snapshot ->> 'serviceId' = $2
+          AND operation.recipient_kind = 'contact'
+          AND operation.status = 'queued') AS same_email_contact_queued_operations,
+       (SELECT count(*)::text
+        FROM notification_delivery_operations operation
+        WHERE operation.payload_snapshot ->> 'serviceId' = $3
+          AND operation.recipient_kind = 'account_user'
+          AND operation.status = 'queued') AS eligible_owner_queued_operations`,
+    [[service.serviceId, eligibleService.serviceId], service.serviceId, eligibleService.serviceId],
   );
   assert.deepEqual(proof.rows[0], {
     runs: "1",
-    renewals: "1",
-    invoice_journals: "1",
-    reminders: "1",
+    renewals: "2",
+    invoice_journals: "2",
+    reminders: "2",
+    notification_operations: "2",
+    restricted_owner_skipped_operations: "1",
+    restricted_owner_skipped_facts: "1",
+    restricted_owner_terminal_projection: "1",
+    same_email_contact_queued_operations: "1",
+    eligible_owner_queued_operations: "1",
   });
   await assert.rejects(
     pool.query(
@@ -3441,7 +3740,8 @@ async function proveScheduledBillingDay(pool: pg.Pool): Promise<{ runId: string 
 
 const pool = new pg.Pool({
   connectionString: databaseUrl,
-  max: 4,
+  // Schema guard + three barriers + HTTP handler + lock observer.
+  max: 6,
   connectionTimeoutMillis: 5_000,
 });
 await runMigrations(pool);
@@ -3457,6 +3757,7 @@ try {
   const fixtureNamespace = randomUUID();
   const productGroupId = `renewal-integration-group-${fixtureNamespace}`;
   const productId = `renewal-integration-product-${fixtureNamespace}`;
+  const catalogProductRevisionId = randomUUID();
   await client.query(
     `INSERT INTO product_groups(id, sort_order, names)
      VALUES ($1, 9999, '{"en":"Renewal Integration"}'::jsonb)`,
@@ -3474,11 +3775,22 @@ try {
     [productId, productGroupId],
   );
   await client.query(
+    `INSERT INTO catalog_product_revisions(
+       id, product_id, revision, group_id, names, descriptions,
+       fulfillment_mode, active, hidden, repeatable, option_schema
+     ) VALUES (
+       $1, $2, 1, $3, '{"en":"Current Catalog Product"}'::jsonb,
+       '{"en":"Synthetic integration product"}'::jsonb,
+       'automatic', true, false, false, '[]'::jsonb
+     )`,
+    [catalogProductRevisionId, productId, productGroupId],
+  );
+  await client.query(
     `INSERT INTO product_prices(
-       product_id, revision, currency, billing_cycle,
+       product_id, catalog_product_revision_id, revision, currency, billing_cycle,
        one_time_minor, setup_minor, recurring_minor, valid_from
-     ) VALUES ($1, 99, 'USD', 'monthly', 0, 0, 9999, $2)`,
-    [productId, TERM_START],
+     ) VALUES ($1, $2, 99, 'USD', 'monthly', 0, 0, 9999, $3)`,
+    [productId, catalogProductRevisionId, TERM_START],
   );
 
   const mainAccount = await createFixtureAccount(client, "main");
@@ -3791,7 +4103,7 @@ try {
      VALUES ($1, 'recurring', 'Synthetic cross-account renewal guard', 555)`,
     [wrongOwnerInvoiceId],
   );
-  await expectDatabaseRejection(client, "renewal_cross_account", /inconsistent/i, () =>
+  await expectDatabaseRejection(client, "renewal_cross_account", /differs/i, () =>
     client.query(
       `INSERT INTO service_renewals(
          service_id, invoice_id, automation_run_id, period_start, period_end,
@@ -4200,7 +4512,7 @@ try {
         pendingMethodRemoval: "409 without revoking active authorization",
         pendingWithdrawal: "bounded generation, exact replay and ABA conflict enforced",
         confirmedReplacementAndRevoke: "fresh decision generation required",
-        lockOrder: "real HTTP waited on Service while Service-first transaction locked Account; no deadlock",
+        lockOrder: "real HTTP waited on Service; the Service-only blocker introduced no reverse lock",
         futureProviderTime: "query-only reconciliation retained the running Worker lease",
         terminalCallback: "completed the released manual reconciliation job",
         lateSuccessAfterActionRequired:

@@ -1,0 +1,253 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: opensales-testb
+
+x-bounded-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-10m}
+    max-file: "${CONTAINER_LOG_MAX_FILES:-3}"
+
+x-provider-runtime: &provider-runtime
+  image: ${PROVIDER_RUNTIME_IMAGE:?required_digest_bound_provider_runtime_image}
+  pull_policy: never
+  command: [node, providers/mock-lab/dist/server.js]
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: ${PROVIDER_PIDS_LIMIT:-192}
+  mem_limit: ${PROVIDER_MEMORY_LIMIT:-512m}
+  cpus: ${PROVIDER_CPU_LIMIT:-0.6}
+  logging: *bounded-logging
+  healthcheck:
+    test: [CMD, node, -e, "fetch('http://127.0.0.1:4000/health/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+
+x-provider-database: &provider-database
+  image: ${POSTGRES_IMAGE:?required_digest_bound_postgres_18_image}
+  pull_policy: never
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 30s
+  pids_limit: ${PROVIDER_DATABASE_PIDS_LIMIT:-192}
+  mem_limit: ${PROVIDER_DATABASE_MEMORY_LIMIT:-768m}
+  cpus: ${PROVIDER_DATABASE_CPU_LIMIT:-0.6}
+  logging: *bounded-logging
+
+services:
+  provider-payment-db:
+    <<: *provider-database
+    environment:
+      POSTGRES_DB: payment_provider
+      POSTGRES_USER: payment_provider
+      POSTGRES_PASSWORD: ${PAYMENT_PROVIDER_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-payment-db-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${PAYMENT_DATABASE_HOST_PORT:-55433}:5432"
+    networks: [payment-data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U payment_provider -d payment_provider"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  provider-provisioning-db:
+    <<: *provider-database
+    environment:
+      POSTGRES_DB: provisioning_provider
+      POSTGRES_USER: provisioning_provider
+      POSTGRES_PASSWORD: ${PROVISIONING_PROVIDER_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-provisioning-db-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${PROVISIONING_DATABASE_HOST_PORT:-55434}:5432"
+    networks: [provisioning-data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U provisioning_provider -d provisioning_provider"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  provider-mail-db:
+    <<: *provider-database
+    environment:
+      POSTGRES_DB: mail_provider
+      POSTGRES_USER: mail_provider
+      POSTGRES_PASSWORD: ${MAIL_PROVIDER_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-mail-db-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${MAIL_DATABASE_HOST_PORT:-55435}:5432"
+    networks: [mail-data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U mail_provider -d mail_provider"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  provider-platform-db:
+    <<: *provider-database
+    environment:
+      POSTGRES_DB: provider_platform
+      POSTGRES_USER: provider_platform
+      POSTGRES_PASSWORD: ${PROVIDER_PLATFORM_DATABASE_PASSWORD:?required}
+    volumes:
+      - provider-platform-db-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:${PLATFORM_DATABASE_HOST_PORT:-55436}:5432"
+    networks: [provider-platform-data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U provider_platform -d provider_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  provider-payment:
+    <<: *provider-runtime
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://payment_provider:${PAYMENT_PROVIDER_DATABASE_PASSWORD:?required}@provider-payment-db:5432/payment_provider
+      MOCK_PAYMENT_PROVIDER_TOKEN: ${MOCK_PAYMENT_PROVIDER_TOKEN:?required}
+      MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?required}
+      CORE_CALLBACK_URL: ${CORE_CALLBACK_URL:?required_https_core_callback_url}
+    depends_on:
+      provider-payment-db:
+        condition: service_healthy
+    networks: [payment-data, payment-app, provider-egress]
+
+  provider-provisioning:
+    <<: *provider-runtime
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provisioning_provider:${PROVISIONING_PROVIDER_DATABASE_PASSWORD:?required}@provider-provisioning-db:5432/provisioning_provider
+      MOCK_PROVISIONING_PROVIDER_TOKEN: ${MOCK_PROVISIONING_PROVIDER_TOKEN:?required}
+      MOCK_PROVISIONING_WEBHOOK_SECRET: ${MOCK_PROVISIONING_WEBHOOK_SECRET:?required}
+      CORE_CALLBACK_URL: ${CORE_CALLBACK_URL:?required_https_core_callback_url}
+    depends_on:
+      provider-provisioning-db:
+        condition: service_healthy
+    networks: [provisioning-data, provisioning-app, provider-egress]
+
+  provider-mail:
+    <<: *provider-runtime
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://mail_provider:${MAIL_PROVIDER_DATABASE_PASSWORD:?required}@provider-mail-db:5432/mail_provider
+      MOCK_MAIL_PROVIDER_TOKEN: ${MOCK_MAIL_PROVIDER_TOKEN:?required}
+      CORE_CALLBACK_URL: ${CORE_CALLBACK_URL:?required_https_core_callback_url}
+    depends_on:
+      provider-mail-db:
+        condition: service_healthy
+    networks: [mail-data, mail-app]
+
+  provider-mailbox:
+    <<: *provider-runtime
+    command:
+      - sh
+      - -c
+      - >-
+        until node -e "fetch('http://provider-mail:4000/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))";
+        do sleep 1; done;
+        exec node providers/mock-lab/dist/server.js
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://mail_provider:${MAIL_PROVIDER_DATABASE_PASSWORD:?required}@provider-mail-db:5432/mail_provider
+      LAB_MAILBOX_TOKEN: ${LAB_MAILBOX_TOKEN:?required}
+      CORE_CALLBACK_URL: ${CORE_CALLBACK_URL:?required_https_core_callback_url}
+    depends_on:
+      provider-mail-db:
+        condition: service_healthy
+      provider-mail:
+        condition: service_healthy
+    networks: [mail-data, mailbox-app]
+
+  provider-platform:
+    <<: *provider-runtime
+    environment:
+      PROVIDER_DATABASE_URL: postgresql://provider_platform:${PROVIDER_PLATFORM_DATABASE_PASSWORD:?required}@provider-platform-db:5432/provider_platform
+      MOCK_PROVIDER_PLATFORM_TOKEN: ${MOCK_PROVIDER_PLATFORM_TOKEN:?required}
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY: ${MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY:?required}
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION: ${MOCK_PROVIDER_REQUEST_FINGERPRINT_KEY_VERSION:-1}
+      MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS: ${MOCK_PROVIDER_REQUEST_FINGERPRINT_PREVIOUS_KEYS:-}
+      MOCK_PROVIDER_PUBLIC_BASE_URL: ${PROVIDER_BASE_URL:?required_https_provider_base_url}
+      CORE_CALLBACK_URL: ${CORE_CALLBACK_URL:?required_https_core_callback_url}
+    depends_on:
+      provider-platform-db:
+        condition: service_healthy
+    networks: [provider-platform-data, provider-platform-app]
+
+  provider-edge:
+    image: ${CADDY_IMAGE:?required_digest_bound_caddy_image}
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      provider-payment:
+        condition: service_healthy
+      provider-provisioning:
+        condition: service_healthy
+      provider-mail:
+        condition: service_healthy
+      provider-mailbox:
+        condition: service_healthy
+      provider-platform:
+        condition: service_healthy
+    ports:
+      - "${PROVIDER_EDGE_BIND_ADDRESS:?required_approved_bind_address}:${PROVIDER_HTTPS_PORT:-443}:8443"
+    volumes:
+      - ./Caddyfile.provider-edge:/etc/caddy/Caddyfile:ro
+    secrets:
+      - provider_tls_cert
+      - provider_tls_key
+    networks:
+      - payment-app
+      - provisioning-app
+      - mail-app
+      - mailbox-app
+      - provider-platform-app
+      - provider-ingress
+    read_only: true
+    tmpfs:
+      - /config:size=8m,mode=0700
+      - /data:size=16m,mode=0700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${EDGE_PIDS_LIMIT:-128}
+    mem_limit: ${EDGE_MEMORY_LIMIT:-256m}
+    cpus: ${EDGE_CPU_LIMIT:-0.5}
+    logging: *bounded-logging
+
+volumes:
+  provider-payment-db-data:
+  provider-provisioning-db-data:
+  provider-mail-db-data:
+  provider-platform-db-data:
+
+secrets:
+  provider_tls_cert:
+    file: ${PROVIDER_TLS_CERT_FILE:?required_private_tls_certificate_file}
+  provider_tls_key:
+    file: ${PROVIDER_TLS_KEY_FILE:?required_private_tls_key_file}
+
+networks:
+  payment-data:
+    internal: true
+  provisioning-data:
+    internal: true
+  mail-data:
+    internal: true
+  provider-platform-data:
+    internal: true
+  payment-app:
+    internal: true
+  provisioning-app:
+    internal: true
+  mail-app:
+    internal: true
+  mailbox-app:
+    internal: true
+  provider-platform-app:
+    internal: true
+  provider-egress:
+  provider-ingress:

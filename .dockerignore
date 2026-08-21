@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Repository and local tooling state
+.git
+.git/**
+.idea
+.vscode
+.DS_Store
+.tmp
+.demo
+
+# Dependencies and generated output are rebuilt inside the image
+node_modules
+**/node_modules
+dist
+**/dist
+build
+**/build
+coverage
+**/coverage
+playwright-report
+test-results
+artifacts
+*.log
+*.tsbuildinfo
+
+# Runtime configuration and private material must never enter the build context
+.env
+.env.*
+!.env.example
+secrets
+private
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { expect, test } from "@playwright/test";
+import { completeCatalogCheckout } from "./helpers/catalog-checkout.js";
 
 test.describe.configure({ retries: 0 });
 
@@ -36,7 +37,7 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   const product = page.locator("article").filter({ hasText: "HKBGP VPS" }).first();
   await product.getByRole("button", { name: /monthly/i }).click();
   const checkoutDialog = page.getByRole("dialog");
-  await checkoutDialog.getByRole("button", { name: "Configure & order" }).click();
+  await completeCatalogCheckout(checkoutDialog);
   const journey = page.locator("section.order-panel").filter({ hasText: "Live customer journey" });
   await journey.getByLabel("Payment method", { exact: true }).selectOption("usdt");
   await journey.getByRole("button", { name: "Start mock payment" }).click();
@@ -124,7 +125,7 @@ test("customer and staff complete a duplicate-safe renewal through real pages", 
   await expect(renewal).toContainText("due $0.00");
 
   await renewalSection.getByRole("button", { name: "Open my Mock Provider mailbox" }).click();
-  await expect(renewalSection.getByText("Renewal invoice created", { exact: true })).toBeVisible({
+  await expect(renewalSection.getByText("Renewal billing update", { exact: true })).toBeVisible({
     timeout: 15_000,
   });
   await expect(renewalSection.getByText(/delivered/).first()).toBeVisible();

@@ -1,0 +1,46 @@
+{
+  "name": "@opensales/provider-contracts",
+  "version": "0.1.0",
+  "description": "Versioned public Provider contracts for OpenSales System",
+  "type": "module",
+  "license": "Apache-2.0",
+  "files": [
+    "dist",
+    "generated",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schemas": {
+      "types": "./dist/schema-documents.d.ts",
+      "default": "./dist/schema-documents.js"
+    }
+  },
+  "bin": {
+    "opensales-provider-validate": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "docs": "tsc -p tsconfig.json && node scripts/generate.mjs",
+    "docs:check": "tsc -p tsconfig.json && node scripts/generate.mjs --check",
+    "prepack": "npm run docs:check",
+    "test": "node --test dist/**/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "ajv": "8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.13",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": "24.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

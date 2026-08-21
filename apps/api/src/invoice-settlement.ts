@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import {
+  hasCustomerMembershipCapability,
+  paidOrderRequiresStaffFulfillmentReview,
+  type CustomerMembershipRole,
+} from "@opensales/core";
 import type { DatabaseClient } from "./database.js";
 import type { RenewalResumeScheduleOutcome } from "./delinquency-lifecycle.js";
 import { settleRenewalInvoice } from "./renewal-lifecycle.js";
@@ -35,6 +40,74 @@ export async function advancePaidInvoice(
   invoiceId: string,
   context?: InvoiceSettlementContext,
 ): Promise<PaidInvoiceOutcome> {
+  const identityPointerResult = await client.query<{
+    client_account_id: string;
+    submitted_by_user_id: string | null;
+    automatic_user_id: string | null;
+  }>(
+    `SELECT invoice.client_account_id,
+            COALESCE(
+              order_record.submitted_by_user_id,
+              original_order.submitted_by_user_id
+            ) AS submitted_by_user_id,
+            renewal_authorization.granted_by_user_id AS automatic_user_id
+     FROM invoices invoice
+     LEFT JOIN orders order_record ON order_record.id = invoice.order_id
+     LEFT JOIN service_renewals renewal ON renewal.invoice_id = invoice.id
+     LEFT JOIN services service ON service.id = renewal.service_id
+     LEFT JOIN order_items item ON item.id = service.order_item_id
+     LEFT JOIN orders original_order ON original_order.id = item.order_id
+     LEFT JOIN automatic_renewal_authorizations renewal_authorization
+       ON renewal_authorization.id = $2
+     WHERE invoice.id = $1`,
+    [
+      invoiceId,
+      context?.kind === "automatic_renewal" ? context.authorizationId : null,
+    ],
+  );
+  const identityPointer = identityPointerResult.rows[0];
+  if (!identityPointer) throw new Error("Invoice does not exist");
+  const contextUserId =
+    context?.kind === "user_command"
+      ? context.userId
+      : context?.kind === "staff_manual" || context?.kind === "staff_hold_resolution"
+        ? context.staffUserId
+        : identityPointer.automatic_user_id;
+  const userIds = [identityPointer.submitted_by_user_id, contextUserId]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .sort();
+  if (userIds.length > 0) {
+    await client.query(
+      `SELECT id FROM users
+       WHERE id = ANY($1::uuid[])
+       ORDER BY id
+       FOR UPDATE`,
+      [userIds],
+    );
+  }
+  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
+    identityPointer.client_account_id,
+  ]);
+  const membershipUserIds = [
+    identityPointer.submitted_by_user_id,
+    context?.kind === "user_command" ? context.userId : null,
+    identityPointer.automatic_user_id,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .sort();
+  if (membershipUserIds.length > 0) {
+    await client.query(
+      `SELECT user_id
+       FROM client_memberships
+       WHERE client_account_id = $1
+         AND user_id = ANY($2::uuid[])
+       ORDER BY user_id
+       FOR UPDATE`,
+      [identityPointer.client_account_id, membershipUserIds],
+    );
+  }
   const invoiceResult = await client.query<{
     total_minor: string;
     order_id: string | null;
@@ -94,19 +167,6 @@ export async function advancePaidInvoice(
   await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [
     lockPointer.service_id,
   ]);
-  await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-    lockPointer.submitted_by_user_id,
-  ]);
-  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-    lockPointer.client_account_id,
-  ]);
-  await client.query(
-    `SELECT client_account_id
-     FROM client_memberships
-     WHERE client_account_id = $1 AND user_id = $2
-     FOR UPDATE`,
-    [lockPointer.client_account_id, lockPointer.submitted_by_user_id],
-  );
   const orderResult = await client.query<{
     id: string;
     status: string;
@@ -115,12 +175,23 @@ export async function advancePaidInvoice(
     email_verified_at: Date | null;
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
+    membership_role: CustomerMembershipRole;
+    membership_permissions: unknown;
+    membership_restricted_at: Date | null;
     removed_at: Date | null;
+    binding_configured: boolean;
+    binding_provider_installation_id: string | null;
   }>(
     `SELECT
        o.id, o.status, oi.fulfillment_mode, s.id AS service_id,
        u.email_verified_at, u.restricted_at AS user_restricted_at,
-       ca.restricted_at AS account_restricted_at, cm.removed_at
+       ca.restricted_at AS account_restricted_at,
+       cm.role AS membership_role,
+       cm.permissions AS membership_permissions,
+       cm.restricted_at AS membership_restricted_at,
+       cm.removed_at,
+       (binding.service_id IS NOT NULL) AS binding_configured,
+       binding.provider_installation_id AS binding_provider_installation_id
      FROM orders o
      JOIN order_items oi ON oi.order_id = o.id
      JOIN services s ON s.order_item_id = oi.id
@@ -129,6 +200,7 @@ export async function advancePaidInvoice(
      JOIN client_memberships cm
        ON cm.client_account_id = o.client_account_id
       AND cm.user_id = o.submitted_by_user_id
+     LEFT JOIN service_provider_bindings binding ON binding.service_id = s.id
      WHERE o.id = $1`,
     [invoice.order_id],
   );
@@ -152,7 +224,21 @@ export async function advancePaidInvoice(
     Boolean(order.email_verified_at) &&
     !order.user_restricted_at &&
     !order.account_restricted_at &&
-    !order.removed_at;
+    !order.membership_restricted_at &&
+    !order.removed_at &&
+    hasCustomerMembershipCapability(
+      {
+        role: order.membership_role,
+        permissions:
+          Array.isArray(order.membership_permissions) &&
+          order.membership_permissions.every(
+            (permission): permission is string => typeof permission === "string",
+          )
+            ? order.membership_permissions
+            : [],
+      },
+      "orders.create",
+    );
   if (!eligible) {
     await client.query(
       `UPDATE orders
@@ -164,7 +250,17 @@ export async function advancePaidInvoice(
     return { invoiceStatus: "paid", orderStatus: "on_hold" };
   }
 
-  if (order.fulfillment_mode === "manual" || order.fulfillment_mode === "review") {
+  if (
+    (
+      order.binding_configured &&
+      order.binding_provider_installation_id === null &&
+      (order.fulfillment_mode === "automatic" || order.fulfillment_mode === "review")
+    ) ||
+    paidOrderRequiresStaffFulfillmentReview(
+      order.fulfillment_mode,
+      BigInt(invoice.total_minor),
+    )
+  ) {
     await client.query(
       `UPDATE orders
        SET status = 'awaiting_manual', updated_at = now(), version = version + 1
@@ -183,6 +279,15 @@ export async function advancePaidInvoice(
   );
   if (accepted.rowCount !== 1) {
     return { invoiceStatus: "paid", orderStatus: order.status };
+  }
+  if (
+    !order.binding_configured ||
+    order.binding_provider_installation_id !== "mock-provisioning-v1"
+  ) {
+    throw Object.assign(
+      new Error("Paid automatic fulfillment has no Provider binding snapshot"),
+      { statusCode: 409, code: "PROVISIONING_BINDING_UNAVAILABLE" },
+    );
   }
   const operationResult = await client.query<{ id: string }>(
     `INSERT INTO provider_operations(

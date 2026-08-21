@@ -1,0 +1,63 @@
+{
+  "format": "opensales-lab-rc-recovery-evidence/v1",
+  "warning": "NOT FOR PRODUCTION — MOCK PROVIDERS ONLY",
+  "recordStatus": "not-measured",
+  "profile": null,
+  "releaseCommit": null,
+  "manifestSha256": null,
+  "operator": null,
+  "exercise": {
+    "failureDeclaredAt": null,
+    "restorePointAt": null,
+    "recoveryDeclaredAt": null,
+    "blankDatabaseEvidence": [],
+    "postgresql18Evidence": [],
+    "deepArchiveVerificationEvidence": []
+  },
+  "nativeIntegrity": {
+    "status": "not-run",
+    "schemaHistoryMatchesManifest": null,
+    "providerTableInventoryMatchesManifest": null,
+    "attachmentCountMatchesManifest": null,
+    "attachmentBytesMatchManifest": null,
+    "attachmentDigestViolations": null,
+    "evidence": []
+  },
+  "reconciliation": {
+    "status": "not-run",
+    "coreJobsAndOutboxReviewed": null,
+    "unknownExternalOutcomesReviewed": null,
+    "providerOperationsReviewed": null,
+    "newSideEffectsObserved": null,
+    "evidence": []
+  },
+  "sideEffectGate": {
+    "workerDispatchStayedDisabled": null,
+    "providerMutationStayedDisabled": null,
+    "explicitResumeAt": null,
+    "explicitResumeOperator": null
+  },
+  "rpo": {
+    "objectiveSeconds": 900,
+    "measuredSeconds": null,
+    "status": "not-measured",
+    "calculation": null,
+    "evidence": []
+  },
+  "rto": {
+    "objectiveSeconds": 7200,
+    "measuredSeconds": null,
+    "status": "not-measured",
+    "calculation": null,
+    "evidence": []
+  },
+  "applicationAcceptance": {
+    "status": "not-run",
+    "apiEvidence": [],
+    "webEvidence": [],
+    "workerEvidence": [],
+    "providerEvidence": []
+  },
+  "outcome": "not-evaluated",
+  "deviations": []
+}

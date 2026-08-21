@@ -2,6 +2,8 @@
 
 import { defineConfig, devices } from "@playwright/test";
 
+const localChromiumExecutable = process.env.OSS_E2E_CHROMIUM_EXECUTABLE;
+
 export default defineConfig({
   testDir: "./tests",
   timeout: 45_000,
@@ -16,9 +18,12 @@ export default defineConfig({
   reporter: [["line"], ["html", { open: "never" }]],
   use: {
     baseURL: process.env.OSS_E2E_URL ?? "http://127.0.0.1:5173",
+    ...(localChromiumExecutable
+      ? { launchOptions: { executablePath: localChromiumExecutable } }
+      : {}),
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    video: localChromiumExecutable ? "off" : "retain-on-failure",
   },
   projects: [
     {

@@ -3,7 +3,16 @@
 import { percentageFeeMinor } from "@opensales/core";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { assertBillingWriteEligible, assertEligible, requireUser } from "./auth.js";
+import {
+  assertBillingWriteEligible,
+  assertCustomerCapability,
+  assertEligible,
+  assertFinancialReadEligible,
+  expectedAccountContextVersion,
+  lockAccountContextForMutation,
+  membershipCapabilities,
+  requireUser,
+} from "./auth.js";
 import type { Config } from "./config.js";
 import { transaction, type DatabasePool } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
@@ -16,7 +25,7 @@ export async function registerBillingRoutes(
 ): Promise<void> {
   app.get("/api/v1/billing/summary", async (request) => {
     const user = await requireUser(request, pool, config);
-    assertEligible(user);
+    assertFinancialReadEligible(user);
     const credit = await pool.query<{ balance_minor: string }>(
       `SELECT COALESCE(sum(ct.credit_minor - ct.debit_minor), 0)::text AS balance_minor
        FROM credit_accounts ca
@@ -68,7 +77,9 @@ export async function registerBillingRoutes(
             minimumMinor: policy.min_principal_minor,
             maximumMinor: policy.max_principal_minor,
             balanceCapMinor: policy.balance_cap_minor,
-            allowed: user.membershipRole === "owner" || user.membershipRole === "billing",
+            allowed:
+              !user.clientAccountRestrictedAt &&
+              membershipCapabilities(user).includes("billing.write"),
           }
         : {
             enabled: false,
@@ -82,6 +93,7 @@ export async function registerBillingRoutes(
 
   app.post("/api/v1/invoices/:invoiceId/payment-quotes", async (request, reply) => {
     const user = await requireUser(request, pool, config);
+    const expectedContextVersion = expectedAccountContextVersion(request);
     assertBillingWriteEligible(user);
     const params = z.object({ invoiceId: z.uuid() }).parse(request.params);
     const body = z
@@ -96,6 +108,12 @@ export async function registerBillingRoutes(
       applyCredit: body.applyCredit,
     });
     const quote = await transaction(pool, async (client) => {
+      const context = await lockAccountContextForMutation(
+        client,
+        user,
+        expectedContextVersion,
+      );
+      assertCustomerCapability(context, "billing.write");
       const methodResult = await client.query<{
         code: string;
         fee_basis_points: number;

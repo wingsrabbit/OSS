@@ -577,6 +577,10 @@ select:focus {
   line-height: 1.55;
 }
 
+.revision-body {
+  white-space: pre-wrap;
+}
+
 .mode {
   padding: 0.3rem 0.5rem;
   border-radius: 0.35rem;
@@ -645,6 +649,197 @@ select:focus {
   border-radius: 1.2rem;
   background: #0c192a;
   box-shadow: 0 30px 90px rgba(0, 0, 0, 0.5);
+}
+
+.catalog-checkout-modal {
+  width: min(720px, 100%);
+}
+
+.catalog-checkout-form,
+.checkout-review {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.25rem;
+}
+
+.checkout-fieldset {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+}
+
+.checkout-fieldset > legend {
+  padding: 0 0.4rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.checkout-option {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.checkout-option > span,
+.checkout-option > legend {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.checkout-option > small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.checkout-option-radio {
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+
+.checkout-option-radio > label,
+.checkout-review .legal-box > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.checkout-option-radio input,
+.checkout-review .legal-box input {
+  width: auto;
+  margin-top: 0.2rem;
+}
+
+.checkout-review .quote-summary span {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.checkout-review .quote-summary strong {
+  color: var(--text);
+}
+
+.checkout-review details {
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+}
+
+.checkout-review details > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.commerce-admin-panel,
+.customer-quote-panel,
+.marketing-consent-panel {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.commerce-admin-panel > .checkout-review,
+.customer-quote-panel > .checkout-review {
+  margin: 0;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: rgba(3, 10, 20, 0.28);
+}
+
+.commerce-admin-panel .form-columns {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr));
+  gap: 1rem;
+}
+
+.commerce-admin-panel form,
+.customer-quote-panel form {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid rgba(97, 217, 207, 0.16);
+  border-radius: 0.75rem;
+  background: rgba(3, 10, 20, 0.32);
+}
+
+.commerce-admin-panel label,
+.customer-quote-panel label {
+  display: grid;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.commerce-admin-panel label:has(> input[type="checkbox"]),
+.customer-quote-panel label:has(> input[type="checkbox"]) {
+  display: flex;
+  align-items: flex-start;
+}
+
+.commerce-admin-panel input[type="checkbox"],
+.customer-quote-panel input[type="checkbox"] {
+  width: auto;
+}
+
+.commerce-admin-panel textarea,
+.customer-quote-panel textarea {
+  width: 100%;
+  min-height: 5.5rem;
+  resize: vertical;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  outline: none;
+  color: var(--text);
+  background: rgba(3, 10, 20, 0.5);
+  font: inherit;
+}
+
+.commerce-admin-panel textarea:focus,
+.customer-quote-panel textarea:focus {
+  border-color: rgba(97, 217, 207, 0.6);
+  box-shadow: 0 0 0 3px rgba(97, 217, 207, 0.1);
+}
+
+.commerce-admin-panel .manual-item,
+.customer-quote-panel .manual-item {
+  flex-wrap: wrap;
+}
+
+.commerce-admin-panel .manual-item > pre,
+.customer-quote-panel pre {
+  flex-basis: 100%;
+  max-width: 100%;
+  overflow: auto;
+  padding: 0.8rem;
+  border-radius: 0.55rem;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.consent-status {
+  display: grid;
+  grid-template-columns: minmax(8rem, auto) minmax(6rem, auto) 1fr;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: rgba(3, 10, 20, 0.4);
+}
+
+.consent-status span {
+  color: var(--muted);
+}
+
+.marketing-consent-panel .button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
 }
 
 .close {
@@ -796,11 +991,359 @@ select:focus {
     grid-template-columns: 1fr;
   }
 
+  .consent-status {
+    grid-template-columns: 1fr;
+  }
+
   .manual-receipt-reason {
     grid-column: auto;
   }
 
   .header-actions .pill {
     display: none;
+  }
+}
+
+.account-context-switcher,
+.account-access-panel {
+  display: grid;
+  gap: 1rem;
+  margin: 0 0 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: rgba(7, 20, 34, 0.82);
+  padding: 1.25rem;
+}
+
+.security-page {
+  display: grid;
+  gap: 1rem;
+  margin-block: 1.5rem;
+}
+
+.security-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.security-page form,
+.security-page fieldset {
+  display: grid;
+  gap: 0.7rem;
+  margin-block: 1rem;
+}
+
+.security-page label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.security-page .scope-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.security-page .scope-option input {
+  width: auto;
+}
+
+.security-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.security-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.security-list article {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.security-list article form {
+  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 1fr) auto;
+  margin: 0;
+}
+
+.one-time-secret {
+  display: grid;
+  gap: 0.6rem;
+  overflow-wrap: anywhere;
+  padding: 0.9rem;
+  border: 1px solid var(--warning, #c28b22);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--warning, #c28b22) 10%, transparent);
+}
+
+.one-time-secret code,
+.one-time-secret pre {
+  overflow: auto;
+  white-space: pre-wrap;
+  user-select: all;
+}
+
+@media (max-width: 800px) {
+  .security-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .security-list article form {
+    grid-template-columns: 1fr;
+  }
+}
+
+.account-context-switcher .inline-form {
+  align-items: end;
+}
+
+.account-context-switcher label,
+.account-reauth,
+.account-access-editor label {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.account-access-panel {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr));
+}
+
+.account-access-panel > .history-heading,
+.account-access-panel > .account-reauth {
+  grid-column: 1 / -1;
+}
+
+.account-access-collection {
+  display: grid;
+  align-content: start;
+  gap: 0.75rem;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: rgba(3, 10, 20, 0.35);
+  padding: 1rem;
+}
+
+.account-access-create,
+.account-access-editor {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.account-access-create {
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  align-items: end;
+  margin-bottom: 1rem;
+}
+
+.account-access-editor {
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.subscription-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.subscription-options label,
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+@media (max-width: 760px) {
+  .account-context-switcher .inline-form,
+  .account-access-create {
+    grid-template-columns: 1fr;
+  }
+}
+
+.history-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 1rem;
+  width: 100%;
+}
+
+.history-card,
+.account360-panel,
+.history-detail {
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: rgba(3, 10, 20, 0.35);
+  padding: 1rem;
+}
+
+.history-card h3,
+.account360-panel h3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0;
+}
+
+.history-count {
+  display: inline-flex;
+  min-width: 1.8rem;
+  height: 1.8rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(97, 217, 207, 0.12);
+  font-size: 0.8rem;
+}
+
+.history-card details,
+.account360-billing details {
+  border-top: 1px solid var(--line);
+  padding: 0.75rem 0;
+}
+
+.history-card details:first-of-type,
+.account360-billing details:first-of-type {
+  border-top: 0;
+}
+
+.history-card details span,
+.account360-billing details span,
+.trace-grid > span {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.history-card summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.history-row {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  padding: 0.75rem 0;
+  text-align: left;
+}
+
+.history-row:first-of-type {
+  border-top: 0;
+}
+
+.history-detail {
+  position: relative;
+  width: 100%;
+  scroll-margin-top: 1rem;
+}
+
+.history-detail-close {
+  float: right;
+}
+
+.history-facts,
+.trace-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.65rem;
+  margin: 1rem 0;
+}
+
+.history-facts > span,
+.trace-grid > a,
+.trace-grid > button,
+.trace-grid > span {
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: rgba(3, 10, 20, 0.32);
+  padding: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.history-refresh-bottom {
+  align-self: flex-start;
+}
+
+.account360-search {
+  display: grid;
+  grid-template-columns: minmax(16rem, 1fr) auto;
+  align-items: end;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.account360-search label {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.account360-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.account360-results button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.account360-workspace {
+  display: grid;
+  gap: 1rem;
+  width: 100%;
+}
+
+.account360-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.account360-billing h4 {
+  margin: 1.25rem 0 0.4rem;
+}
+
+@media (max-width: 760px) {
+  .history-heading {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .account360-search {
+    grid-template-columns: 1fr;
+  }
+
+  .history-heading > button,
+  .account360-search > button {
+    width: 100%;
   }
 }

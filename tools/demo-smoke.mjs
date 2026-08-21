@@ -43,29 +43,89 @@ async function waitFor(description, read, predicate, timeoutMs = 60_000) {
   throw new Error(`Timed out waiting for ${description}: ${detail}`);
 }
 
-class DemoSession {
-  constructor(baseUrl) {
+export class DemoSession {
+  constructor(baseUrl, fetchImpl = fetch) {
     this.baseUrl = baseUrl;
+    this.fetchImpl = fetchImpl;
     this.cookie = "";
+    this.sessionEpoch = 0;
+    this.accountContextVersion = null;
+    this.clientAccountId = null;
   }
 
   async request(path, init = {}, expectedStatus = 200) {
-    const response = await fetch(new URL(path, this.baseUrl), {
+    const requestSessionEpoch = this.sessionEpoch;
+    const method = (init.method ?? "GET").toUpperCase();
+    const headers = new Headers(init.headers);
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    if (this.cookie && !headers.has("Cookie")) headers.set("Cookie", this.cookie);
+    if (
+      method !== "GET" &&
+      method !== "HEAD" &&
+      this.accountContextVersion !== null &&
+      !headers.has("X-OSS-Account-Context-Version")
+    ) {
+      headers.set("X-OSS-Account-Context-Version", this.accountContextVersion);
+    }
+
+    const response = await this.fetchImpl(new URL(path, this.baseUrl), {
       ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...(this.cookie ? { Cookie: this.cookie } : {}),
-        ...init.headers,
-      },
+      headers,
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
     });
     const setCookie = response.headers.get("set-cookie");
-    if (setCookie) this.cookie = setCookie.split(";", 1)[0] ?? "";
+    let responseEstablishedCurrentSession = false;
+    if (setCookie && requestSessionEpoch === this.sessionEpoch) {
+      const nextCookie = setCookie.split(";", 1)[0] ?? "";
+      const cookieValue = nextCookie.includes("=")
+        ? nextCookie.slice(nextCookie.indexOf("=") + 1).trim()
+        : "";
+      const maxAge = /(?:^|;)\s*max-age\s*=\s*(-?\d+)/i.exec(setCookie)?.[1];
+      const expires = /(?:^|;)\s*expires\s*=\s*([^;]+)/i.exec(setCookie)?.[1];
+      const expiresAt = expires === undefined ? Number.NaN : Date.parse(expires);
+      const clearsSession =
+        cookieValue.length === 0 ||
+        (maxAge !== undefined && Number(maxAge) <= 0) ||
+        (Number.isFinite(expiresAt) && expiresAt <= Date.now());
+      if (clearsSession) {
+        this.cookie = "";
+        this.sessionEpoch += 1;
+        this.accountContextVersion = null;
+        this.clientAccountId = null;
+      } else if (nextCookie !== this.cookie) {
+        this.cookie = nextCookie;
+        this.sessionEpoch += 1;
+        this.accountContextVersion = null;
+        this.clientAccountId = null;
+        responseEstablishedCurrentSession = true;
+      }
+    }
+    const accountContextVersion = response.headers.get("x-oss-account-context-version");
+    const responseBelongsToCurrentSession =
+      requestSessionEpoch === this.sessionEpoch || responseEstablishedCurrentSession;
+    if (accountContextVersion !== null && responseBelongsToCurrentSession) {
+      assert.match(
+        accountContextVersion,
+        /^(?:0|[1-9]\d*)$/,
+        "API returned an invalid account-context version",
+      );
+      const responseVersion = BigInt(accountContextVersion);
+      const currentVersion =
+        this.accountContextVersion === null ? null : BigInt(this.accountContextVersion);
+      if (
+        currentVersion === null ||
+        responseVersion >= currentVersion
+      ) {
+        this.accountContextVersion = accountContextVersion;
+        const clientAccountId = response.headers.get("x-oss-client-account-id");
+        this.clientAccountId = clientAccountId?.trim() || null;
+      }
+    }
     const bodyText = await response.text();
     if (response.status !== expectedStatus) {
       throw new Error(
-        `${init.method ?? "GET"} ${path} expected ${expectedStatus}, received ${response.status}: ${bodyText}`,
+        `${method} ${path} expected ${expectedStatus}, received ${response.status}: ${bodyText}`,
       );
     }
     if (response.status === 204 || bodyText.length === 0) return undefined;
@@ -391,6 +451,101 @@ async function runManualReceiptOutflowSmoke({
   };
 }
 
+export async function runServiceOperationsSmoke({
+  customerSession,
+  serviceId,
+  timeoutMs,
+}) {
+  const steps = [
+    { action: "stop", expectedResourceState: "stopped" },
+    { action: "start", expectedResourceState: "running" },
+    { action: "reboot", expectedResourceState: "running" },
+  ];
+  const requests = [];
+
+  for (const step of steps) {
+    const before = await customerSession.request(
+      `/api/v1/services/${serviceId}/operations`,
+    );
+    assert.equal(before.warning, LAB_WARNING);
+    assert.equal(before.service.id, serviceId);
+    assert.equal(before.service.status, "active");
+    assert.ok(
+      before.service.availableActions.includes(step.action),
+      `${step.action} is not available for Demo service ${serviceId}`,
+    );
+
+    const created = await customerSession.request(
+      `/api/v1/services/${serviceId}/operations`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          action: step.action,
+          expectedServiceVersion: before.service.version,
+          expectedResourceRevision: before.service.resourceRevision,
+          idempotencyKey: `${step.action}-${randomUUID()}`,
+        }),
+      },
+      201,
+    );
+    assert.match(created.requestId, /^[0-9a-f-]{36}$/);
+    assert.equal(created.serviceId, serviceId);
+    assert.equal(created.action, step.action);
+    assert.equal(created.executionMode, "automatic");
+    assert.equal(created.status, "queued");
+    assert.equal(created.replayed, false);
+
+    const terminal = await waitFor(
+      `Demo ${step.action} operation ${created.requestId}`,
+      () => customerSession.request(`/api/v1/services/${serviceId}/operations`),
+      (value) => {
+        const fact = value.items.find((item) => item.requestId === created.requestId);
+        return fact?.status === "succeeded" &&
+          value.service.resourceState === step.expectedResourceState;
+      },
+      timeoutMs,
+    );
+    const terminalFact = terminal.items.find(
+      (item) => item.requestId === created.requestId,
+    );
+    assert.ok(terminalFact, `Demo ${step.action} terminal fact is missing`);
+    assert.equal(terminalFact.action, step.action);
+    assert.equal(terminalFact.executionMode, "automatic");
+    assert.equal(terminalFact.resultingResourceState, step.expectedResourceState);
+    requests.push({
+      requestId: created.requestId,
+      action: step.action,
+      status: terminalFact.status,
+      resultingResourceState: terminalFact.resultingResourceState,
+      resultRevision: terminalFact.revision,
+      resourceRevision: terminal.service.resourceRevision,
+    });
+  }
+
+  assert.equal(new Set(requests.map((request) => request.requestId)).size, steps.length);
+  const final = await customerSession.request(
+    `/api/v1/services/${serviceId}/operations`,
+  );
+  for (const request of requests) {
+    assert.ok(
+      final.items.some(
+        (item) => item.requestId === request.requestId && item.status === "succeeded",
+      ),
+      `Demo service timeline is missing ${request.action} request ${request.requestId}`,
+    );
+  }
+  assert.equal(final.service.status, "active");
+  assert.equal(final.service.resourceState, "running");
+
+  return {
+    serviceId,
+    requests,
+    finalServiceStatus: final.service.status,
+    finalResourceState: final.service.resourceState,
+    finalResourceRevision: final.service.resourceRevision,
+  };
+}
+
 export async function runDemoSmoke({
   baseUrl = "http://127.0.0.1:5173",
   bootstrapToken,
@@ -439,6 +594,7 @@ export async function runDemoSmoke({
 
   const catalog = await session.request("/api/v1/catalog?locale=en");
   const legal = await session.request("/api/v1/legal/current?locale=en");
+  const publicContent = await session.request("/api/v1/content?locale=en");
   const automaticProduct = catalog.products.find((product) => product.id === "hkbgp-vps");
   const automaticPrice = automaticProduct?.prices.find(
     (price) => price.billingCycle === "monthly",
@@ -447,6 +603,26 @@ export async function runDemoSmoke({
   assert.ok(automaticPrice, "Synthetic HKBGP VPS monthly price is missing");
   assert.ok(legal.documents?.terms?.version, "Synthetic Terms are missing");
   assert.ok(legal.documents?.aup?.version, "Synthetic AUP is missing");
+  assert.ok(legal.documents?.privacy?.version, "Synthetic Privacy notice is missing");
+  for (const kind of ["terms", "aup", "privacy"]) {
+    assert.match(legal.documents[kind].documentId, /^[0-9a-f-]{36}$/);
+    assert.equal(legal.documents[kind].locale, "en");
+    assert.equal(legal.documents[kind].fallback, false);
+    assert.match(legal.documents[kind].revision, /^(?:0|[1-9]\d*)$/);
+  }
+  assert.ok(
+    publicContent.items.some((item) => item.kind === "announcement"),
+    "Published synthetic Announcement is missing",
+  );
+  assert.ok(
+    publicContent.items.some((item) => item.kind === "network_status"),
+    "Published synthetic Network Status is missing",
+  );
+  assert.equal(
+    publicContent.items.some((item) => item.audience !== "public"),
+    false,
+    "Public Content returned a non-public entry",
+  );
 
   const administratorAccess = bootstrapToken
     ? await createAdministrator({
@@ -463,6 +639,61 @@ export async function runDemoSmoke({
   const identity = syntheticIdentity("customer");
   const registeredCustomer = await registerAndVerify({ session, identity, timeoutMs });
   const registration = registeredCustomer.registration;
+  const notificationPreferences = await session.request(
+    "/api/v1/customer/notification-preferences",
+  );
+  assert.equal(notificationPreferences.channel, "email");
+  assert.equal(notificationPreferences.categories.length, 6);
+  assert.ok(
+    notificationPreferences.categories
+      .filter((category) => category.mandatory)
+      .every((category) => category.enabled === true),
+    "Required notification categories must remain enabled",
+  );
+  const supportPreference = notificationPreferences.categories.find(
+    (category) => category.category === "support",
+  );
+  assert.ok(supportPreference && !supportPreference.mandatory);
+  const supportDisabled = await session.request(
+    "/api/v1/customer/notification-preferences/support/email",
+    {
+      method: "PUT",
+      body: JSON.stringify({ enabled: false, expectedVersion: supportPreference.version }),
+    },
+  );
+  assert.equal(supportDisabled.enabled, false);
+  const supportEnabled = await session.request(
+    "/api/v1/customer/notification-preferences/support/email",
+    {
+      method: "PUT",
+      body: JSON.stringify({ enabled: true, expectedVersion: supportDisabled.version }),
+    },
+  );
+  assert.equal(supportEnabled.enabled, true);
+
+  const templateRegistry = await administratorAccess.session.request(
+    "/api/v1/admin/notification-templates",
+  );
+  assert.equal(templateRegistry.events.length, 7);
+  assert.ok(
+    templateRegistry.events.every(
+      (event) =>
+        event.locales.some((entry) => entry.locale === "en") &&
+        event.locales.some((entry) => entry.locale === "zh-CN"),
+    ),
+    "Every seeded notification event must expose English and Chinese channels",
+  );
+  const customerContent = await session.request("/api/v1/customer/content?locale=zh-CN");
+  assert.ok(
+    customerContent.items.some((item) => item.kind === "knowledge_base"),
+    "Published synthetic Customer Knowledge Base is missing",
+  );
+  assert.ok(
+    customerContent.items.every(
+      (item) => item.locale === "zh-CN" || (item.locale === "en" && item.fallback === true),
+    ),
+    "Customer Content did not use deterministic zh-CN then English fallback",
+  );
 
   const created = await session.request(
     "/api/v1/orders",
@@ -473,6 +704,11 @@ export async function runDemoSmoke({
         configuration: {},
         termsVersion: legal.documents.terms.version,
         aupVersion: legal.documents.aup.version,
+        termsDocumentId: legal.documents.terms.documentId,
+        aupDocumentId: legal.documents.aup.documentId,
+        legalLocale: "en",
+        termsLocale: legal.documents.terms.locale,
+        aupLocale: legal.documents.aup.locale,
         idempotencyKey: randomUUID(),
       }),
     },
@@ -506,6 +742,12 @@ export async function runDemoSmoke({
     timeoutMs,
   );
   assert.ok(activeOrder.service.activatedAt, "Active service has no Ready-for-Service time");
+
+  const serviceOperations = await runServiceOperationsSmoke({
+    customerSession: session,
+    serviceId: activeOrder.service.id,
+    timeoutMs,
+  });
 
   const supportTicket = await runSupportTicketSmoke({
     customerSession: session,
@@ -545,8 +787,18 @@ export async function runDemoSmoke({
       serviceStatus: activeOrder.service.status,
       readyForServiceAt: activeOrder.service.activatedAt,
     },
+    serviceOperations,
     supportTicket,
     manualReceiptOutflow,
+    notifications: {
+      categoryCount: notificationPreferences.categories.length,
+      requiredCategories: notificationPreferences.categories
+        .filter((category) => category.mandatory)
+        .map((category) => category.category),
+      supportPreferenceVersion: supportEnabled.version,
+      templateEventCount: templateRegistry.events.length,
+      locales: ["en", "zh-CN"],
+    },
   };
 }
 

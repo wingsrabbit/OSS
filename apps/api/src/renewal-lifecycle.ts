@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import { percentageFeeMinor, type BillingCycle } from "@opensales/core";
+import {
+  hasCustomerMembershipCapability,
+  percentageFeeMinor,
+  type BillingCycle,
+  type CustomerMembershipRole,
+} from "@opensales/core";
 import type { DatabaseClient } from "./database.js";
 import { requestFingerprint } from "./idempotency.js";
+import {
+  enqueueNotification,
+  enqueueSubscribedContactNotifications,
+} from "./notification-outbox.js";
 import {
   assessLateFeesAndScheduleSuspensions,
   scheduleResumeAfterRenewalSettlement,
@@ -47,6 +56,8 @@ async function enqueueReminder(
   input: {
     invoiceId: string;
     serviceId: string;
+    clientAccountId: string;
+    recipientUserId: string;
     kind: ReminderKind;
     offsetDays: number;
     policySnapshot: Record<string, unknown>;
@@ -66,37 +77,30 @@ async function enqueueReminder(
   );
   if (existing.rowCount) return false;
 
-  const outboxResult = await client.query<{ id: string }>(
-    `WITH inserted AS (
-       INSERT INTO outbox(event_type, unique_key, payload)
-       VALUES ('notification.renewal_reminder_requested', $1, $2)
-       ON CONFLICT (event_type, unique_key) DO NOTHING
-       RETURNING id
-     )
-     SELECT id FROM inserted
-     UNION ALL
-     SELECT id
-     FROM outbox
-     WHERE event_type = 'notification.renewal_reminder_requested'
-       AND unique_key = $1
-     LIMIT 1`,
-    [
-      `renewal:${input.invoiceId}:${input.kind}`,
-      {
-        email: input.email,
-        locale: input.locale,
-        invoiceId: input.invoiceId,
-        serviceId: input.serviceId,
-        kind: input.kind,
-        offsetDays: input.offsetDays,
-        currency: input.currency,
-        dueAt: input.dueAt.toISOString(),
-        amountDueMinor: input.amountDueMinor.toString(),
-      },
-    ],
-  );
-  const outboxId = outboxResult.rows[0]?.id;
-  if (!outboxId) throw new Error("Unable to create renewal reminder outbox event");
+  const eventType = "notification.renewal_reminder_requested";
+  const uniqueKey = `renewal:${input.invoiceId}:${input.kind}`;
+  const notificationPayload = {
+    invoiceId: input.invoiceId,
+    serviceId: input.serviceId,
+    kind: input.kind,
+    offsetDays: input.offsetDays,
+    currency: input.currency,
+    dueAt: input.dueAt.toISOString(),
+    amountDueMinor: input.amountDueMinor.toString(),
+  } as const;
+  const ownerNotification = await enqueueNotification(client, {
+    eventType,
+    uniqueKey,
+    payload: notificationPayload,
+    recipient: {
+      kind: "account_user",
+      category: "billing",
+      userId: input.recipientUserId,
+      clientAccountId: input.clientAccountId,
+      email: input.email,
+      locale: input.locale,
+    },
+  });
   const insertedIntent = await client.query(
     `INSERT INTO renewal_reminder_intents(
        invoice_id, service_id, kind, offset_days, policy_snapshot,
@@ -114,16 +118,18 @@ async function enqueueReminder(
       input.locale,
       input.dueAt,
       input.amountDueMinor.toString(),
-      outboxId,
+      ownerNotification.outboxId,
     ],
   );
   if (insertedIntent.rowCount !== 1) return false;
-  await client.query(
-    `INSERT INTO durable_jobs(job_type, unique_key, payload)
-     VALUES ('notification.send', $1, $2)
-     ON CONFLICT (job_type, unique_key) DO NOTHING`,
-    [`outbox:${outboxId}`, { outboxId }],
-  );
+  await enqueueSubscribedContactNotifications(client, {
+    eventType,
+    uniqueKeyPrefix: uniqueKey,
+    payload: notificationPayload,
+    clientAccountId: input.clientAccountId,
+    category: "billing",
+    ...(ownerNotification.status === "queued" ? { excludeEmails: [input.email] } : {}),
+  });
   return true;
 }
 
@@ -683,6 +689,7 @@ export async function runRenewalAutomation(
     product_name: string;
     price_snapshot: unknown;
     currency: string;
+    owner_user_id: string;
     email: string;
     locale: "en" | "zh-CN";
   }>(
@@ -695,6 +702,7 @@ export async function runRenewalAutomation(
        item.product_name,
        item.price_snapshot,
        original_order.currency,
+       owner.id AS owner_user_id,
        owner.email,
        owner.locale
      FROM services service
@@ -817,6 +825,8 @@ export async function runRenewalAutomation(
       await enqueueReminder(client, {
         invoiceId,
         serviceId: candidate.service_id,
+        clientAccountId: candidate.client_account_id,
+        recipientUserId: candidate.owner_user_id,
         kind: "renewal_created",
         offsetDays: 0,
         policySnapshot: {
@@ -853,6 +863,8 @@ export async function runRenewalAutomation(
   const reminderCandidates = await client.query<{
     invoice_id: string;
     service_id: string;
+    client_account_id: string;
+    owner_user_id: string;
     due_at: Date;
     total_minor: string;
     allocated_minor: string;
@@ -866,6 +878,8 @@ export async function runRenewalAutomation(
     `SELECT
        renewal.invoice_id,
        renewal.service_id,
+       service.client_account_id,
+       owner.id AS owner_user_id,
        invoice.due_at,
        invoice.total_minor::text,
        allocation.allocated_minor::text,
@@ -912,6 +926,8 @@ export async function runRenewalAutomation(
       (await enqueueReminder(client, {
         invoiceId: candidate.invoice_id,
         serviceId: candidate.service_id,
+        clientAccountId: candidate.client_account_id,
+        recipientUserId: candidate.owner_user_id,
         kind,
         offsetDays,
         policySnapshot: {
@@ -1022,26 +1038,9 @@ export async function settleRenewalInvoice(
   const pointer = pointerResult.rows[0];
   if (!pointer) return null;
 
+  const commandUserId = context?.kind === "user_command" ? context.userId : null;
   await client.query("SELECT id FROM orders WHERE id = $1 FOR UPDATE", [pointer.order_id]);
   await client.query("SELECT id FROM services WHERE id = $1 FOR UPDATE", [pointer.service_id]);
-  const commandUserId = context?.kind === "user_command" ? context.userId : null;
-  if (commandUserId) {
-    await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-      commandUserId,
-    ]);
-  }
-  await client.query("SELECT id FROM client_accounts WHERE id = $1 FOR UPDATE", [
-    pointer.client_account_id,
-  ]);
-  if (commandUserId) {
-    await client.query(
-      `SELECT client_account_id
-       FROM client_memberships
-       WHERE client_account_id = $1 AND user_id = $2
-       FOR UPDATE`,
-      [pointer.client_account_id, commandUserId],
-    );
-  }
   await client.query("SELECT id FROM service_renewals WHERE id = $1 FOR UPDATE", [
     pointer.renewal_id,
   ]);
@@ -1067,8 +1066,10 @@ export async function settleRenewalInvoice(
     user_restricted_at: Date | null;
     account_restricted_at: Date | null;
     removed_at: Date | null;
+    membership_restricted_at: Date | null;
     membership_client_account_id: string | null;
-    membership_role: "owner" | "billing" | "technical" | "viewer" | null;
+    membership_role: CustomerMembershipRole | null;
+    membership_permissions: unknown;
     suspension_case_status: string | null;
     automatic_authorization_status: string | null;
     automatic_authorization_service_id: string | null;
@@ -1099,8 +1100,10 @@ export async function settleRenewalInvoice(
        customer.restricted_at AS user_restricted_at,
        account.restricted_at AS account_restricted_at,
        membership.removed_at,
+       membership.restricted_at AS membership_restricted_at,
        membership.client_account_id AS membership_client_account_id,
        membership.role AS membership_role,
+       membership.permissions AS membership_permissions,
        suspension_case.status AS suspension_case_status,
        automatic_authorization.status AS automatic_authorization_status,
        automatic_authorization.service_id AS automatic_authorization_service_id,
@@ -1200,7 +1203,21 @@ export async function settleRenewalInvoice(
     Boolean(renewal.email_verified_at) &&
     !renewal.user_restricted_at &&
     !renewal.removed_at &&
-    (renewal.membership_role === "owner" || renewal.membership_role === "billing");
+    !renewal.membership_restricted_at &&
+    Boolean(renewal.membership_role) &&
+    hasCustomerMembershipCapability(
+      {
+        role: renewal.membership_role!,
+        permissions:
+          Array.isArray(renewal.membership_permissions) &&
+          renewal.membership_permissions.every(
+            (permission): permission is string => typeof permission === "string",
+          )
+            ? renewal.membership_permissions
+            : [],
+      },
+      "billing.write",
+    );
   const automaticRenewalEligible =
     context?.kind === "automatic_renewal" &&
     renewal.automatic_authorization_status === "active" &&
