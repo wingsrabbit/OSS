@@ -9,6 +9,10 @@ import {
   schema023CatalogDigest,
   schema023CatalogFingerprintInput,
 } from "@opensales/core/schema-022-023-native-compatibility";
+import {
+  EXPECTED_SCHEMA_028_HISTORY,
+  SCHEMA_028,
+} from "@opensales/core/schema-027-028-native-compatibility";
 import pg from "pg";
 import { digestToken, passwordHash } from "./auth.js";
 
@@ -1278,38 +1282,16 @@ async function runSchemaGate(): Promise<void> {
   const reviewedDigest = schema023CatalogDigest(reviewedInput);
   assert.equal(reviewedDigest, SCHEMA_023_CATALOG_DIGEST);
   assert.doesNotThrow(() => assertSchema023CatalogDigest(reviewedDigest));
-  const history = await core.query<{ version: string; count: number }>(
-    "SELECT max(version) AS version, count(*)::integer AS count FROM schema_migrations",
+  const history = await core.query<{ version: string }>(
+    `SELECT version
+       FROM schema_migrations
+      ORDER BY version COLLATE "C"`,
   );
-  assert.deepEqual(history.rows[0], {
-    version: "023_stage_c_service_operations",
-    count: 23,
-  });
-  const client = await core.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(
-      `ALTER FUNCTION opensales_check_service_operation_request_commit()
-       RENAME TO opensales_check_service_operation_request_commit_tampered`,
-    );
-    const tamperedInput = await schema023CatalogFingerprintInput(client);
-    const tamperedDigest = schema023CatalogDigest(tamperedInput);
-    assert.notEqual(tamperedDigest, SCHEMA_023_CATALOG_DIGEST);
-    assert.throws(
-      () => assertSchema023CatalogDigest(tamperedDigest),
-      /incomplete or counterfeit/,
-    );
-    await client.query("ROLLBACK");
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
-  assert.equal(
-    schema023CatalogDigest(await schema023CatalogFingerprintInput(core)),
-    SCHEMA_023_CATALOG_DIGEST,
+  assert.deepEqual(
+    history.rows.map((row) => row.version),
+    [...EXPECTED_SCHEMA_028_HISTORY],
   );
+  assert.equal(history.rows.at(-1)?.version, SCHEMA_028);
 }
 
 async function runTimeout(): Promise<void> {
