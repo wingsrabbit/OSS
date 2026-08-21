@@ -5891,16 +5891,15 @@ try {
     },
   );
   await waitFor(
-    "staff allocation to wait for the Provider-held invoice before locking the receipt",
+    "staff allocation to wait for the Provider-held User before locking the receipt",
     async () => {
       const result = await corePool.query<{ waiting: string }>(
         `SELECT count(*)::text AS waiting
          FROM pg_stat_activity
-         WHERE state = 'active'
+         WHERE application_name = 'opensales-api'
+           AND state = 'active'
            AND wait_event_type = 'Lock'
-           AND query ILIKE '%SELECT id, client_account_id, currency, total_minor::text%'
-           AND query ILIKE '%FROM invoices%'
-           AND query ILIKE '%FOR UPDATE%'`,
+           AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
       );
       return result.rows[0]?.waiting ?? "0";
     },
@@ -6073,16 +6072,15 @@ try {
       },
     );
     await waitFor(
-      "staff allocation to wait for the Provider-held invoice before locking the account",
+      "staff allocation to wait for the Provider-held User before locking the account",
       async () => {
         const result = await corePool.query<{ waiting: string }>(
           `SELECT count(*)::text AS waiting
            FROM pg_stat_activity
-           WHERE state = 'active'
+           WHERE application_name = 'opensales-api'
+             AND state = 'active'
              AND wait_event_type = 'Lock'
-             AND query ILIKE '%SELECT id, client_account_id, currency, total_minor::text%'
-             AND query ILIKE '%FROM invoices%'
-             AND query ILIKE '%FOR UPDATE%'`,
+             AND query ILIKE '%SELECT id FROM users%FOR UPDATE%'`,
         );
         return result.rows[0]?.waiting ?? "0";
       },
@@ -6091,7 +6089,7 @@ try {
     // The Provider callback now deliberately owns User and Client Account
     // before inserting its receipt (foreign keys would otherwise acquire the
     // Account row first implicitly). The staff allocation is observed waiting
-    // on Invoice above, so it cannot have reached its later Account lock.
+    // on User above, so it cannot have reached its later Account or Invoice locks.
 
     await accountGateClient.query("COMMIT");
     accountGateOpen = false;
